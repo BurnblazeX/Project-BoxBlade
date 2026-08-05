@@ -1,8 +1,7 @@
 import * as THREE from 'three';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
-
-// --- INPUT RULES ---
+import bobTextureUrl from '../assets/sprites/character_Bob.png'
 const inputRules = {
   explore: { click: true, keyboard: true },
   battle:  { click: true, keyboard: false }
@@ -24,7 +23,7 @@ dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-createTestArea(32, 32);
+createTestArea(48, 48);
 initWorldRender(scene);
 
 // --- PLAYER ENTITY & SPRITE SETUP ---
@@ -38,7 +37,7 @@ const player = createEntity({
 World.get(getVoxelKey(8, 0, 8)).occupant = player.id;
 
 const texLoader = new THREE.TextureLoader();
-const bobTexture = texLoader.load('/assets/sprites/character_Bob.png');
+const bobTexture = texLoader.load(bobTextureUrl);
 bobTexture.magFilter = THREE.NearestFilter; 
 bobTexture.minFilter = THREE.NearestFilter;
 
@@ -106,7 +105,7 @@ const cameraConfigs = {
   },
   battle: { 
     fov: 8,         
-    distance: 150,  
+    distance: 125,  
     pitch: Math.atan(1 / Math.sqrt(2)), 
     headingOffset: Math.PI / 4
   }
@@ -253,39 +252,6 @@ window.addEventListener('pointerup', (e) => {
       
       pathGroup.clear(); 
     }
-  }
-});
-
-window.addEventListener('pointerup', (e) => {
-  console.log(`[Click] Triggered in mode: ${currentMode}`);
-  if (!inputRules[currentMode].click) return;
-
-  const intersect = getGridIntersection(e.clientX, e.clientY);
-  if (intersect) {
-    const { gx, gz } = intersect;
-    const targetKey = getVoxelKey(gx, 0, gz);
-    console.log(`[Click] Target Voxel Key: ${targetKey}`);
-
-    if (World.has(targetKey)) {
-      const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
-      console.log(`[Click] Path length to target: ${path.length}`);
-      
-      if (path.length > 0) {
-        console.log(`[Click] Committing to movement!`);
-        currentPath = path;
-        
-        clickPulseTime = 1.0; 
-        highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
-        highlightMesh.visible = true;
-        highlightMesh.material.color.setHex(0xffff00); 
-        
-        pathGroup.clear(); 
-      } else {
-        console.warn(`[Click] No valid path found to target!`);
-      }
-    }
-  } else {
-    console.warn(`[Click] Raycast missed the grid plane.`);
   }
 });
 

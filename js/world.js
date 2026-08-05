@@ -118,7 +118,7 @@ export function attackRange(a, b) {
 
 export function enterBattle(playerGridPos) {
   const arena = new Map();
-  const chunkSize = 16;
+  const chunkSize = 12;
   
   const cx = Math.floor(playerGridPos.x / chunkSize);
   const cz = Math.floor(playerGridPos.z / chunkSize);

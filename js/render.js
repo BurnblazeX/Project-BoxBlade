@@ -17,7 +17,7 @@ export function initWorldRender(scene) {
   if (renderCount === 0) return;
 
   const textureLoader = new THREE.TextureLoader();
-  const grassTexture = textureLoader.load('/assets/textures/terrain_grass.png');
+  const grassTexture = textureLoader.load(grassTextureUrl);
   grassTexture.magFilter = THREE.NearestFilter;
   grassTexture.minFilter = THREE.NearestFilter;
   grassTexture.colorSpace = THREE.SRGBColorSpace;
@@ -78,7 +78,6 @@ export function updateVoxelVisibility(arenaMap, isBattle) {
       _scale.set(1, 1, 1); // Show
     }
     
-    // Compose a brand new, uncorrupted matrix
     _matrix.compose(_position, _quaternion, _scale);
     worldInstancedMesh.setMatrixAt(idx, _matrix);
   }
