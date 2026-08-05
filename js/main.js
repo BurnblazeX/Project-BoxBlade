@@ -1,4 +1,12 @@
 import * as THREE from 'three';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath } from './world.js';
+import { initWorldRender, VOXEL_SIZE } from './render.js';
+
+// --- INPUT RULES ---
+const inputRules = {
+  explore: { click: true, keyboard: true },
+  battle:  { click: true, keyboard: false }
+};
 
 // --- SCENE SETUP ---
 const scene = new THREE.Scene();
@@ -8,7 +16,6 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 
-// --- LIGHTING & DEBUG HELPERS ---
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambientLight);
 
@@ -16,113 +23,399 @@ const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
 dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
-// Grid and center marker to visualize the camera rotation clearly
-const gridHelper = new THREE.GridHelper(30, 30, 0x555555, 0x333333);
-scene.add(gridHelper);
+// --- WORLD GENERATION ---
+createTestArea(10, 10);
+initWorldRender(scene);
 
-const centerBoxGeo = new THREE.BoxGeometry(1.5, 1.5, 1.5);
-const centerBoxMat = new THREE.MeshStandardMaterial({ color: 0x44aa88 });
-const centerBox = new THREE.Mesh(centerBoxGeo, centerBoxMat);
-centerBox.position.y = 0.75;
-scene.add(centerBox);
+// --- PLAYER ENTITY & SPRITE SETUP ---
+const player = createEntity({
+  id: "player_1",
+  name: "Bob",
+  gridPos: { x: 0, y: 0, z: 0 },
+  speed: 6,
+  mode: "explore"
+});
+World.get(getVoxelKey(0, 0, 0)).occupant = player.id;
 
-// --- ORTHOGRAPHIC CAMERA RIG SYSTEM ---
-// Orthographic relies on left/right/top/bottom, zooming is controlled by a 'viewSize' multiplier
+const texLoader = new THREE.TextureLoader();
+const bobTexture = texLoader.load('/assets/sprites/character_Bob.png');
+bobTexture.magFilter = THREE.NearestFilter; 
+bobTexture.minFilter = THREE.NearestFilter;
+
+const bobMaterial = new THREE.SpriteMaterial({ map: bobTexture, transparent: true });
+const playerSprite = new THREE.Sprite(bobMaterial);
+
+playerSprite.center.set(0.5, 0); 
+playerSprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+
+const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
+  gridPos.x * VOXEL_SIZE,
+  VOXEL_SIZE / 2, 
+  gridPos.z * VOXEL_SIZE
+);
+playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
+scene.add(playerSprite);
+
+// --- VISUAL AIDS (HIGHLIGHT & PATH DOTS) ---
+// 1. Blue Hover Highlight (Edge Outline Only)
+const shapeGeo = new THREE.PlaneGeometry(VOXEL_SIZE * 0.95, VOXEL_SIZE * 0.95);
+shapeGeo.rotateX(-Math.PI / 2); // Lay flat on the ground
+const highlightGeo = new THREE.EdgesGeometry(shapeGeo);
+const highlightMat = new THREE.LineBasicMaterial({ 
+  color: 0x0088ff, 
+  transparent: true, 
+  opacity: 0.8
+});
+const highlightMesh = new THREE.LineSegments(highlightGeo, highlightMat);
+highlightMesh.visible = false;
+scene.add(highlightMesh);
+
+// 2. Path Dots
+const pathGroup = new THREE.Group();
+scene.add(pathGroup);
+const dotGeo = new THREE.SphereGeometry(0.12, 8, 8);
+const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+function updatePathDots(path) {
+  pathGroup.clear();
+  for (const node of path) {
+    const dot = new THREE.Mesh(dotGeo, dotMat);
+    // Position slightly above the surface
+    dot.position.set(node.x * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.1, node.z * VOXEL_SIZE);
+    pathGroup.add(dot);
+  }
+}
+
+
+// --- CAMERA RIG SYSTEM ---
 let aspect = window.innerWidth / window.innerHeight;
-const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
 
+// We use one PerspectiveCamera to allow buttery smooth lerping (no janky swaps).
+// We mimic Orthographic for battle mode by lowering the FOV and pulling back distance.
+const camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 1000);
 const pivot = new THREE.Object3D();
+let arenaCenter = new THREE.Vector3(); 
 scene.add(pivot);
 
 const cameraConfigs = {
-  explore: {
-    viewSize: 15,              // "Zoom" level
-    pitch: Math.PI / 3,        // ~60 degrees pitch down (steep, Pokemon style)
-    headingOffset: 0           // Axis-aligned (looking straight down N/E/S/W)
+  explore: { 
+    fov: 45,        
+    distance: 22,   
+    pitch: Math.PI / 3, 
+    headingOffset: 0
   },
-  battle: {
-    viewSize: 22,              // Show more of the map
-    pitch: Math.atan(1 / Math.sqrt(2)), // ~35.26 degrees (True Isometric pitch)
-    headingOffset: Math.PI / 4 // 45 degrees offset (FF Tactics corner-view)
+  battle: { 
+    fov: 8,         
+    distance: 120,  
+    pitch: Math.atan(1 / Math.sqrt(2)), 
+    headingOffset: Math.PI / 4
   }
 };
 
-// State
 let currentMode = 'explore';
-let rotationStep = 0; // Tracks our 90-degree chunks (0, 1, 2, 3)
-
-// Values that will smoothly lerp frame-by-frame
-let currentViewSize = cameraConfigs.explore.viewSize;
+let rotationStep = 0; 
+let currentFov = cameraConfigs.explore.fov;
 let currentPitch = cameraConfigs.explore.pitch;
 let currentHeading = cameraConfigs.explore.headingOffset;
-
-const LERP_SPEED = 0.1;
-// Distance doesn't change object size in Orthographic, but we need it far enough away to not clip geometry
+let currentDistance = cameraConfigs.explore.distance;
+const CAMERA_LERP_SPEED = 0.1;
 const CAMERA_DISTANCE = 50; 
 
 function updateCameraTargets() {
   const config = cameraConfigs[currentMode];
-  const targetViewSize = config.viewSize;
-  const targetPitch = config.pitch;
-  // Base 90-degree step + the mode's specific offset (0 for explore, 45 for battle)
-  const targetHeading = (rotationStep * Math.PI / 2) + config.headingOffset;
-  
-  return { targetViewSize, targetPitch, targetHeading };
+  return {
+    targetViewSize: config.viewSize,
+    targetPitch: config.pitch,
+    targetHeading: (rotationStep * Math.PI / 2) + config.headingOffset
+  };
 }
 
+// --- MOVEMENT STATE ---
+let currentPath = [];
+const clock = new THREE.Clock();
+const keyState = { w: false, a: false, s: false, d: false };
+
 // --- INPUT HANDLING ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const clickPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -(VOXEL_SIZE / 2));
+
+// Helper: Convert screen coords to grid coords
+function getGridIntersection(clientX, clientY) {
+  mouse.x = (clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+  
+  raycaster.setFromCamera(mouse, camera); // CHANGED: Back to standard camera
+  const intersection = new THREE.Vector3();
+  
+  if (raycaster.ray.intersectPlane(clickPlane, intersection)) {
+    return {
+      gx: Math.round(intersection.x / VOXEL_SIZE),
+      gz: Math.round(intersection.z / VOXEL_SIZE)
+    };
+  }
+  return null;
+}
+
+let lastHoveredKey = null;
+let clickPulseTime = 0; 
+
+window.addEventListener('pointermove', (e) => {
+  const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
+  
+  // PERFORMANCE FIX: Stop raycasting and pathfinding if the player is actively moving
+  if (!inputRules[currentMode].click || currentPath.length > 0 || isWalkingManual) {
+    highlightMesh.visible = false;
+    pathGroup.clear();
+    lastHoveredKey = null;
+    return;
+  }
+  
+  if (clickPulseTime > 0) return;
+
+  const intersect = getGridIntersection(e.clientX, e.clientY);
+  if (intersect) {
+    const { gx, gz } = intersect;
+    const targetKey = getVoxelKey(gx, 0, gz);
+
+    if (targetKey !== lastHoveredKey) {
+      lastHoveredKey = targetKey;
+      const voxel = World.get(targetKey);
+
+      if (voxel && voxel.walkable) {
+        highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+        highlightMesh.visible = true;
+
+        if (currentMode === 'battle') {
+          const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
+          updatePathDots(path);
+        } else {
+          pathGroup.clear();
+        }
+      } else {
+        highlightMesh.visible = false;
+        pathGroup.clear();
+      }
+    }
+  } else {
+    highlightMesh.visible = false;
+    pathGroup.clear();
+    lastHoveredKey = null;
+  }
+});
+
+window.addEventListener('pointerup', (e) => {
+  console.log(`[Click] Triggered in mode: ${currentMode}`);
+  if (!inputRules[currentMode].click) return;
+
+  const intersect = getGridIntersection(e.clientX, e.clientY);
+  if (intersect) {
+    const { gx, gz } = intersect;
+    const targetKey = getVoxelKey(gx, 0, gz);
+    console.log(`[Click] Target Voxel Key: ${targetKey}`);
+
+    if (World.has(targetKey)) {
+      const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
+      console.log(`[Click] Path length to target: ${path.length}`);
+      
+      if (path.length > 0) {
+        console.log(`[Click] Committing to movement!`);
+        currentPath = path;
+        
+        clickPulseTime = 1.0; 
+        highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+        highlightMesh.visible = true;
+        highlightMesh.material.color.setHex(0xffff00); 
+        
+        pathGroup.clear(); 
+      } else {
+        console.warn(`[Click] No valid path found to target!`);
+      }
+    }
+  } else {
+    console.warn(`[Click] Raycast missed the grid plane.`);
+  }
+});
+
 window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
   
+  if (keyState.hasOwnProperty(key)) {
+    keyState[key] = true;
+  }
+  
   if (key === 'b') {
-    // Toggle Mode
     currentMode = currentMode === 'explore' ? 'battle' : 'explore';
-    document.getElementById('mode-text').innerText = 
-      currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
+    document.getElementById('mode-text').innerText = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
+    
+    currentPath = []; 
+    
+    highlightMesh.visible = false;
+    pathGroup.clear();
+    lastHoveredKey = null;
+    clickPulseTime = 0;
+    highlightMesh.material.color.setHex(0x0088ff);
+    
+    if (currentMode === 'battle') {
+      player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
+      player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
+      playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
+      
+      // Lock camera target to the center of the test arena map
+      arenaCenter.set(0, 0, 0);
+    }
   }
   
-  if (key === 'q') {
-    // Rotate left (90 degrees)
-    rotationStep += 1;
-  }
-  
-  if (key === 'e') {
-    // Rotate right (90 degrees)
-    rotationStep -= 1;
+  if (key === 'q') rotationStep += 1;
+  if (key === 'e') rotationStep -= 1;
+});
+
+window.addEventListener('keyup', (e) => {
+  const key = e.key.toLowerCase();
+  if (keyState.hasOwnProperty(key)) {
+    keyState[key] = false;
   }
 });
 
-// --- WINDOW RESIZE ---
 window.addEventListener('resize', () => {
   aspect = window.innerWidth / window.innerHeight;
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- RENDER LOOP ---
+// --- RENDER & GAME LOOP ---
 function animate() {
   requestAnimationFrame(animate);
+  const dt = clock.getDelta();
 
-  const { targetViewSize, targetPitch, targetHeading } = updateCameraTargets();
+  // Handle Highlight Pulse Animation
+  if (clickPulseTime > 0) {
+    clickPulseTime -= dt * 4; // Roughly 0.25 sec total duration
+    const scale = 1 + Math.sin(clickPulseTime * Math.PI) * 0.15; // Pop scale effect
+    highlightMesh.scale.set(scale, scale, 1);
+    
+    if (clickPulseTime <= 0) {
+      // Reset after pulse completes
+      highlightMesh.material.color.setHex(0x0088ff);
+      highlightMesh.material.opacity = 0.5;
+      highlightMesh.scale.set(1, 1, 1);
+      lastHoveredKey = null; // Force an update check next frame
+    }
+  }
 
-  // 1. Lerp camera values
-  currentViewSize += (targetViewSize - currentViewSize) * LERP_SPEED;
-  currentPitch += (targetPitch - currentPitch) * LERP_SPEED;
-  currentHeading += (targetHeading - currentHeading) * LERP_SPEED;
+  // 1. Process Movement Logic
+  if (currentPath.length > 0) {
+    const targetNode = currentPath[0];
+    const targetWorldPos = getSpriteWorldPos(targetNode);
+    const step = 8 * dt;
+    
+    if (playerSprite.position.distanceTo(targetWorldPos) <= step) {
+      playerSprite.position.copy(targetWorldPos);
+      
+      // Free old occupant, claim new one
+      const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
+      if (oldVoxel) oldVoxel.occupant = null;
+      
+      player.gridPos = currentPath.shift();
+      
+      const newVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
+      if (newVoxel) newVoxel.occupant = player.id;
+      
+    } else {
+      const dir = targetWorldPos.clone().sub(playerSprite.position).normalize();
+      playerSprite.position.add(dir.multiplyScalar(step));
+    }
+  } 
+  else if (currentMode === 'explore' && inputRules.explore.keyboard) {
+    // 1. Raw Input (Opposing keys now cancel each other out)
+    let rawDx = 0, rawDz = 0;
+    if (keyState.w) rawDz -= 1; // Up
+    if (keyState.s) rawDz += 1; // Down
+    if (keyState.a) rawDx -= 1; // Left
+    if (keyState.d) rawDx += 1; // Right
 
-  // 2. Update Orthographic Frustum (Handling the smooth zoom)
-  camera.left = -currentViewSize * aspect / 2;
-  camera.right = currentViewSize * aspect / 2;
-  camera.top = currentViewSize / 2;
-  camera.bottom = -currentViewSize / 2;
+    if (rawDx !== 0 || rawDz !== 0) {
+      // Normalize raw diagonals so you don't run faster diagonally
+      if (rawDx !== 0 && rawDz !== 0) {
+        const invSqrt2 = 1 / Math.sqrt(2);
+        rawDx *= invSqrt2;
+        rawDz *= invSqrt2;
+      }
+
+      // 2. Rotate input vector based on camera perspective
+      const targetHeading = (rotationStep * Math.PI / 2) + cameraConfigs.explore.headingOffset;
+      const cosH = Math.cos(targetHeading);
+      const sinH = Math.sin(targetHeading);
+
+      // 2D Rotation Matrix applied to X/Z axes
+      const dx = rawDx * cosH + rawDz * sinH;
+      const dz = -rawDx * sinH + rawDz * cosH;
+
+      const moveSpeed = 8;
+      const stepX = dx * moveSpeed * dt;
+      const stepZ = dz * moveSpeed * dt;
+
+      const newX = playerSprite.position.x + stepX;
+      const newZ = playerSprite.position.z + stepZ;
+
+      const nextGX = Math.round(newX / VOXEL_SIZE);
+      const nextGZ = Math.round(newZ / VOXEL_SIZE);
+      const voxel = World.get(getVoxelKey(nextGX, 0, nextGZ));
+
+      if (voxel && voxel.walkable) {
+        playerSprite.position.x = newX;
+        playerSprite.position.z = newZ;
+      } else {
+        // Wall sliding
+        const voxelX = World.get(getVoxelKey(nextGX, 0, Math.round(playerSprite.position.z / VOXEL_SIZE)));
+        if (voxelX && voxelX.walkable) playerSprite.position.x = newX;
+
+        const voxelZ = World.get(getVoxelKey(Math.round(playerSprite.position.x / VOXEL_SIZE), 0, nextGZ));
+        if (voxelZ && voxelZ.walkable) playerSprite.position.z = newZ;
+      }
+
+      // Update gridPos and manage occupant swapping during free-roam
+      const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
+      const newGridZ = Math.round(playerSprite.position.z / VOXEL_SIZE);
+      
+      if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
+        const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
+        if (oldVoxel) oldVoxel.occupant = null;
+        
+        const newVoxel = World.get(getVoxelKey(newGridX, 0, newGridZ));
+        if (newVoxel) newVoxel.occupant = player.id;
+        
+        player.gridPos.x = newGridX;
+        player.gridPos.z = newGridZ;
+      }
+    }
+  }
+
+  // 2. Camera Lerping & Pivot Tracking
+  if (currentMode === 'explore') {
+    pivot.position.lerp(playerSprite.position, 0.1); 
+  } else {
+    pivot.position.lerp(arenaCenter, 0.1); 
+  }
+
+  const config = cameraConfigs[currentMode];
+  const targetHeading = (rotationStep * Math.PI / 2) + config.headingOffset;
+  
+  // Lerp all camera properties smoothly
+  currentFov += (config.fov - currentFov) * CAMERA_LERP_SPEED;
+  currentPitch += (config.pitch - currentPitch) * CAMERA_LERP_SPEED;
+  currentHeading += (targetHeading - currentHeading) * CAMERA_LERP_SPEED;
+  currentDistance += (config.distance - currentDistance) * CAMERA_LERP_SPEED;
+
+  camera.fov = currentFov;
   camera.updateProjectionMatrix();
 
-  // 3. Apply position based on spherical coordinates (Pitch + Heading)
-  const xzLen = CAMERA_DISTANCE * Math.cos(currentPitch);
+  const xzLen = currentDistance * Math.cos(currentPitch);
   camera.position.x = pivot.position.x + xzLen * Math.sin(currentHeading);
-  camera.position.y = pivot.position.y + CAMERA_DISTANCE * Math.sin(currentPitch);
+  camera.position.y = pivot.position.y + currentDistance * Math.sin(currentPitch);
   camera.position.z = pivot.position.z + xzLen * Math.cos(currentHeading);
-
-  // 4. Look directly at the pivot
+  
   camera.lookAt(pivot.position);
 
   renderer.render(scene, camera);
