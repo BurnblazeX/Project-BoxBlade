@@ -1,22 +1,15 @@
 export const World = new Map();
 
 export function getVoxelKey(x, y, z) {
-  return `${x},${y},${z}`;
+  return `${Math.round(x)},${Math.round(y)},${Math.round(z)}`;
 }
 
 export function createTestArea(width, depth) {
   World.clear();
-  const halfWidth = Math.floor(width / 2);
-  const halfDepth = Math.floor(depth / 2);
-
-  for (let x = -halfWidth; x <= halfWidth; x++) {
-    for (let z = -halfDepth; z <= halfDepth; z++) {
-      const y = 0; 
-      World.set(getVoxelKey(x, y, z), {
-        walkable: true,
-        elevation: y,
-        occupant: null,
-        triggerId: null
+  for (let x = 0; x < width; x++) {
+    for (let z = 0; z < depth; z++) {
+      World.set(getVoxelKey(x, 0, z), {
+        walkable: true, elevation: 0, occupant: null, triggerId: null
       });
     }
   }
@@ -92,13 +85,13 @@ export function findPath(start, end) {
     for (const dir of dirs) {
       const neighbor = { x: current.x + dir.x, y: current.y + dir.y, z: current.z + dir.z };
       const neighborKey = getVoxelKey(neighbor.x, neighbor.y, neighbor.z);
-      const voxel = World.get(neighborKey);
       
-      if (!voxel || !voxel.walkable || voxel.occupant) {
-        continue; 
-      }
+      // Prevent routing outside the active battle arena
+      if (currentArena && !currentArena.has(neighborKey)) continue;
 
-      // CRITICAL FIX: Use ?? instead of ||
+      const voxel = World.get(neighborKey);
+      if (!voxel || !voxel.walkable || voxel.occupant) continue; 
+
       const tentative_gScore = (gScore.get(currentKey) ?? Infinity) + 1;
 
       if (tentative_gScore < (gScore.get(neighborKey) ?? Infinity)) {
@@ -113,4 +106,70 @@ export function findPath(start, end) {
     }
   }
   return []; 
+}
+
+// --- BATTLE & RANGE LOGIC ---
+export let currentArena = null;
+
+export function attackRange(a, b) {
+  // Chebyshev distance (Allows diagonal adjacency)
+  return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+}
+
+export function enterBattle(playerGridPos) {
+  const arena = new Map();
+  const chunkSize = 16;
+  
+  const cx = Math.floor(playerGridPos.x / chunkSize);
+  const cz = Math.floor(playerGridPos.z / chunkSize);
+  
+  const minX = cx * chunkSize;
+  const maxX = minX + chunkSize - 1;
+  const minZ = cz * chunkSize;
+  const maxZ = minZ + chunkSize - 1; 
+  
+  for (const [key, voxel] of World.entries()) {
+    const [gx, gy, gz] = key.split(',').map(Number);
+    if (gx >= minX && gx <= maxX && gz >= minZ && gz <= maxZ) {
+      arena.set(key, voxel);
+    }
+  }
+  currentArena = arena;
+  return { arena, bounds: { minX, maxX, minZ, maxZ } };
+}
+
+export function exitBattle() {
+  currentArena = null;
+}
+
+export function getReachableVoxels(start, speed) {
+  const reachable = new Map();
+  const queue = [{ pos: start, cost: 0 }];
+  reachable.set(getVoxelKey(start.x, start.y, start.z), 0);
+  
+  const dirs = [ {x: 0,y: 0,z: -1}, {x: 0,y: 0,z: 1}, {x: -1,y: 0,z: 0}, {x: 1,y: 0,z: 0} ];
+
+  while (queue.length > 0) {
+    queue.sort((a, b) => a.cost - b.cost); 
+    const current = queue.shift();
+    
+    if (current.cost >= speed) continue;
+
+    for (const dir of dirs) {
+      const neighbor = { x: current.pos.x + dir.x, y: current.pos.y + dir.y, z: current.pos.z + dir.z };
+      const nKey = getVoxelKey(neighbor.x, neighbor.y, neighbor.z);
+      
+      if (currentArena && !currentArena.has(nKey)) continue;
+      
+      const voxel = World.get(nKey);
+      if (!voxel || !voxel.walkable || voxel.occupant) continue; 
+
+      const newCost = current.cost + 1;
+      if (!reachable.has(nKey) || newCost < reachable.get(nKey)) {
+        reachable.set(nKey, newCost);
+        queue.push({ pos: neighbor, cost: newCost });
+      }
+    }
+  }
+  return reachable;
 }

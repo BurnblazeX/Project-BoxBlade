@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath } from './world.js';
-import { initWorldRender, VOXEL_SIZE } from './render.js';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
+import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
 
 // --- INPUT RULES ---
 const inputRules = {
@@ -24,18 +24,18 @@ dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-createTestArea(10, 10);
+createTestArea(32, 32);
 initWorldRender(scene);
 
 // --- PLAYER ENTITY & SPRITE SETUP ---
 const player = createEntity({
   id: "player_1",
   name: "Bob",
-  gridPos: { x: 0, y: 0, z: 0 },
+  gridPos: { x: 8, y: 0, z: 8 }, // Placed cleanly inside Chunk (0,0)
   speed: 6,
   mode: "explore"
 });
-World.get(getVoxelKey(0, 0, 0)).occupant = player.id;
+World.get(getVoxelKey(8, 0, 8)).occupant = player.id;
 
 const texLoader = new THREE.TextureLoader();
 const bobTexture = texLoader.load('/assets/sprites/character_Bob.png');
@@ -106,7 +106,7 @@ const cameraConfigs = {
   },
   battle: { 
     fov: 8,         
-    distance: 120,  
+    distance: 150,  
     pitch: Math.atan(1 / Math.sqrt(2)), 
     headingOffset: Math.PI / 4
   }
@@ -159,11 +159,21 @@ function getGridIntersection(clientX, clientY) {
 
 let lastHoveredKey = null;
 let clickPulseTime = 0; 
+let currentReachable = null; 
+let currentArenaMap = null;
+
+function refreshReachableTiles() {
+  if (currentMode === 'battle') {
+    currentReachable = getReachableVoxels(player.gridPos, player.speed);
+    updateVoxelTints(currentArenaMap, currentReachable, true);
+  } else {
+    updateVoxelTints(null, null, false);
+  }
+}
 
 window.addEventListener('pointermove', (e) => {
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
   
-  // PERFORMANCE FIX: Stop raycasting and pathfinding if the player is actively moving
   if (!inputRules[currentMode].click || currentPath.length > 0 || isWalkingManual) {
     highlightMesh.visible = false;
     pathGroup.clear();
@@ -182,7 +192,8 @@ window.addEventListener('pointermove', (e) => {
       lastHoveredKey = targetKey;
       const voxel = World.get(targetKey);
 
-      if (voxel && voxel.walkable) {
+      // Only allow hover if in explore mode OR if tile is in battle reachable range
+      if (voxel && voxel.walkable && (currentMode === 'explore' || (currentReachable && currentReachable.has(targetKey)))) {
         highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
         highlightMesh.visible = true;
 
@@ -201,6 +212,47 @@ window.addEventListener('pointermove', (e) => {
     highlightMesh.visible = false;
     pathGroup.clear();
     lastHoveredKey = null;
+  }
+});
+
+window.addEventListener('pointerup', (e) => {
+  if (!inputRules[currentMode].click) return;
+  if (currentPath.length > 0) return; // Prevent clicking while currently walking
+
+  const intersect = getGridIntersection(e.clientX, e.clientY);
+  if (!intersect) return; // Abort if clicked into the void
+
+  const { gx, gz } = intersect;
+  const targetKey = getVoxelKey(gx, 0, gz);
+
+  // STRICT BATTLE REJECTION:
+  if (currentMode === 'battle') {
+    // If currentReachable doesn't have the tile, it is instantly rejected.
+    if (!currentReachable || !currentReachable.has(targetKey)) {
+      console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
+      return; 
+    }
+  }
+
+  if (World.has(targetKey)) {
+    const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
+    
+    // Double fail-safe: Check actual calculated path length against speed
+    if (currentMode === 'battle' && path.length > player.speed) {
+       console.warn(`Rejected: Path length (${path.length}) exceeds speed stat (${player.speed}).`);
+       return;
+    }
+
+    if (path.length > 0) {
+      currentPath = path;
+      
+      clickPulseTime = 1.0; 
+      highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+      highlightMesh.visible = true;
+      highlightMesh.material.color.setHex(0xffff00); 
+      
+      pathGroup.clear(); 
+    }
   }
 });
 
@@ -261,8 +313,21 @@ window.addEventListener('keydown', (e) => {
       player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
       playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
       
-      // Lock camera target to the center of the test arena map
-      arenaCenter.set(0, 0, 0);
+      const battleData = enterBattle(player.gridPos);
+      currentArenaMap = battleData.arena;
+      
+      // Calculate exact center of the 16x16 Chunk for the camera
+      const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
+      const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
+      arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
+      
+      updateVoxelVisibility(currentArenaMap, true);
+      refreshReachableTiles();
+    } else {
+      exitBattle();
+      currentArenaMap = null;
+      updateVoxelVisibility(null, false);
+      refreshReachableTiles();
     }
   }
   
@@ -310,10 +375,10 @@ function animate() {
     const targetWorldPos = getSpriteWorldPos(targetNode);
     const step = 8 * dt;
     
+    // Inside animate() -> if (currentPath.length > 0) ...
     if (playerSprite.position.distanceTo(targetWorldPos) <= step) {
       playerSprite.position.copy(targetWorldPos);
       
-      // Free old occupant, claim new one
       const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
       if (oldVoxel) oldVoxel.occupant = null;
       
@@ -321,6 +386,11 @@ function animate() {
       
       const newVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
       if (newVoxel) newVoxel.occupant = player.id;
+      
+      // Recalculate reachable tiles after completing movement
+      if (currentPath.length === 0 && currentMode === 'battle') {
+        refreshReachableTiles();
+      }
       
     } else {
       const dir = targetWorldPos.clone().sub(playerSprite.position).normalize();
