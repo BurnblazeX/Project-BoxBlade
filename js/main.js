@@ -2,8 +2,13 @@ import * as THREE from 'three';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
 import { createWanderAI } from './ai.js';
+import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn } from './battle.js';
+import { performAttack, isDefeated, takeEnemyTurn } from './combat.js';
+
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
+
+
 const inputRules = {
   explore: { click: true, keyboard: true },
   battle:  { click: true, keyboard: false }
@@ -208,10 +213,68 @@ let currentReachable = null;
 let currentArenaMap = null;
 let isPointerDown = false;
 let currentMoveTargetKey = null;
+let enemyPath = []; // Tracks AI movement animation
 
+// Handles resetting resources and triggering AI
+function onTurnStart(entity) {
+  entity.turnResources.actionAvailable = true;
+  entity.turnResources.bonusActionAvailable = true;
+  entity.turnResources.spellAvailable = true;
+  entity.turnResources.moveRemaining = entity.speed;
+
+  if (entity.id === player.id) {
+    refreshReachableTiles();
+  } else if (entity.id === enemy.id) {
+    updateVoxelTints(currentArenaMap, null, true); // Hide player's reachable tiles
+    setTimeout(processEnemyAI, 500); // 0.5s dramatic pause
+  }
+}
+
+function endBattleSequence(message) {
+  console.log(`[Combat] ${message}`);
+  currentMode = 'explore';
+  document.getElementById('mode-text').innerText = 'Explore';
+  exitBattle();
+  currentArenaMap = null;
+  updateVoxelVisibility(null, false);
+  
+  if (!isDefeated(enemy)) enemyAI.isPaused = false;
+  
+  resetBattleState(battleParticipants);
+  battleParticipants = [];
+  refreshReachableTiles();
+}
+
+function processEnemyAI() {
+  if (currentMode !== 'battle') return;
+
+  const aiDecision = takeEnemyTurn(enemy, player);
+
+  if (aiDecision.action === 'move') {
+    enemyPath = aiDecision.path;
+    // Animation loop will walk this path, then call processEnemyAI() again when finished
+  } else if (aiDecision.action === 'attack') {
+    const res = aiDecision.result;
+    if (res.hit) {
+      console.log(`[Combat] Evil Bob hits for ${res.damage}! (HP: ${player.hp.current}/${player.hp.max})`);
+      if (isDefeated(player)) {
+        endBattleSequence("GAME OVER. You have been defeated!");
+        return;
+      }
+    } else {
+      console.log(`[Combat] Evil Bob misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
+    }
+    setTimeout(() => nextTurn(battleParticipants, onTurnStart), 1000);
+  } else if (aiDecision.action === 'end') {
+    setTimeout(() => nextTurn(battleParticipants, onTurnStart), 500);
+  }
+}
+
+// Modify refreshReachableTiles to dynamically use moveRemaining
 function refreshReachableTiles() {
   if (currentMode === 'battle') {
-    currentReachable = getReachableVoxels(player.gridPos, player.speed);
+    const currentSpeed = player.turnResources ? player.turnResources.moveRemaining : player.speed;
+    currentReachable = getReachableVoxels(player.gridPos, currentSpeed);
     updateVoxelTints(currentArenaMap, currentReachable, true);
   } else {
     updateVoxelTints(null, null, false);
@@ -267,6 +330,8 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
 }
 
 window.addEventListener('pointerdown', (e) => {
+  if (e.target.tagName !== 'CANVAS') return; 
+
   if (e.button !== 0) return; 
 
   mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
@@ -380,13 +445,67 @@ document.getElementById('btn-fight').addEventListener('click', () => {
   
   updateVoxelVisibility(currentArenaMap, true);
   refreshReachableTiles();
+  
+  // PHASE 7: Roll Initiative & Start Turn Queue
+  rollInitiativeForParticipants(battleParticipants);
+  const activeEntity = getCurrentEntity(battleParticipants);
+  console.log(`[Battle] First up: ${activeEntity.name}`);
+  onTurnStart(activeEntity);
 });
 
 window.addEventListener('pointerup', (e) => {
   if (e.button === 0) isPointerDown = false;
+  
+  if (e.target.tagName !== 'CANVAS') return; 
+  
+  if (!inputRules[currentMode].click) return;
+  if (currentPath.length > 0) return; 
+
+  const intersect = getGridIntersection(e.clientX, e.clientY);
+  if (!intersect) return; 
+
+  const { gx, gz } = intersect;
+  const targetKey = getVoxelKey(gx, 0, gz);
+
+  if (currentMode === 'battle') {
+    if (!currentReachable || !currentReachable.has(targetKey)) {
+      return; 
+    }
+  }
+
+  if (World.has(targetKey)) {
+    const allowDiagonals = currentMode === 'explore';
+    const path = findPath(player.gridPos, { x: gx, y: 0, z: gz }, allowDiagonals);
+    
+    // Compare against moveRemaining instead of speed
+    if (currentMode === 'battle' && path.length > player.turnResources.moveRemaining) {
+       console.warn(`Rejected: Path exceeds remaining movement.`);
+       return;
+    }
+
+    if (path.length > 0) {
+      currentPath = path;
+      currentMoveTargetKey = targetKey;
+      clickPulseTime = 1.0; 
+      highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+      highlightMesh.visible = true;
+      highlightMesh.material.color.setHex(0xffff00); 
+      
+      if (currentMode === 'explore') {
+          pathGroup.clear(); 
+      } else {
+          updatePathDots(path);
+      }
+    }
+  }
 });
 
 window.addEventListener('pointermove', (e) => {
+  if (e.target.tagName !== 'CANVAS') {
+      document.body.style.cursor = 'default';
+      return;
+  }
+
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
   const isWalkingInBattle = (currentMode === 'battle' && currentPath.length > 0);
   
@@ -491,18 +610,41 @@ if (key === 'escape' && isDialogueOpen) {
       
       updateVoxelVisibility(currentArenaMap, true);
       refreshReachableTiles();
-    } else {
+    } else { 
       exitBattle();
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
       refreshReachableTiles();
-      enemyAI.isPaused = false; 
-      battleParticipants = []; 
+      enemyAI.isPaused = false;
+      
+      resetBattleState(battleParticipants);
+      battleParticipants = [];
     }
   }
   
   if (key === 'q') rotationStep += 1;
   if (key === 'e') rotationStep -= 1;
+
+  // --- TEMPORARY COMBAT TEST KEYS ---
+  if (key === 't' && currentMode === 'battle') {
+    if (getCurrentEntity(battleParticipants)?.id === player.id) {
+      console.log("[Combat] Player ends turn.");
+      nextTurn(battleParticipants, onTurnStart);
+    }
+  }
+  
+  if (key === 'y' && currentMode === 'battle') {
+    if (getCurrentEntity(battleParticipants)?.id === player.id) {
+      const res = performAttack(player, enemy);
+      console.log(`[Combat] Player Attacks! Hit: ${res.hit}, Damage: ${res.damage}`);
+      if (res.hit && isDefeated(enemy)) {
+        enemySprite.visible = false;
+        const v = World.get(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
+        if (v) v.occupant = null;
+        endBattleSequence("VICTORY! You slew the Evil Bob!");
+      }
+    }
+  }
 });
 
 window.addEventListener('keyup', (e) => {
@@ -560,7 +702,6 @@ function animate() {
       playerSprite.position.copy(targetWorldPos);
       
       const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
-      // FIX: Only clear the occupant if we are actually the owner!
       if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
       
       player.gridPos = currentPath.shift();
@@ -569,6 +710,7 @@ function animate() {
       if (newVoxel) newVoxel.occupant = player.id;
 
       if (currentMode === 'battle') {
+        player.turnResources.moveRemaining -= 1;
         updatePathDots(currentPath);
       }
       
@@ -601,6 +743,35 @@ function animate() {
       }
     }
   } 
+  // ENEMY AI MOVEMENT LOGIC
+  if (enemyPath.length > 0) {
+    const targetNode = enemyPath[0];
+    const targetWorldPos = getSpriteWorldPos(targetNode);
+    const step = 5 * dt; 
+    
+    if (enemySprite.position.distanceTo(targetWorldPos) <= step) {
+      enemySprite.position.copy(targetWorldPos);
+      
+      const oldVoxel = World.get(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
+      if (oldVoxel && oldVoxel.occupant === enemy.id) oldVoxel.occupant = null;
+      
+      enemy.gridPos = enemyPath.shift();
+      
+      const newVoxel = World.get(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
+      if (newVoxel) newVoxel.occupant = enemy.id;
+      
+      enemy.turnResources.moveRemaining -= 1;
+      
+      if (enemyPath.length === 0) {
+         processEnemyAI(); // Trigger the attack check now that movement is finished
+      }
+    } else {
+      const dir = targetWorldPos.clone().sub(enemySprite.position).normalize();
+      const dot = dir.x * Math.cos(currentHeading) - dir.z * Math.sin(currentHeading);
+      if (Math.abs(dot) > 0.05) updateSpriteFacing(enemySprite, dot > 0);
+      enemySprite.position.add(dir.multiplyScalar(step));
+    }
+  }
   else if (currentMode === 'explore' && inputRules.explore.keyboard) {
     let rawDx = 0, rawDz = 0;
     if (keyState.w) rawDz -= 1; 
