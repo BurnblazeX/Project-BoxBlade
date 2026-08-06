@@ -35,22 +35,38 @@ export function pathDistance(a, b) {
   return Math.abs(a.x - b.x) + Math.abs(a.y - b.y) + Math.abs(a.z - b.z);
 }
 
-export function findPath(start, end) {
+export function findPath(start, end, allowDiagonals = false) {
   const openSet = [start];
   const cameFrom = new Map();
   
   const gScore = new Map();
   gScore.set(getVoxelKey(start.x, start.y, start.z), 0);
   
+  // Octile heuristic for diagonals, Manhattan for 4-way
+  const getH = (a, b) => {
+    const dx = Math.abs(a.x - b.x);
+    const dz = Math.abs(a.z - b.z);
+    return allowDiagonals ? (Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz)) : (dx + dz);
+  };
+  
   const fScore = new Map();
-  fScore.set(getVoxelKey(start.x, start.y, start.z), pathDistance(start, end));
+  fScore.set(getVoxelKey(start.x, start.y, start.z), getH(start, end));
   
   const dirs = [
-    {x: 0, y: 0, z: -1}, 
-    {x: 0, y: 0, z: 1},  
-    {x: -1, y: 0, z: 0}, 
-    {x: 1, y: 0, z: 0}   
+    {x: 0, y: 0, z: -1, cost: 1}, 
+    {x: 0, y: 0, z: 1, cost: 1},  
+    {x: -1, y: 0, z: 0, cost: 1}, 
+    {x: 1, y: 0, z: 0, cost: 1}   
   ];
+
+  if (allowDiagonals) {
+    dirs.push(
+      {x: -1, y: 0, z: -1, cost: Math.SQRT2},
+      {x: 1, y: 0, z: -1, cost: Math.SQRT2},
+      {x: -1, y: 0, z: 1, cost: Math.SQRT2},
+      {x: 1, y: 0, z: 1, cost: Math.SQRT2}
+    );
+  }
 
   while (openSet.length > 0) {
     let current = openSet[0];
@@ -59,7 +75,6 @@ export function findPath(start, end) {
     
     for (let i = 1; i < openSet.length; i++) {
       const nodeKey = getVoxelKey(openSet[i].x, openSet[i].y, openSet[i].z);
-      // CRITICAL FIX: Use ?? instead of || so 0 isn't treated as Infinity
       if ((fScore.get(nodeKey) ?? Infinity) < (fScore.get(currentKey) ?? Infinity)) {
         current = openSet[i];
         lowestIndex = i;
@@ -86,18 +101,24 @@ export function findPath(start, end) {
       const neighbor = { x: current.x + dir.x, y: current.y + dir.y, z: current.z + dir.z };
       const neighborKey = getVoxelKey(neighbor.x, neighbor.y, neighbor.z);
       
-      // Prevent routing outside the active battle arena
       if (currentArena && !currentArena.has(neighborKey)) continue;
 
       const voxel = World.get(neighborKey);
       if (!voxel || !voxel.walkable || voxel.occupant) continue; 
+      
+      // Prevent clipping through solid corners when moving diagonally
+      if (allowDiagonals && dir.cost > 1) {
+        const v1 = World.get(getVoxelKey(current.x + dir.x, 0, current.z));
+        const v2 = World.get(getVoxelKey(current.x, 0, current.z + dir.z));
+        if ((!v1 || !v1.walkable) || (!v2 || !v2.walkable)) continue;
+      }
 
-      const tentative_gScore = (gScore.get(currentKey) ?? Infinity) + 1;
+      const tentative_gScore = (gScore.get(currentKey) ?? Infinity) + dir.cost;
 
       if (tentative_gScore < (gScore.get(neighborKey) ?? Infinity)) {
         cameFrom.set(neighborKey, current);
         gScore.set(neighborKey, tentative_gScore);
-        fScore.set(neighborKey, tentative_gScore + pathDistance(neighbor, end));
+        fScore.set(neighborKey, tentative_gScore + getH(neighbor, end));
         
         if (!openSet.find(n => n.x === neighbor.x && n.y === neighbor.y && n.z === neighbor.z)) {
           openSet.push(neighbor);

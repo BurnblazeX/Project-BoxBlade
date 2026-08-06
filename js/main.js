@@ -23,7 +23,7 @@ dirLight.position.set(10, 20, 10);
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-createTestArea(48, 48);
+createTestArea(36, 36);
 initWorldRender(scene);
 
 // --- PLAYER ENTITY & SPRITE SETUP ---
@@ -41,7 +41,9 @@ const bobTexture = texLoader.load(bobTextureUrl);
 bobTexture.magFilter = THREE.NearestFilter; 
 bobTexture.minFilter = THREE.NearestFilter;
 
-const bobMaterial = new THREE.SpriteMaterial({ map: bobTexture, transparent: true });
+// Clone the texture so this specific sprite can flip independently
+const playerTex = bobTexture.clone();
+const bobMaterial = new THREE.SpriteMaterial({ map: playerTex, transparent: true });
 const playerSprite = new THREE.Sprite(bobMaterial);
 
 playerSprite.center.set(0.5, 0); 
@@ -55,7 +57,18 @@ const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
 scene.add(playerSprite);
 
-// --- VISUAL AIDS (HIGHLIGHT & PATH DOTS) ---
+// SPRITE FLIP HELPER
+function updateSpriteFacing(sprite, isFacingRight) {
+  if (isFacingRight) {
+    sprite.material.map.repeat.x = -1;  
+    sprite.material.map.offset.x = 1; 
+  } else {
+    sprite.material.map.repeat.x = 1;   
+    sprite.material.map.offset.x = 0; 
+  }
+}
+
+// VISUAL AIDS (HIGHLIGHT & PATH DOTS)
 // 1. Blue Hover Highlight (Edge Outline Only)
 const shapeGeo = new THREE.PlaneGeometry(VOXEL_SIZE * 0.95, VOXEL_SIZE * 0.95);
 shapeGeo.rotateX(-Math.PI / 2); // Lay flat on the ground
@@ -160,6 +173,8 @@ let lastHoveredKey = null;
 let clickPulseTime = 0; 
 let currentReachable = null; 
 let currentArenaMap = null;
+let isPointerDown = false;
+let currentMoveTargetKey = null;
 
 function refreshReachableTiles() {
   if (currentMode === 'battle') {
@@ -170,16 +185,81 @@ function refreshReachableTiles() {
   }
 }
 
+function processClickToMove(clientX, clientY, isDownEvent = false) {
+  if (!inputRules[currentMode].click) return;
+  // Strict lock for Battle mode turns: No interruptions allowed
+  if (currentMode === 'battle' && currentPath.length > 0) return; 
+
+  const intersect = getGridIntersection(clientX, clientY);
+  if (!intersect) return;
+
+  const { gx, gz } = intersect;
+  const targetKey = getVoxelKey(gx, 0, gz);
+
+  if (currentMode === 'battle') {
+    if (!currentReachable || !currentReachable.has(targetKey)) {
+      if (isDownEvent) console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
+      return; 
+    }
+  }
+
+  // Prevent spamming pathfinder calculations if we are holding the mouse and hovering the same tile
+  if (!isDownEvent && targetKey === currentMoveTargetKey && currentPath.length > 0) return;
+
+  if (World.has(targetKey)) {
+    const allowDiagonals = currentMode === 'explore'; 
+    const path = findPath(player.gridPos, { x: gx, y: 0, z: gz }, allowDiagonals);
+    
+    if (currentMode === 'battle' && path.length > player.speed) return;
+
+    if (path.length > 0) {
+      currentPath = path; // Instant override of the path!
+      currentMoveTargetKey = targetKey;
+      
+      highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+      highlightMesh.visible = true;
+      
+      if (isDownEvent) {
+         clickPulseTime = 1.0; 
+         highlightMesh.material.color.setHex(0xffff00); 
+      }
+      
+      if (currentMode === 'explore') {
+          pathGroup.clear(); // No dots in explore mode
+      } else {
+          updatePathDots(path);
+      }
+    }
+  }
+}
+
+window.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return; // Left click only
+  isPointerDown = true;
+  processClickToMove(e.clientX, e.clientY, true);
+});
+
+window.addEventListener('pointerup', (e) => {
+  if (e.button === 0) isPointerDown = false;
+});
+
 window.addEventListener('pointermove', (e) => {
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
   
-  if (!inputRules[currentMode].click || currentPath.length > 0 || isWalkingManual) {
+  if (!inputRules[currentMode].click || isWalkingManual) {
     highlightMesh.visible = false;
     pathGroup.clear();
     lastHoveredKey = null;
     return;
   }
   
+  // Continuously path to the cursor if the mouse is held in explore mode
+  if (isPointerDown && currentMode === 'explore') {
+     processClickToMove(e.clientX, e.clientY, false);
+     return;
+  }
+  
+  // Standard Hover Logic (When not holding mouse)
   if (clickPulseTime > 0) return;
 
   const intersect = getGridIntersection(e.clientX, e.clientY);
@@ -191,13 +271,12 @@ window.addEventListener('pointermove', (e) => {
       lastHoveredKey = targetKey;
       const voxel = World.get(targetKey);
 
-      // Only allow hover if in explore mode OR if tile is in battle reachable range
       if (voxel && voxel.walkable && (currentMode === 'explore' || (currentReachable && currentReachable.has(targetKey)))) {
         highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
         highlightMesh.visible = true;
 
         if (currentMode === 'battle') {
-          const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
+          const path = findPath(player.gridPos, { x: gx, y: 0, z: gz }, false);
           updatePathDots(path);
         } else {
           pathGroup.clear();
@@ -211,47 +290,6 @@ window.addEventListener('pointermove', (e) => {
     highlightMesh.visible = false;
     pathGroup.clear();
     lastHoveredKey = null;
-  }
-});
-
-window.addEventListener('pointerup', (e) => {
-  if (!inputRules[currentMode].click) return;
-  if (currentPath.length > 0) return; // Prevent clicking while currently walking
-
-  const intersect = getGridIntersection(e.clientX, e.clientY);
-  if (!intersect) return; // Abort if clicked into the void
-
-  const { gx, gz } = intersect;
-  const targetKey = getVoxelKey(gx, 0, gz);
-
-  // STRICT BATTLE REJECTION:
-  if (currentMode === 'battle') {
-    // If currentReachable doesn't have the tile, it is instantly rejected.
-    if (!currentReachable || !currentReachable.has(targetKey)) {
-      console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
-      return; 
-    }
-  }
-
-  if (World.has(targetKey)) {
-    const path = findPath(player.gridPos, { x: gx, y: 0, z: gz });
-    
-    // Double fail-safe: Check actual calculated path length against speed
-    if (currentMode === 'battle' && path.length > player.speed) {
-       console.warn(`Rejected: Path length (${path.length}) exceeds speed stat (${player.speed}).`);
-       return;
-    }
-
-    if (path.length > 0) {
-      currentPath = path;
-      
-      clickPulseTime = 1.0; 
-      highlightMesh.position.set(gx * VOXEL_SIZE, (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
-      highlightMesh.visible = true;
-      highlightMesh.material.color.setHex(0xffff00); 
-      
-      pathGroup.clear(); 
-    }
   }
 });
 
@@ -336,12 +374,18 @@ function animate() {
   }
 
   // 1. Process Movement Logic
+  const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
+
+  if (isWalkingManual && currentMode === 'explore' && currentPath.length > 0) {
+    currentPath = [];
+    currentMoveTargetKey = null;
+  }
+
   if (currentPath.length > 0) {
     const targetNode = currentPath[0];
     const targetWorldPos = getSpriteWorldPos(targetNode);
     const step = 8 * dt;
     
-    // Inside animate() -> if (currentPath.length > 0) ...
     if (playerSprite.position.distanceTo(targetWorldPos) <= step) {
       playerSprite.position.copy(targetWorldPos);
       
@@ -352,39 +396,65 @@ function animate() {
       
       const newVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
       if (newVoxel) newVoxel.occupant = player.id;
-      
-      // Recalculate reachable tiles after completing movement
-      if (currentPath.length === 0 && currentMode === 'battle') {
-        refreshReachableTiles();
+
+      if (currentMode === 'battle') {
+        updatePathDots(currentPath);
       }
       
+      if (currentPath.length === 0 && currentMode === 'battle') {
+         refreshReachableTiles();
+      }
     } else {
       const dir = targetWorldPos.clone().sub(playerSprite.position).normalize();
+      
+      // RELATIVE FLIPPING: Dot product of movement dir and camera's local 'Right' vector
+      const dot = dir.x * Math.cos(currentHeading) - dir.z * Math.sin(currentHeading);
+      if (Math.abs(dot) > 0.05) { // Only flip if moving horizontally on screen
+         updateSpriteFacing(playerSprite, dot > 0);
+      }
+      
       playerSprite.position.add(dir.multiplyScalar(step));
+      
+      if (currentMode === 'explore') {
+        const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
+        const newGridZ = Math.round(playerSprite.position.z / VOXEL_SIZE);
+        
+        if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
+          const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
+          if (oldVoxel) oldVoxel.occupant = null;
+          
+          const newVoxel = World.get(getVoxelKey(newGridX, 0, newGridZ));
+          if (newVoxel) newVoxel.occupant = player.id;
+          
+          player.gridPos.x = newGridX;
+          player.gridPos.z = newGridZ;
+        }
+      }
     }
   } 
   else if (currentMode === 'explore' && inputRules.explore.keyboard) {
-    // 1. Raw Input (Opposing keys now cancel each other out)
     let rawDx = 0, rawDz = 0;
-    if (keyState.w) rawDz -= 1; // Up
-    if (keyState.s) rawDz += 1; // Down
-    if (keyState.a) rawDx -= 1; // Left
-    if (keyState.d) rawDx += 1; // Right
+    if (keyState.w) rawDz -= 1; 
+    if (keyState.s) rawDz += 1; 
+    if (keyState.a) rawDx -= 1; 
+    if (keyState.d) rawDx += 1; 
 
     if (rawDx !== 0 || rawDz !== 0) {
-      // Normalize raw diagonals so you don't run faster diagonally
+      // RELATIVE FLIPPING for WASD: A/D directly correspond to screen-left/screen-right
+      if (rawDx !== 0) {
+         updateSpriteFacing(playerSprite, rawDx > 0);
+      }
+
       if (rawDx !== 0 && rawDz !== 0) {
         const invSqrt2 = 1 / Math.sqrt(2);
         rawDx *= invSqrt2;
         rawDz *= invSqrt2;
       }
 
-      // 2. Rotate input vector based on camera perspective
       const targetHeading = (rotationStep * Math.PI / 2) + cameraConfigs.explore.headingOffset;
       const cosH = Math.cos(targetHeading);
       const sinH = Math.sin(targetHeading);
 
-      // 2D Rotation Matrix applied to X/Z axes
       const dx = rawDx * cosH + rawDz * sinH;
       const dz = -rawDx * sinH + rawDz * cosH;
 
@@ -403,7 +473,6 @@ function animate() {
         playerSprite.position.x = newX;
         playerSprite.position.z = newZ;
       } else {
-        // Wall sliding
         const voxelX = World.get(getVoxelKey(nextGX, 0, Math.round(playerSprite.position.z / VOXEL_SIZE)));
         if (voxelX && voxelX.walkable) playerSprite.position.x = newX;
 
@@ -411,7 +480,6 @@ function animate() {
         if (voxelZ && voxelZ.walkable) playerSprite.position.z = newZ;
       }
 
-      // Update gridPos and manage occupant swapping during free-roam
       const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
       const newGridZ = Math.round(playerSprite.position.z / VOXEL_SIZE);
       
