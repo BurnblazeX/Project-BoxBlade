@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
+import { createWanderAI } from './ai.js';
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
+import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
 const inputRules = {
   explore: { click: true, keyboard: true },
   battle:  { click: true, keyboard: false }
@@ -56,6 +58,37 @@ const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
 );
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
 scene.add(playerSprite);
+
+// --- ENEMY ENTITY & SPRITE SETUP ---
+const enemy = createEntity({
+  id: "enemy_1",
+  name: "Evil Bob",
+  gridPos: { x: 10, y: 0, z: 10 }, // Placed slightly away from Bob
+  stats: { STR: 12, DEX: 12, CON: 12, INT: 8, WIS: 8, CHA: 8 },
+  speed: 5,
+  hp: { current: 15, max: 15 },
+  ac: 12,
+  weaponDie: "1d6",
+  mode: "explore"
+});
+World.get(getVoxelKey(10, 0, 10)).occupant = enemy.id;
+
+const evilBobTexture = texLoader.load(evilBobTextureUrl);
+evilBobTexture.magFilter = THREE.NearestFilter; 
+evilBobTexture.minFilter = THREE.NearestFilter;
+// Clone material so EvilBob can flip independently
+const evilBobMaterial = new THREE.SpriteMaterial({ map: evilBobTexture.clone(), transparent: true });
+const enemySprite = new THREE.Sprite(evilBobMaterial);
+
+enemySprite.center.set(0.5, 0); 
+enemySprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
+scene.add(enemySprite);
+
+const enemyAI = createWanderAI(enemy, enemySprite, 4);
+
+// --- BATTLE STATE ---
+export let battleParticipants = [];
 
 // SPRITE FLIP HELPER
 function updateSpriteFacing(sprite, isFacingRight) {
@@ -234,9 +267,119 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
 }
 
 window.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return; // Left click only
+  if (e.button !== 0) return; 
+
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  if (currentMode === 'explore') {
+     const spriteIntersects = raycaster.intersectObject(enemySprite);
+     if (spriteIntersects.length > 0) {
+        if (pathDistance(player.gridPos, enemy.gridPos) <= 2) {
+            document.getElementById('dialogue-panel').style.display = 'block';
+            document.getElementById('dialogue-name').innerText = enemy.name;
+            isDialogueOpen = true;
+            isPointerDown = false; 
+            currentPath = [];      
+        } else {
+            console.log("Enemy is too far away to interact!");
+        }
+        return; // Always consume the click so we don't accidentally walk behind them
+     }
+  }
+
   isPointerDown = true;
   processClickToMove(e.clientX, e.clientY, true);
+});
+
+// --- DIALOGUE BUTTONS & STATE ---
+let isDialogueOpen = false;
+
+// Fix 1: Stop UI clicks from falling through to the game world
+document.getElementById('dialogue-panel').addEventListener('pointerdown', (e) => e.stopPropagation());
+
+document.getElementById('btn-talk').addEventListener('click', () => {
+  console.log(`${enemy.name} snarls: "You shouldn't be here..."`);
+});
+
+document.getElementById('btn-fight').addEventListener('click', () => {
+  document.getElementById('dialogue-panel').style.display = 'none';
+  isDialogueOpen = false;
+  
+  // Snap player to grid
+  player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
+  player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
+  playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
+  
+  // FIX 6: Force Enemy into the Player's 12x12 Arena Chunk
+  const chunkSize = 12;
+  const minX = Math.floor(player.gridPos.x / chunkSize) * chunkSize;
+  const maxX = minX + chunkSize - 1;
+  const minZ = Math.floor(player.gridPos.z / chunkSize) * chunkSize;
+  const maxZ = minZ + chunkSize - 1;
+  
+  let ex = Math.round(enemySprite.position.x / VOXEL_SIZE);
+  let ez = Math.round(enemySprite.position.z / VOXEL_SIZE);
+  
+  if (ex < minX || ex > maxX || ez < minZ || ez > maxZ) {
+    const oldV = World.get(getVoxelKey(ex, 0, ez));
+    if (oldV && oldV.occupant === enemy.id) oldV.occupant = null; 
+    
+    // Clamp to arena edges
+    ex = Math.max(minX, Math.min(ex, maxX));
+    ez = Math.max(minZ, Math.min(ez, maxZ));
+    
+    // Safe Radial Search: Find nearest vacant tile in the chunk
+    let found = false;
+    for (let radius = 0; radius < 5; radius++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        for (let dz = -radius; dz <= radius; dz++) {
+          const cx = ex + dx;
+          const cz = ez + dz;
+          if (cx >= minX && cx <= maxX && cz >= minZ && cz <= maxZ) {
+            const checkV = World.get(getVoxelKey(cx, 0, cz));
+            if (checkV && checkV.walkable && !checkV.occupant) {
+              ex = cx;
+              ez = cz;
+              found = true;
+              break;
+            }
+          }
+        }
+        if (found) break;
+      }
+      if (found) break;
+    }
+  }
+  
+  enemy.gridPos.x = ex;
+  enemy.gridPos.z = ez;
+  enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
+  
+  const newV = World.get(getVoxelKey(ex, 0, ez));
+  if (newV) newV.occupant = enemy.id;
+
+  battleParticipants = [player, enemy];
+  enemyAI.isPaused = true;
+  
+  currentMode = 'battle';
+  document.getElementById('mode-text').innerText = 'Battle';
+  highlightMesh.visible = false;
+  pathGroup.clear();
+  lastHoveredKey = null;
+  clickPulseTime = 0;
+  
+  // Enter Battle Centered on PLAYER'S chunk (since enemy was pulled into it)
+  const battleData = enterBattle(player.gridPos);
+  currentArenaMap = battleData.arena;
+  
+  const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
+  const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
+  arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
+  
+  updateVoxelVisibility(currentArenaMap, true);
+  refreshReachableTiles();
 });
 
 window.addEventListener('pointerup', (e) => {
@@ -245,21 +388,34 @@ window.addEventListener('pointerup', (e) => {
 
 window.addEventListener('pointermove', (e) => {
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
+  const isWalkingInBattle = (currentMode === 'battle' && currentPath.length > 0);
   
-  if (!inputRules[currentMode].click || isWalkingManual) {
+  // FIX: Reset sprite hover state every frame
+  enemySprite.material.color.setHex(0xffffff);
+  document.body.style.cursor = 'default';
+
+  // FIX: Highlight enemy if in range
+  if (currentMode === 'explore' && !isDialogueOpen) {
+     raycaster.setFromCamera(mouse, camera);
+     const spriteIntersects = raycaster.intersectObject(enemySprite);
+     if (spriteIntersects.length > 0 && pathDistance(player.gridPos, enemy.gridPos) <= 2) {
+         enemySprite.material.color.setHex(0xffff00); // Yellow highlight
+         document.body.style.cursor = 'pointer';
+     }
+  }
+
+  if (!inputRules[currentMode].click || isWalkingManual || isWalkingInBattle) {
     highlightMesh.visible = false;
-    pathGroup.clear();
     lastHoveredKey = null;
+    if (!isWalkingInBattle) pathGroup.clear();
     return;
   }
   
-  // Continuously path to the cursor if the mouse is held in explore mode
   if (isPointerDown && currentMode === 'explore') {
      processClickToMove(e.clientX, e.clientY, false);
      return;
   }
   
-  // Standard Hover Logic (When not holding mouse)
   if (clickPulseTime > 0) return;
 
   const intersect = getGridIntersection(e.clientX, e.clientY);
@@ -296,6 +452,15 @@ window.addEventListener('pointermove', (e) => {
 window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
   
+if (key === 'escape' && isDialogueOpen) {
+     document.getElementById('dialogue-panel').style.display = 'none';
+     isDialogueOpen = false;
+  }
+
+  if (keyState.hasOwnProperty(key)) {
+    keyState[key] = true;
+  }
+
   if (keyState.hasOwnProperty(key)) {
     keyState[key] = true;
   }
@@ -320,7 +485,6 @@ window.addEventListener('keydown', (e) => {
       const battleData = enterBattle(player.gridPos);
       currentArenaMap = battleData.arena;
       
-      // Calculate exact center of the 16x16 Chunk for the camera
       const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
       const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
       arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
@@ -332,6 +496,8 @@ window.addEventListener('keydown', (e) => {
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
       refreshReachableTiles();
+      enemyAI.isPaused = false; 
+      battleParticipants = []; 
     }
   }
   
@@ -357,6 +523,10 @@ window.addEventListener('resize', () => {
 function animate() {
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
+
+  if (currentMode === 'explore') {
+    enemyAI.update(dt, currentHeading);
+  }
 
   // Handle Highlight Pulse Animation
   if (clickPulseTime > 0) {
@@ -390,7 +560,8 @@ function animate() {
       playerSprite.position.copy(targetWorldPos);
       
       const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
-      if (oldVoxel) oldVoxel.occupant = null;
+      // FIX: Only clear the occupant if we are actually the owner!
+      if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
       
       player.gridPos = currentPath.shift();
       
@@ -407,11 +578,8 @@ function animate() {
     } else {
       const dir = targetWorldPos.clone().sub(playerSprite.position).normalize();
       
-      // RELATIVE FLIPPING: Dot product of movement dir and camera's local 'Right' vector
       const dot = dir.x * Math.cos(currentHeading) - dir.z * Math.sin(currentHeading);
-      if (Math.abs(dot) > 0.05) { // Only flip if moving horizontally on screen
-         updateSpriteFacing(playerSprite, dot > 0);
-      }
+      if (Math.abs(dot) > 0.05) updateSpriteFacing(playerSprite, dot > 0);
       
       playerSprite.position.add(dir.multiplyScalar(step));
       
@@ -421,7 +589,8 @@ function animate() {
         
         if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
           const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
-          if (oldVoxel) oldVoxel.occupant = null;
+          // FIX: Only clear if we own it
+          if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
           
           const newVoxel = World.get(getVoxelKey(newGridX, 0, newGridZ));
           if (newVoxel) newVoxel.occupant = player.id;
@@ -440,10 +609,7 @@ function animate() {
     if (keyState.d) rawDx += 1; 
 
     if (rawDx !== 0 || rawDz !== 0) {
-      // RELATIVE FLIPPING for WASD: A/D directly correspond to screen-left/screen-right
-      if (rawDx !== 0) {
-         updateSpriteFacing(playerSprite, rawDx > 0);
-      }
+      if (rawDx !== 0) updateSpriteFacing(playerSprite, rawDx > 0);
 
       if (rawDx !== 0 && rawDz !== 0) {
         const invSqrt2 = 1 / Math.sqrt(2);
@@ -467,17 +633,18 @@ function animate() {
 
       const nextGX = Math.round(newX / VOXEL_SIZE);
       const nextGZ = Math.round(newZ / VOXEL_SIZE);
-      const voxel = World.get(getVoxelKey(nextGX, 0, nextGZ));
+      
+      const canWalk = (gx, gz) => {
+         const v = World.get(getVoxelKey(gx, 0, gz));
+         return v && v.walkable && (!v.occupant || v.occupant === player.id);
+      };
 
-      if (voxel && voxel.walkable) {
+      if (canWalk(nextGX, nextGZ)) {
         playerSprite.position.x = newX;
         playerSprite.position.z = newZ;
       } else {
-        const voxelX = World.get(getVoxelKey(nextGX, 0, Math.round(playerSprite.position.z / VOXEL_SIZE)));
-        if (voxelX && voxelX.walkable) playerSprite.position.x = newX;
-
-        const voxelZ = World.get(getVoxelKey(Math.round(playerSprite.position.x / VOXEL_SIZE), 0, nextGZ));
-        if (voxelZ && voxelZ.walkable) playerSprite.position.z = newZ;
+        if (canWalk(nextGX, Math.round(playerSprite.position.z / VOXEL_SIZE))) playerSprite.position.x = newX;
+        if (canWalk(Math.round(playerSprite.position.x / VOXEL_SIZE), nextGZ)) playerSprite.position.z = newZ;
       }
 
       const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
@@ -485,7 +652,8 @@ function animate() {
       
       if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
         const oldVoxel = World.get(getVoxelKey(player.gridPos.x, 0, player.gridPos.z));
-        if (oldVoxel) oldVoxel.occupant = null;
+        // FIX: Strict ownership check
+        if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
         
         const newVoxel = World.get(getVoxelKey(newGridX, 0, newGridZ));
         if (newVoxel) newVoxel.occupant = player.id;
@@ -494,6 +662,12 @@ function animate() {
         player.gridPos.z = newGridZ;
       }
     }
+  }
+
+  // FIX 2: Auto-close dialogue if player walks out of range
+  if (isDialogueOpen && pathDistance(player.gridPos, enemy.gridPos) > 2) {
+     document.getElementById('dialogue-panel').style.display = 'none';
+     isDialogueOpen = false;
   }
 
   // 2. Camera Lerping & Pivot Tracking

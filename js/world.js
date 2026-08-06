@@ -24,6 +24,9 @@ export function createEntity(config) {
     stats: config.stats || { STR: 10, DEX: 10, CON: 10, WIS: 10, INT: 10, CHA: 10 },
     speed: config.speed || 6,
     hp: config.hp || { current: 100, max: 100 },
+    ac: config.ac || 10,                  
+    initiative: config.initiative || null, 
+    weaponDie: config.weaponDie || "1d6",  
     facing: config.facing || "N",
     mode: config.mode || "explore"
   };
@@ -193,4 +196,8 @@ export function getReachableVoxels(start, speed) {
     }
   }
   return reachable;
+}
+
+export function getAbilityModifier(score) {
+  return Math.floor((score - 10) / 2);
 }

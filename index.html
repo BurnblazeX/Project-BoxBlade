@@ -14,6 +14,11 @@
       <p>Mode: <span id="mode-text">Explore</span></p>
       <p>Controls: [B] Toggle Mode | [Q]/[E] Rotate Camera</p>
     </div>
+    <div id="dialogue-panel" style="display: none; position: absolute; bottom: 15%; left: 50%; transform: translateX(-50%); background: #222; border: 2px solid #fff; padding: 20px; color: white; min-width: 300px; text-align: center; font-family: monospace; z-index: 10;">
+      <h3 id="dialogue-name" style="margin-top: 0;">Enemy Name</h3>
+      <button id="btn-talk" style="margin-right: 10px; padding: 5px 15px; cursor: pointer;">Talk</button>
+      <button id="btn-fight" style="padding: 5px 15px; cursor: pointer; color: red;">Fight</button>
+    </div>
     <script type="module" src="/js/main.js"></script>
   </body>
 </html>
