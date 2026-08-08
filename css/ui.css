@@ -1,0 +1,52 @@
+/* ALL PANELS */
+.ui-panel {
+  position: absolute;
+  background: rgba(20, 20, 25, 0.9);
+  border: 2px solid #777;
+  color: white;
+  padding: 10px;
+  pointer-events: auto; /* Re-enables clicking on UI elements */
+  font-family: monospace;
+  box-shadow: 2px 2px 8px rgba(0,0,0,0.8);
+}
+
+/* SPECIFIC PLACEMENTS */
+.hud-panel { top: 20px; left: 20px; width: 200px; }
+.party-view-panel { top: 50%; transform: translateY(-75%); left: 20px; display: flex; flex-direction: column; } 
+.action-order-panel { top: 20px; left: 50%; transform: translateX(-50%); display: flex; padding: 5px; }
+.map-panel { top: 20px; right: 20px; width: 200px; height: 200px; display: flex; align-items: center; justify-content: center; }
+.dice-view-panel { top: 50%; transform: translateY(-75%); right: 20px; width: 200px; height: 180px; display: flex; flex-direction: column; }
+.end-turn-panel { bottom: 40px; right: 30px; padding: 0; border: none; background: transparent; box-shadow: none; }
+.actions-panel { bottom: 60px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 15px; }
+.resources-strip { bottom: 10px; left: 50%; transform: translateX(-50%); font-size: 14px; padding: 5px 15px; border-radius: 5px; }
+.chat-panel { bottom: 20px; left: 20px; width: 250px; height: 80px; }
+
+/* INTERNAL ELEMENTS */
+.hp-bar-bg { background: #444; height: 10px; width: 100%; margin: 5px 0; border: 1px solid #111; }
+.hp-bar-fill { background: #d32f2f; height: 100%; width: 100%; transition: width 0.3s; }
+.hp-text { text-align: right; font-size: 12px; }
+.stat-effects { margin-top: 5px; font-size: 12px; color: #aaa; }
+
+.vertical-text { writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; color: #888; font-size: 12px; margin-right: 5px; }
+.party-member { border: 1px solid #555; padding: 10px; text-align: center; margin-bottom: 5px; background: #333; }
+
+.turn-box { border: 1px solid #555; width: 50px; height: 40px; display: flex; align-items: center; justify-content: center; margin: 0 2px; font-size: 11px; background: #222; text-align: center;}
+.turn-box.active-turn { border-color: #00ff00; background: #1a331a; font-weight: bold; }
+
+.dice-log { flex-grow: 1; overflow-y: auto; font-size: 12px; line-height: 1.4; }
+.dice-log-entry { margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #333; }
+.dice-log-entry.enemy-turn { color: #ff8888; }
+.dice-log-entry.player-turn { color: #88ff88; }
+
+.ui-btn { background: #333; color: white; border: 1px solid #777; padding: 5px 10px; cursor: pointer; font-family: monospace; }
+.ui-btn:hover:not(.disabled) { background: #555; }
+.ui-btn.disabled { opacity: 0.5; cursor: not-allowed; }
+.end-btn { font-size: 16px; padding: 10px 20px; background: #C03020; border-color: #802018; font-weight: bold; width: 200px; }
+
+.portrait-center { font-size: 24px; border: 2px solid #777; padding: 10px; background: #222; }
+.actions-group { display: flex; flex-direction: column; gap: 5px; }
+
+.res-box { display: inline-block; width: 12px; height: 12px; border: 1px solid #777; vertical-align: middle; margin-right: 8px; }
+.res-avail { background: #44aa88; }
+.res-spent { background: #333; border-color: #444; }
+.text-box { width: auto; min-width: 12px; padding: 0 4px; text-align: center; border-radius: 3px; font-weight: bold; }

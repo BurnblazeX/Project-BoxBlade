@@ -3,11 +3,49 @@ import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPat
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
 import { createWanderAI } from './ai.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn } from './battle.js';
+import * as UI from './ui.js';
 import { performAttack, isDefeated, takeEnemyTurn } from './combat.js';
 
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
 
+UI.initUI(
+  // Attack Button Callback
+  () => {
+    if (currentMode !== 'battle') return;
+    const current = getCurrentEntity(battleParticipants);
+    if (current.id !== player.id) return; // Not your turn!
+
+    const res = performAttack(player, enemy);
+    if (!res.success) {
+      UI.logDiceRoll("<i>You have no action left!</i>", "system");
+      return;
+    }
+
+    if (res.hit) {
+      UI.logDiceRoll(`<b>${player.name}</b> hits ${enemy.name}! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}] <br>Deals <b>${res.damage} damage!</b>`, "player-turn");
+      if (isDefeated(enemy)) {
+        enemySprite.visible = false;
+        const v = World.get(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
+        if (v && v.occupant === enemy.id) v.occupant = null;
+        endBattleSequence("VICTORY! You slew Evil Bob!");
+      }
+    } else {
+      UI.logDiceRoll(`<b>${player.name}</b> misses! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}]`, "player-turn");
+    }
+    
+    UI.updateHUD(player); // Update if needed (though enemy took damage)
+    UI.updateActionResources(player.turnResources);
+  },
+  // End Turn Button Callback
+  () => {
+    if (currentMode !== 'battle') return;
+    if (getCurrentEntity(battleParticipants)?.id !== player.id) return;
+    
+    UI.logDiceRoll(`<i>${player.name} ends their turn.</i>`, "system");
+    nextTurn(battleParticipants, onTurnStart);
+  }
+);
 
 const inputRules = {
   explore: { click: true, keyboard: true },
@@ -63,6 +101,8 @@ const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
 );
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
 scene.add(playerSprite);
+
+UI.updatePartyView([player], player.id);
 
 // --- ENEMY ENTITY & SPRITE SETUP ---
 const enemy = createEntity({
@@ -225,8 +265,12 @@ function onTurnStart(entity) {
   if (entity.id === player.id) {
     refreshReachableTiles();
   } else if (entity.id === enemy.id) {
-    updateVoxelTints(currentArenaMap, null, true); // Hide player's reachable tiles
-    setTimeout(processEnemyAI, 500); // 0.5s dramatic pause
+    updateVoxelTints(currentArenaMap, null, true); 
+    
+    // GUARD: Only trigger AI if the battle wasn't abruptly ended
+    setTimeout(() => {
+      if (currentMode === 'battle') processEnemyAI();
+    }, 500); 
   }
 }
 
@@ -252,21 +296,26 @@ function processEnemyAI() {
 
   if (aiDecision.action === 'move') {
     enemyPath = aiDecision.path;
-    // Animation loop will walk this path, then call processEnemyAI() again when finished
   } else if (aiDecision.action === 'attack') {
     const res = aiDecision.result;
     if (res.hit) {
-      console.log(`[Combat] Evil Bob hits for ${res.damage}! (HP: ${player.hp.current}/${player.hp.max})`);
+      console.log(`[Combat] ${enemy.name} hits for ${res.damage}! (HP: ${player.hp.current}/${player.hp.max})`);
       if (isDefeated(player)) {
         endBattleSequence("GAME OVER. You have been defeated!");
-        return;
+        return; 
       }
     } else {
-      console.log(`[Combat] Evil Bob misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
+      console.log(`[Combat] ${enemy.name} misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
     }
-    setTimeout(() => nextTurn(battleParticipants, onTurnStart), 1000);
+    
+    setTimeout(() => {
+      if (currentMode === 'battle') nextTurn(battleParticipants, onTurnStart);
+    }, 1000);
+    
   } else if (aiDecision.action === 'end') {
-    setTimeout(() => nextTurn(battleParticipants, onTurnStart), 500);
+    setTimeout(() => {
+      if (currentMode === 'battle') nextTurn(battleParticipants, onTurnStart);
+    }, 500);
   }
 }
 
@@ -331,27 +380,32 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
 
 window.addEventListener('pointerdown', (e) => {
   if (e.target.tagName !== 'CANVAS') return; 
-
   if (e.button !== 0) return; 
 
   mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
 
-  if (currentMode === 'explore') {
-     const spriteIntersects = raycaster.intersectObject(enemySprite);
-     if (spriteIntersects.length > 0) {
+  // Intercept clicks on ANY sprite so you can't walk through them
+  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite]);
+  if (spriteIntersects.length > 0) {
+     const hitSprite = spriteIntersects[0].object;
+     
+     // Only trigger dialogue if we specifically clicked Evil Bob in Explore mode
+     if (currentMode === 'explore' && hitSprite === enemySprite) {
         if (pathDistance(player.gridPos, enemy.gridPos) <= 2) {
             document.getElementById('dialogue-panel').style.display = 'block';
             document.getElementById('dialogue-name').innerText = enemy.name;
             isDialogueOpen = true;
-            isPointerDown = false; 
-            currentPath = [];      
         } else {
             console.log("Enemy is too far away to interact!");
         }
-        return; // Always consume the click so we don't accidentally walk behind them
      }
+     
+     // Consume the click if a sprite was hit
+     isPointerDown = false; 
+     currentPath = [];      
+     return; 
   }
 
   isPointerDown = true;
@@ -448,18 +502,25 @@ document.getElementById('btn-fight').addEventListener('click', () => {
   
   // PHASE 7: Roll Initiative & Start Turn Queue
   rollInitiativeForParticipants(battleParticipants);
+  UI.toggleBattleUI(true);
+  UI.updateHUD(player);
+  UI.updatePartyView(battleParticipants, player.id);
+  UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
+  
   const activeEntity = getCurrentEntity(battleParticipants);
-  console.log(`[Battle] First up: ${activeEntity.name}`);
-  onTurnStart(activeEntity);
+  onTurnStart(activeEntity); 
 });
 
 window.addEventListener('pointerup', (e) => {
   if (e.button === 0) isPointerDown = false;
-  
   if (e.target.tagName !== 'CANVAS') return; 
-  
   if (!inputRules[currentMode].click) return;
   if (currentPath.length > 0) return; 
+
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  if (raycaster.intersectObjects([playerSprite, enemySprite]).length > 0) return; 
 
   const intersect = getGridIntersection(e.clientX, e.clientY);
   if (!intersect) return; 
@@ -469,6 +530,7 @@ window.addEventListener('pointerup', (e) => {
 
   if (currentMode === 'battle') {
     if (!currentReachable || !currentReachable.has(targetKey)) {
+      console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
       return; 
     }
   }
@@ -477,9 +539,8 @@ window.addEventListener('pointerup', (e) => {
     const allowDiagonals = currentMode === 'explore';
     const path = findPath(player.gridPos, { x: gx, y: 0, z: gz }, allowDiagonals);
     
-    // Compare against moveRemaining instead of speed
     if (currentMode === 'battle' && path.length > player.turnResources.moveRemaining) {
-       console.warn(`Rejected: Path exceeds remaining movement.`);
+       console.warn(`Rejected: Path length exceeds speed stat.`);
        return;
     }
 
@@ -506,19 +567,20 @@ window.addEventListener('pointermove', (e) => {
       return;
   }
 
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
   const isWalkingInBattle = (currentMode === 'battle' && currentPath.length > 0);
   
-  // FIX: Reset sprite hover state every frame
   enemySprite.material.color.setHex(0xffffff);
   document.body.style.cursor = 'default';
 
-  // FIX: Highlight enemy if in range
   if (currentMode === 'explore' && !isDialogueOpen) {
      raycaster.setFromCamera(mouse, camera);
      const spriteIntersects = raycaster.intersectObject(enemySprite);
      if (spriteIntersects.length > 0 && pathDistance(player.gridPos, enemy.gridPos) <= 2) {
-         enemySprite.material.color.setHex(0xffff00); // Yellow highlight
+         enemySprite.material.color.setHex(0xffff00); 
          document.body.style.cursor = 'pointer';
      }
   }
@@ -589,7 +651,6 @@ if (key === 'escape' && isDialogueOpen) {
     document.getElementById('mode-text').innerText = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
     
     currentPath = []; 
-    
     highlightMesh.visible = false;
     pathGroup.clear();
     lastHoveredKey = null;
@@ -609,42 +670,52 @@ if (key === 'escape' && isDialogueOpen) {
       arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
       
       updateVoxelVisibility(currentArenaMap, true);
+      
+      // Dynamically build participants based on who is actually inside this 12x12 chunk!
+      battleParticipants = [player];
+      if (currentArenaMap.has(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z))) {
+         battleParticipants.push(enemy);
+         enemyAI.isPaused = true;
+      }
+      
+      // Hide entities that aren't in the battle
+      enemySprite.visible = battleParticipants.some(p => p.id === enemy.id);
+      
       refreshReachableTiles();
-    } else { 
+
+      // Manually trigger the UI shell for the debug key
+      rollInitiativeForParticipants(battleParticipants);
+      UI.toggleBattleUI(true);
+      UI.updateHUD(player);
+      UI.updatePartyView(battleParticipants, player.id);
+      UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
+      
+      const activeEntity = getCurrentEntity(battleParticipants);
+      if (activeEntity) onTurnStart(activeEntity);
+
+    } else {
+      // EXITING BATTLE VIA B KEY
       exitBattle();
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
       refreshReachableTiles();
-      enemyAI.isPaused = false;
+      
+      if (!isDefeated(enemy)) {
+         enemyAI.isPaused = false;
+         enemySprite.visible = true; // Un-hide the enemy
+      }
       
       resetBattleState(battleParticipants);
       battleParticipants = [];
+      
+      UI.toggleBattleUI(false);
+      UI.clearDiceLog();
     }
   }
   
   if (key === 'q') rotationStep += 1;
   if (key === 'e') rotationStep -= 1;
 
-  // --- TEMPORARY COMBAT TEST KEYS ---
-  if (key === 't' && currentMode === 'battle') {
-    if (getCurrentEntity(battleParticipants)?.id === player.id) {
-      console.log("[Combat] Player ends turn.");
-      nextTurn(battleParticipants, onTurnStart);
-    }
-  }
-  
-  if (key === 'y' && currentMode === 'battle') {
-    if (getCurrentEntity(battleParticipants)?.id === player.id) {
-      const res = performAttack(player, enemy);
-      console.log(`[Combat] Player Attacks! Hit: ${res.hit}, Damage: ${res.damage}`);
-      if (res.hit && isDefeated(enemy)) {
-        enemySprite.visible = false;
-        const v = World.get(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
-        if (v) v.occupant = null;
-        endBattleSequence("VICTORY! You slew the Evil Bob!");
-      }
-    }
-  }
 });
 
 window.addEventListener('keyup', (e) => {

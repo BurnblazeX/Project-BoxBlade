@@ -19,6 +19,78 @@
       <button id="btn-talk" style="margin-right: 10px; padding: 5px 15px; cursor: pointer;">Talk</button>
       <button id="btn-fight" style="padding: 5px 15px; cursor: pointer; color: red;">Fight</button>
     </div>
+   <!-- PERSISTENT UI SHELL (Both Modes) -->
+    <div id="persistent-ui-layer" style="position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 4;">
+      
+      <!-- Left Center: Party View -->
+      <div class="ui-panel party-view-panel">
+        <div class="vertical-text" style="writing-mode: horizontal-tb; transform: none; margin-bottom: 10px;">Party</div>
+        <div id="party-list" style="display: flex; flex-direction: column; gap: 5px;"></div>
+      </div>
+
+      <!-- Top Right: Map -->
+      <div class="ui-panel map-panel">
+        <div class="map-placeholder">MAP</div>
+      </div>
+
+      <!-- Bottom Left: Chat -->
+      <div class="ui-panel chat-panel">
+        <div style="opacity: 0.5;">CHAT (Placeholder)</div>
+      </div>
+
+    </div>
+
+    <!-- BATTLE UI SHELL (Battle Mode Only) -->
+    <div id="battle-ui-layer" style="display: none; position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 5;">
+      
+      <!-- Top Left: HP + Stat Effects -->
+      <div class="ui-panel hud-panel">
+        <div class="hud-header">
+          <b id="hud-name">Player</b> <span id="hud-ac">AC: 10</span>
+        </div>
+        <div class="hp-bar-bg"><div id="hud-hp-bar" class="hp-bar-fill"></div></div>
+        <div id="hud-hp-text" class="hp-text">100 / 100</div>
+        <div class="stat-effects">[ ] [ ] [ ]</div>
+      </div>
+
+      <!-- Top Center: Action Order -->
+      <div class="ui-panel action-order-panel" id="action-order-list">
+        <!-- Injected via JS -->
+      </div>
+
+      <!-- Middle Right: Dice Roll View -->
+      <div class="ui-panel dice-view-panel">
+        <div style="border-bottom: 1px solid #555; margin-bottom: 5px;">Dice Roll View</div>
+        <div id="dice-log" class="dice-log"></div>
+      </div>
+
+      <!-- Bottom Right: End Turn -->
+      <div class="ui-panel end-turn-panel">
+        <button id="btn-end-turn" class="ui-btn end-btn">End Turn</button>
+      </div>
+
+      <!-- Bottom Middle: Actions & Spells -->
+      <div class="ui-panel actions-panel">
+        <div class="actions-group">
+          <button id="btn-action-attack" class="ui-btn">Attack</button>
+          <button class="ui-btn disabled">Dash</button>
+        </div>
+        <div class="portrait-center">👤</div>
+        <div class="actions-group">
+          <button class="ui-btn disabled">Spell</button>
+          <button class="ui-btn disabled">Ability</button>
+        </div>
+      </div>
+
+      <!-- Bottom Edge: Resource Strip -->
+      <div class="ui-panel resources-strip">
+        Action <span id="res-action" class="res-box"></span> | 
+        Bonus <span id="res-bonus" class="res-box"></span> | 
+        Move <span id="res-move" class="res-box text-box">6</span> | 
+        Spell <span id="res-spell" class="res-box"></span>
+      </div>
+      
+    </div>
     <script type="module" src="/js/main.js"></script>
   </body>
 </html>
