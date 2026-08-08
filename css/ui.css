@@ -19,7 +19,7 @@
 .end-turn-panel { bottom: 40px; right: 30px; padding: 0; border: none; background: transparent; box-shadow: none; }
 .actions-panel { bottom: 60px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 15px; }
 .resources-strip { bottom: 10px; left: 50%; transform: translateX(-50%); font-size: 14px; padding: 5px 15px; border-radius: 5px; }
-.chat-panel { bottom: 20px; left: 20px; width: 250px; height: 80px; }
+.chat-panel { bottom: 20px; left: 20px; width: 250px; height: 80px; display: flex; flex-direction: column; }
 
 /* INTERNAL ELEMENTS */
 .hp-bar-bg { background: #444; height: 10px; width: 100%; margin: 5px 0; border: 1px solid #111; }
@@ -37,6 +37,9 @@
 .dice-log-entry { margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #333; }
 .dice-log-entry.enemy-turn { color: #ff8888; }
 .dice-log-entry.player-turn { color: #88ff88; }
+
+.chat-log { flex-grow: 1; overflow-y: auto; font-size: 12px; line-height: 1.4; }
+.chat-log-entry { margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #333; color: #ffd700; }
 
 .ui-btn { background: #333; color: white; border: 1px solid #777; padding: 5px 10px; cursor: pointer; font-family: monospace; }
 .ui-btn:hover:not(.disabled) { background: #555; }

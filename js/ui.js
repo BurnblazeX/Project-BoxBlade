@@ -45,6 +45,15 @@ export function clearDiceLog() {
   document.getElementById('dice-log').innerHTML = '';
 }
 
+export function logChatMessage(message) {
+  const log = document.getElementById('chat-log');
+  const entry = document.createElement('div');
+  entry.className = 'chat-log-entry';
+  entry.innerHTML = message;
+  log.appendChild(entry);
+  log.scrollTop = log.scrollHeight;
+}
+
 export function updateActionResources(turnResources) {
   if (!turnResources) return;
   document.getElementById('res-action').className = `res-box ${turnResources.actionAvailable ? 'res-avail' : 'res-spent'}`;

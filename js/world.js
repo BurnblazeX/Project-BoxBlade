@@ -26,10 +26,17 @@ export function createEntity(config) {
     hp: config.hp || { current: 100, max: 100 },
     ac: config.ac || 10,                  
     initiative: config.initiative || null, 
-    weaponDie: config.weaponDie || "1d6",  
+    weaponDie: config.weaponDie || "1d6",
     facing: config.facing || "N",
-    mode: config.mode || "explore"
+    mode: config.mode || "explore",
+    inventory: config.inventory || []
   };
+}
+
+export function addToInventory(entity, itemId, quantity) {
+  const existing = entity.inventory.find(i => i.itemId === itemId);
+  if (existing) existing.quantity += quantity;
+  else entity.inventory.push({ itemId, quantity });
 }
 
 // --- DISTANCE & PATHFINDING ---
@@ -138,6 +145,12 @@ export let currentArena = null;
 export function attackRange(a, b) {
   // Chebyshev distance (Allows diagonal adjacency)
   return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.z - b.z));
+}
+
+export function isInInteractRange(a, b) {
+  // Chebyshev adjacency, same shape as melee range - deliberately NOT calling
+  // combat.js's isInMeleeRange to keep world.js/objects.js free of combat imports.
+  return attackRange(a.gridPos, b.gridPos) <= 1;
 }
 
 export function enterBattle(playerGridPos) {

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange } from './world.js';
+import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
 import { createWanderAI } from './ai.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
@@ -8,6 +9,7 @@ import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './comb
 
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
+import treeTextureUrl from '../assets/sprites/decor_tree.png'
 
 UI.initUI(
   // Attack Button Callback
@@ -99,12 +101,15 @@ World.get(getVoxelKey(8, 0, 8)).occupant = player.id;
 
 const texLoader = new THREE.TextureLoader();
 const bobTexture = texLoader.load(bobTextureUrl);
-bobTexture.magFilter = THREE.NearestFilter; 
+bobTexture.magFilter = THREE.NearestFilter;
 bobTexture.minFilter = THREE.NearestFilter;
+bobTexture.colorSpace = THREE.SRGBColorSpace;
 
 // Clone the texture so this specific sprite can flip independently
 const playerTex = bobTexture.clone();
-const bobMaterial = new THREE.SpriteMaterial({ map: playerTex, transparent: true });
+// alphaTest discards fully-transparent pixels before the depth test, so this
+// sprite's invisible corners don't still write depth and occlude what's behind it.
+const bobMaterial = new THREE.SpriteMaterial({ map: playerTex, transparent: true, alphaTest: 0.5 });
 const playerSprite = new THREE.Sprite(bobMaterial);
 
 playerSprite.center.set(0.5, 0); 
@@ -135,10 +140,11 @@ const enemy = createEntity({
 World.get(getVoxelKey(10, 0, 10)).occupant = enemy.id;
 
 const evilBobTexture = texLoader.load(evilBobTextureUrl);
-evilBobTexture.magFilter = THREE.NearestFilter; 
+evilBobTexture.magFilter = THREE.NearestFilter;
 evilBobTexture.minFilter = THREE.NearestFilter;
+evilBobTexture.colorSpace = THREE.SRGBColorSpace;
 // Clone material so EvilBob can flip independently
-const evilBobMaterial = new THREE.SpriteMaterial({ map: evilBobTexture.clone(), transparent: true });
+const evilBobMaterial = new THREE.SpriteMaterial({ map: evilBobTexture.clone(), transparent: true, alphaTest: 0.5 });
 const enemySprite = new THREE.Sprite(evilBobMaterial);
 
 enemySprite.center.set(0.5, 0); 
@@ -147,6 +153,119 @@ enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
 scene.add(enemySprite);
 
 const enemyAI = createWanderAI(enemy, enemySprite, 4);
+
+// --- WORLD OBJECTS (Phase 10: Tree, Chest, Barrel) ---
+// Untextured colored placeholder sprites - no dedicated object art yet.
+function createObjectSprite(color) {
+  const mat = new THREE.SpriteMaterial({ color, transparent: true });
+  const sprite = new THREE.Sprite(mat);
+  sprite.center.set(0.5, 0);
+  sprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+  return sprite;
+}
+
+const treeData = createObject({
+  id: "object_tree_1",
+  name: "Old Tree",
+  type: "tree",
+  gridPos: { x: 5, y: 0, z: 15 },
+  blocking: true
+});
+const treeTexture = texLoader.load(treeTextureUrl);
+treeTexture.magFilter = THREE.NearestFilter;
+treeTexture.minFilter = THREE.NearestFilter;
+treeTexture.colorSpace = THREE.SRGBColorSpace;
+
+// Decor (tree): fixed-orientation ground-planted cutout, NOT a camera-facing
+// Sprite - meshes stay put as the camera rotates, like cardboard planted in
+// the world rather than a character that always faces you.
+// Cruciform: 4 planes at 45-degree increments (0/45/90/135), so at least one is
+// always within 22.5 degrees of face-on. Plain 0/90 left a gap in battle view,
+// since battle mode's camera heading is offset 45 degrees from explore's.
+// PlaneGeometry's default local axes already line up as a vertical standee
+// (local Y = world up, normal along world Z), so the first plane needs no rotation.
+// 2 blocks tall (3m) per spec, vs. the 1-block-tall character sprites.
+// (A horizontal top face is planned too, once that texture exists - not yet.)
+const treePlaneGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE * 2);
+treePlaneGeo.translate(0, VOXEL_SIZE, 0); // anchor the bottom edge at local origin, like the sprites' center.set(0.5, 0)
+const treeMaterial = new THREE.MeshBasicMaterial({
+  map: treeTexture, transparent: true, side: THREE.DoubleSide,
+  alphaTest: 0.5 // discard fully-transparent pixels before the depth test, so they don't occlude what's behind
+});
+const treePlaneA = new THREE.Mesh(treePlaneGeo, treeMaterial);
+const treePlaneB = new THREE.Mesh(treePlaneGeo, treeMaterial);
+const treePlaneC = new THREE.Mesh(treePlaneGeo, treeMaterial);
+const treePlaneD = new THREE.Mesh(treePlaneGeo, treeMaterial);
+treePlaneB.rotation.y = Math.PI / 2;
+treePlaneC.rotation.y = Math.PI / 4;
+treePlaneD.rotation.y = (3 * Math.PI) / 4;
+const treeMesh = new THREE.Group();
+treeMesh.add(treePlaneA, treePlaneB, treePlaneC, treePlaneD);
+treeMesh.position.copy(getSpriteWorldPos(treeData.gridPos));
+scene.add(treeMesh);
+World.get(getVoxelKey(treeData.gridPos.x, 0, treeData.gridPos.z)).occupant = treeData.id;
+
+const chestData = createObject({
+  id: "object_chest_1",
+  name: "Old Chest",
+  type: "chest",
+  gridPos: { x: 12, y: 0, z: 5 },
+  blocking: true,
+  lootTable: [
+    { itemId: "gold_coin", weight: 5, minQty: 3, maxQty: 10 },
+    { itemId: "healing_potion", weight: 3, minQty: 1, maxQty: 2 },
+    { itemId: "iron_ore", weight: 2, minQty: 1, maxQty: 4 }
+  ]
+});
+const chestSprite = createObjectSprite(0xd4a017);
+chestSprite.position.copy(getSpriteWorldPos(chestData.gridPos));
+scene.add(chestSprite);
+World.get(getVoxelKey(chestData.gridPos.x, 0, chestData.gridPos.z)).occupant = chestData.id;
+
+const barrelData = createObject({
+  id: "object_barrel_1",
+  name: "Old Barrel",
+  type: "barrel",
+  gridPos: { x: 15, y: 0, z: 15 },
+  blocking: true,
+  fixedItem: { itemId: "ale", quantity: 2 }
+});
+const barrelSprite = createObjectSprite(0x8b5a2b);
+barrelSprite.position.copy(getSpriteWorldPos(barrelData.gridPos));
+scene.add(barrelSprite);
+World.get(getVoxelKey(barrelData.gridPos.x, 0, barrelData.gridPos.z)).occupant = barrelData.id;
+
+// Every world object's data + render node, so battle-arena visibility can be
+// driven generically instead of hand-listing objects at each call site.
+const worldObjects = [
+  { data: treeData, mesh: treeMesh },
+  { data: chestData, mesh: chestSprite },
+  { data: barrelData, mesh: barrelSprite }
+];
+
+// Mirrors how enemySprite/updateVoxelVisibility hide things outside the arena:
+// in explore mode everything shows; in battle, only objects inside the current
+// arena chunk render at all.
+function updateObjectVisibility(arenaMap, isBattle) {
+  for (const { data, mesh } of worldObjects) {
+    mesh.visible = !isBattle || arenaMap.has(getVoxelKey(data.gridPos.x, 0, data.gridPos.z));
+  }
+}
+
+// Lookup from a clicked/hovered sprite to its underlying data. The tree has no
+// entry on purpose - it's pure scenery with no interaction panel at all.
+const spriteToTarget = new Map([
+  [enemySprite, enemy],
+  [chestSprite, chestData],
+  [barrelSprite, barrelData]
+]);
+// Base tint per hover-able sprite, so the hover-highlight reset restores each
+// sprite's own look instead of stomping untextured object sprites back to white.
+const spriteBaseColor = new Map([
+  [enemySprite, 0xffffff],
+  [chestSprite, 0xd4a017],
+  [barrelSprite, 0x8b5a2b]
+]);
 
 // --- BATTLE STATE ---
 export let battleParticipants = [];
@@ -303,7 +422,8 @@ function endBattleSequence(message) {
   exitBattle();
   currentArenaMap = null;
   updateVoxelVisibility(null, false);
-  
+  updateObjectVisibility(null, false);
+
   if (!isDefeated(enemy)) enemyAI.isPaused = false;
   
   resetBattleState(battleParticipants);
@@ -410,46 +530,102 @@ window.addEventListener('pointerdown', (e) => {
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
 
-  // Intercept clicks on ANY sprite so you can't walk through them
-  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite]);
+  // Intercept clicks on ANY sprite (including the tree) so you can't walk through them
+  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, treeMesh]);
   if (spriteIntersects.length > 0) {
      const hitSprite = spriteIntersects[0].object;
-     
-     // Only trigger dialogue if we specifically clicked Evil Bob in Explore mode
-     if (currentMode === 'explore' && hitSprite === enemySprite) {
-        if (pathDistance(player.gridPos, enemy.gridPos) <= 2) {
-            document.getElementById('dialogue-panel').style.display = 'block';
-            document.getElementById('dialogue-name').innerText = enemy.name;
-            isDialogueOpen = true;
+     const target = spriteToTarget.get(hitSprite); // undefined for the tree - no panel, by design
+
+     if (currentMode === 'explore' && target) {
+        if (pathDistance(player.gridPos, target.gridPos) <= 2) {
+            openInteractionPanel(target);
         } else {
-            console.log("Enemy is too far away to interact!");
+            console.log(`${target.name} is too far away to interact!`);
         }
      }
-     
+
      // Consume the click if a sprite was hit
-     isPointerDown = false; 
-     currentPath = [];      
-     return; 
+     isPointerDown = false;
+     currentPath = [];
+     return;
   }
 
   isPointerDown = true;
   processClickToMove(e.clientX, e.clientY, true);
 });
 
-// --- DIALOGUE BUTTONS & STATE ---
+// --- INTERACTION PANEL (generic: enemy dialogue + object "Open") ---
 let isDialogueOpen = false;
+let interactionTarget = null;
+
+function openInteractionPanel(target) {
+  interactionTarget = target;
+  isDialogueOpen = true;
+
+  document.getElementById('dialogue-panel').style.display = 'block';
+  document.getElementById('dialogue-name').innerText = target.name;
+
+  // Objects always carry a `type` ("tree"/"chest"/"barrel"); entities never do.
+  const isEnemy = target.type === undefined;
+  document.getElementById('btn-talk').style.display = isEnemy ? 'inline-block' : 'none';
+  document.getElementById('btn-fight').style.display = isEnemy ? 'inline-block' : 'none';
+  document.getElementById('btn-open').style.display = isEnemy ? 'none' : 'inline-block';
+
+  updateInteractionButtons();
+}
+
+function closeInteractionPanel() {
+  document.getElementById('dialogue-panel').style.display = 'none';
+  isDialogueOpen = false;
+  interactionTarget = null;
+}
+
+// Live adjacency gate: the panel opens from "look" range, but each action button
+// only enables at true adjacency, re-checked every frame while the panel is open.
+function updateInteractionButtons() {
+  if (!interactionTarget) return;
+  const inRange = isInInteractRange(player, interactionTarget);
+
+  for (const id of ['btn-talk', 'btn-fight', 'btn-open']) {
+    const btn = document.getElementById(id);
+    if (btn.style.display === 'none') continue;
+    btn.disabled = !inRange;
+    btn.classList.toggle('disabled', !inRange);
+  }
+}
+
+function formatItemName(itemId) {
+  return itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
 
 // Fix 1: Stop UI clicks from falling through to the game world
 document.getElementById('dialogue-panel').addEventListener('pointerdown', (e) => e.stopPropagation());
 
 document.getElementById('btn-talk').addEventListener('click', () => {
-  console.log(`${enemy.name} snarls: "You shouldn't be here..."`);
+  console.log(`${interactionTarget.name} snarls: "You shouldn't be here..."`);
+});
+
+document.getElementById('btn-open').addEventListener('click', () => {
+  const obj = interactionTarget;
+  if (!obj || (obj.type !== 'chest' && obj.type !== 'barrel')) return;
+  if (!isInInteractRange(player, obj)) return; // safety net; button should already be disabled
+
+  if (obj.looted) {
+    UI.logChatMessage(`The ${obj.name} is already empty.`);
+    return;
+  }
+
+  const result = obj.type === 'chest' ? rollLootTable(obj.lootTable) : obj.fixedItem;
+  addToInventory(player, result.itemId, result.quantity);
+  obj.looted = true;
+  obj.state = 'open';
+
+  UI.logChatMessage(`Found ${result.quantity}x ${formatItemName(result.itemId)} in the ${obj.name}.`);
 });
 
 document.getElementById('btn-fight').addEventListener('click', () => {
-  document.getElementById('dialogue-panel').style.display = 'none';
-  isDialogueOpen = false;
-  
+  closeInteractionPanel();
+
   // Snap player to grid
   player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
   player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
@@ -523,8 +699,9 @@ document.getElementById('btn-fight').addEventListener('click', () => {
   arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
   
   updateVoxelVisibility(currentArenaMap, true);
+  updateObjectVisibility(currentArenaMap, true);
   refreshReachableTiles();
-  
+
   // PHASE 7: Roll Initiative & Start Turn Queue
   rollInitiativeForParticipants(battleParticipants);
   UI.toggleBattleUI(true);
@@ -545,7 +722,7 @@ window.addEventListener('pointerup', (e) => {
   mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
-  if (raycaster.intersectObjects([playerSprite, enemySprite]).length > 0) return; 
+  if (raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, treeMesh]).length > 0) return;
 
   const intersect = getGridIntersection(e.clientX, e.clientY);
   if (!intersect) return; 
@@ -598,15 +775,23 @@ window.addEventListener('pointermove', (e) => {
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
   const isWalkingInBattle = (currentMode === 'battle' && currentPath.length > 0);
   
-  enemySprite.material.color.setHex(0xffffff);
+  // Reset each interactable sprite to its own base tint (not a shared white -
+  // chest/barrel are untextured color sprites, not tinted photos like enemySprite).
+  for (const [sprite, baseColor] of spriteBaseColor) {
+    sprite.material.color.setHex(baseColor);
+  }
   document.body.style.cursor = 'default';
 
   if (currentMode === 'explore' && !isDialogueOpen) {
      raycaster.setFromCamera(mouse, camera);
-     const spriteIntersects = raycaster.intersectObject(enemySprite);
-     if (spriteIntersects.length > 0 && pathDistance(player.gridPos, enemy.gridPos) <= 2) {
-         enemySprite.material.color.setHex(0xffff00); 
-         document.body.style.cursor = 'pointer';
+     const hoverIntersects = raycaster.intersectObjects([enemySprite, chestSprite, barrelSprite]);
+     if (hoverIntersects.length > 0) {
+        const hovered = hoverIntersects[0].object;
+        const target = spriteToTarget.get(hovered);
+        if (target && pathDistance(player.gridPos, target.gridPos) <= 2) {
+           hovered.material.color.setHex(0xffff00);
+           document.body.style.cursor = 'pointer';
+        }
      }
   }
 
@@ -659,8 +844,7 @@ window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
   
 if (key === 'escape' && isDialogueOpen) {
-     document.getElementById('dialogue-panel').style.display = 'none';
-     isDialogueOpen = false;
+     closeInteractionPanel();
   }
 
   if (keyState.hasOwnProperty(key)) {
@@ -692,7 +876,8 @@ if (key === 'escape' && isDialogueOpen) {
       arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
       
       updateVoxelVisibility(currentArenaMap, true);
-      
+      updateObjectVisibility(currentArenaMap, true);
+
       // FIX: Only the player starts in combat automatically
       battleParticipants = [player];
       
@@ -722,11 +907,12 @@ if (key === 'escape' && isDialogueOpen) {
       exitBattle();
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
+      updateObjectVisibility(null, false);
       refreshReachableTiles();
-      
+
       if (!isDefeated(enemy)) {
          enemyAI.isPaused = false;
-         enemySprite.visible = true; 
+         enemySprite.visible = true;
       }
       
       resetBattleState(battleParticipants);
@@ -930,10 +1116,14 @@ function animate() {
     }
   }
 
-  // FIX 2: Auto-close dialogue if player walks out of range
-  if (isDialogueOpen && pathDistance(player.gridPos, enemy.gridPos) > 2) {
-     document.getElementById('dialogue-panel').style.display = 'none';
-     isDialogueOpen = false;
+  // Auto-close the panel if the player walks out of look-range of whichever
+  // target is open; otherwise keep its action buttons' enabled state live.
+  if (isDialogueOpen && interactionTarget) {
+     if (pathDistance(player.gridPos, interactionTarget.gridPos) > 2) {
+        closeInteractionPanel();
+     } else {
+        updateInteractionButtons();
+     }
   }
 
   // 2. Camera Lerping & Pivot Tracking

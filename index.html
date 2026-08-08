@@ -16,8 +16,9 @@
     </div>
     <div id="dialogue-panel" style="display: none; position: absolute; bottom: 15%; left: 50%; transform: translateX(-50%); background: #222; border: 2px solid #fff; padding: 20px; color: white; min-width: 300px; text-align: center; font-family: monospace; z-index: 10;">
       <h3 id="dialogue-name" style="margin-top: 0;">Enemy Name</h3>
-      <button id="btn-talk" style="margin-right: 10px; padding: 5px 15px; cursor: pointer;">Talk</button>
-      <button id="btn-fight" style="padding: 5px 15px; cursor: pointer; color: red;">Fight</button>
+      <button id="btn-talk" class="ui-btn" style="margin-right: 10px;">Talk</button>
+      <button id="btn-fight" class="ui-btn" style="color: red;">Fight</button>
+      <button id="btn-open" class="ui-btn">Open</button>
     </div>
    <!-- PERSISTENT UI SHELL (Both Modes) -->
     <div id="persistent-ui-layer" style="position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 4;">
@@ -35,7 +36,8 @@
 
       <!-- Bottom Left: Chat -->
       <div class="ui-panel chat-panel">
-        <div style="opacity: 0.5;">CHAT (Placeholder)</div>
+        <div style="border-bottom: 1px solid #555; margin-bottom: 5px;">Chat</div>
+        <div id="chat-log" class="chat-log"></div>
       </div>
 
     </div>
