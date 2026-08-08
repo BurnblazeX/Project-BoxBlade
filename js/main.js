@@ -105,19 +105,33 @@ bobTexture.magFilter = THREE.NearestFilter;
 bobTexture.minFilter = THREE.NearestFilter;
 bobTexture.colorSpace = THREE.SRGBColorSpace;
 
-// Clone the texture so this specific sprite can flip independently
-const playerTex = bobTexture.clone();
-// alphaTest discards fully-transparent pixels before the depth test, so this
-// sprite's invisible corners don't still write depth and occlude what's behind it.
-const bobMaterial = new THREE.SpriteMaterial({ map: playerTex, transparent: true, alphaTest: 0.5 });
-const playerSprite = new THREE.Sprite(bobMaterial);
+// Ground-anchored plane, same footprint as the old Sprite (VOXEL_SIZE square).
+// Characters always rotate around Y to face the camera's heading (set per-frame
+// in animate()), plus a partial lean-back toward the camera's pitch, capped at
+// MAX_CHARACTER_TILT - a full billboard tilt (matching the camera's real ~35-60
+// degree pitch) let the top of the quad swing into adjacent geometry like the
+// tree's fixed planes; staying fully vertical (no lean at all) looked squished
+// under this game's steep camera angles. The cap is a middle ground.
+const MAX_CHARACTER_TILT = THREE.MathUtils.degToRad(22.5);
+const characterGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE);
+characterGeo.translate(0, VOXEL_SIZE / 2, 0); // anchor the bottom edge at local origin
 
-playerSprite.center.set(0.5, 0); 
-playerSprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+function createCharacterMesh(texture) {
+  // alphaTest discards fully-transparent pixels before the depth test, so this
+  // mesh's invisible corners don't still write depth and occlude what's behind it.
+  const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, alphaTest: 0.5, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(characterGeo, material);
+  mesh.rotation.order = 'YXZ'; // yaw (heading) applied before pitch (lean), so lean tilts around the already-yawed local X axis
+  return mesh;
+}
+
+// Clone the texture so this specific character can flip independently
+const playerTex = bobTexture.clone();
+const playerSprite = createCharacterMesh(playerTex);
 
 const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
   gridPos.x * VOXEL_SIZE,
-  VOXEL_SIZE / 2, 
+  VOXEL_SIZE / 2,
   gridPos.z * VOXEL_SIZE
 );
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
@@ -143,12 +157,8 @@ const evilBobTexture = texLoader.load(evilBobTextureUrl);
 evilBobTexture.magFilter = THREE.NearestFilter;
 evilBobTexture.minFilter = THREE.NearestFilter;
 evilBobTexture.colorSpace = THREE.SRGBColorSpace;
-// Clone material so EvilBob can flip independently
-const evilBobMaterial = new THREE.SpriteMaterial({ map: evilBobTexture.clone(), transparent: true, alphaTest: 0.5 });
-const enemySprite = new THREE.Sprite(evilBobMaterial);
-
-enemySprite.center.set(0.5, 0); 
-enemySprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+// Clone the texture so EvilBob can flip independently
+const enemySprite = createCharacterMesh(evilBobTexture.clone());
 enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
 scene.add(enemySprite);
 
@@ -330,7 +340,7 @@ const cameraConfigs = {
   explore: { 
     fov: 45,        
     distance: 22,   
-    pitch: Math.PI / 3, 
+    pitch: Math.PI / 3.43, 
     headingOffset: 0
   },
   battle: { 
@@ -1151,6 +1161,13 @@ function animate() {
   camera.position.z = pivot.position.z + xzLen * Math.cos(currentHeading);
   
   camera.lookAt(pivot.position);
+
+  // Clamped billboard: characters turn to face the camera's heading, plus lean
+  // back toward its pitch up to MAX_CHARACTER_TILT - enough to avoid looking
+  // flat/squished, not enough to swing into adjacent geometry like the tree.
+  const characterTilt = Math.min(currentPitch, MAX_CHARACTER_TILT);
+  playerSprite.rotation.set(-characterTilt, currentHeading, 0);
+  enemySprite.rotation.set(-characterTilt, currentHeading, 0);
 
   renderer.render(scene, camera);
 }

@@ -116,11 +116,11 @@ export function findPath(start, end, allowDiagonals = false) {
       const voxel = World.get(neighborKey);
       if (!voxel || !voxel.walkable || voxel.occupant) continue; 
       
-      // Prevent clipping through solid corners when moving diagonally
+      // Prevent clipping through solid OR occupied corners when moving diagonally
       if (allowDiagonals && dir.cost > 1) {
         const v1 = World.get(getVoxelKey(current.x + dir.x, 0, current.z));
         const v2 = World.get(getVoxelKey(current.x, 0, current.z + dir.z));
-        if ((!v1 || !v1.walkable) || (!v2 || !v2.walkable)) continue;
+        if ((!v1 || !v1.walkable || v1.occupant) || (!v2 || !v2.walkable || v2.occupant)) continue;
       }
 
       const tentative_gScore = (gScore.get(currentKey) ?? Infinity) + dir.cost;
