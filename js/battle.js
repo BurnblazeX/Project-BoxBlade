@@ -63,9 +63,11 @@ export function nextTurn(participants, onTurnStart) {
   }
   
   const current = getCurrentEntity(participants);
+  if (!current) return;
+
   console.log(`[Battle] Turn: ${current.name}`);
-  
-  if (onTurnStart && current) {
+
+  if (onTurnStart) {
     onTurnStart(current);
   }
 }
@@ -75,4 +77,34 @@ export function resetBattleState(participants) {
   currentTurnIndex = 0;
   roundNumber = 1;
   participants.forEach(p => p.initiative = null);
+}
+
+export function addParticipant(entity) {
+  const dexMod = getAbilityModifier(entity.stats.DEX);
+  entity.initiative = rollD20().kept + dexMod;
+  entity.turnResources = {
+    actionAvailable: true,
+    bonusActionAvailable: true,
+    spellAvailable: true,
+    moveRemaining: entity.speed
+  };
+  
+  const newEntry = { entityId: entity.id, initiative: entity.initiative, tieBreaker: 0 };
+  const hadTurnsAlready = turnOrder.length > 0;
+
+  // Find where they belong in the descending list
+  let insertIndex = turnOrder.findIndex(t =>
+     t.initiative < newEntry.initiative ||
+     (t.initiative === newEntry.initiative && t.tieBreaker < newEntry.tieBreaker)
+  );
+
+  if (insertIndex === -1) insertIndex = turnOrder.length;
+
+  turnOrder.splice(insertIndex, 0, newEntry);
+
+  // Shift the active turn index if they cut in line, so the current turn isn't interrupted
+  // (only relevant when there was already an active turn to protect)
+  if (hadTurnsAlready && insertIndex <= currentTurnIndex) {
+     currentTurnIndex++;
+  }
 }

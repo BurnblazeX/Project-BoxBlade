@@ -2,9 +2,9 @@ import * as THREE from 'three';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels } from './world.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
 import { createWanderAI } from './ai.js';
-import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn } from './battle.js';
+import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
-import { performAttack, isDefeated, takeEnemyTurn } from './combat.js';
+import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
 
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
@@ -14,14 +14,30 @@ UI.initUI(
   () => {
     if (currentMode !== 'battle') return;
     const current = getCurrentEntity(battleParticipants);
-    if (current.id !== player.id) return; // Not your turn!
+    if (current.id !== player.id) return; 
 
+    // 1. Check Range 
+    if (!isInMeleeRange(player, enemy)) {
+       UI.logDiceRoll("<i>Target is out of range!</i>", "system");
+       return; 
+    }
+
+    // 2. Roll Attack
     const res = performAttack(player, enemy);
     if (!res.success) {
       UI.logDiceRoll("<i>You have no action left!</i>", "system");
       return;
     }
 
+    // 3. Provoke Mechanic: If enemy wasn't in combat, add them now!
+    if (!battleParticipants.some(p => p.id === enemy.id)) {
+       battleParticipants.push(enemy);
+       addParticipant(enemy);
+       UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
+       UI.logDiceRoll(`<i>${enemy.name} was provoked and joined the battle!</i>`, "system");
+    }
+
+    // 4. Resolve Hit/Damage
     if (res.hit) {
       UI.logDiceRoll(`<b>${player.name}</b> hits ${enemy.name}! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}] <br>Deals <b>${res.damage} damage!</b>`, "player-turn");
       if (isDefeated(enemy)) {
@@ -34,7 +50,7 @@ UI.initUI(
       UI.logDiceRoll(`<b>${player.name}</b> misses! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}]`, "player-turn");
     }
     
-    UI.updateHUD(player); // Update if needed (though enemy took damage)
+    UI.updateHUD(player); 
     UI.updateActionResources(player.turnResources);
   },
   // End Turn Button Callback
@@ -134,6 +150,10 @@ const enemyAI = createWanderAI(enemy, enemySprite, 4);
 
 // --- BATTLE STATE ---
 export let battleParticipants = [];
+// Bumped every time battle is entered or exited, so timers scheduled by a
+// previous battle can detect they're stale even if currentMode flips back
+// to 'battle' before they fire.
+let battleSessionId = 0;
 
 // SPRITE FLIP HELPER
 function updateSpriteFacing(sprite, isFacingRight) {
@@ -265,18 +285,20 @@ function onTurnStart(entity) {
   if (entity.id === player.id) {
     refreshReachableTiles();
   } else if (entity.id === enemy.id) {
-    updateVoxelTints(currentArenaMap, null, true); 
-    
-    // GUARD: Only trigger AI if the battle wasn't abruptly ended
+    updateVoxelTints(currentArenaMap, null, true);
+
+    // GUARD: Only trigger AI if the battle wasn't abruptly ended (or replaced by a new one)
+    const scheduledSession = battleSessionId;
     setTimeout(() => {
-      if (currentMode === 'battle') processEnemyAI();
-    }, 500); 
+      if (currentMode === 'battle' && battleSessionId === scheduledSession) processEnemyAI();
+    }, 500);
   }
 }
 
 function endBattleSequence(message) {
   console.log(`[Combat] ${message}`);
   currentMode = 'explore';
+  battleSessionId++;
   document.getElementById('mode-text').innerText = 'Explore';
   exitBattle();
   currentArenaMap = null;
@@ -307,14 +329,16 @@ function processEnemyAI() {
     } else {
       console.log(`[Combat] ${enemy.name} misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
     }
-    
+
+    const scheduledSessionAttack = battleSessionId;
     setTimeout(() => {
-      if (currentMode === 'battle') nextTurn(battleParticipants, onTurnStart);
+      if (currentMode === 'battle' && battleSessionId === scheduledSessionAttack) nextTurn(battleParticipants, onTurnStart);
     }, 1000);
-    
+
   } else if (aiDecision.action === 'end') {
+    const scheduledSessionEnd = battleSessionId;
     setTimeout(() => {
-      if (currentMode === 'battle') nextTurn(battleParticipants, onTurnStart);
+      if (currentMode === 'battle' && battleSessionId === scheduledSessionEnd) nextTurn(battleParticipants, onTurnStart);
     }, 500);
   }
 }
@@ -481,8 +505,9 @@ document.getElementById('btn-fight').addEventListener('click', () => {
 
   battleParticipants = [player, enemy];
   enemyAI.isPaused = true;
-  
+
   currentMode = 'battle';
+  battleSessionId++;
   document.getElementById('mode-text').innerText = 'Battle';
   highlightMesh.visible = false;
   pathGroup.clear();
@@ -642,12 +667,9 @@ if (key === 'escape' && isDialogueOpen) {
     keyState[key] = true;
   }
 
-  if (keyState.hasOwnProperty(key)) {
-    keyState[key] = true;
-  }
-  
   if (key === 'b') {
     currentMode = currentMode === 'explore' ? 'battle' : 'explore';
+    battleSessionId++;
     document.getElementById('mode-text').innerText = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
     
     currentPath = []; 
@@ -671,19 +693,21 @@ if (key === 'escape' && isDialogueOpen) {
       
       updateVoxelVisibility(currentArenaMap, true);
       
-      // Dynamically build participants based on who is actually inside this 12x12 chunk!
+      // FIX: Only the player starts in combat automatically
       battleParticipants = [player];
-      if (currentArenaMap.has(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z))) {
-         battleParticipants.push(enemy);
-         enemyAI.isPaused = true;
-      }
       
-      // Hide entities that aren't in the battle
-      enemySprite.visible = battleParticipants.some(p => p.id === enemy.id);
+      const enemyInChunk = currentArenaMap.has(getVoxelKey(enemy.gridPos.x, 0, enemy.gridPos.z));
+      
+      // Freeze them if they are in the chunk, hide them if they aren't
+      if (enemyInChunk) {
+         enemyAI.isPaused = true;
+         enemySprite.visible = true;
+      } else {
+         enemySprite.visible = false;
+      }
       
       refreshReachableTiles();
 
-      // Manually trigger the UI shell for the debug key
       rollInitiativeForParticipants(battleParticipants);
       UI.toggleBattleUI(true);
       UI.updateHUD(player);
@@ -694,7 +718,7 @@ if (key === 'escape' && isDialogueOpen) {
       if (activeEntity) onTurnStart(activeEntity);
 
     } else {
-      // EXITING BATTLE VIA B KEY
+      // EXITING BATTLE
       exitBattle();
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
@@ -702,7 +726,7 @@ if (key === 'escape' && isDialogueOpen) {
       
       if (!isDefeated(enemy)) {
          enemyAI.isPaused = false;
-         enemySprite.visible = true; // Un-hide the enemy
+         enemySprite.visible = true; 
       }
       
       resetBattleState(battleParticipants);
