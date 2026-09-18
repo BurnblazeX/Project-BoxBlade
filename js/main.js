@@ -10,6 +10,8 @@ import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './comb
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
 import treeTextureUrl from '../assets/sprites/decor_tree.png'
+import chestTextureUrl from '../assets/sprites/container_chest.png'
+import chestOpenTextureUrl from '../assets/sprites/container_chest_open.png'
 
 UI.initUI(
   // Attack Button Callback
@@ -113,8 +115,8 @@ bobTexture.colorSpace = THREE.SRGBColorSpace;
 // tree's fixed planes; staying fully vertical (no lean at all) looked squished
 // under this game's steep camera angles. The cap is a middle ground.
 const MAX_CHARACTER_TILT = THREE.MathUtils.degToRad(22.5);
-const characterGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE);
-characterGeo.translate(0, VOXEL_SIZE / 2, 0); // anchor the bottom edge at local origin
+const characterGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE * 2); // 2 voxels tall
+characterGeo.translate(0, VOXEL_SIZE, 0); 
 
 function createCharacterMesh(texture) {
   // alphaTest discards fully-transparent pixels before the depth test, so this
@@ -174,13 +176,6 @@ function createObjectSprite(color) {
   return sprite;
 }
 
-const treeData = createObject({
-  id: "object_tree_1",
-  name: "Old Tree",
-  type: "tree",
-  gridPos: { x: 5, y: 0, z: 15 },
-  blocking: true
-});
 const treeTexture = texLoader.load(treeTextureUrl);
 treeTexture.magFilter = THREE.NearestFilter;
 treeTexture.minFilter = THREE.NearestFilter;
@@ -194,65 +189,113 @@ treeTexture.colorSpace = THREE.SRGBColorSpace;
 // since battle mode's camera heading is offset 45 degrees from explore's.
 // PlaneGeometry's default local axes already line up as a vertical standee
 // (local Y = world up, normal along world Z), so the first plane needs no rotation.
-// 2 blocks tall (3m) per spec, vs. the 1-block-tall character sprites.
+// 2 voxels wide and 3 voxels tall, vs. the 1-block-tall character sprites.
 // (A horizontal top face is planned too, once that texture exists - not yet.)
-const treePlaneGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE * 2);
-treePlaneGeo.translate(0, VOXEL_SIZE, 0); // anchor the bottom edge at local origin, like the sprites' center.set(0.5, 0)
+const treePlaneGeo = new THREE.PlaneGeometry(VOXEL_SIZE * 2, VOXEL_SIZE * 3);
+treePlaneGeo.translate(0, VOXEL_SIZE * 1.5, 0); // anchor the bottom edge at local origin, like the sprites' center.set(0.5, 0)
 const treeMaterial = new THREE.MeshBasicMaterial({
   map: treeTexture, transparent: true, side: THREE.DoubleSide,
   alphaTest: 0.5 // discard fully-transparent pixels before the depth test, so they don't occlude what's behind
 });
-const treePlaneA = new THREE.Mesh(treePlaneGeo, treeMaterial);
-const treePlaneB = new THREE.Mesh(treePlaneGeo, treeMaterial);
-const treePlaneC = new THREE.Mesh(treePlaneGeo, treeMaterial);
-const treePlaneD = new THREE.Mesh(treePlaneGeo, treeMaterial);
-treePlaneB.rotation.y = Math.PI / 2;
-treePlaneC.rotation.y = Math.PI / 4;
-treePlaneD.rotation.y = (3 * Math.PI) / 4;
-const treeMesh = new THREE.Group();
-treeMesh.add(treePlaneA, treePlaneB, treePlaneC, treePlaneD);
-treeMesh.position.copy(getSpriteWorldPos(treeData.gridPos));
-scene.add(treeMesh);
-World.get(getVoxelKey(treeData.gridPos.x, 0, treeData.gridPos.z)).occupant = treeData.id;
+const treeMeshes = [];
+const worldObjects = [];
 
-const chestData = createObject({
-  id: "object_chest_1",
+function createTreeAt(gridPos, id) {
+  const treeObject = createObject({
+    id,
+    name: "Tree",
+    subType: "Decor",
+    model: "tree",
+    gridPos,
+    blocking: true
+  });
+
+  const treeMesh = new THREE.Group();
+  treeMesh.add(
+    new THREE.Mesh(treePlaneGeo, treeMaterial),
+    new THREE.Mesh(treePlaneGeo, treeMaterial),
+    new THREE.Mesh(treePlaneGeo, treeMaterial),
+    new THREE.Mesh(treePlaneGeo, treeMaterial)
+  );
+  treeMesh.children[1].rotation.y = Math.PI / 2;
+  treeMesh.children[2].rotation.y = Math.PI / 4;
+  treeMesh.children[3].rotation.y = (3 * Math.PI) / 4;
+  treeMesh.position.copy(getSpriteWorldPos(treeObject.gridPos));
+  scene.add(treeMesh);
+
+  const voxel = World.get(getVoxelKey(treeObject.gridPos.x, 0, treeObject.gridPos.z));
+  if (voxel) voxel.occupant = treeObject.id;
+
+  worldObjects.push({ data: treeObject, mesh: treeMesh });
+  treeMeshes.push(treeMesh);
+  return treeObject;
+}
+
+function createTrees(treePositions) {
+  treePositions.forEach((gridPos, index) => {
+    createTreeAt(gridPos, `obj_tree_${index + 1}`);
+  });
+}
+
+createTrees([
+  { x: 5, y: 0, z: 15 },
+  { x: 8, y: 0, z: 14 },
+  { x: 13, y: 0, z: 9 },
+  { x: 14, y: 0, z: 9 },
+  { x: 15, y: 0, z: 9 },
+  { x: 14, y: 0, z: 8 },
+  { x: 15, y: 0, z: 8 },
+  { x: 17, y: 0, z: 9 }
+]);
+
+
+
+const chest = createObject({
+  id: "obj_chest_1",
   name: "Old Chest",
-  type: "chest",
+  subType: "Container",
+  model: "chest",
   gridPos: { x: 12, y: 0, z: 5 },
   blocking: true,
   lootTable: [
-    { itemId: "gold_coin", weight: 5, minQty: 3, maxQty: 10 },
-    { itemId: "healing_potion", weight: 3, minQty: 1, maxQty: 2 },
-    { itemId: "iron_ore", weight: 2, minQty: 1, maxQty: 4 }
+    { itemId: "gold_coin", weight: 5, minQty: 3, maxQty: 10 } // example loot
   ]
 });
-const chestSprite = createObjectSprite(0xd4a017);
-chestSprite.position.copy(getSpriteWorldPos(chestData.gridPos));
-scene.add(chestSprite);
-World.get(getVoxelKey(chestData.gridPos.x, 0, chestData.gridPos.z)).occupant = chestData.id;
+const chestTexture = texLoader.load(chestTextureUrl);
+chestTexture.magFilter = THREE.NearestFilter;
+chestTexture.minFilter = THREE.NearestFilter;
+chestTexture.colorSpace = THREE.SRGBColorSpace;
 
-const barrelData = createObject({
-  id: "object_barrel_1",
-  name: "Old Barrel",
-  type: "barrel",
+const chestOpenTexture = texLoader.load(chestOpenTextureUrl);
+chestOpenTexture.magFilter = THREE.NearestFilter;
+chestOpenTexture.minFilter = THREE.NearestFilter;
+chestOpenTexture.colorSpace = THREE.SRGBColorSpace;
+
+const chestSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: chestTexture, transparent: true }));
+chestSprite.center.set(0.5, 0);
+chestSprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
+chestSprite.position.copy(getSpriteWorldPos(chest.gridPos));
+scene.add(chestSprite);
+World.get(getVoxelKey(chest.gridPos.x, 0, chest.gridPos.z)).occupant = chest.id;
+worldObjects.push({ data: chest, mesh: chestSprite });
+
+const barrel = createObject({
+  id: "obj_barrel_1",
+  name: "Wooden Barrel",
+  subType: "Container",
+  model: "barrel",
   gridPos: { x: 15, y: 0, z: 15 },
   blocking: true,
-  fixedItem: { itemId: "ale", quantity: 2 }
+  fixedItem: { itemId: "apple", quantity: 2 }
 });
 const barrelSprite = createObjectSprite(0x8b5a2b);
-barrelSprite.position.copy(getSpriteWorldPos(barrelData.gridPos));
+barrelSprite.position.copy(getSpriteWorldPos(barrel.gridPos));
 scene.add(barrelSprite);
-World.get(getVoxelKey(barrelData.gridPos.x, 0, barrelData.gridPos.z)).occupant = barrelData.id;
+World.get(getVoxelKey(barrel.gridPos.x, 0, barrel.gridPos.z)).occupant = barrel.id;
+worldObjects.push({ data: barrel, mesh: barrelSprite });
 
 // Every world object's data + render node, so battle-arena visibility can be
 // driven generically instead of hand-listing objects at each call site.
-const worldObjects = [
-  { data: treeData, mesh: treeMesh },
-  { data: chestData, mesh: chestSprite },
-  { data: barrelData, mesh: barrelSprite }
-];
-
 // Mirrors how enemySprite/updateVoxelVisibility hide things outside the arena:
 // in explore mode everything shows; in battle, only objects inside the current
 // arena chunk render at all.
@@ -266,17 +309,16 @@ function updateObjectVisibility(arenaMap, isBattle) {
 // entry on purpose - it's pure scenery with no interaction panel at all.
 const spriteToTarget = new Map([
   [enemySprite, enemy],
-  [chestSprite, chestData],
-  [barrelSprite, barrelData]
+  [chestSprite, chest],
+  [barrelSprite, barrel]
 ]);
 // Base tint per hover-able sprite, so the hover-highlight reset restores each
 // sprite's own look instead of stomping untextured object sprites back to white.
 const spriteBaseColor = new Map([
   [enemySprite, 0xffffff],
-  [chestSprite, 0xd4a017],
+  [chestSprite, 0xffffff],
   [barrelSprite, 0x8b5a2b]
 ]);
-
 // --- BATTLE STATE ---
 export let battleParticipants = [];
 // Bumped every time battle is entered or exited, so timers scheduled by a
@@ -541,10 +583,18 @@ window.addEventListener('pointerdown', (e) => {
   raycaster.setFromCamera(mouse, camera);
 
   // Intercept clicks on ANY sprite (including the tree) so you can't walk through them
-  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, treeMesh]);
+  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes]);
   if (spriteIntersects.length > 0) {
      const hitSprite = spriteIntersects[0].object;
-     const target = spriteToTarget.get(hitSprite); // undefined for the tree - no panel, by design
+     let target = spriteToTarget.get(hitSprite); // undefined for the tree - no panel, by design
+
+      // Check if the target is an Object instead of an Entity
+     if (target && target.subType) {
+        // Ignore Decor and Lights; only allow interaction with Containers
+        if (target.subType !== "Container") {
+           target = undefined; 
+        }
+     }
 
      if (currentMode === 'explore' && target) {
         if (pathDistance(player.gridPos, target.gridPos) <= 2) {
@@ -575,11 +625,14 @@ function openInteractionPanel(target) {
   document.getElementById('dialogue-panel').style.display = 'block';
   document.getElementById('dialogue-name').innerText = target.name;
 
-  // Objects always carry a `type` ("tree"/"chest"/"barrel"); entities never do.
-  const isEnemy = target.type === undefined;
+  // World objects come from createObject() and always include subType/model.
+  // Entities (player/enemies) do not, so they are the only valid fight/talk targets.
+  const isObject = !!target && typeof target.subType === 'string' && typeof target.model === 'string';
+  const isContainer = isObject && target.subType === 'Container';
+  const isEnemy = !isObject;
   document.getElementById('btn-talk').style.display = isEnemy ? 'inline-block' : 'none';
   document.getElementById('btn-fight').style.display = isEnemy ? 'inline-block' : 'none';
-  document.getElementById('btn-open').style.display = isEnemy ? 'none' : 'inline-block';
+  document.getElementById('btn-open').style.display = isContainer ? 'inline-block' : 'none';
 
   updateInteractionButtons();
 }
@@ -611,29 +664,53 @@ function formatItemName(itemId) {
 // Fix 1: Stop UI clicks from falling through to the game world
 document.getElementById('dialogue-panel').addEventListener('pointerdown', (e) => e.stopPropagation());
 
-document.getElementById('btn-talk').addEventListener('click', () => {
-  console.log(`${interactionTarget.name} snarls: "You shouldn't be here..."`);
-});
-
 document.getElementById('btn-open').addEventListener('click', () => {
   const obj = interactionTarget;
-  if (!obj || (obj.type !== 'chest' && obj.type !== 'barrel')) return;
-  if (!isInInteractRange(player, obj)) return; // safety net; button should already be disabled
+  if (!obj || obj.subType !== 'Container') return;
+  if (!isInInteractRange(player, obj)) return; 
 
-  if (obj.looted) {
+  if (!obj.looted) {
+    const result = obj.lootTable ? rollLootTable(obj.lootTable) : obj.fixedItem;
+    if (result) {
+      addToInventory(player, result.itemId, result.quantity);
+      UI.logChatMessage(`Found ${result.quantity}x ${formatItemName(result.itemId)} in the ${obj.name}.`);
+    }
+    obj.looted = true;
+  } else {
     UI.logChatMessage(`The ${obj.name} is already empty.`);
-    return;
   }
 
-  const result = obj.type === 'chest' ? rollLootTable(obj.lootTable) : obj.fixedItem;
-  addToInventory(player, result.itemId, result.quantity);
-  obj.looted = true;
   obj.state = 'open';
 
-  UI.logChatMessage(`Found ${result.quantity}x ${formatItemName(result.itemId)} in the ${obj.name}.`);
+  // Find the visual mesh associated with this object data
+  const objRender = worldObjects.find(wo => wo.data.id === obj.id);
+  
+  if (objRender && obj.model === 'chest') {
+    const targetSprite = objRender.mesh;
+    
+    // Swap to pre-loaded Open Texture
+    targetSprite.material.map = chestOpenTexture;
+    targetSprite.material.needsUpdate = true;
+
+    // 2-Second Rummaging State
+    setTimeout(() => {
+      obj.state = 'closed';
+      targetSprite.material.map = chestTexture; 
+      targetSprite.material.needsUpdate = true;
+      UI.logChatMessage(`Finished checking the ${obj.name}.`);
+    }, 2000);
+    
+  } else if (objRender) {
+    // Fallback for Barrel (no open texture exists yet, just state delay)
+    setTimeout(() => {
+      obj.state = 'closed';
+      UI.logChatMessage(`Finished checking the ${obj.name}.`);
+    }, 2000);
+  }
 });
 
 document.getElementById('btn-fight').addEventListener('click', () => {
+  if (!interactionTarget || typeof interactionTarget.subType === 'string') return;
   closeInteractionPanel();
 
   // Snap player to grid
@@ -732,7 +809,7 @@ window.addEventListener('pointerup', (e) => {
   mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
   raycaster.setFromCamera(mouse, camera);
-  if (raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, treeMesh]).length > 0) return;
+  if (raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes]).length > 0) return;
 
   const intersect = getGridIntersection(e.clientX, e.clientY);
   if (!intersect) return; 
