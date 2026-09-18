@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange } from './world.js';
 import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility } from './render.js';
@@ -76,7 +76,10 @@ const inputRules = {
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x222233);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// WebGPU, not WebGL: the texel-space shading architecture needs compute shaders
+// and TSL, neither of which WebGL2 can provide. Everything imports from
+// 'three/webgpu' so materials resolve to their NodeMaterial equivalents.
+const renderer = new THREE.WebGPURenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 
@@ -1031,7 +1034,6 @@ window.addEventListener('resize', () => {
 
 // --- RENDER & GAME LOOP ---
 function animate() {
-  requestAnimationFrame(animate);
   const dt = clock.getDelta();
 
   if (currentMode === 'explore') {
@@ -1249,4 +1251,8 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-animate();
+// setAnimationLoop instead of a manual requestAnimationFrame chain: WebGPURenderer
+// needs an async device/adapter init before the first frame, and setAnimationLoop
+// awaits it internally. Calling animate() directly would render before the device
+// exists.
+renderer.setAnimationLoop(animate);

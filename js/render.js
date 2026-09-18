@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { World } from './world.js';
 
 // Import the texture so Vite knows to bundle and serve it
