@@ -1,5 +1,5 @@
-import * as THREE from 'three';
-import { World, getVoxelKey, pathDistance, findPath } from './world.js';
+import * as THREE from 'three/webgpu';
+import { World, getVoxelKey, pathDistance, findPath, isStandable } from './world.js';
 import { VOXEL_SIZE } from './render.js';
 
 function updateSpriteFacing(sprite, isFacingRight) {
@@ -26,7 +26,7 @@ export function createWanderAI(entity, sprite, tetherRadius) {
         if (pathDistance(spawnPos, node) <= tetherRadius) {
             const key = getVoxelKey(node.x, node.y, node.z);
             const voxel = World.get(key);
-            if (voxel && voxel.walkable && !voxel.occupant) {
+            if (voxel && isStandable(node.x, node.y, node.z) && !voxel.occupant) {
             candidates.push(node);
             }
         }
@@ -55,13 +55,13 @@ export function createWanderAI(entity, sprite, tetherRadius) {
         if (sprite.position.distanceTo(targetWorldPos) <= step) {
           sprite.position.copy(targetWorldPos);
           
-          const oldVoxel = World.get(getVoxelKey(entity.gridPos.x, 0, entity.gridPos.z));
+          const oldVoxel = World.get(getVoxelKey(entity.gridPos.x, entity.gridPos.y, entity.gridPos.z));
           // FIX: Only clear if the enemy actually owns it!
           if (oldVoxel && oldVoxel.occupant === entity.id) oldVoxel.occupant = null;
           
           entity.gridPos = path.shift();
           
-          const newVoxel = World.get(getVoxelKey(entity.gridPos.x, 0, entity.gridPos.z));
+          const newVoxel = World.get(getVoxelKey(entity.gridPos.x, entity.gridPos.y, entity.gridPos.z));
           if (newVoxel) newVoxel.occupant = entity.id;
         } else {
           const dir = targetWorldPos.clone().sub(sprite.position).normalize();
@@ -74,11 +74,11 @@ export function createWanderAI(entity, sprite, tetherRadius) {
           const newGridX = Math.round(sprite.position.x / VOXEL_SIZE);
           const newGridZ = Math.round(sprite.position.z / VOXEL_SIZE);
           if (newGridX !== entity.gridPos.x || newGridZ !== entity.gridPos.z) {
-            const oldVoxel = World.get(getVoxelKey(entity.gridPos.x, 0, entity.gridPos.z));
+            const oldVoxel = World.get(getVoxelKey(entity.gridPos.x, entity.gridPos.y, entity.gridPos.z));
             // FIX: Strict check
             if (oldVoxel && oldVoxel.occupant === entity.id) oldVoxel.occupant = null;
             
-            const newVoxel = World.get(getVoxelKey(newGridX, 0, newGridZ));
+            const newVoxel = World.get(getVoxelKey(newGridX, entity.gridPos.y, newGridZ));
             if (newVoxel) newVoxel.occupant = entity.id;
             entity.gridPos.x = newGridX;
             entity.gridPos.z = newGridZ;
