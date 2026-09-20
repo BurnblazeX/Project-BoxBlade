@@ -1,15 +1,26 @@
 import * as THREE from 'three/webgpu';
-import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE } from './world.js';
+import { uniform } from 'three/tsl';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid } from './world.js';
 import { createObject, rollLootTable } from './objects.js';
-import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance } from './render.js';
+import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap } from './render.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug } from './debug.js';
-import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy } from './boxgrid.js';
+import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
-import { runComputeSmokeTest, createOccupancyTexture, updateOccupancyTexture,
+import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
          runGPUMarch, createShadowColorNode, applyShadowMaterial,
-         restoreOriginalMaterial } from './gpu.js';
+         restoreOriginalMaterial, followShadowGrid,
+         createTexelAtlas, clearTexelAtlas, createAtlasShadePass, updateShadeJobs,
+         runAtlasShade, createAtlasColorNode,
+         createCascadeTargets, createCascadeCameras, createShadowScene, addShadowCaster,
+         createLightDepthMaterials, updateCascadeCameras, renderCascades,
+         createCascadeUniforms, writeCascadeUniforms, createBayerTexture,
+         createCsmShadowTSL, readCascade, hideCascadeView, NORMAL_BIAS_TEXELS,
+         probeCascade,
+         createCascadeBlit, drawCascadeBlit } from './gpu.js';
+import { CASCADE_COUNT, fitCascade, cascadeExtent, cascadeDepth, SUN_ANGULAR_SIZE } from './csm.js';
+import { atlasLayout, buildShadeJobs } from './atlas.js';
 import { createConsole, installConsole } from './console.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
@@ -95,7 +106,10 @@ const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambientLight);
 
 const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
-dirLight.position.set(10, 20, 10);
+// ~23 degrees elevation. The old (10,20,10) was ~55 degrees, which put the sun
+// nearly overhead and left every shadow hidden under the block casting it.
+// A low sun is also what makes voxel shadow blockiness legible.
+dirLight.position.set(10, 6, 10);
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
@@ -1287,15 +1301,170 @@ function animate() {
   // Rebuilds the overlay if the player has walked into a different chunk.
   // No-op when the overlay is off or the chunk is unchanged.
   refreshBoxGridDebug(scene, player.gridPos, currentMode);
+
+  // Keep the shadow grid centred on the player. Without this it stays wherever
+  // it was first built, so shading only works in that one 12x12 patch - which
+  // is exactly why the wall at x=20 cast nothing.
+  if (shadowsOn || atlasOn) {
+    const want = gridOriginFor(currentMode, player.gridPos);
+    if (!shadowOrigin || want.x !== shadowOrigin.x || want.z !== shadowOrigin.z) {
+      followShadowGrid(shadowGrid, shadowTex, shadowGridOrigin, want);
+      shadowOrigin = want;
+      // The atlas covers the same footprint, so the pages that just came into
+      // range hold no light yet and the ones that left are stale. Rewriting the
+      // job list and re-dispatching is a buffer write plus one compute pass,
+      // once per block stepped - not per frame.
+      if (csmOn) csmRefresh();
+      if (atlasOn) {
+        const jobs = atlasJobsAt(want);
+        if (updateShadeJobs(atlasPass, jobs)) atlasShade();
+        else console.warn(`[atlas] ${jobs.count} jobs exceeds capacity ` +
+                          `${atlasPass.capacity}; run bxb.atlas() twice to resize`);
+      }
+    }
+  }
   perf.update(dt);
 
   renderer.render(scene, camera);
+  // The depth map goes on screen AFTER the scene, scissored into the corner, so
+  // the map and the geometry it was built from are visible side by side.
+  if (csmBlit && csmBlit.visible) csmBlit.setMarker(getSpriteWorldPos(player.gridPos));
+  drawCascadeBlit(renderer, csmBlit);
 }
 
 // --- DEBUG CONSOLE (bxb) ---
 let shadowsOn = false;
 let shadowGrid = null;
 let shadowTex = null;
+let shadowSun = null;       // live sun-direction uniform, so bxb.light can move it
+let shadowGridOrigin = null; // live grid-origin uniform, so the grid can follow
+let shadowOrigin = null;     // block origin the shadow grid is currently built at
+
+// --- Phase C: texel atlas ---
+let atlasOn = false;
+let atlasTex = null;
+let atlasInfo = null;   // layout: page grid, atlas dimensions
+let atlasPass = null;   // compute kernel plus its job buffers and uniforms
+let atlasShading = false;
+
+function atlasJobsAt(origin) {
+  return buildShadeJobs({
+    originBlockX: origin.x, originBlockZ: origin.z,
+    isSolid,
+    instanceIdOf: (x, y, z) => voxelIndexMap.get(getVoxelKey(x, y, z)),
+    pagesX: atlasInfo.pagesX, pageCount: atlasInfo.pageCount
+  });
+}
+
+// Fire and forget. Compute is async, and the atlas simply shows the previous
+// light for however many frames the dispatch takes - which is the property that
+// makes this affordable in the first place. The guard stops a fast walk from
+// queueing several passes over the same buffers.
+function atlasShade() {
+  if (!atlasPass || atlasShading) return;
+  atlasShading = true;
+  runAtlasShade(renderer, atlasPass).finally(() => { atlasShading = false; });
+}
+
+
+// --- The sun: cascaded shadow map ---
+//
+// Doc 6.1b. The sphere-traced path stays available on bxb.atlas() alone for
+// comparison, but a sun ray has no termination distance, so marching it always
+// truncated at the edge of C0 - which is the notch that showed up at the screen
+// edge. The CSM has no such limit and is the doc's accepted exception.
+let csmOn = false;
+let csmTargets = null, csmCameras = null, csmDepth = null;
+let csmUniforms = null, csmBayer = null, csmAngular = null, csmSteps = null;
+let csmCascades = null;
+let csmBlit = null;
+let csmShadowScene = null;
+let csmSoft = false;   // hard shadows first; softening is a separate problem
+
+function csmViewCentre() {
+  // The cascades follow the VIEW, not the player. The camera looks from 13 m
+  // back and sees ~17 m past the player, so centring on the player alone wastes
+  // half the near cascade behind the camera - which is exactly the asymmetry
+  // that left the far edge of the screen unshaded.
+  const p = getSpriteWorldPos(player.gridPos);
+  const ahead = cascadeExtent(0) * 0.22;
+  return {
+    x: p.x + Math.sin(currentHeading) * -ahead,
+    y: p.y,
+    z: p.z + Math.cos(currentHeading) * -ahead
+  };
+}
+
+function csmRefresh() {
+  if (!csmOn) return;
+  csmCascades = [];
+  const centre = csmViewCentre();
+  for (let i = 0; i < CASCADE_COUNT; i++) {
+    csmCascades.push(fitCascade(i, centre, dirLight.position));
+  }
+  updateCascadeCameras(csmCascades, csmCameras);
+  writeCascadeUniforms(csmUniforms, csmCascades, csmCameras);
+  renderCascades(renderer, csmShadowScene, csmCameras, csmTargets, csmDepth);
+}
+
+
+// The kernel is compiled with or without the CSM lookup baked in, so switching
+// the sun technique is a rebuild, not a uniform write. Tracked explicitly
+// because reusing a pass built the other way is silent: everything runs, the
+// shadow maps fill, and nothing on screen changes - which is exactly what
+// toggling bxb.atlas() off and on used to do.
+let atlasPassUsedCsm = false;
+let atlasPassUsedSoft = false;
+let atlasPassUsedShadowOnly = false;
+let atlasPassUsedLevelDebug = false;
+let atlasPassUsedDiff = false;
+// Live shadow tuning. These are uniforms rather than constants so a sweep costs
+// a re-shade instead of a kernel rebuild, which matters because bias and slope
+// allowance have to be found by eye.
+let csmBias = null, csmSlope = null, csmShadowOnly = false, csmLevelDebug = false;
+let csmDiff = null, csmDiffOn = false;
+
+function buildOrReuseAtlasPass(jobs) {
+  const stale = !atlasPass || jobs.count > atlasPass.capacity
+                || atlasPassUsedCsm !== csmOn || atlasPassUsedSoft !== csmSoft
+                || atlasPassUsedShadowOnly !== csmShadowOnly
+                || atlasPassUsedLevelDebug !== csmLevelDebug
+                || atlasPassUsedDiff !== csmDiffOn;
+  if (!stale) { updateShadeJobs(atlasPass, jobs); return false; }
+
+  atlasPass = createAtlasShadePass({
+    atlas: atlasTex, occTex: shadowTex, grid: shadowGrid, jobs,
+    layout: atlasInfo, sunDirection: dirLight.position,
+    shadowOnly: csmShadowOnly,
+    sunShadow: csmOn
+      ? createCsmShadowTSL(csmTargets.map(t => t.texture), csmUniforms,
+                           csmAngular, csmBayer, csmSteps, csmSoft,
+                           csmBias, csmSlope, csmLevelDebug,
+                           csmDiffOn ? csmDiff : null)
+      : null,
+    // Room to walk into denser geometry without rebuilding the kernel.
+    capacity: Math.min(atlasInfo.pageCount, jobs.count * 2 + 512)
+  });
+  atlasPassUsedCsm = csmOn;
+  atlasPassUsedSoft = csmSoft;
+  atlasPassUsedShadowOnly = csmShadowOnly;
+  atlasPassUsedLevelDebug = csmLevelDebug;
+  atlasPassUsedDiff = csmDiffOn;
+  shadowSun = atlasPass.sunDirUniform;
+  shadowGridOrigin = atlasPass.gridOriginUniform;
+  return true;
+}
+
+function bxbLight(x, y, z) {
+  dirLight.position.set(x, y, z);
+  if (shadowSun) shadowSun.value.set(x, y, z).normalize();
+  // The atlas holds baked light, so moving the sun has no effect at all until
+  // the pages are rewritten. This is the cost of object-space shading, and the
+  // whole reason it is cheap.
+  if (csmOn) csmRefresh();
+  if (atlasOn) atlasShade();
+  return 'sun toward ' + x.toFixed(2) + ',' + y.toFixed(2) + ',' + z.toFixed(2);
+}
 
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
@@ -1310,7 +1479,7 @@ installConsole(createConsole({
     run: async (n = 256) => {
       const origin = gridOriginFor(currentMode, player.gridPos);
       const grid = createBoxGridAt(origin.x, origin.z);
-      const tex = createOccupancyTexture(grid);
+      const tex = createDistanceTexture(grid);
 
       // Spread over the grid in random directions, so the comparison covers
       // axis-aligned, diagonal and grazing rays rather than one easy case.
@@ -1331,23 +1500,33 @@ installConsole(createConsole({
       let agree = 0;
       const disagreements = [];
       for (let i = 0; i < n; i++) {
-        const cpuHit = marchOccupancy(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit;
+        // The GPU runs a sphere trace, so the sphere trace is the reference.
+        // The binary DDA is reported alongside as a third opinion: it is a
+        // completely different traversal over the same field, so if all three
+        // move together the field itself is right, and if only the DDA differs
+        // the disagreement is about grazing rays and grid boundaries rather
+        // than about the shader.
+        const cpuHit = sphereTrace(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit;
         const gpuHit = gpu[i] > 0.5;
         if (cpuHit === gpuHit) agree++;
-        else if (disagreements.length < 5) disagreements.push({ i, cpu: cpuHit, gpu: gpuHit, ray: rays[i] });
+        else if (disagreements.length < 5) {
+          disagreements.push({ i, cpu: cpuHit, gpu: gpuHit, ray: rays[i],
+            dda: marchOccupancy(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit });
+        }
       }
       // Hit counts on each side: when one is zero the fault is systematic
       // (a bad threshold, an unbound texture) rather than a subtle stepping bug.
-      let cpuHits = 0, gpuHits = 0;
+      let cpuHits = 0, gpuHits = 0, ddaHits = 0;
       for (let i = 0; i < n; i++) {
-        if (marchOccupancy(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit) cpuHits++;
+        if (sphereTrace(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit) cpuHits++;
+        if (marchOccupancy(grid, rays[i].origin, rays[i].dir, rays[i].maxDist).hit) ddaHits++;
         if (gpu[i] > 0.5) gpuHits++;
       }
       const out = { rays: n, agree, disagree: n - agree, pct: +(agree / n * 100).toFixed(2),
-                    cpuHits, gpuHits, disagreements };
+                    cpuHits, gpuHits, ddaHits, disagreements };
       console.log(out.disagree === 0
-        ? `[gpu] DDA parity PASSED - ${n}/${n} rays agree with the CPU reference`
-        : `[gpu] DDA parity FAILED - ${out.disagree}/${n} disagree`, out.disagreements);
+        ? `[gpu] sphere-trace parity PASSED - ${n}/${n} rays agree with the CPU reference`
+        : `[gpu] sphere-trace parity FAILED - ${out.disagree}/${n} disagree`, out.disagreements);
       return out;
     }
   },
@@ -1357,20 +1536,243 @@ installConsole(createConsole({
       if (shadowsOn) {
         restoreOriginalMaterial(worldInstancedMesh);
         shadowsOn = false;
+        shadowOrigin = null;
         return 'shadows off';
       }
+      if (atlasOn) return 'turn bxb.atlas() off first - they share the terrain material';
       const origin = gridOriginFor(currentMode, player.gridPos);
       shadowGrid = createBoxGridAt(origin.x, origin.z, shadowGrid);
-      shadowTex = shadowTex || createOccupancyTexture(shadowGrid);
-      updateOccupancyTexture(shadowTex);
-      const { node } = createShadowColorNode({
+      shadowTex = shadowTex || createDistanceTexture(shadowGrid);
+      updateDistanceTexture(shadowTex);
+      const { node, sunDirUniform, gridOriginUniform } = createShadowColorNode({
         occTex: shadowTex,
         grid: shadowGrid,
-        lightPos: dirLight.position.clone()
+        sunDirection: dirLight.position
       });
+      shadowSun = sunDirUniform;
+      shadowGridOrigin = gridOriginUniform;
+      shadowOrigin = origin;
       applyShadowMaterial(worldInstancedMesh, node);
       shadowsOn = true;
-      return 'shadows on - one light, marched per pixel';
+      return `shadows on - directional sun, 12m march cap, grid covering blocks ` +
+             `${origin.x}..${origin.x + CHUNK_SIZE - 1} x ${origin.z}..${origin.z + CHUNK_SIZE - 1}`;
+    }
+  },
+  atlas: {
+    help: 'toggle texel-space shading: one ray per texel, baked into an atlas',
+    run: async () => {
+      if (atlasOn) {
+        restoreOriginalMaterial(worldInstancedMesh);
+        atlasOn = false;
+        shadowOrigin = null;
+        return 'atlas off';
+      }
+      if (shadowsOn) return 'turn bxb.shadows() off first - they share the terrain material';
+
+      const origin = gridOriginFor(currentMode, player.gridPos);
+      shadowGrid = createBoxGridAt(origin.x, origin.z, shadowGrid);
+      shadowTex = shadowTex || createDistanceTexture(shadowGrid);
+      updateDistanceTexture(shadowTex);
+
+      atlasInfo = atlasLayout(worldInstancedMesh.count);
+      if (!atlasInfo.fits) {
+        return `world too large for one atlas: ${atlasInfo.pageCount} pages ` +
+               `would need ${atlasInfo.width}x${atlasInfo.height} texels`;
+      }
+      atlasTex = atlasTex || createTexelAtlas(atlasInfo);
+      await clearTexelAtlas(renderer, atlasTex, atlasInfo);
+
+      const jobs = atlasJobsAt(origin);
+      buildOrReuseAtlasPass(jobs);
+      shadowSun = atlasPass.sunDirUniform;
+      shadowGridOrigin = atlasPass.gridOriginUniform;
+      shadowOrigin = origin;
+
+      await runAtlasShade(renderer, atlasPass);
+      applyShadowMaterial(worldInstancedMesh,
+        createAtlasColorNode({ atlas: atlasTex, layout: atlasInfo }));
+      atlasOn = true;
+
+      return `atlas on - ${atlasInfo.width}x${atlasInfo.height} texels ` +
+             `(${(atlasInfo.bytes / 1048576).toFixed(1)} MB, ${atlasInfo.pageCount} pages), ` +
+             `${jobs.count} faces / ${jobs.texels.toLocaleString()} rays shaded over blocks ` +
+             `${origin.x}..${origin.x + CHUNK_SIZE - 1} x ${origin.z}..${origin.z + CHUNK_SIZE - 1}`;
+    }
+  },
+  csm: {
+    help: 'toggle the cascaded shadow map for the sun (use with bxb.atlas())',
+    run: async () => {
+      if (csmOn) {
+        csmOn = false;
+        if (atlasOn) {
+          buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin));
+          atlasShade();
+          return 'csm off - atlas back on the sphere-traced sun';
+        }
+        return 'csm off';
+      }
+      if (!csmTargets) {
+        csmTargets = createCascadeTargets();
+        csmCameras = createCascadeCameras();
+        csmDepth = createLightDepthMaterials();
+        csmUniforms = createCascadeUniforms();
+        csmBayer = createBayerTexture();
+        csmAngular = uniform(SUN_ANGULAR_SIZE);
+        csmSteps = uniform(4);
+        csmBias = uniform(NORMAL_BIAS_TEXELS);
+        csmSlope = uniform(0.75);
+        csmDiff = uniform(200);
+      }
+      // The caster set is explicit: a proxy sharing the terrain geometry and
+      // instance buffer, in a scene of its own. Models opt in with another
+      // addShadowCaster call; camera-facing billboards stay out.
+      csmShadowScene = csmShadowScene || createShadowScene();
+      addShadowCaster(csmShadowScene, worldInstancedMesh, csmDepth[0].material);
+      csmOn = true;
+      csmRefresh();
+      // Rebuild and re-shade here rather than asking the user to toggle the
+      // atlas: the only visible effect of the CSM is via the atlas, so leaving
+      // it unbuilt makes the command look like it did nothing.
+      let note = ' Run bxb.atlas() to shade with it.';
+      if (atlasOn) {
+        buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin));
+        atlasShade();
+        note = ' Atlas re-shaded through it.';
+      }
+      const ext = [];
+      for (let i = 0; i < CASCADE_COUNT; i++) ext.push(cascadeExtent(i).toFixed(0) + 'm');
+      return 'csm on - ' + CASCADE_COUNT + ' cascades at 144 texels covering ' +
+             ext.join(' / ') + '.' + note;
+    }
+  },
+  csmview: {
+    help: 'show the light depth map on screen (banded), or read it back for numbers',
+    usage: 'bxb.csmview(level)  |  bxb.csmview(-1) to hide  |  bxb.csmview(0, true) for numbers',
+    run: async (level = 0, numbers = false) => {
+      if (level < 0) {
+        if (csmBlit) csmBlit.visible = false;
+        hideCascadeView();
+        return 'cascade view hidden';
+      }
+      if (!csmTargets) return 'run bxb.csm() first';
+      // The blit samples the texture through the same path the shadow lookup
+      // uses, so it cannot be wrong about the map while the lookup is right.
+      // Shown BANDED: the cascade spans 54 m and the terrain sits in a slice of
+      // it, so a plain ramp of a healthy map looks like a blank white square.
+      // Cleared texels draw purple, exact zeros red.
+      csmBlit = csmBlit || createCascadeBlit(csmTargets, csmUniforms);
+      csmBlit.setLevel(level);
+      csmBlit.visible = true;
+      if (!numbers) {
+        return 'cascade ' + level + ' bottom-right. Banded depth; purple = never ' +
+               'written, red = exactly 0. RED strip marks the map +u edge, GREEN ' +
+               'marks +v - if green is at the BOTTOM of the overlay the display ' +
+               'is flipped. The YELLOW crosshair is your own position projected ' +
+               'through the cascade matrix: if it sits on your own patch of the ' +
+               'map, the world-to-map transform is correct. ' +
+               'bxb.csmview(' + level + ', true) for numbers, bxb.csmview(-1) to hide.';
+      }
+      return readCascade(renderer, csmTargets, level,
+                         csmCascades && csmCascades[level].depth);
+    }
+  },
+  shadowonly: {
+    help: 'show the raw sun visibility term with no albedo or N.L, to judge acne',
+    run: () => {
+      if (!csmOn) return 'run bxb.csm() first';
+      csmShadowOnly = !csmShadowOnly;
+      if (atlasOn) { buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin)); atlasShade(); }
+      return csmShadowOnly
+        ? 'shadow term only: white is lit, black is occluded. Acne shows as ' +
+          'speckle or banding on surfaces that should be uniformly white.'
+        : 'back to full shading';
+    }
+  },
+  csmlevels: {
+    help: 'tint every surface by which cascade shadows it, to find what a band is',
+    run: () => {
+      if (!csmOn) return 'run bxb.csm() first';
+      csmLevelDebug = !csmLevelDebug;
+      if (!csmLevelDebug && csmShadowOnly) csmShadowOnly = true;
+      if (atlasOn) { buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin)); atlasShade(); }
+      return csmLevelDebug
+        ? 'cascade levels: darkest = C0 (12.5cm), mid = C1 (25cm), light = C2 ' +
+          '(50cm), full bright = beyond every cascade. Use with bxb.shadowonly(). ' +
+          'If a band sits on a cascade boundary it is a selection problem; if it ' +
+          'sits inside one flat region it is bias in that cascade.'
+        : 'cascade level tint off';
+    }
+  },
+  probe: {
+    help: 'print both sides of the depth comparison under your feet, in metres',
+    usage: 'bxb.probe(level)',
+    run: async (level = 0) => {
+      if (!csmOn || !csmCascades) return 'run bxb.csm() first';
+      // The ground texel the player stands on: the block top face, nudged out
+      // the same way the atlas nudges it, so this is the exact point the shade
+      // kernel would hand the lookup.
+      const w = getSpriteWorldPos(player.gridPos);
+      const p = { x: w.x, y: w.y, z: w.z };
+      return probeCascade(renderer, csmTargets, csmCascades[level],
+                          p, { x: 0, y: 1, z: 0 }, level);
+    }
+  },
+  csmdiff: {
+    help: 'show the raw depth comparison instead of a shadow, to tell bias from a transform bug',
+    usage: 'bxb.csmdiff(scale)  |  bxb.csmdiff(0) to turn off',
+    run: (scale = 200) => {
+      if (!csmOn) return 'run bxb.csm() first';
+      csmDiffOn = scale > 0;
+      if (csmDiffOn) csmDiff.value = scale;
+      if (atlasOn) { buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin)); atlasShade(); }
+      if (!csmDiffOn) return 'depth diff off';
+      return 'depth diff at x' + scale + ': MID GREY means the map and the ' +
+             'receiver agree. Mostly mid grey with speckle = bias tuning. A ' +
+             'large flat dark or bright region = the receiver depth and the ' +
+             'stored depth disagree systematically, which is a transform bug, ' +
+             'not a bias one. Try bxb.csmdiff(20) and bxb.csmdiff(2000) to see ' +
+             'the magnitude.';
+    }
+  },
+  bias: {
+    help: 'normal-offset bias and slope allowance, both in shadow texels',
+    usage: 'bxb.bias(normalTexels, slopeScale)',
+    run: (b = NORMAL_BIAS_TEXELS, slope = 0.75) => {
+      if (!csmBias) return 'run bxb.csm() first';
+      csmBias.value = b;
+      csmSlope.value = slope;
+      if (atlasOn) atlasShade();
+      return 'normal bias ' + b + ' texels, slope allowance x' + slope +
+             '. Raise until acne clears, then stop - too much detaches shadows ' +
+             'from their casters.';
+    }
+  },
+  csmbands: {
+    help: 'contour density of the depth map blit',
+    usage: 'bxb.csmbands(40)',
+    run: (n = 40) => {
+      if (!csmBlit) return 'run bxb.csmview(0) first';
+      csmBlit.bands.value = n;
+      const range = csmCascades ? csmCascades[0].depth : cascadeDepth(0);
+      return n + ' bands across the ' + range.toFixed(0) + ' m depth range (' +
+             (range / n).toFixed(2) + ' m per stripe)';
+    }
+  },
+  soften: {
+    help: 'distance-based soft shadows: off by default until the hard ones are right',
+    usage: 'bxb.soften(on?, angularSize?, steps?)',
+    run: (on = true, a = SUN_ANGULAR_SIZE, steps = 4) => {
+      if (!csmTargets) return 'run bxb.csm() first';
+      csmSoft = !!on;
+      csmAngular.value = a;
+      csmSteps.value = steps;
+      if (atlasOn) {
+        buildOrReuseAtlasPass(atlasJobsAt(shadowOrigin));
+        atlasShade();
+      }
+      return csmSoft
+        ? 'soft shadows on - sun angular size ' + a + ' rad, ' + steps + ' steps'
+        : 'soft shadows off - single-tap hard comparison';
     }
   },
   perf: {
@@ -1432,9 +1834,26 @@ installConsole(createConsole({
     }
   },
   light: {
-    help: 'move the directional light, in world metres',
+    help: 'set the sun direction (a vector pointing toward the sun)',
     usage: 'bxb.light(x, y, z)',
-    run: (x, y, z) => { dirLight.position.set(x, y, z); return 'light at ' + x + ',' + y + ',' + z; }
+    run: (x, y, z) => {
+      dirLight.position.set(x, y, z);
+      // The shadow march needs the normalised direction, and it lives in a
+      // uniform - writing dirLight alone would not reach the shader.
+      if (shadowSun) shadowSun.value.set(x, y, z).normalize();
+      return shadowsOn
+        ? 'sun toward ' + x + ',' + y + ',' + z + ' (shadows updated)'
+        : 'sun toward ' + x + ',' + y + ',' + z + ' (run bxb.shadows() to see it)';
+    }
+  },
+  sun: {
+    help: 'set the sun by angle - elevation 15-25 gives long readable shadows',
+    usage: 'bxb.sun(azimuthDeg, elevationDeg)',
+    run: (az = 45, el = 20) => {
+      const a = az * Math.PI / 180, e = el * Math.PI / 180;
+      const x = Math.cos(e) * Math.sin(a), y = Math.sin(e), z = Math.cos(e) * Math.cos(a);
+      return bxbLight(x, y, z);
+    }
   }
 }));
 
