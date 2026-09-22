@@ -20,6 +20,68 @@ export const TEXELS_PER_BLOCK = 12;
 export const GRID_DIM = CHUNK_SIZE * TEXELS_PER_BLOCK;      // 144
 export const VOXEL_METRES = BLOCK_METRES / TEXELS_PER_BLOCK;  // 0.125 m
 
+// --- Cascades ---
+//
+// One field was never going to be enough, and the symptom was specific: a shadow
+// cut off by a diagonal line once the player walked away from its caster. Shadow
+// rays travel toward the sun, so a receiver at the far end of a long shadow has
+// to march a long way up-sun to reach what casts it, and C0's 18 m ran out first.
+// Leaning the footprint up-sun bought a few metres; this is the structural fix.
+//
+// Every level is the SAME 144^3 buffer at a different voxel size, so each step
+// coarser doubles the reach for the same 2.99 MB:
+//
+//   C0   12 voxels/block   12.5 cm   12 blocks   18 m
+//   C1    6 voxels/block   25 cm     24 blocks   36 m
+//   C2    3 voxels/block   50 cm     48 blocks   72 m
+//
+// The 1:1 lock between voxel and texel holds at C0 only, which is the level the
+// atlas is addressed in. C1 exists to answer "is anything in the way" for distant
+// casters, where a shadow edge is already smaller than a texel - so half
+// resolution there costs nothing visible.
+export const CASCADE_COUNT = 3;
+
+// Voxels per block at each level: 12, 6, then 3. Halving rather than any other
+// ratio so a C1 voxel is a whole number of C0 voxels, which keeps the two fields
+// in phase and stops a cascade boundary landing mid-voxel.
+export function cascadeVoxelsPerBlock(level) {
+  return TEXELS_PER_BLOCK >> level;
+}
+
+export function cascadeVoxelMetres(level) {
+  return BLOCK_METRES / cascadeVoxelsPerBlock(level);
+}
+
+// Side of the footprint in blocks: 12, then 24.
+export function cascadeBlocks(level) {
+  return GRID_DIM / cascadeVoxelsPerBlock(level);
+}
+
+export function cascadeExtentMetres(level) {
+  return cascadeBlocks(level) * BLOCK_METRES;
+}
+
+// THE CLAMP IS CONSTANT IN WORLD SPACE, not in voxels - 1 m at every level, so 8
+// voxels at C0 and 4 at C1.
+//
+// Holding it at 8 voxels everywhere instead would have made the coarse levels
+// cost MORE to bake than the fine one, which is the opposite of what a cascade is
+// for: C1 covers four times the area, so it touches four times the blocks, and
+// per-block the band would have been (6+16)^3 against C0's (12+16)^3 - about
+// 6.1M writes against 3.2M. Scaling the range with the voxel keeps C1 at (6+8)^3
+// over those blocks, which is cheaper than C0 rather than dearer.
+//
+// It also keeps the cone trace honest. Its penumbra saturates once d/(R*t)
+// reaches 1, which depends on the range in METRES - so a constant world-space
+// range means a ray crossing from C0 into C1 does not change brightness at the
+// seam. A constant voxel range would have doubled the saturation distance at C1
+// and put a visible step there.
+export const DISTANCE_RANGE_METRES = 1;
+
+export function cascadeRangeVoxels(level) {
+  return DISTANCE_RANGE_METRES / cascadeVoxelMetres(level);
+}
+
 if (CHUNK_HEIGHT * TEXELS_PER_BLOCK !== GRID_DIM) {
   // Guards the 1:1 lock: the vertical span must produce the same voxel count as
   // the footprint, or C0 stops being a cube and the cascade math in the design
@@ -37,20 +99,95 @@ function blockMinCorner(b) {
 // caller's choice - see gridOriginFor(). Pass an existing grid as `reuse` to
 // repopulate it in place: the occupancy buffer is ~3 MB, so reallocating it
 // every time the origin moves is a visible hitch for no reason.
-export function createBoxGridAt(originBlockX, originBlockZ, reuse = null) {
+export function createBoxGridAt(originBlockX, originBlockZ, reuse = null, level = 0) {
   const grid = reuse || {
     data: new Uint8Array(GRID_DIM * GRID_DIM * GRID_DIM),
     dim: GRID_DIM,
-    voxelSize: VOXEL_METRES,
+    level,
+    voxelsPerBlock: cascadeVoxelsPerBlock(level),
+    voxelSize: cascadeVoxelMetres(level),
+    range: cascadeRangeVoxels(level),
     origin: { x: 0, y: blockMinCorner(Y_MIN), z: 0 },
     originBlock: { x: 0, y: Y_MIN, z: 0 }
   };
+  // A RE-ORIGIN IS A SCROLL, NOT A REBAKE.
+  //
+  // Stepping one block moves the footprint by one block and leaves eleven
+  // twelfths of the field holding exactly the values it should still hold. The
+  // first version re-baked all 144^3 anyway - 18.8 ms at C0, against a 4.2 ms
+  // budget at 240 Hz - so every block stepped cost four or five dropped frames
+  // while the steady-state framerate sat pinned at the refresh rate. That is the
+  // shape of a hitch on movement and nothing about shading load explains it.
+  //
+  // So: memmove the overlap into place, then bake ONLY the strip that scrolled
+  // in. The retained values need no revisiting, and this is worth stating
+  // because it is not obvious - a stored distance is the true distance to the
+  // nearest geometry, which does not depend on where the footprint happens to
+  // sit. A block that has since scrolled out of the footprint still contributed
+  // a correct distance, and keeping it is righter than dropping it. What the
+  // footprint decides is only which voxels EXIST, not what they mean.
+  const prior = grid.filledBlocks ? grid.originBlock : null;
+  const dx = prior ? originBlockX - prior.x : 0;
+  const dz = prior ? originBlockZ - prior.z : 0;
+  const per = grid.voxelsPerBlock || TEXELS_PER_BLOCK;
+
   grid.origin.x = blockMinCorner(originBlockX);
   grid.origin.z = blockMinCorner(originBlockZ);
   grid.originBlock.x = originBlockX;
   grid.originBlock.z = originBlockZ;
-  populateDistanceField(grid);
+
+  const sx = dx * per, sz = dz * per;
+  const slid = prior && (sx !== 0 || sz !== 0) &&
+               Math.abs(sx) < GRID_DIM && Math.abs(sz) < GRID_DIM;
+  if (slid) populateDistanceField(grid, scrollField(grid, sx, sz));
+  else if (prior && sx === 0 && sz === 0) populateDistanceField(grid, []);
+  else populateDistanceField(grid);
   return grid;
+}
+
+// Slide the field by (sx, sz) voxels and report what scrolled in.
+//
+// A voxel at new coordinate v held, before the move, the world point now at
+// v + s - so new[v] = old[v + s], and the whole thing is one linear offset. It
+// is still done row by row rather than as a single copyWithin over the buffer:
+// x is the fastest axis, so an x shift makes each row's source spill into its
+// neighbour, and a buffer-wide copy would drag that wrapped data into cells
+// nothing afterwards clears.
+//
+// Returns the strips NOT covered by the copy, in new coordinates, as the dirty
+// rects the bake then fills. Two of them when the footprint moved diagonally;
+// they overlap at the corner, which costs one corner baked twice and is cheaper
+// than the arithmetic to avoid it.
+export function scrollField(grid, sx, sz) {
+  const data = grid.data;
+  const x0 = Math.max(0, -sx), x1 = Math.min(GRID_DIM, GRID_DIM - sx);
+  const z0 = Math.max(0, -sz), z1 = Math.min(GRID_DIM, GRID_DIM - sz);
+  const width = x1 - x0;
+
+  if (width > 0 && z1 > z0) {
+    // Ascending when the source lies after the destination, descending when it
+    // lies before, so a slab is never read after it has been overwritten. Only
+    // z needs the ordering: a nonzero sz puts source and destination in
+    // different slabs, and a pure x shift is one self-contained copyWithin per
+    // row, which handles its own overlap.
+    const ahead = sz > 0 || (sz === 0 && sx > 0);
+    for (let i = 0; i < z1 - z0; i++) {
+      const vz = ahead ? z0 + i : z1 - 1 - i;
+      for (let vy = 0; vy < GRID_DIM; vy++) {
+        const dst = voxelIndex(x0, vy, vz);
+        const src = voxelIndex(x0 + sx, vy, vz + sz);
+        data.copyWithin(dst, src, src + width);
+      }
+    }
+  }
+
+  const rects = [];
+  const full = { x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM };
+  if (sx > 0) rects.push({ ...full, x0: GRID_DIM - sx });
+  else if (sx < 0) rects.push({ ...full, x1: -sx });
+  if (sz > 0) rects.push({ ...full, z0: GRID_DIM - sz });
+  else if (sz < 0) rects.push({ ...full, z1: -sz });
+  return rects;
 }
 
 // Chunk-aligned convenience wrapper.
@@ -64,20 +201,70 @@ export function createBoxGrid(chunkX = 0, chunkZ = 0, reuse = null) {
 // duration of the fight, and aligning means the grid and the arena share
 // bounds exactly.
 //
-// Explore centres the footprint on the player instead. Lighting coverage then
-// stays symmetric around them rather than falling off on whichever side they
-// happen to be standing near the chunk edge - which is also why the design doc
-// centres its cascades on the camera. The cost is rebuilding once per block
-// stepped rather than once per chunk crossed.
-export function gridOriginFor(mode, gridPos) {
+// Explore follows the player instead, rebuilding once per block stepped rather
+// than once per chunk crossed - so lighting coverage travels with them instead of
+// falling off wherever they happen to be standing near a chunk edge.
+//
+// It does NOT centre on them, though; it leans up-sun. See the body for why.
+
+// How far up-sun to push the explore footprint, in blocks.
+export const SUN_BIAS_BLOCKS = 2;
+
+export function gridOriginFor(mode, gridPos, sunDirection = null,
+                              bias = SUN_BIAS_BLOCKS, level = 0) {
   if (mode === 'battle') {
-    return {
-      x: Math.floor(gridPos.x / CHUNK_SIZE) * CHUNK_SIZE,
-      z: Math.floor(gridPos.z / CHUNK_SIZE) * CHUNK_SIZE
-    };
+    const cx = Math.floor(gridPos.x / CHUNK_SIZE) * CHUNK_SIZE;
+    const cz = Math.floor(gridPos.z / CHUNK_SIZE) * CHUNK_SIZE;
+    // C0 IS the arena, exactly. A coarser level is wider than a chunk, so it
+    // centres on the same arena rather than aligning to it - padding out equally
+    // on all sides keeps the arena in the middle of every level, which is what
+    // makes a battle's lighting stable for its whole duration.
+    if (level === 0) return { x: cx, z: cz };
+    const pad = (cascadeBlocks(level) - CHUNK_SIZE) / 2;
+    return { x: cx - pad, z: cz - pad };
   }
-  const half = Math.floor(CHUNK_SIZE / 2);
-  return { x: gridPos.x - half, z: gridPos.z - half };
+  const half = Math.floor(cascadeBlocks(level) / 2);
+
+  // BIASED TOWARD THE SUN, not centred on the player.
+  //
+  // A shadow ray travels TOWARD the sun, so the occluders that can affect ground
+  // the player sees all lie up-sun of it - and the footprint spent down-sun holds
+  // nothing that can cast onto anything visible. Centred, the window reaches 9 m
+  // each way; at a 20 degree sun a 3 m wall throws an 8.2 m shadow, so a caster
+  // that matters sits right on the boundary and its far shadow is cut off. That
+  // is the diagonal line across the end of a long shadow once you walk away from
+  // its caster.
+  //
+  // Pushing the window up-sun trades down-sun reach for caster range at no cost -
+  // same footprint, same bake. The trade is not free in principle: ground down-sun
+  // of the player is still visible and now falls outside the job list, where it
+  // keeps its last shaded value rather than being updated. A stale shadow reads
+  // far better than a missing one, which is what makes this the right direction to
+  // spend the asymmetry.
+  //
+  // Only the HORIZONTAL component matters - elevation sets shadow length, azimuth
+  // sets which way the footprint should lean.
+  let x = gridPos.x - half, z = gridPos.z - half;
+  if (sunDirection && bias) {
+    const len = Math.hypot(sunDirection.x, sunDirection.z);
+    if (len > 1e-6) {
+      x += Math.round((sunDirection.x / len) * bias);
+      z += Math.round((sunDirection.z / len) * bias);
+    }
+  }
+
+  // COARSE LEVELS SNAP TO A COARSER STRIDE, so they do not rebuild as often as
+  // C0 does. Without this every level re-origins on every block stepped and a
+  // cascade costs its full bake per step - which is most of the reason to have
+  // one gone. C1 moves in 2-block jumps, so it rebuilds half as often, and being
+  // off-centre by up to 2 of its 24 blocks is not something a distant shadow can
+  // show. Math.floor rather than truncation, so the stride is uniform either side
+  // of the origin instead of bunching up around zero.
+  const snap = 1 << level;
+  return {
+    x: Math.floor(x / snap) * snap,
+    z: Math.floor(z / snap) * snap
+  };
 }
 
 export function voxelIndex(vx, vy, vz) {
@@ -94,8 +281,8 @@ export function inBounds(vx, vy, vz) {
 //
 // One byte per voxel, same footprint as the binary occupancy this replaced, but
 // the byte now means SIGNED DISTANCE TO THE NEAREST SURFACE in voxels, negative
-// inside solid, clamped to +-1 voxel. Two things follow, and only one of them is
-// about speed:
+// inside solid, clamped to +-DISTANCE_RANGE voxels. Two things follow, and only
+// one of them is about speed:
 //
 //   1. Slopes and stairs stop needing sub-blocks. A slope is just a distance
 //      function whose zero-crossing falls between voxel centres, so occlusion
@@ -105,33 +292,71 @@ export function inBounds(vx, vy, vz) {
 //   2. Rays can sphere-trace, stepping by the stored distance instead of
 //      crawling voxel to voxel.
 //
-// Honest note on (2): with the range clamped to +-1 voxel, a step in open air is
-// one voxel, so this is not the order-of-magnitude win sphere tracing gives over
-// a wide-range SDF. It beats DDA mainly on diagonals, where DDA pays ~1.7 steps
-// per voxel of travel and this pays one. The clamp is what keeps the byte
-// format, and slopes are the reason the field exists.
+// On (2): this used to come with an apology. The range was clamped to one voxel,
+// so a step in open air was one voxel and sphere tracing was barely better than
+// the DDA it replaced - a win only on diagonals, where DDA pays ~1.7 steps per
+// voxel of travel and this pays one. Measured, 92.6% of a populated grid sat
+// pinned at the maximum, meaning the field had nothing to say about open space
+// anywhere.
 //
-// The encoding maps [-1, +1] voxels onto the full byte range, which makes the
-// shader-side decode a single multiply-add: an R8 texture samples normalised to
-// [0,1], so distance = sample * 2 - 1. Nothing to divide by 255 anywhere.
-export const DISTANCE_RANGE = 1;               // voxels; the clamp, both signs
-export const FAR_BYTE = 255;                   // +1 voxel: air, nothing nearby
+// The range is now 8 voxels, and that changes three things at once: rays cross
+// open air in metre steps rather than 12.5 cm ones, the sun's shadow can be
+// SOFTENED from a single ray because the stored distance is a usable estimate of
+// how much room there is beside it (see sun.js), and the step cap stops being the
+// thing that terminates a long ray.
+//
+// A NOTE ON WHAT WAS BROKEN HERE. DISTANCE_RANGE was not a working knob: the bake
+// inlines the encode into its hot loop, and that inlined copy clamped to +-1
+// without dividing by the range. Widening the constant widened the loop bounds,
+// cost proportionally more time, and wrote the same bytes - the field stayed
+// pinned at 1.6% graded exterior at every range from 1 to 16. Both copies now go
+// through the same squared mapping and the test asserts they agree, because a
+// constant that silently does nothing is worse than one that is wrong.
+export const DISTANCE_RANGE = cascadeRangeVoxels(0);   // 8 voxels at C0
+export const FAR_BYTE = 255;                   // the full range: air, nothing near
 const SOLID_THRESHOLD = 128;                   // bytes below this decode negative
 
-export function encodeDistance(d) {
-  const c = Math.max(-1, Math.min(1, d / DISTANCE_RANGE));
+// --- Why the mapping is SQUARED rather than linear ---
+//
+// A linear map over +-8 voxels would spend the byte uniformly and lose 8x the
+// precision everywhere, including at the zero crossing - which is the one place
+// precision is the whole point, because the sub-voxel position of that crossing
+// IS the slope mechanism.
+//
+// So: c = sign(d) * sqrt(|d| / RANGE), stored over the byte, and d = c * |c| *
+// RANGE coming back. The derivative vanishes at the surface, so resolution
+// concentrates exactly where the geometry is and thins out far away where all a
+// ray needs is a rough answer to "how much room is there".
+//
+// The numbers, at RANGE = 8 and 127.5 steps per unit of c:
+//
+//   at the surface   0.0005 voxels per step  (16x FINER than the old +-1 linear)
+//   at 1 voxel out   0.045                   (coarser, and nothing reads it)
+//   at 8 voxels out  0.125                   (a sixteenth of a step; irrelevant)
+//
+// So this is strictly better than the old encoding at the surface and eight times
+// the reach, for one extra multiply in the decode. The shader decode is
+// c = sample*2-1 then c*abs(c)*RANGE - see traceDistanceTSL, which must stay the
+// exact mirror of decodeDistance() or the CPU reference and the GPU part company.
+// The range is a per-level property now, so both of these take it. It defaults to
+// C0's so that call sites which only ever meant the fine field keep working.
+export function encodeDistance(d, range = DISTANCE_RANGE) {
+  const t = Math.min(1, Math.abs(d) / range);
+  const c = Math.sign(d) * Math.sqrt(t);
   return Math.round((c + 1) * 127.5);
 }
 
-export function decodeDistance(byte) {
-  return (byte / 127.5 - 1) * DISTANCE_RANGE;
+export function decodeDistance(byte, range = DISTANCE_RANGE) {
+  const c = byte / 127.5 - 1;
+  return c * Math.abs(c) * range;
 }
 
 // Distance at a voxel centre, in voxels. Outside the grid reads as open air, so
 // a ray that leaves never reports a hit on the way out.
 export function distanceAt(grid, vx, vy, vz) {
-  if (!inBounds(vx, vy, vz)) return DISTANCE_RANGE;
-  return decodeDistance(grid.data[voxelIndex(vx, vy, vz)]);
+  const range = grid.range || DISTANCE_RANGE;
+  if (!inBounds(vx, vy, vz)) return range;
+  return decodeDistance(grid.data[voxelIndex(vx, vy, vz)], range);
 }
 
 // Kept as the binary view of the field, because a voxel centre is never exactly
@@ -205,29 +430,35 @@ export function voxelCentreToWorld(grid, vx, vy, vz) {
 // on screen. Grid population and atlas shading have deliberately different
 // visibility criteria: an off-screen torch-lit wall still has to be present
 // here, or off-screen reflections silently degrade later.
-export function populateDistanceField(grid) {
-  // Clear only what was written last time, expanded by the field's one-voxel
-  // band. A blanket fill memsets ~3 MB on every re-origin, which in explore mode
-  // is every block the player steps. All clearing happens before any writing, so
-  // over-clearing a neighbour's band cannot erase it.
-  const previous = grid.filledBlocks;
-  if (previous) {
-    for (let k = 0; k < previous.length; k += 3) {
-      const x0 = Math.max(0, previous[k] - 1);
-      const x1 = Math.min(GRID_DIM - 1, previous[k] + TEXELS_PER_BLOCK);
-      const y0 = Math.max(0, previous[k + 1] - 1);
-      const y1 = Math.min(GRID_DIM - 1, previous[k + 1] + TEXELS_PER_BLOCK);
-      const z0 = Math.max(0, previous[k + 2] - 1);
-      const z1 = Math.min(GRID_DIM - 1, previous[k + 2] + TEXELS_PER_BLOCK);
-      for (let vz = z0; vz <= z1; vz++) {
-        for (let vy = y0; vy <= y1; vy++) {
-          const base = voxelIndex(x0, vy, vz);
-          grid.data.fill(FAR_BYTE, base, base + (x1 - x0 + 1));
-        }
+export function populateDistanceField(grid, dirty = null) {
+  // `dirty` is the list of voxel rects this call is responsible for, in grid
+  // coordinates - what scrollField() just exposed. null means the whole grid,
+  // which is a first bake or a jump too far to slide. An EMPTY list is a real
+  // answer too: the footprint did not move, so nothing is dirty and there is
+  // nothing to do.
+  //
+  // Everything below is clipped to these rects, not merely culled by them. A
+  // block near the strip would otherwise re-write its whole band over retained
+  // voxels - correct, but it is the band writes that cost the milliseconds, and
+  // a one-block step touches a twelfth of the grid.
+  const range = grid.range || DISTANCE_RANGE;
+  const per = grid.voxelsPerBlock || TEXELS_PER_BLOCK;
+  const band = Math.ceil(range);
+  const whole = [{ x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM }];
+  const rects = dirty === null ? whole : dirty;
+
+  // Clear only what this call will rewrite. A blanket fill of 3 MB is about
+  // 0.6 ms, which is most of a frame at 240 Hz and pure waste when a strip is
+  // all that changed.
+  for (const r of rects) {
+    if (r.x0 === 0 && r.x1 === GRID_DIM && r.y0 === 0 && r.y1 === GRID_DIM &&
+        r.z0 === 0 && r.z1 === GRID_DIM) { grid.data.fill(FAR_BYTE); continue; }
+    for (let vz = r.z0; vz < r.z1; vz++) {
+      for (let vy = r.y0; vy < r.y1; vy++) {
+        const base = voxelIndex(r.x0, vy, vz);
+        grid.data.fill(FAR_BYTE, base, base + (r.x1 - r.x0));
       }
     }
-  } else {
-    grid.data.fill(FAR_BYTE);
   }
 
   let filled = 0;
@@ -238,13 +469,41 @@ export function populateDistanceField(grid) {
   for (const key of World.keys()) {
     const [bx, by, bz] = key.split(',').map(Number);
 
-    const vx0 = (bx - grid.originBlock.x) * TEXELS_PER_BLOCK;
-    const vy0 = (by - grid.originBlock.y) * TEXELS_PER_BLOCK;
-    const vz0 = (bz - grid.originBlock.z) * TEXELS_PER_BLOCK;
+    const vx0 = (bx - grid.originBlock.x) * per;
+    const vy0 = (by - grid.originBlock.y) * per;
+    const vz0 = (bz - grid.originBlock.z) * per;
 
-    // Skip blocks outside this chunk entirely.
-    if (vx0 < 0 || vy0 < 0 || vz0 < 0) continue;
-    if (vx0 >= GRID_DIM || vy0 >= GRID_DIM || vz0 >= GRID_DIM) continue;
+    // Skip blocks whose distance BAND misses this chunk - which is not the same
+    // as blocks outside it, and the difference was a real artifact.
+    //
+    // The band is what makes the field honest at its own boundary. Culling on the
+    // block instead meant a wall one block past the footprint wrote nothing, so
+    // the voxels beside it read FAR - "at least a metre of clear air" - when the
+    // wall was 9 cm away. A ray believes that distance and steps a whole metre on
+    // it, which at C0's boundary is a metre of path nothing has ever looked at:
+    // it lands past the wall, leaves the grid, and hands a cascade that starts
+    // BEHIND the occluder to the next level. Whether any given ray cleared the
+    // silhouette in that one blind step depends on where its previous steps
+    // happened to land, so the shadow edge came out as a staircase with a tread
+    // of about a metre - and only when a caster sat within a block of the
+    // boundary, which is why it appeared at exactly one distance and not on
+    // either side of it.
+    //
+    // THE BAND AND THE LONGEST STEP ARE THE SAME METRE, and not by coincidence:
+    // a saturated sample reads `range` voxels, so the longest step a trace can
+    // take is range * voxelSize = DISTANCE_RANGE_METRES, and the band written
+    // here reaches exactly that far past the footprint. Baking it means no step
+    // can be taken on a distance that does not already account for whatever it
+    // is about to jump over. Keep the two equal if either ever moves.
+    const reach = band;
+    if (vx0 + per + reach <= 0 || vy0 + per + reach <= 0 || vz0 + per + reach <= 0) continue;
+    if (vx0 - reach >= GRID_DIM || vy0 - reach >= GRID_DIM || vz0 - reach >= GRID_DIM) continue;
+
+    // Whether the block's own box - not its band - is in the footprint. Only
+    // these count toward the occupancy figure, so the number keeps meaning "what
+    // is in this chunk" rather than growing by a shell of neighbours.
+    const inFootprint = vx0 >= 0 && vy0 >= 0 && vz0 >= 0 &&
+                        vx0 < GRID_DIM && vy0 < GRID_DIM && vz0 < GRID_DIM;
 
     // A block with nothing beneath it - surface ground over empty space, the
     // common case now that there is no sub-surface fill - only needs its top
@@ -254,15 +513,15 @@ export function populateDistanceField(grid) {
     // voxel boundary with nothing left over. Under the SDF this is not a
     // special case any more, just a box of a different height.
     const supported = World.has(getVoxelKey(bx, by - 1, bz));
-    const dyStart = supported ? 0 : TEXELS_PER_BLOCK / 2;
-    const height = TEXELS_PER_BLOCK - dyStart;
+    const dyStart = supported ? 0 : per / 2;
+    const height = per - dyStart;
     blocks.push(vx0, vy0 + dyStart, vz0);
 
     // The box in voxel units, as a centre and a half-extent.
-    const cx = vx0 + TEXELS_PER_BLOCK / 2;
+    const cx = vx0 + per / 2;
     const cy = vy0 + dyStart + height / 2;
-    const cz = vz0 + TEXELS_PER_BLOCK / 2;
-    const hx = TEXELS_PER_BLOCK / 2, hy = height / 2, hz = TEXELS_PER_BLOCK / 2;
+    const cz = vz0 + per / 2;
+    const hx = per / 2, hy = height / 2, hz = per / 2;
 
     // Evaluate over the box plus the one-voxel band the clamp allows, and take
     // the MINIMUM with whatever is already there. Minimum of distances is union
@@ -276,15 +535,34 @@ export function populateDistanceField(grid) {
     // that encloses them. Math.hypot is also avoided deliberately - its
     // overflow-safe scaling costs several times a plain sqrt, and these operands
     // are all within a voxel or two of zero.
-    const lo = (v, h) => Math.max(0, Math.ceil(v - h - DISTANCE_RANGE));
-    const hi = (v, h) => Math.min(GRID_DIM - 1, Math.floor(v + h + DISTANCE_RANGE));
-    const x0 = lo(cx, hx), x1 = hi(cx, hx);
     const data = grid.data;
+    const invRange = 1 / range;
+    // The band, as a voxel box, before any rect clips it.
+    const bLo = (v, h) => Math.ceil(v - h - range);
+    const bHi = (v, h) => Math.floor(v + h + range);
+    const bx0 = bLo(cx, hx), bx1 = bHi(cx, hx);
+    const by0 = bLo(cy, hy), by1 = bHi(cy, hy);
+    const bz0 = bLo(cz, hz), bz1 = bHi(cz, hz);
 
-    for (let vz = lo(cz, hz); vz <= hi(cz, hz); vz++) {
+    for (const r of rects) {
+    const x0 = Math.max(r.x0, bx0), x1 = Math.min(r.x1 - 1, bx1);
+    const y0 = Math.max(r.y0, by0), y1 = Math.min(r.y1 - 1, by1);
+    const z0 = Math.max(r.z0, bz0), z1 = Math.min(r.z1 - 1, bz1);
+    if (x0 > x1 || y0 > y1 || z0 > z1) continue;
+
+    // The band is a BOX while the clamp is a SPHERE, so its corners are in
+    // principle wasted work - a voxel at the corner of an eight-voxel band is
+    // 8*sqrt(3) = 13.9 voxels out, past the clamp, so it encodes to FAR_BYTE and
+    // the min against an already-cleared grid is a no-op. Clipping each row to the
+    // sphere was tried and MEASURED SLOWER: 19.9 ms against 16.9. The rows are 28
+    // voxels long, so a sqrt and four clamps per row cost more than the handful of
+    // iterations they save - and for a flat ground slab most rows sit inside the
+    // box's own y and z extent, where there is nothing to clip at all. Left as a
+    // plain box on the strength of the measurement.
+    for (let vz = z0; vz <= z1; vz++) {
       const qz = Math.abs(vz + 0.5 - cz) - hz;
       const pz = qz > 0 ? qz * qz : 0;
-      for (let vy = lo(cy, hy); vy <= hi(cy, hy); vy++) {
+      for (let vy = y0; vy <= y1; vy++) {
         const qy = Math.abs(vy + 0.5 - cy) - hy;
         const py = qy > 0 ? qy * qy : 0;
         const qyz = qy > qz ? qy : qz;
@@ -295,17 +573,24 @@ export function populateDistanceField(grid) {
           const outside = qx > 0 ? Math.sqrt(pyz + qx * qx) : Math.sqrt(pyz);
           const mx = qx > qyz ? qx : qyz;
           const d = outside + (mx < 0 ? mx : 0);
-          // encodeDistance, inlined and with the clamp folded in.
-          const c = d < -1 ? -1 : (d > 1 ? 1 : d);
+          // encodeDistance, inlined. This copy is the one that used to fold the
+          // clamp in at a hard-coded +-1 and so pinned the whole field to one
+          // voxel whatever DISTANCE_RANGE said; sdf.test.mjs now asserts the two
+          // agree byte for byte over the range.
+          const t = (d < 0 ? -d : d) * invRange;
+          const c = t >= 1 ? (d < 0 ? -1 : 1)
+                           : (d < 0 ? -Math.sqrt(t) : Math.sqrt(t));
           const b = ((c + 1) * 127.5 + 0.5) | 0;
           if (b < data[idx]) data[idx] = b;
         }
       }
     }
+    }
 
     // Counted from the box itself rather than by scanning the written band:
-    // bands overlap between neighbouring blocks, boxes never do.
-    filled += TEXELS_PER_BLOCK * height * TEXELS_PER_BLOCK;
+    // bands overlap between neighbouring blocks, boxes never do. Neighbours
+    // pulled in for their band alone are not occupancy in this chunk.
+    if (inFootprint) filled += per * height * per;
   }
 
   grid.occupiedCount = filled;

@@ -1,5 +1,7 @@
 import * as THREE from 'three/webgpu';
-import { createBoxGridAt, gridOriginFor, isOccupied, GRID_DIM, VOXEL_METRES, TEXELS_PER_BLOCK, voxelCentreToWorld } from './boxgrid.js';
+import { createBoxGridAt, gridOriginFor, isOccupied, GRID_DIM,
+         voxelCentreToWorld, CASCADE_COUNT, cascadeVoxelMetres, cascadeBlocks,
+         cascadeExtentMetres, SUN_BIAS_BLOCKS } from './boxgrid.js';
 
 // --- boxGrid debug visualisation (Alt+X) ---
 //
@@ -23,8 +25,20 @@ const SOLID_SCALE = 0.82;
 const CHECKER_LIGHTNESS = 0.14;
 
 let solidMesh = null;
+const meshes = [];
+let clipBoxes = [];
 let isVisible = false;
 let currentOrigin = null;
+
+// ONE OVERLAY, BOTH CASCADES, NO OVERLAP.
+//
+// C0 is drawn where it exists and C1 only OUTSIDE C0's footprint - subtracted,
+// not layered. They occupy the same world space, so drawing both in full would
+// z-fight everywhere a ray actually marches the fine field, and the coarse
+// cubes would hide the fine ones they enclose. Subtracting makes the overlay a
+// picture of what a ray really sees: fine near the player, coarse further out,
+// and the seam between them visible as the exact place the resolution halves.
+
 
 function isSurfaceVoxel(grid, x, y, z) {
   if (!isOccupied(grid, x, y, z)) return false;
@@ -60,9 +74,13 @@ function surfaceMask(grid, x, y, z) {
   return mask;
 }
 
-function fill(mesh, grid) {
+function fill(mesh, grid, clip = null) {
   let i = 0;
   const b = grid.filledBlocks;
+  // Per LEVEL, not the C0 constant: a coarse cascade fills six voxels per block
+  // per axis, and walking twelve would run off the end of each block's range
+  // into its neighbour's.
+  const per = grid.voxelsPerBlock;
   _generation = (_generation + 1) & 0xff;
   if (_generation === 0) { _seen.fill(0); _generation = 1; } // wrapped, retire old stamps
 
@@ -70,10 +88,15 @@ function fill(mesh, grid) {
   // 144^3 cells meant ~18M neighbour lookups per rebuild; this is ~12x fewer.
   for (let k = 0; k < b.length; k += 3) {
     const vx0 = b[k], vy0 = b[k + 1], vz0 = b[k + 2];
-    for (let dz = 0; dz < TEXELS_PER_BLOCK; dz++) {
-      for (let dy = 0; dy < TEXELS_PER_BLOCK && vy0 + dy < GRID_DIM; dy++) {
-        for (let dx = 0; dx < TEXELS_PER_BLOCK; dx++) {
+    for (let dz = 0; dz < per; dz++) {
+      for (let dy = 0; dy < per && vy0 + dy < GRID_DIM; dy++) {
+        for (let dx = 0; dx < per; dx++) {
           const vx = vx0 + dx, vy = vy0 + dy, vz = vz0 + dz;
+          // Blocks outside the footprint are baked now, for their band alone -
+          // see populateDistanceField - so their voxel ranges can start outside
+          // the grid and must be skipped rather than wrapped.
+          if (vx < 0 || vy < 0 || vz < 0 ||
+              vx >= GRID_DIM || vz >= GRID_DIM) continue;
           if (!surfaceMask(grid, vx, vy, vz)) continue;
 
           // Blocks overlap at shared faces, so the same voxel can be reached
@@ -84,6 +107,10 @@ function fill(mesh, grid) {
 
           if (i >= MAX_INSTANCES) { mesh.count = i; return i; }
           const w = voxelCentreToWorld(grid, vx, vy, vz);
+          // The subtraction. A coarse voxel whose centre falls inside C0's
+          // footprint is already drawn, finer, by C0.
+          if (clip && w.x > clip.x0 && w.x < clip.x1 &&
+              w.z > clip.z0 && w.z < clip.z1) continue;
           _m.setPosition(w.x, w.y, w.z);
           mesh.setMatrixAt(i, _m);
 
@@ -104,8 +131,8 @@ function fill(mesh, grid) {
   return i;
 }
 
-function createMesh() {
-  const s = VOXEL_METRES * SOLID_SCALE;
+function createMesh(voxelMetres) {
+  const s = voxelMetres * SOLID_SCALE;
   // Unlit on purpose: this is an overlay reporting data, not lit geometry.
   const mesh = new THREE.InstancedMesh(
     new THREE.BoxGeometry(s, s, s), new THREE.MeshBasicMaterial(), MAX_INSTANCES);
@@ -115,11 +142,14 @@ function createMesh() {
 }
 
 function disposeMeshes(scene) {
-  if (!solidMesh) return;
-  scene.remove(solidMesh);
-  solidMesh.geometry.dispose();
-  solidMesh.material.dispose();
-  solidMesh.dispose();
+  for (const m of meshes) {
+    if (!m) continue;
+    scene.remove(m);
+    m.geometry.dispose();
+    m.material.dispose();
+    m.dispose();
+  }
+  meshes.length = 0;
   solidMesh = null;
 }
 
@@ -131,24 +161,52 @@ function disposeMeshes(scene) {
 // perceptible.
 let pendingOrigin = null;
 let pendingMode = null;
+let pendingPlayer = null;
 
-function beginRebuild(scene, origin, mode) {
-  cachedGrid = createBoxGridAt(origin.x, origin.z, cachedGrid);
-  if (!solidMesh) {
-    solidMesh = createMesh();
-    scene.add(solidMesh);
+// One cached grid PER LEVEL. createBoxGridAt() only initialises voxelSize,
+// range and voxelsPerBlock when it allocates, so handing it a C0 buffer and
+// asking for C1 would repopulate at the coarse stride while the grid still
+// claimed to be fine - a field that is wrong by a factor of two in a way that
+// looks plausible. They are also cheap to keep: two 3 MB buffers, and the debug
+// overlay is not on during play.
+const cachedGrids = [];
+
+function beginRebuild(scene, origin, mode, sunDirection, bias) {
+  for (let l = 0; l < CASCADE_COUNT; l++) {
+    const o = l === 0 ? origin : gridOriginFor(mode, pendingPlayer, sunDirection, bias, l);
+    cachedGrids[l] = createBoxGridAt(o.x, o.z, cachedGrids[l] || null, l);
+  }
+  cachedGrid = cachedGrids[0];
+  // Each level is clipped by the one finer than it, so the ladder subtracts all
+  // the way out: C0 solid, C1 filling the ring around it, C2 the ring around
+  // that. Generic in CASCADE_COUNT rather than written twice, because a third
+  // level arriving and being silently invisible is exactly what this overlay is
+  // meant to catch.
+  clipBoxes = cachedGrids.map((g, l) => {
+    const side = cascadeExtentMetres(l);
+    return { x0: g.origin.x, x1: g.origin.x + side,
+             z0: g.origin.z, z1: g.origin.z + side };
+  });
+  if (!meshes.length) {
+    for (let l = 0; l < CASCADE_COUNT; l++) {
+      meshes[l] = createMesh(cascadeVoxelMetres(l));
+      scene.add(meshes[l]);
+    }
+    solidMesh = meshes[0];
   }
   pendingOrigin = origin;
   pendingMode = mode;
-  currentOrigin = origin; // claimed now, so the next frame doesn't re-trigger
+  currentOrigin = origin;
 }
 
 function finishRebuild() {
-  const count = fill(solidMesh, cachedGrid);
+  const counts = cachedGrids.map((g, l) => fill(meshes[l], g, l === 0 ? null : clipBoxes[l - 1]));
+  const count = counts[0];
   console.log(
     `[boxGrid debug] ${pendingMode} | origin (${pendingOrigin.x},${pendingOrigin.z}) | ` +
-    `${GRID_DIM}^3 @ ${VOXEL_METRES * 100}cm | ` +
-    `occupied ${cachedGrid.occupiedCount.toLocaleString()} | visible surface ${count.toLocaleString()} drawn`
+    counts.map((c, l) =>
+      `C${l} ${(cascadeVoxelMetres(l) * 100).toFixed(1)}cm to ` +
+      `${cascadeExtentMetres(l)}m: ${c.toLocaleString()}`).join(' | ')
   );
   pendingOrigin = null;
   pendingMode = null;
@@ -157,12 +215,14 @@ function finishRebuild() {
 
 // Both halves at once. Used on enable, where there is nothing on screen yet and
 // splitting would just show an empty frame.
-function rebuild(scene, origin, mode) {
-  beginRebuild(scene, origin, mode);
+function rebuild(scene, origin, mode, sunDirection, bias) {
+  beginRebuild(scene, origin, mode, sunDirection, bias);
   return finishRebuild();
 }
 
-export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh, mode = 'explore') {
+export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh,
+                                   mode = 'explore', opts = {}) {
+  const { sunDirection = null, bias = SUN_BIAS_BLOCKS } = opts;
   isVisible = !isVisible;
 
   if (!isVisible) {
@@ -175,30 +235,50 @@ export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh, mode = 'ex
     return false;
   }
 
-  rebuild(scene, gridOriginFor(mode, playerGridPos), mode);
+  pendingPlayer = playerGridPos;
+  rebuild(scene, originFor(mode, playerGridPos, sunDirection, bias), mode,
+          sunDirection, bias);
 
   // The terrain hides while the overlay is up. A voxel's top face is exactly
   // coplanar with its block's top face, so drawing both would z-fight across
   // the whole ground plane; substituting the view also makes it unambiguous
   // that what is on screen is grid data, not the world.
   if (terrainMesh) terrainMesh.visible = false;
-  return true;
+  return `boxGrid overlay on - C0 at ${(cascadeVoxelMetres(0) * 100).toFixed(1)} cm ` +
+         `over ${cascadeExtentMetres(0)} m, C1 at ` +
+         `${(cascadeVoxelMetres(1) * 100).toFixed(1)} cm filling out to ` +
+         `${cascadeExtentMetres(1)} m around it. C1 is drawn with C0 subtracted, ` +
+         `so the seam IS where a ray's resolution halves.`;
+}
+
+// THE SAME ORIGIN THE MARCHER USES, sun lean and coarse-level snap included.
+//
+// This used to call gridOriginFor() with no sun, so the overlay drew a footprint
+// CENTRED on the player while the field being marched leaned two blocks up-sun.
+// An overlay whose whole job is "the field is where you think it is" was
+// answering a question nobody asked, and it would have been worse at C1, which
+// snaps to a two-block stride on top of the lean.
+function originFor(mode, playerGridPos, sunDirection, bias) {
+  return gridOriginFor(mode, playerGridPos, sunDirection, bias, 0);
 }
 
 // Called every frame. Cheap to call: compares two integers and returns unless
 // the grid origin actually moved, or a split rebuild is half done. In explore
 // that is once per block stepped (the footprint follows the player); in battle
 // it is chunk-aligned and static for the whole fight.
-export function refreshBoxGridDebug(scene, playerGridPos, mode = 'explore') {
+export function refreshBoxGridDebug(scene, playerGridPos, mode = 'explore',
+                                    opts = {}) {
   if (!isVisible) return false;
 
   // Second half of a split rebuild takes priority, so a rebuild always
   // completes before another can start.
   if (pendingOrigin) { finishRebuild(); return true; }
 
-  const origin = gridOriginFor(mode, playerGridPos);
+  const { sunDirection = null, bias = SUN_BIAS_BLOCKS } = opts;
+  const origin = originFor(mode, playerGridPos, sunDirection, bias);
   if (currentOrigin && origin.x === currentOrigin.x && origin.z === currentOrigin.z) return false;
-  beginRebuild(scene, origin, mode);
+  pendingPlayer = playerGridPos;
+  beginRebuild(scene, origin, mode, sunDirection, bias);
   return true;
 }
 

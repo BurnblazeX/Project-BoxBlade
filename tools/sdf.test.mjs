@@ -4,27 +4,60 @@ import {
   createBoxGrid, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
   DISTANCE_RANGE, FAR_BYTE, encodeDistance, decodeDistance,
   distanceAt, isOccupied, sampleDistance, boxDistance,
-  sphereTrace, marchOccupancy, voxelCentreToWorld
+  sphereTrace, marchOccupancy, voxelCentreToWorld, createBoxGridAt
 } from '../js/boxgrid.js';
 
 file('sdf.test.mjs - signed distance field and sphere tracing');
 
 section('the byte encoding');
-// The whole point of this mapping: an R8 texture samples normalised to [0,1],
-// and the field spans [-1,+1] voxels, so the shader decode is sample*2-1 with
-// nothing to divide by 255. A silent normalisation mistake here is exactly what
-// broke the binary version, where an occupied voxel arrived as 1/255.
-ok('the far end of the range is the top of the byte', encodeDistance(1), FAR_BYTE);
-ok('and the deep end is the bottom', encodeDistance(-1), 0);
+// An R8 texture samples normalised to [0,1] and the field stores c over [-1,+1],
+// so the decode is c = sample*2-1 with nothing to divide by 255. A silent
+// normalisation mistake here is exactly what broke the binary version, where an
+// occupied voxel arrived as 1/255.
+//
+// The mapping is SQUARED: c = sign(d)*sqrt(|d|/RANGE), so resolution concentrates
+// at the zero crossing - which is where the geometry is, and where a slope's
+// sub-voxel position will live - and thins out far away, where all a ray needs is
+// a rough answer to how much room there is.
+ok('the far end of the range is the top of the byte', encodeDistance(DISTANCE_RANGE), FAR_BYTE);
+ok('and the deep end is the bottom', encodeDistance(-DISTANCE_RANGE), 0);
 near('a surface sits mid-range', encodeDistance(0), 127.5, 1);
-ok('beyond the range clamps rather than wrapping', encodeDistance(9), FAR_BYTE);
-ok('and clamps on the solid side too', encodeDistance(-9), 0);
+ok('beyond the range clamps rather than wrapping', encodeDistance(DISTANCE_RANGE + 1), FAR_BYTE);
+ok('and clamps on the solid side too', encodeDistance(-DISTANCE_RANGE - 1), 0);
 truthy('the encoding is monotonic, which is why the bake can min raw bytes',
   encodeDistance(-0.7) < encodeDistance(-0.2) && encodeDistance(-0.2) < encodeDistance(0.6));
-inRange('a round trip is within half a quantisation step',
-  Math.abs(decodeDistance(encodeDistance(0.25)) - 0.25), 0, DISTANCE_RANGE / 255);
-near('the shader decode agrees with the CPU one',
-  encodeDistance(-0.5) / 255 * 2 - 1, -0.5, 1 / 255);
+truthy('and stays monotonic across the whole range, not just near the surface',
+  [-8, -4, -1, -0.1, 0, 0.1, 1, 4, 8].every((d, i, a) =>
+    i === 0 || encodeDistance(a[i]) >= encodeDistance(a[i - 1])));
+
+// THE PRECISION TRADE, as numbers rather than as a claim. A linear map over +-8
+// would have cost 8x resolution everywhere including at the surface; the squared
+// one is finer than the old +-1 linear map where it matters and coarser only
+// where nothing reads it.
+const quantumAt = d => Math.abs(decodeDistance(encodeDistance(d) + 1) -
+                                decodeDistance(encodeDistance(d)));
+inRange('at the surface a byte step is under a hundredth of a voxel',
+        quantumAt(0), 0, 0.01);
+truthy('which is FINER than the old +-1 linear map managed (1/127.5)',
+       quantumAt(0) < 1 / 127.5);
+inRange('at one voxel out it is a few hundredths', quantumAt(1), 0, 0.08);
+inRange('and at the far end an eighth of a voxel, which is plenty for stepping',
+        quantumAt(DISTANCE_RANGE - 0.01), 0, 0.2);
+inRange('a round trip near the surface is essentially exact',
+  Math.abs(decodeDistance(encodeDistance(0.25)) - 0.25), 0, 0.01);
+
+// The shader has its own copy of the decode in TSL (decodeFieldTSL), and the CPU
+// reference is only worth having if the two read the same byte the same way.
+// This is the arithmetic, transcribed, so a divergence fails here rather than
+// looking like a shadow bug.
+const shaderDecode = byte => {
+  const c = (byte / 255) * 2 - 1;
+  return c * Math.abs(c) * DISTANCE_RANGE;
+};
+for (const d of [-8, -2, -0.5, 0, 0.5, 2, 8]) {
+  near(`the shader decode agrees with the CPU one at ${d} voxels`,
+       shaderDecode(encodeDistance(d)), decodeDistance(encodeDistance(d)), 0.02);
+}
 
 section('box distance');
 // Exact, and the seam where every future block type plugs in: a slope is this
@@ -48,10 +81,22 @@ ok('unsupported ground fills its top half only', g.occupiedCount,
    144 * (TEXELS_PER_BLOCK / 2) * TEXELS_PER_BLOCK * TEXELS_PER_BLOCK);
 
 // Voxel 47 is the top voxel of the ground slab, 48 the air above it.
-near('the top solid voxel centre is half a voxel inside', distanceAt(g, 0, 47, 0), -0.5, 0.01);
-near('the air voxel above it is half a voxel outside', distanceAt(g, 0, 48, 0), 0.5, 0.01);
-near('the bottom of the half-filled slab is also a face', distanceAt(g, 0, 42, 0), -0.5, 0.01);
-near('a voxel two clear of anything reads as far air', distanceAt(g, 0, 60, 0), 1, 0.01);
+// Tolerance is 0.02 rather than 0.01 because half a voxel out is exactly where
+// the squared encoding is coarsest in relative terms - see the precision table
+// above. The error is 1.5 mm at this scale.
+near('the top solid voxel centre is half a voxel inside', distanceAt(g, 0, 47, 0), -0.5, 0.02);
+near('the air voxel above it is half a voxel outside', distanceAt(g, 0, 48, 0), 0.5, 0.02);
+near('the bottom of the half-filled slab is also a face', distanceAt(g, 0, 42, 0), -0.5, 0.02);
+// Twelve voxels above the surface, so past the 8-voxel clamp: saturated.
+near('a voxel beyond the range reads as far air', distanceAt(g, 0, 60, 0), DISTANCE_RANGE, 0.01);
+// And the point of widening it: two voxels out is now a REAL distance rather
+// than a saturated one. This is the number that stayed frozen at 1 through every
+// attempt to widen the range, because the bake had the old clamp inlined.
+near('but two voxels out is a real distance, not a saturated one',
+     distanceAt(g, 0, 50, 0), 2.5, 0.05);
+truthy('the field grades monotonically away from the surface',
+  [48, 50, 52, 54, 56].every((vy, i, a) =>
+    i === 0 || distanceAt(g, 0, a[i], 0) > distanceAt(g, 0, a[i - 1], 0)));
 near('out of bounds reads as open air', distanceAt(g, -1, 0, 0), DISTANCE_RANGE, 1e-12);
 
 section('isOccupied is now the sign of the field');
@@ -69,18 +114,46 @@ truthy('negative just below', sampleDistance(g, 0.5, faceY - VOXEL_METRES * 0.4,
 truthy('positive just above', sampleDistance(g, 0.5, faceY + VOXEL_METRES * 0.4, 0.5) > 0);
 // Across the surface the field is a true distance: one voxel of travel is one
 // unit of distance, which is what lets sphere tracing step by the value it reads.
+// The 2.3% shortfall is the byte, not a bug, and it is read AT +-0.5 voxels -
+// the coarsest point of the squared mapping in relative terms, where one step is
+// about 0.03 of a voxel, or 4 mm on the ground. Sampled closer to the face, where
+// occlusion is actually decided, the same measurement is near exact.
 near('the gradient is one per voxel across the surface',
      sampleDistance(g, 0.5, faceY + VOXEL_METRES * 0.5, 0.5)
-     - sampleDistance(g, 0.5, faceY - VOXEL_METRES * 0.5, 0.5), 1, 0.01);
-// The 0.4% shortfall is the byte, not a bug: +-0.5 quantises to +-0.498 because
-// one step of the encoding is 1/127.5 of a voxel, or 0.1 mm on the ground.
-// Further out the +-1 clamp takes over, and it does so immediately - one voxel
-// past the face the gradient has already dropped to 0.75. This is the honest
-// cost of the byte format and the reason sphere tracing here is a modest win
-// rather than a large one: in open air every step is capped at a single voxel.
-inRange('but the clamp flattens it beyond one voxel',
-        sampleDistance(g, 0.5, faceY + VOXEL_METRES * 2, 0.5)
-        - sampleDistance(g, 0.5, faceY + VOXEL_METRES, 0.5), 0, 0.5);
+     - sampleDistance(g, 0.5, faceY - VOXEL_METRES * 0.5, 0.5), 1, 0.04);
+// Sampling CLOSER to the face does not tighten that number, and it is worth
+// knowing why: the field is trilinear between voxel centres, so its gradient is
+// constant across the cell and is fixed by the two stored centre values whatever
+// point inside the cell you read. The centres sit at +-0.5 voxels, so the
+// encoding's resolution there is what caps the gradient - permanently, for any
+// sampling distance.
+//
+// What the squared mapping actually buys is the ZERO CROSSING's position, which is
+// what occlusion is decided by and what a slope's sub-voxel placement will be.
+// That is the thing to assert.
+{
+  // Bisect for where the interpolated field changes sign, and compare with the
+  // face the bake was given.
+  let lo = faceY - VOXEL_METRES, hi = faceY + VOXEL_METRES;
+  for (let i = 0; i < 40; i++) {
+    const mid = (lo + hi) / 2;
+    if (sampleDistance(g, 0.5, mid, 0.5) < 0) lo = mid; else hi = mid;
+  }
+  const crossing = (lo + hi) / 2;
+  near('the zero crossing lands on the face to within a hundredth of a voxel',
+       (crossing - faceY) / VOXEL_METRES, 0, 0.01);
+}
+// The small shortfall is the byte, not a bug. What matters is that the gradient
+// now SURVIVES away from the face instead of flattening immediately: at +-1 voxel
+// of range the gradient one voxel past the face had already collapsed to 0.75,
+// which is what made sphere tracing barely better than a DDA. It should now stay
+// near one out to several voxels.
+near('and the gradient survives two voxels out, where the old clamp killed it',
+     sampleDistance(g, 0.5, faceY + VOXEL_METRES * 3, 0.5)
+     - sampleDistance(g, 0.5, faceY + VOXEL_METRES * 2, 0.5), 1, 0.06);
+inRange('flattening only arrives at the far end of the range',
+        sampleDistance(g, 0.5, faceY + VOXEL_METRES * 12, 0.5)
+        - sampleDistance(g, 0.5, faceY + VOXEL_METRES * 11, 0.5), 0, 0.5);
 
 section('sphere tracing');
 const surface = voxelCentreToWorld(g, 0, 48, 0);   // in air, just above ground
@@ -137,3 +210,40 @@ const fresh = createBoxGrid(0, 0);
 ok('same occupied count', reused.occupiedCount, fresh.occupiedCount);
 truthy('and byte-for-byte identical, with no stale band left behind',
        reused.data.every((v, i) => v === fresh.data[i]));
+
+section('a re-origin that slides is a scroll, not a rebake');
+// The hitch this removes: a full bake is 18.8 ms at C0, which at 240 Hz is four
+// or five dropped frames on every block stepped. Sliding the overlap into place
+// and baking only the strip that scrolled in is about a twelfth of that.
+//
+// The whole safety argument for it is this assertion. A scroll is only allowed
+// to be faster, never different - if it drifts, the symptom is a stale rim of
+// distances reading as an occluder that is not there, which is very hard to see
+// and very easy to blame on the shadow code. Byte-for-byte or it is wrong.
+for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -4]]) {
+  const slid = createBoxGridAt(10, 10);
+  createBoxGridAt(10 + dx, 10 + dz, slid);
+  const baked = createBoxGridAt(10 + dx, 10 + dz);
+  truthy(`scrolling by (${dx}, ${dz}) matches a fresh bake byte for byte`,
+         slid.data.every((v, i) => v === baked.data[i]));
+  ok(`  and keeps the occupancy count exact`, slid.occupiedCount, baked.occupiedCount);
+}
+// The coarse level scrolls by its own voxel stride, not C0's - a level that
+// slid by the wrong number of voxels would look almost right, which is the
+// worst way for this to fail.
+{
+  const slid = createBoxGridAt(10, 10, null, 1);
+  createBoxGridAt(12, 14, slid, 1);
+  const baked = createBoxGridAt(12, 14, null, 1);
+  truthy('C1 scrolls by its own voxel size',
+         slid.data.every((v, i) => v === baked.data[i]));
+}
+// A jump too far to share anything has to fall back to a full bake rather than
+// scrolling in garbage from the far side of the buffer.
+{
+  const jumped = createBoxGridAt(10, 10);
+  createBoxGridAt(60, 60, jumped);
+  const baked = createBoxGridAt(60, 60);
+  truthy('and a jump past the footprint rebakes instead',
+         jumped.data.every((v, i) => v === baked.data[i]));
+}

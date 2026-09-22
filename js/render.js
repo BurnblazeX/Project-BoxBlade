@@ -1,6 +1,5 @@
 import * as THREE from 'three/webgpu';
 import { World, BLOCK_METRES } from './world.js';
-import { addFaceIndexAttribute } from './gpu.js';
 
 // Import the texture so Vite knows to bundle and serve it
 import grassTextureUrl from '../assets/textures/terrain_grass.png';
@@ -31,10 +30,6 @@ export function initWorldRender(scene) {
   grassTexture.colorSpace = THREE.SRGBColorSpace;
 
   const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
-  // Which of the six faces a vertex belongs to. Unused by the lit material, but
-  // the texel atlas addresses a page per instance PER FACE, and a shared
-  // InstancedMesh geometry gives the shader no other way to tell them apart.
-  addFaceIndexAttribute(geometry);
   const material = new THREE.MeshStandardMaterial({ 
     map: grassTexture, roughness: 0.9, metalness: 0.0 
   });

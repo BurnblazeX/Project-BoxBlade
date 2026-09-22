@@ -1,6 +1,6 @@
-import { file, section, ok, truthy, falsy, inRange, note } from './lib/harness.mjs';
+import { file, section, ok, truthy, falsy, inRange, note, near } from './lib/harness.mjs';
 import { createTestArea, World, getVoxelKey } from '../js/world.js';
-import { GRID_DIM, TEXELS_PER_BLOCK } from '../js/boxgrid.js';
+import { GRID_DIM, TEXELS_PER_BLOCK, cascadeExtentMetres, gridOriginFor, CASCADE_COUNT, cascadeVoxelMetres } from '../js/boxgrid.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible, getBoxGridDebugOrigin } from '../js/debug.js';
 
 file('debug.test.mjs - Alt+X boxGrid overlay');
@@ -26,7 +26,7 @@ section('enabling');
 const on = toggleBoxGridDebug(scene, playerPos, terrain);
 truthy('toggle reports enabled', on);
 truthy('state says visible', isBoxGridDebugVisible());
-ok('one mesh added', added.length, 1);
+ok('one mesh per cascade added', added.length, CASCADE_COUNT);
 falsy('terrain hidden so it cannot z-fight with coplanar voxel faces', terrain.visible);
 
 const mesh = added[0];
@@ -45,10 +45,38 @@ truthy('far below total occupied voxels', mesh.count < 127872 * 0.5);
 truthy('far below total grid voxels', mesh.count < GRID_DIM ** 3 * 0.02);
 note(`${mesh.count.toLocaleString()} instances drawn for a ${GRID_DIM}^3 grid`);
 
+section('one overlay, both cascades, C1 subtracted');
+// C0 where it exists, C1 only outside it. Layered rather than subtracted, the
+// coarse cubes would z-fight the fine ones they enclose across the whole
+// footprint - and the seam is the point: it is exactly where a ray's resolution
+// halves.
+{
+  ok('one mesh per cascade', added.length, CASCADE_COUNT);
+  const [fine, coarse] = added;
+  // Each level is clipped by the one finer than it, so the ladder subtracts all
+  // the way out. A level added later and silently left invisible is exactly
+  // what this overlay exists to catch, so the count is generic.
+  added.forEach((m, l) => near(`C${l} draws ${cascadeVoxelMetres(l) * 100} cm voxels`,
+                               m.geometry.parameters.width,
+                               cascadeVoxelMetres(l) * 0.82, 1e-12));
+  truthy('every level is populated', added.every(m => m.count > 0));
+  near('C0 draws 12.5 cm voxels',
+       fine.geometry.parameters.width, 0.125 * 0.82, 1e-12);
+  near('C1 draws 25 cm voxels',
+       coarse.geometry.parameters.width, 0.25 * 0.82, 1e-12);
+  truthy('both are populated', fine.count > 0 && coarse.count > 0);
+  // C1 covers 4x C0's area at a quarter the voxel density per axis. With C0's
+  // square cut out of it, its surface count must land well under what an
+  // unsubtracted C1 would draw - and nowhere near zero, or the clip box is
+  // swallowing the whole field.
+  truthy('C1 is subtracted, not layered', coarse.count < fine.count * 2);
+  note(`C0 ${fine.count.toLocaleString()} | C1 outside it ${coarse.count.toLocaleString()}`);
+}
+
 section('disabling');
 const off = toggleBoxGridDebug(scene, playerPos, terrain);
 falsy('toggle reports disabled', off);
-ok('mesh removed from the scene', removed.length, 1);
+ok('every mesh removed from the scene', removed.length, CASCADE_COUNT);
 truthy('terrain restored', terrain.visible);
 falsy('state says hidden', isBoxGridDebugVisible());
 
@@ -98,3 +126,21 @@ note(`explore at (8,8): ${explore0.toLocaleString()} | battle chunk with the wal
 toggleBoxGridDebug(scene, { x: 20, y: 0, z: 10 }, terrain, 'battle');
 falsy('left disabled', isBoxGridDebugVisible());
 falsy('refresh is a no-op while hidden', refreshBoxGridDebug(scene, { x: 8, y: 0, z: 8 }, 'explore'));
+
+section('the overlay draws the footprint the marcher actually uses');
+// It used to call gridOriginFor() with no sun, so it drew a CENTRED footprint
+// while the field being marched leaned two blocks up-sun - an overlay whose one
+// job is "the field is where you think it is", answering a question nobody
+// asked. Worse at C1, which snaps to a two-block stride on top of the lean.
+{
+  const sun = { x: 10, y: 6, z: 10 };
+  toggleBoxGridDebug(scene, { x: 8, y: 0, z: 8 }, terrain, 'explore',
+                     { sunDirection: sun, bias: 2 });
+  const leaned = getBoxGridDebugOrigin();
+  ok('C0 leans up-sun with the marcher', `${leaned.x},${leaned.z}`, '3,3');
+  // C1 is built at its own origin inside the same rebuild - leaned, then
+  // snapped to its two-block stride.
+  const want = gridOriginFor('explore', { x: 8, y: 0, z: 8 }, sun, 2, 1);
+  truthy('and C1 snaps to its 2-block stride', want.x % 2 === 0 && want.z % 2 === 0);
+  toggleBoxGridDebug(scene, { x: 8, y: 0, z: 8 }, terrain, 'explore');
+}
