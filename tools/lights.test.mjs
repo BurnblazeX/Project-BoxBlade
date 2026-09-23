@@ -163,6 +163,7 @@ ok('capped at the budget', liveLights(Array.from({ length: 20 }, () => L(3))).le
   ok('colour as linear 0..1', [out[o + 4], out[o + 5], out[o + 6]].join(), '1,0,0');
   ok('source radius', out[o + 7], 0.5);
   ok('card slice', [out[o + 8], out[o + 9]].join(), '7,9');
+  ok('card weight defaults to on', out[o + 11], 1);
   ok('shadow weight defaults to fully shadowed', out[o + 10], 1);
   packLight(out, 0, { position: { x: 0, y: 0, z: 0 }, level: 3 });
   near('source radius defaults to the flame', out[7], LIGHT_SOURCE_RADIUS, 1e-6);

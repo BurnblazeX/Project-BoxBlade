@@ -17,6 +17,7 @@ import { MAX_LIGHT_LEVEL, MAX_LIGHTS, LIGHT_VEC4S, DEFAULT_LIGHT_CUTOFF } from '
 import { CARD_RANGE, CARD_PAD, CARD_FADE_START,
          CARD_SUN_REACH } from './cards.js';
 import { BLOCK_METRES } from './world.js';
+import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
 
@@ -785,6 +786,7 @@ function createAOConeTSL(cascades) {
     const t = float(VOXEL_METRES).toVar();
     const occ = float(0).toVar();
     const done = float(0).toVar();
+    const hit = float(0).toVar();
     for (const { c } of eachCascade(cascades, float(0))) {
       If(done.equal(float(0)), () => {
         Loop({ start: 0, end: 32, type: 'int', condition: '<' }, () => {
@@ -795,20 +797,58 @@ function createAOConeTSL(cascades) {
           const d = decodeFieldTSL(texture3D(c.tex, ringUV(vp, c.ring)).r, c.range);
           const blocked = float(1).sub(clamp(d.mul(c.voxel).div(coneR.mul(t)), float(0), float(1)));
           occ.assign(max(occ, blocked.mul(float(1).sub(t.div(maxDist)))));
-          If(d.lessThan(float(HIT_EPS)), () => { done.assign(float(1)); Break(); });
+          If(d.lessThan(float(HIT_EPS)), () => {
+            done.assign(float(1)); hit.assign(float(1)); Break();
+          });
           t.addAssign(max(d, float(MIN_STEP)).mul(c.voxel));
           If(t.greaterThan(maxDist), () => { done.assign(float(1)); Break(); });
         });
       });
     }
-    return occ;
+    // x the occlusion; y how far the axis got, z whether it ended on a surface -
+    // which is where the GI gather samples the LPV.
+    return vec3(occ, min(t, maxDist), hit);
   });
+}
+
+// The GI volumes, sampled trilinearly at a world position. gi.levels holds one
+// gi.js binding per volume, finest first: C0's, then C1's.
+//
+// Each level fades to nothing over its outermost cells, and the finer one is
+// laid over the coarser: inside C0 it is C0's answer, crossing its edge it
+// blends into C1's, and past C1's edge the bounce is gone. Sampling one volume
+// outside itself is what went wrong before - the texture clamps, so everything
+// beyond C0 read whatever its boundary cells held.
+const LPV_EDGE_CELLS = 2;
+export function lpvSampleTSL(gi, p) {
+  let out = null;
+  for (let i = gi.levels.length - 1; i >= 0; i--) {
+    const lv = gi.levels[i];
+    const uvw = p.sub(lv.origin).div(float(lv.extent)).toVar();
+    // Distance to the nearest face of the volume, in cells.
+    const edge = min(min(min(uvw.x, uvw.y), uvw.z),
+                     min(min(float(1).sub(uvw.x), float(1).sub(uvw.y)), float(1).sub(uvw.z)))
+                   .mul(float(LPV_DIM));
+    const w = smoothstep(float(0.5), float(0.5 + LPV_EDGE_CELLS), edge);
+    const s = texture3D(lv.tex, uvw).rgb;
+    out = out ? mix(out, s, w) : s.mul(w);
+  }
+  return out;
 }
 
 // Returns Fn([p, n, lift, skip]) -> visibility in [0, 1]: n is the hemisphere,
 // lift the direction the origin is raised along (the geometry's, as for
 // shadows), skip the sprite's own card.
-export function createAOTSL({ cascades, distance, biasUniform = null }) {
+//
+// With an lpv it returns vec4(gi.rgb, visibility) instead: the same six cones
+// are the GI gather's short band (§6.2), so the bounce costs six texture reads
+// on top of the AO, not six more marches. Each cone samples the LPV where it
+// ENDED - pulled back half a cell off the surface it hit, or at full reach when
+// it escaped - and the samples are weighted as the occlusion is. Sampling at the
+// hit rather than at the receiver is what makes the bounce directional: the
+// cones that struck a red wall bring back red, the ones that escaped bring back
+// whatever fills the open air.
+export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null }) {
   const cone = createAOConeTSL(cascades);
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
   const R = float(AO_CONE_R);
@@ -818,15 +858,24 @@ export function createAOTSL({ cascades, distance, biasUniform = null }) {
     const T = normalize(cross(helper, n)).toVar();
     const B = cross(n, T).toVar();
     const vis = float(1).toVar();
+    const gi = vec3(0, 0, 0).toVar();
     for (let i = 0; i < AO_CONES; i++) {
       const up = i === 0;
       const phi = (i - 1) * (2 * Math.PI / 5);
       const st = up ? 0 : Math.sin(AO_TILT), ct = up ? 1 : Math.cos(AO_TILT);
       const dir = normalize(T.mul(float(st * Math.cos(phi))).add(B.mul(float(st * Math.sin(phi))))
                             .add(n.mul(float(ct)))).toVar();
-      vis.subAssign(cone(origin, dir, distance, R).mul(float(up ? AO_WEIGHT_UP : AO_WEIGHT_SIDE)));
+      const w = float(up ? AO_WEIGHT_UP : AO_WEIGHT_SIDE);
+      const r = cone(origin, dir, distance, R).toVar();
+      vis.subAssign(r.x.mul(w));
+      if (lpv) {
+        const back = select(r.z.greaterThan(float(0)),
+                            max(r.y.sub(float(LPV_CELL_METRES * 0.5)), float(0)), r.y);
+        gi.addAssign(lpvSampleTSL(lpv, origin.add(dir.mul(back))).mul(w));
+      }
     }
-    return clamp(vis, float(0), float(1));
+    const v = clamp(vis, float(0), float(1));
+    return lpv ? vec4(gi, v) : v;
   });
 }
 
@@ -960,7 +1009,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   cards = null, lightCards = null,
                                   terrainNormal = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
-                                  aoOnly = false }) {
+                                  aoOnly = false, gi = null, giOnly = false }) {
   // Held as uniforms whose .value is live, so moving the sun is a uniform write
   // rather than a material rebuild.
   const sun = createSunUniforms(sunDirection, angular);
@@ -974,11 +1023,24 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   });
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
-  const cones = aoOn ? createAOTSL({ cascades, distance: aoDistance, biasUniform }) : null;
+  // The cones are built for AO, for GI, or both - GI gathers along them - so
+  // AO off with GI on still marches them and just ignores the occlusion.
+  const cones = aoOn || gi
+    ? createAOTSL({ cascades, distance: aoDistance, biasUniform, lpv: gi }) : null;
   const spriteAO = aoOn ? createSpriteAOTSL(cards) : null;
-  // Terrain cones times the sprite discs.
-  const rtao = cones ? (p, n, lift, skip) =>
-    spriteAO ? cones(p, n, lift, skip).mul(spriteAO(p, skip)) : cones(p, n, lift, skip) : null;
+  // { ao, gi }: terrain cones times the sprite discs times the texture's own
+  // AO, and the gathered bounce (null without GI). The bounce is scaled by the
+  // texture AO too - a crevice in the art receives less of it.
+  const occlusion = (p, n, lift, skip, texAO) => {
+    if (!cones) return { ao: texAO, gi: null };
+    const r = cones(p, n, lift, skip).toVar();
+    let vis = aoOn ? (gi ? r.w : r) : float(1);
+    if (spriteAO) vis = vis.mul(spriteAO(p, skip));
+    return {
+      ao: vis.mul(texAO).toVar(),
+      gi: gi ? r.xyz.mul(gi.strength).mul(texAO).toVar() : null
+    };
+  };
 
   // Every point light, in one loop over the list. Compiled in whenever there is
   // a list at all: an empty list is a loop of zero iterations, so turning lights
@@ -1007,13 +1069,17 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const p = texelLockTSL(positionWorld, n).toVar();
     // Traced AO times the texture's own. The hemisphere is the geometric face,
     // not the bumped normal - the rays test real geometry.
-    const ao = (rtao ? rtao(p, n, n, NO_SKIP).mul(texAO) : texAO).toVar();
+    const occ = occlusion(p, n, n, NO_SKIP, texAO);
+    const ao = occ.ao;
     if (aoOnly) return vec3(ao, ao, ao);
+    if (giOnly && occ.gi) return occ.gi;
+    // The bounce adds under everything else - it is light, like the others.
+    const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
     // Sun off: no march, no shading term, just the ambient floor for anything a
     // dynamic light does not reach.
     if (!sunOn) {
       const dark = vec3(ambient, ambient, ambient).mul(ao);
-      return pointLight ? dark.add(pointLight(p, n, NO_SKIP, nS)) : dark;
+      return plusGI(pointLight ? dark.add(pointLight(p, n, NO_SKIP, nS)) : dark);
     }
     // Faces turned from the sun get N.L = 0, so the march result is multiplied
     // away - skip it. Not in shadowOnly, which shows the raw term everywhere.
@@ -1031,8 +1097,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     if (shadowOnly) return vec3(visible, visible, visible);
     const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
                                   ambientUniform: ambient, mode: shadeMode, ao });
-    if (!pointLight) return vec3(sunTerm, sunTerm, sunTerm);
-    return vec3(sunTerm, sunTerm, sunTerm).add(pointLight(p, n, NO_SKIP, nS));
+    if (!pointLight) return plusGI(vec3(sunTerm, sunTerm, sunTerm));
+    return plusGI(vec3(sunTerm, sunTerm, sunTerm).add(pointLight(p, n, NO_SKIP, nS)));
   })();
 
   // Sprites: the same lights, shaded at the sprite's own texel centres and
@@ -1055,11 +1121,14 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     If(drawn, () => {
       // Over the shading normal's hemisphere - a billboard has no geometric
       // face in the field, so the way its texels face is the best there is.
-      const ao = (rtao ? rtao(p, nS, n, skip).mul(texAO) : texAO).toVar();
+      const occ = occlusion(p, nS, n, skip, texAO);
+      const ao = occ.ao;
       if (aoOnly) { out.assign(vec3(ao, ao, ao)); return; }
+      if (giOnly && occ.gi) { out.assign(occ.gi); return; }
+      const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
       if (!sunOn) {
         const dark = vec3(ambient, ambient, ambient).mul(ao);
-        out.assign(pointLight ? dark.add(pointLight(p, n, skip, nS)) : dark);
+        out.assign(plusGI(pointLight ? dark.add(pointLight(p, n, skip, nS)) : dark));
         return;
       }
       const visible = sunShadow(p, n, skip);
@@ -1070,7 +1139,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
                                     ambientUniform: ambient, mode: 'lambert', ao });
       const lit = vec3(sunTerm, sunTerm, sunTerm);
-      out.assign(pointLight ? lit.add(pointLight(p, n, skip, nS)) : lit);
+      out.assign(plusGI(pointLight ? lit.add(pointLight(p, n, skip, nS)) : lit));
     });
     return out;
   })();
@@ -1122,7 +1191,7 @@ export function writeLightBindings(b, packed, count) {
 
 // Returns Fn([p, n, skip, shadeN]) -> the summed colour of every live light.
 // The body is the single torch's, unchanged, run once per row of the list.
-function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
+export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
                                 edgeFadeUniform, cards = null }) {
   // Ranged: the point lights share one card buffer and each walks only the
   // slice that was turned to face it.
@@ -1210,10 +1279,13 @@ function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
           // Sprites are not in the field, so they are tested here - against the
           // cards turned to face THIS light. Same ray, same cap, same cone slope,
           // so a sprite's penumbra matches a wall's.
+          // C.w is the card weight: 0 for a light outside the card budget,
+          // which tests an empty slice. Faded like the shadow weight.
           if (cardsFn) {
             const start = int(C.x).toVar();
-            v.mulAssign(cardsFn(origin, dir, reach, slope, skip,
-                                start, start.add(int(C.y))));
+            const cardVis = cardsFn(origin, dir, reach, slope, skip,
+                                    start, start.add(int(C.y)));
+            v.mulAssign(mix(float(1), cardVis, C.w));
           }
           visible.assign(mix(float(1), v, weight));
         });
@@ -1428,7 +1500,7 @@ export const EDGE_FADE_VOXELS = 12;
 // The reference is floored so that a sun on the horizon does not divide every
 // surface up to full brightness and collapse the differentiation entirely.
 export const GROUND_REFERENCE_FLOOR = 0.25;
-export const DEFAULT_AMBIENT = 0.35;
+export const DEFAULT_AMBIENT = 0.17;
 
 // ao scales the AMBIENT term only - it is occlusion of light arriving from all
 // around, and says nothing about the one direction the sun comes from.

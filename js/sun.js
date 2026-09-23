@@ -309,7 +309,7 @@ export function texelLock(p, n, q = VOXEL_METRES) {
 // ndotl is the raw dot of the face normal with the sun; sunUpDot is the sun
 // direction's y, which is what a horizontal up-facing surface would receive.
 export const GROUND_REFERENCE_FLOOR = 0.25;
-export const DEFAULT_AMBIENT = 0.35;
+export const DEFAULT_AMBIENT = 0.17;
 
 export function sunShade(visible, ndotl, sunUpDot, ambient = DEFAULT_AMBIENT,
                          mode = 'ground') {

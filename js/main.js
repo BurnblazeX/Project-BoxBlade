@@ -26,7 +26,8 @@ import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
          LIGHT_SOURCE_RADIUS, clampLevel, lightRadiusMetres,
          pointPenumbraMetres, MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY,
          liveLights, packLight, parseColour, DEFAULT_SHADOW_BUDGET,
-         DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight } from './lights.js';
+         DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight,
+         DEFAULT_CARD_BUDGET } from './lights.js';
 import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
 import { maskFromRGBA, createSilhouetteSet, facingToward,
          AXIS_X, AXIS_Z } from './silhouette.js';
@@ -36,6 +37,9 @@ import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
 import { spriteNormals, terrainNormals } from './normals.js';
 import { createConsole, installConsole } from './console.js';
 import { createSettingsPanel } from './settings.js';
+import { createLPV } from './gi.js';
+import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS,
+         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS } from './lpv.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
@@ -304,12 +308,16 @@ function normalMapFor(name, generate) {
 // The grass texture's normals, once its image has loaded. Polled like the
 // cards, for the same reason (Texture has no load event).
 let terrainNormalTex = null;
+// The grass texture's mean colour, linear - what the terrain bounces into the
+// LPV until the material system gives each block its own albedo.
+let terrainAlbedo = null;
 function resolveTerrainNormal() {
   if (terrainNormalTex || !worldInstancedMesh) return false;
   const base = worldInstancedMesh.userData.originalMaterial || worldInstancedMesh.material;
   const map = base.userData.albedoMap !== undefined ? base.userData.albedoMap : base.map;
   const img = map && map.image;
   if (!img || !img.width) return false;
+  terrainAlbedo = averageAlbedo(imageRGBA(img));
   terrainNormalTex = normalMapFor('terrain_grass', () => ({
     data: terrainNormals(imageRGBA(img), img.width, img.height),
     w: img.width, h: img.height
@@ -841,11 +849,21 @@ const pathGroup = new THREE.Group();
 scene.add(pathGroup);
 const dotGeo = new THREE.SphereGeometry(0.12, 8, 8);
 const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const dotMatOut = new THREE.MeshBasicMaterial({ color: 0xff3030 });
 
-function updatePathDots(path) {
+// Battle hover colours, BG3-style: white inside this turn's movement, red past
+// it. Nothing on the terrain is tinted - the border and dots carry it alone.
+const REACH_COLOUR = 0xffffff;
+const OUT_OF_REACH_COLOUR = 0xff3030;
+const HOVER_COLOUR = 0x0088ff;   // explore
+
+// reach: how many steps of the path are affordable. Dots past it turn red, so
+// the path shows exactly where the movement runs out.
+function updatePathDots(path, reach = Infinity) {
   pathGroup.clear();
-  for (const node of path) {
-    const dot = new THREE.Mesh(dotGeo, dotMat);
+  for (let i = 0; i < path.length; i++) {
+    const node = path[i];
+    const dot = new THREE.Mesh(dotGeo, i < reach ? dotMat : dotMatOut);
     // Position slightly above the surface
     dot.position.set(node.x * VOXEL_SIZE, (node.y * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.1, node.z * VOXEL_SIZE);
     pathGroup.add(dot);
@@ -969,7 +987,6 @@ function onTurnStart(entity) {
   if (entity.id === player.id) {
     refreshReachableTiles();
   } else if (entity.id === enemy.id) {
-    updateVoxelTints(currentArenaMap, null, true);
 
     // GUARD: Only trigger AI if the battle wasn't abruptly ended (or replaced by a new one)
     const scheduledSession = battleSessionId;
@@ -1033,10 +1050,9 @@ function refreshReachableTiles() {
   if (currentMode === 'battle') {
     const currentSpeed = player.turnResources ? player.turnResources.moveRemaining : player.speed;
     currentReachable = getReachableVoxels(player.gridPos, currentSpeed);
-    updateVoxelTints(currentArenaMap, currentReachable, true);
-  } else {
-    updateVoxelTints(null, null, false);
   }
+  // Never tinted: reach is shown by the hover border and path dots instead.
+  updateVoxelTints(null, null, false);
 }
 
 function processClickToMove(clientX, clientY, isDownEvent = false) {
@@ -1418,14 +1434,22 @@ window.addEventListener('pointermove', (e) => {
       lastHoveredKey = targetKey;
       const voxel = World.get(targetKey);
 
-      if (voxel && isStandable(gx, gy, gz) && (currentMode === 'explore' || (currentReachable && currentReachable.has(targetKey)))) {
+      const inArena = currentMode === 'explore' || !currentArenaMap || currentArenaMap.has(targetKey);
+      if (voxel && isStandable(gx, gy, gz) && inArena) {
         highlightMesh.position.set(gx * VOXEL_SIZE, (gy * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
         highlightMesh.visible = true;
 
         if (currentMode === 'battle') {
+          // Every standable tile gets a border and a path; reachable ones are
+          // white, the rest red, with the dots turning red where movement runs
+          // out. No path at all is red with no dots.
+          const reachable = !!(currentReachable && currentReachable.has(targetKey));
           const path = findPath(player.gridPos, { x: gx, y: gy, z: gz }, false);
-          updatePathDots(path);
+          const reach = player.turnResources ? player.turnResources.moveRemaining : player.speed;
+          highlightMesh.material.color.setHex(reachable ? REACH_COLOUR : OUT_OF_REACH_COLOUR);
+          updatePathDots(path, reachable ? Infinity : reach);
         } else {
+          highlightMesh.material.color.setHex(HOVER_COLOUR);
           pathGroup.clear();
         }
       } else {
@@ -1445,6 +1469,12 @@ window.addEventListener('pointermove', (e) => {
 // path picks it up on rebuild and the unshadowed path picks it up directly.
 let whiteWorld = false;
 const whiteUniform = uniform(0);
+// The GI-only view draws on whiteworld too: the receiving surface goes white so
+// the bounce reads as the colour it is. What the terrain INJECTS is still its
+// real texture's albedo (terrainAlbedo), so green grass still bounces green.
+function syncWhite() {
+  whiteUniform.value = whiteWorld || giOnly ? 1 : 0;
+}
 function toggleWhiteWorld() {
   const mesh = worldInstancedMesh;
   if (!mesh) return 'no terrain yet';
@@ -1454,7 +1484,7 @@ function toggleWhiteWorld() {
   base.map = whiteWorld ? null : base.userData.albedoMap;
   base.needsUpdate = true;
   // The shadowed material reads this as a uniform, so no rebuild.
-  whiteUniform.value = whiteWorld ? 1 : 0;
+  syncWhite();
   return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
 }
 
@@ -1555,7 +1585,7 @@ if (key === 'escape' && isDialogueOpen) {
     pathGroup.clear();
     lastHoveredKey = null;
     clickPulseTime = 0;
-    highlightMesh.material.color.setHex(0x0088ff);
+    highlightMesh.material.color.setHex(HOVER_COLOUR);
     
     if (currentMode === 'battle') {
       player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
@@ -1656,7 +1686,7 @@ function animate(time) {
     
     if (clickPulseTime <= 0) {
       // Reset after pulse completes
-      highlightMesh.material.color.setHex(0x0088ff);
+      highlightMesh.material.color.setHex(HOVER_COLOUR);
       highlightMesh.material.opacity = 0.5;
       highlightMesh.scale.set(1, 1, 1);
       lastHoveredKey = null; // Force an update check next frame
@@ -1891,6 +1921,7 @@ function animate(time) {
   if (shadowsOn) updateOccluders();
   updateTorchPosition();
   if (shadowsOn) updateLights();
+  if (shadowsOn) updateGI();
 
   const tRender = performance.now();
   renderer.render(scene, camera);
@@ -2077,6 +2108,67 @@ let aoOn = true;
 let aoOnly = false;
 const aoDistance = uniform(AO_DISTANCE);
 
+// --- GI: the LPV (lpv.js, gi.js) ---
+//
+// On/off and the GI-only view are compiled into the shading kernel, like AO.
+// Strength and spread are uniforms; iterations and injection slices are CPU
+// numbers read each frame. The volume is built once, on the first shadows-on
+// frame that has cascades and a light list, and follows C0 from then on.
+let giOn = true;
+let giOnly = false;
+// One volume per level, finest first: C0 at 0.75 m cells, C1 at 1.5 m. They
+// share every setting; the shading pass blends them (lpvSampleTSL).
+let lpvs = null;
+let lpvOrigins = [];        // cascade origin each volume was last laid over
+let lpvIterations = DEFAULT_LPV_ITERATIONS;
+let lpvSpread = DEFAULT_LPV_SPREAD;
+let lpvSlices = DEFAULT_LPV_SLICES;
+const giStrength = uniform(DEFAULT_GI_STRENGTH);
+let lastGIms = 0;
+
+function ensureLPV() {
+  if (lpvs || shadowCascades.length < LPV_LEVELS) return lpvs;
+  ensureSunUniforms();
+  lpvs = [];
+  for (let level = 0; level < LPV_LEVELS; level++) {
+    lpvs.push(createLPV({ cascades: shadowCascades, lights: ensureLightBindings(), level,
+                          biasUniform: sunBias, fadeStartUniform: sunFadeStart,
+                          edgeFadeUniform: sunEdgeFade }));
+  }
+  return lpvs;
+}
+
+function giBinding() {
+  return { levels: lpvs.map(v => v.binding), strength: giStrength };
+}
+
+// One frame of GI, per volume: follow its cascade, then solid / inject /
+// propagate / resolve.
+function updateGI() {
+  if (!giOn || !lpvs) return;
+  const t0 = performance.now();
+  for (const v of lpvs) {
+    const o = shadowCascades[v.level].origin.value;
+    const at = { x: o.x, y: o.y, z: o.z };
+    const was = lpvOrigins[v.level];
+    let shift = null;
+    if (!was) shift = 'reset';
+    else if (at.x !== was.x || at.y !== was.y || at.z !== was.z) {
+      shift = lpvShift(was, at, v.cellMetres) || 'reset';
+    }
+    lpvOrigins[v.level] = at;
+    const u = v.uniforms;
+    u.origin.value.set(at.x, at.y, at.z);
+    if (terrainAlbedo) u.albedo.value.set(terrainAlbedo.r, terrainAlbedo.g, terrainAlbedo.b);
+    u.sunGain.value = sunOn ? 1 : 0;
+    u.spread.value = lpvSpread;
+    v.slices = lpvSlices;
+    writeSunUniforms(v.sun, dirLight.position, sunAngular);
+    v.update(renderer, { shift, iterations: lpvIterations });
+  }
+  lastGIms = performance.now() - t0;
+}
+
 // Quantisation is a KERNEL flag, not a uniform, so changing it rebuilds. Off by
 // default now: it was inherited from the sampled path, where a fixed sample
 // pattern genuinely does band, and applied to the cone trace, whose output is
@@ -2125,6 +2217,9 @@ let lastShadowedCount = 0;
 // Perf settings. The budget is CPU-side - it decides which rows get a shadow
 // weight - and the cutoff is a uniform on the bindings, so neither rebuilds.
 let shadowBudget = DEFAULT_SHADOW_BUDGET;
+// Of those, how many test sprite cards too. The rest still march the field.
+let cardBudget = DEFAULT_CARD_BUDGET;
+let lastCardLights = 0;
 let lastLightTime = 0;
 
 function ensureLightBindings() {
@@ -2148,7 +2243,11 @@ function updateLights() {
   const dt = lastLightTime ? Math.min(0.1, (now - lastLightTime) / 1000) : 0;
   lastLightTime = now;
   const shadowed = pickShadowed(live, playerSprite.position, shadowBudget);
-  let used = 0, marching = 0;
+  // The card budget ranks by the same score, so it is a subset of the shadowed
+  // set whenever it is the smaller of the two.
+  const carded = pickShadowed(live, playerSprite.position,
+                              Math.min(cardBudget, shadowBudget));
+  let used = 0, marching = 0, cardLights = 0;
   for (let i = 0; i < live.length; i++) {
     const l = live[i];
     const start = used;
@@ -2156,9 +2255,13 @@ function updateLights() {
     // A new light starts at its target rather than fading in from nothing.
     l.shadowWeight = l.shadowWeight === undefined ? (shadowed.has(l) ? 1 : 0)
                    : easeShadowWeight(l.shadowWeight, shadowed.has(l), dt);
+    l.cardWeight = l.cardWeight === undefined ? (carded.has(l) ? 1 : 0)
+                 : easeShadowWeight(l.cardWeight, carded.has(l), dt);
     if (l.shadowWeight > 0) marching++;
-    // An unshadowed light needs no cards - they are only ever read by its march.
-    if (withCards && l.shadowWeight > 0) {
+    // Cards only for a light that marches AND is in the card budget - they are
+    // only ever read by its march, and weighted out past the budget.
+    if (withCards && l.shadowWeight > 0 && l.cardWeight > 0) {
+      cardLights++;
       const room = Math.min(MAX_CARDS, POINT_CARD_CAPACITY - used);
       if (room > 0) {
         count = packCardsFor(frameCasters, l.position, lightRadiusMetres(l.level),
@@ -2166,13 +2269,14 @@ function updateLights() {
         used += count;
       }
     }
-    packLight(lightPack, i, l, start, count, l.shadowWeight);
+    packLight(lightPack, i, l, start, count, l.shadowWeight, l.cardWeight);
   }
   if (withCards) writeCardBindings(lightCards, cardPack, used);
   writeLightBindings(lightBindings, lightPack, live.length);
   lastLightCount = live.length;
   lastLightCards = used;
   lastShadowedCount = marching;
+  lastCardLights = cardLights;
 }
 
 function lampMarker(colour) {
@@ -2224,7 +2328,8 @@ function listLights() {
   const live = new Set(liveLights(all, MAX_LIGHTS));
   const rows = all.map((l, i) => describeLight(l, i) + (live.has(l) ? '' : '  (not shaded)'));
   return `${live.size}/${MAX_LIGHTS} lights shaded, ${lastShadowedCount} with ` +
-         `shadows (budget ${shadowBudget}), ${lastLightCards} point-light ` +
+         `shadows (budget ${shadowBudget}), ${lastCardLights} with sprite shadows ` +
+         `(budget ${cardBudget}), ${lastLightCards} point-light ` +
          `cards this frame (cap ${MAX_CARDS} per light, ${POINT_CARD_CAPACITY} ` +
          `shared)\n` + rows.join('\n');
 }
@@ -2429,7 +2534,8 @@ function buildPerPixelShadows() {
     cards: cardsReady && cardsOn ? sunCards : null,
     lightCards: cardsReady && cardsOn ? lightCards : null,
     terrainNormal: terrainNormalTex,
-    ao: aoOn, aoDistanceUniform: aoDistance, aoOnly
+    ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
+    gi: giOn && ensureLPV() ? giBinding() : null, giOnly
   });
   shadowSun = sun;
   const terrainMat = createShadowMaterial(worldInstancedMesh, node, whiteUniform);
@@ -2933,14 +3039,44 @@ const bxbApi = installConsole(createConsole({
       return listLights();
     }
   },
+  gi: {
+    help: 'global illumination: the LPV bounce. On/off, strength, or "only" to view it alone',
+    usage: "bxb.gi()  toggles  |  bxb.gi(true, 1.5) strength  |  bxb.gi('only')",
+    run: (a = null, strength = null) => {
+      const was = `${giOn}${giOnly}`;
+      if (a === 'only') giOnly = !giOnly;
+      else if (a !== null || strength === null) giOn = a === null ? !giOn : !!a;
+      syncWhite();
+      if (strength !== null) giStrength.value = Math.max(0, Number(strength));
+      if (!giOn) lpvOrigins = [];   // stale while off; start over when it returns
+      if (shadowsOn && was !== `${giOn}${giOnly}`) buildPerPixelShadows();
+      if (!shadowsOn) return 'run bxb.shadows() first';
+      if (!giOn) return 'GI off';
+      return `GI on - two 24^3 volumes, over C0 (0.75 m cells) and C1 (1.5 m), ` +
+             `strength ${giStrength.value.toFixed(2)}, spread ${lpvSpread.toFixed(2)}, ` +
+             `${lpvIterations} iterations, 1/${lpvSlices} injected a frame, ` +
+             `${lastGIms.toFixed(2)} ms CPU to encode` +
+             `${giOnly ? ' - showing the bounce alone' : ''}`;
+    }
+  },
   shadowbudget: {
     help: 'how many point lights get a shadow march per frame; the rest light unshadowed',
-    usage: 'bxb.shadowbudget(9)  |  bxb.shadowbudget(16) every light',
+    usage: 'bxb.shadowbudget(12)  |  bxb.shadowbudget(16) every light',
     run: (n = DEFAULT_SHADOW_BUDGET) => {
       shadowBudget = Math.max(0, Math.min(MAX_LIGHTS, Math.round(n)));
       return `shadow budget ${shadowBudget} - the ${shadowBudget} lights that ` +
              `give Bob's surroundings the most get a march, the rest light ` +
              `unshadowed. Changes fade over a quarter second.`;
+    }
+  },
+  cardbudget: {
+    help: 'how many point lights also cast sprite (card) shadows; the rest shadow terrain only',
+    usage: 'bxb.cardbudget(6)  |  bxb.cardbudget(16) every shadowed light',
+    run: (n = DEFAULT_CARD_BUDGET) => {
+      cardBudget = Math.max(0, Math.min(MAX_LIGHTS, Math.round(n)));
+      return `card budget ${cardBudget} - the ${cardBudget} most important ` +
+             `shadowed lights test sprite cards. The others still march the ` +
+             `field, so walls still block them; only sprites stop casting.`;
     }
   },
   lightcutoff: {
@@ -3134,6 +3270,9 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'budget', label: 'Shadowed lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
       help: 'how many point lights get a shadow march; the rest light unshadowed',
       get: () => shadowBudget, set: v => bxbApi.shadowbudget(v) },
+    { key: 'cardbudget', label: 'Sprite-shadow lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
+      help: 'of the shadowed lights, how many also cast sprite (card) shadows - walls still block the rest',
+      get: () => cardBudget, set: v => bxbApi.cardbudget(v) },
     { key: 'cutoff', label: 'Light cutoff', type: 'range', min: 0, max: 0.1, step: 0.005,
       help: 'faint outer band of each light that is not marched',
       get: () => (lightBindings ? lightBindings.cutoff.value : DEFAULT_LIGHT_CUTOFF),
@@ -3196,6 +3335,22 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => aoOnly, set: v => flip(aoOnly, v, () => bxbApi.ao('only')) },
     { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
       get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) }
+  ]},
+  { title: 'GI', settings: [
+    { key: 'gi', label: 'Bounce light (LPV)', type: 'toggle',
+      get: () => giOn, set: v => flip(giOn, v, () => bxbApi.gi()) },
+    { key: 'gistrength', label: 'Strength', type: 'range', min: 0, max: 4, step: 0.05,
+      get: () => giStrength.value, set: v => bxbApi.gi(true, v) },
+    { key: 'gispread', label: 'Spread', type: 'range', min: 0.5, max: 0.98, step: 0.01,
+      help: 'how far light carries cell to cell - brightness is normalised, only reach changes',
+      get: () => lpvSpread, set: v => { lpvSpread = v; } },
+    { key: 'giiter', label: 'Iterations / frame', type: 'range', min: 2, max: 32, step: 2,
+      get: () => lpvIterations, set: v => { lpvIterations = v; } },
+    { key: 'gislices', label: 'Inject 1/N a frame', type: 'range', min: 1, max: 8, step: 1,
+      help: 'injection re-marches every light per surface; 1/N of the cells each frame',
+      get: () => lpvSlices, set: v => { lpvSlices = v; } },
+    { key: 'gionly', label: 'View: bounce only', type: 'toggle',
+      get: () => giOnly, set: v => flip(giOnly, v, () => bxbApi.gi('only')) }
   ]},
   { title: 'Sprites', settings: [
     { key: 'cards', label: 'Card shadows', type: 'toggle',

@@ -169,9 +169,11 @@ export const MAX_LIGHTS = 16;
 // Three vec4 per light:
 //   0  position xyz, level
 //   1  colour rgb,   source radius (metres)
-//   2  card start,   card count, shadow weight, 0
-//      - its slice of the shared card buffer, and how much of its shadow is
-//        applied (0 = unshadowed, no march; see the shadow budget below)
+//   2  card start,   card count, shadow weight, card weight
+//      - its slice of the shared card buffer, how much of its shadow is
+//        applied (0 = unshadowed, no march), and how much of the SPRITE part
+//        of that shadow is (0 = terrain only, no card test) - see the budgets
+//        below
 export const LIGHT_VEC4S = 3;
 export const LIGHT_FLOATS = LIGHT_VEC4S * 4;
 
@@ -207,7 +209,7 @@ export function liveLights(lights, capacity = MAX_LIGHTS) {
 // One light into its three vec4. cardStart/cardCount are the slice of the
 // shared card buffer that was turned to face THIS light.
 export function packLight(out, index, light, cardStart = 0, cardCount = 0,
-                          shadowWeight = 1) {
+                          shadowWeight = 1, cardWeight = 1) {
   const o = index * LIGHT_FLOATS;
   const { r, g, b } = colourToRGB(parseColour(light.colour));
   out[o + 0] = light.position.x;
@@ -219,7 +221,7 @@ export function packLight(out, index, light, cardStart = 0, cardCount = 0,
   out[o + 8] = cardStart;
   out[o + 9] = cardCount;
   out[o + 10] = Math.max(0, Math.min(1, shadowWeight));
-  out[o + 11] = 0;
+  out[o + 11] = Math.max(0, Math.min(1, cardWeight));
   return out;
 }
 
@@ -252,7 +254,13 @@ export function cutAmount(amount, cutoff = DEFAULT_LIGHT_CUTOFF) {
 // contribution each would make at the focus point, as lightContribution
 // computes it. A light that does not reach the focus scores its level alone,
 // below every light that does, so a bright far lamp still outranks a dim one.
-export const DEFAULT_SHADOW_BUDGET = 9;
+export const DEFAULT_SHADOW_BUDGET = 12;
+
+// The card budget: of the lights that march, how many also test sprite cards.
+// A narrower cut than the shadow budget, and a safe one: a light over it still
+// marches the field, so walls still block it - only sprites stop casting its
+// shadow. Picked by the same score, so it is the most important few.
+export const DEFAULT_CARD_BUDGET = 6;
 
 // Seconds for a light's shadow to fade in or out when it enters or leaves the
 // budget, so walking past a lamp does not pop its shadows on and off.
