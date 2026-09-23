@@ -134,9 +134,23 @@ export function mirrorReach(r, sun, lights) {
 // Nearest `capacity` to a point that reflect anything, packed four vec4 each:
 //   0  axis, sign, plane, mask          1  umin, vmin, umax, vmax
 //   2  sun box min xyz, 0               3  sun box max xyz, 0
+// A rectangle's footprint on the ground, { minX, maxX, minZ, maxZ }, metres.
+export function mirrorFootprint(r) {
+  const [ua, va] = PLANE_AXES[r.axis];
+  const lo = [0, 0, 0], hi = [0, 0, 0];
+  lo[r.axis] = hi[r.axis] = r.plane;
+  lo[ua] = r.min[0]; hi[ua] = r.max[0];
+  lo[va] = r.min[1]; hi[va] = r.max[1];
+  return { minX: lo[0], maxX: hi[0], minZ: lo[2], maxZ: hi[2] };
+}
+
 export const MIRROR_VEC4S = 4;
+// area: optional { minX, maxX, minZ, maxZ } - only rectangles overlapping it
+// are packed. main.js passes C1's footprint: past C1 the field is too coarse
+// for a mirror's two marches to mean much, and a mirror the player is nowhere
+// near should cost the frame nothing.
 export function packMirrors(rects, near, out, capacity = MAX_MIRRORS,
-                            sun = { dir: [0, 1, 0], on: false }, lights = []) {
+                            sun = { dir: [0, 1, 0], on: false }, lights = [], area = null) {
   const centre = r => {
     const [ua, va] = PLANE_AXES[r.axis];
     const p = [0, 0, 0];
@@ -145,7 +159,12 @@ export function packMirrors(rects, near, out, capacity = MAX_MIRRORS,
     return p;
   };
   const d2 = r => { const c = centre(r); return (c[0] - near.x) ** 2 + (c[1] - near.y) ** 2 + (c[2] - near.z) ** 2; };
-  const live = rects.map(r => ({ r, reach: mirrorReach(r, sun, lights) }))
+  const inArea = r => {
+    if (!area) return true;
+    const f = mirrorFootprint(r);
+    return f.maxX >= area.minX && f.minX <= area.maxX && f.maxZ >= area.minZ && f.minZ <= area.maxZ;
+  };
+  const live = rects.filter(inArea).map(r => ({ r, reach: mirrorReach(r, sun, lights) }))
     .filter(m => m.reach.mask !== 0)
     .sort((a, b) => d2(a.r) - d2(b.r)).slice(0, capacity);
   live.forEach(({ r, reach }, i) => {

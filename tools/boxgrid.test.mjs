@@ -260,16 +260,33 @@ ok('and 4 at C1', cascadeRangeVoxels(1), 4);
 // the reason to have one gone.
 {
   const sun = { x: 1, y: 0.4, z: 0 };
-  const originsOver = (level, n) => {
-    const seen = new Set();
-    for (let i = 0; i < n; i++) {
+  // Re-origins across n single-block steps - counted as changes, so where the
+  // walk starts relative to a stride boundary does not matter.
+  const moves = (level, n) => {
+    let count = 0, prev = null;
+    for (let i = 0; i <= n; i++) {
       const o = gridOriginFor('explore', { x: i, z: 0 }, sun, 2, level);
-      seen.add(o.x + ',' + o.z);
+      const key = o.x + ',' + o.z;
+      if (prev !== null && key !== prev) count++;
+      prev = key;
     }
-    return seen.size;
+    return count;
   };
-  ok('C0 re-origins on every block stepped', originsOver(0, 16), 16);
-  ok('C1 only on every second one', originsOver(1, 16), 8);
+  ok('C0 re-origins on every block stepped', moves(0, 16), 16);
+  ok('C1 only on every second one', moves(1, 16), 8);
+}
+
+// Centred on the player: rounded to the stride, not floored toward -x/-z.
+{
+  for (let level = 0; level < CASCADE_COUNT; level++) {
+    const half = cascadeBlocks(level) / 2;
+    let worst = 0;
+    for (let px = 0; px < 16; px++) {
+      const o = gridOriginFor('explore', { x: px, z: px }, null, 0, level);
+      worst = Math.max(worst, Math.abs(o.x + half - px), Math.abs(o.z + half - px));
+    }
+    truthy(`C${level} stays within half a stride of the player`, worst <= (1 << level) / 2);
+  }
 }
 
 // And the field itself bakes sanely at the coarse level - same world, half the

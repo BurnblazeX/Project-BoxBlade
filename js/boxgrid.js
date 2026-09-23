@@ -333,7 +333,11 @@ export function createBoxGrid(chunkX = 0, chunkZ = 0, reuse = null) {
 // It does NOT centre on them, though; it leans up-sun. See the body for why.
 
 // How far up-sun to push the explore footprint, in blocks.
-export const SUN_BIAS_BLOCKS = 2;
+// 0: every cascade centred on the player. The sun lean (see gridOriginFor)
+// dates from before C1 and C2, when a long shadow ran out of C0 with nowhere
+// to go; now a sun ray leaving C0 carries on in C1, and the lean only put the
+// footprints off-centre. Kept as a setting (bxb.gridbias).
+export const SUN_BIAS_BLOCKS = 0;
 
 export function gridOriginFor(mode, gridPos, sunDirection = null,
                               bias = SUN_BIAS_BLOCKS, level = 0) {
@@ -385,10 +389,15 @@ export function gridOriginFor(mode, gridPos, sunDirection = null,
   // off-centre by up to 2 of its 24 blocks is not something a distant shadow can
   // show. Math.floor rather than truncation, so the stride is uniform either side
   // of the origin instead of bunching up around zero.
+  //
+  // ROUNDED to the nearest stride, not floored: flooring put C1 up to a block
+  // and C2 up to three toward -x/-z of the player, every time. Rounding keeps
+  // the same stride - so the same rebuild rate - with the player within half
+  // a stride of centre.
   const snap = 1 << level;
   return {
-    x: Math.floor(x / snap) * snap,
-    z: Math.floor(z / snap) * snap
+    x: Math.round(x / snap) * snap,
+    z: Math.round(z / snap) * snap
   };
 }
 

@@ -11,6 +11,8 @@ import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          VOXEL_METRES, applyHandoff } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
+import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
+         createVoxelAONode } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings } from './gpu.js';
 import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS } from './mirrors.js';
@@ -144,7 +146,8 @@ async function requestGPUDevice() {
 }
 // trackTimestamp gives the perf graph the GPU's own frame time. It only takes
 // effect when the device has timestamp-query; without it the graph says so.
-const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: true,
+// stencil: the texel cache's miss pass is gated by it - see renderTexelCache.
+const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: true, stencil: true,
                                            device: await requestGPUDevice() });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
@@ -639,10 +642,19 @@ function updateCards() {
     }
     cardsReady = true;
     if (shadowsOn) { buildPerPixelShadows(); }
+    // The plain material's AO takes the sprites' contact discs from here on.
+    enableAlwaysOnAO();
   }
-  if (!cardsReady || !cardsOn) { lastCardCount = 0; frameCasters = null; return; }
+  if (!cardsReady || !cardsOn) {
+    lastCardCount = 0; frameCasters = null;
+    if (sunCards) sunCards.count.value = 0;   // no discs either
+    return;
+  }
 
-  const casters = cardCasters().filter(c => (c.lod = cardLod(c.centre)) !== null);
+  // Each card's cascade LOD - with shadows off the cascades are not kept, and
+  // the only reader is the contact disc, which has no LOD: every card counts.
+  const casters = cardCasters()
+    .filter(c => (c.lod = shadowsOn ? cardLod(c.centre) : 0) !== null);
   // The sun is directional: its "position" is a direction, and everything is
   // within reach of it.
   lastCardCount = writeCardsFor(sunCards, casters, dirLight.position, Infinity, true);
@@ -1941,7 +1953,8 @@ function animate(time) {
   const tCards = performance.now();
   // The sun's cards. The point lights' are packed in updateLights below, after
   // the torch has moved, so they face where the flame IS this frame.
-  if (shadowsOn) updateCards();
+  // Always: with shadows off the sprites' contact AO still reads the sun's cards.
+  updateCards();
   updateSky();
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
@@ -1955,6 +1968,7 @@ function animate(time) {
   if (shadowsOn) updateGI();
 
   const tRender = performance.now();
+  renderTexelCache();
   renderer.render(scene, camera);
   const tEnd = performance.now();
   logSpike(tGrid, tCards, tRender, tEnd, moved);
@@ -2139,7 +2153,10 @@ let sunOn = true;
 let shadowOnly = false; // raw visibility, no albedo or N.L, for judging artifacts
 // Cone-traced AO. On/off is compiled into the kernel; the distance is a
 // uniform. aoOnly shows the AO term alone.
-let aoOn = true;
+// Always on, by two methods swapped with shadows: traced cones through the
+// field with shadows on, static voxel AO with them off (see enableAlwaysOnAO).
+// Not a switch.
+const aoOn = true;
 let aoOnly = false;
 const aoDistance = uniform(AO_DISTANCE);
 // View: the terrain's raw LabPBR specular texel in place of the lit colour.
@@ -2214,6 +2231,97 @@ function giBinding() {
   return { levels: lpvs.map(v => v.binding), strength: giStrength };
 }
 
+// --- Texel-rate shading (gpu.js section 8) ---
+//
+// The terrain is shaded in a low-res pass - 1/texelCacheScale per axis - into
+// a float target of vec4(colour, texel id); the full-res pass then reuses the
+// colour of a nearby sample from the same texel, and shades only pixels that
+// have none. Exact, since a texel's colour is the same everywhere in it.
+// The low-res pass draws only layer TEXEL_LAYER, which only the terrain is on.
+const TEXEL_LAYER = 1;
+let texelCacheOn = true;
+let texelCacheScale = 4;
+const texelCache = {
+  rt: null,
+  tex: null,
+  scale: uniform(new THREE.Vector2(1, 1)),   // low-res / full-res, per axis
+  size: uniform(new THREE.Vector2(1, 1)),    // low-res pixels
+  showMisses: false                          // debug view, compiled in
+};
+let terrainLowMat = null;      // the low-res pass's material, when the cache is on
+let terrainLookupMat = null;   // the terrain's material it belongs with
+
+// The full-res terrain is three draws of the same instances, in this order:
+//
+//   prepass  depth only - so each pixel's visible terrain fragment, and only
+//            it, passes the depth tests of the two after it
+//   lookup   the terrain mesh itself: the cached colour, stencil set to 1 on
+//            every pixel it fills; a pixel with no matching sample discards
+//   miss     the full shading, stencil-tested against 0: a pixel the lookup
+//            filled is rejected BEFORE its shader runs, so the heavy shader
+//            only ever starts on the misses
+//
+// The twins share the terrain's geometry and instance buffers, so arena
+// hiding and tinting reach them with no extra writes. Identical vertex code in
+// all three, so the visible fragment's depth matches exactly.
+const terrainTwins = { prepass: null, miss: null };
+function terrainTwin(material, renderOrder) {
+  const src = worldInstancedMesh;
+  const m = new THREE.InstancedMesh(src.geometry, material, src.count);
+  m.instanceMatrix = src.instanceMatrix;
+  m.instanceColor = src.instanceColor;
+  m.frustumCulled = false;
+  m.raycast = () => {};          // picking stays on the terrain mesh itself
+  m.renderOrder = renderOrder;
+  m.visible = false;
+  scene.add(m);
+  return m;
+}
+function ensureTerrainTwins() {
+  if (terrainTwins.prepass) return terrainTwins;
+  const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
+  terrainTwins.prepass = terrainTwin(depthOnly, -3);
+  terrainTwins.miss = terrainTwin(depthOnly, -1);   // real material set per build
+  return terrainTwins;
+}
+const _drawSize = new THREE.Vector2();
+function sizeTexelCache() {
+  renderer.getDrawingBufferSize(_drawSize);
+  const w = Math.max(1, Math.ceil(_drawSize.x / texelCacheScale));
+  const h = Math.max(1, Math.ceil(_drawSize.y / texelCacheScale));
+  if (!texelCache.rt) {
+    texelCache.rt = new THREE.RenderTarget(w, h, { type: THREE.FloatType, depthBuffer: true });
+    texelCache.tex = texelCache.rt.texture;
+    texelCache.tex.minFilter = texelCache.tex.magFilter = THREE.NearestFilter;
+    texelCache.tex.generateMipmaps = false;
+  } else if (texelCache.rt.width !== w || texelCache.rt.height !== h) {
+    texelCache.rt.setSize(w, h);
+  }
+  texelCache.scale.value.set(w / _drawSize.x, h / _drawSize.y);
+  texelCache.size.value.set(w, h);
+}
+// The low-res pass, before the main render. Only while the terrain wears the
+// material this cache was built for - mid-rebuild it may not.
+function renderTexelCache() {
+  const mesh = worldInstancedMesh;
+  const active = texelCacheOn && shadowsOn && terrainLowMat && mesh
+    && mesh.material === terrainLookupMat;
+  // The twins follow the terrain's own visibility (the grid overlay hides it).
+  if (terrainTwins.prepass) {
+    terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible;
+  }
+  if (!active) return;
+  sizeTexelCache();
+  const mask = camera.layers.mask;
+  mesh.material = terrainLowMat;
+  camera.layers.set(TEXEL_LAYER);
+  renderer.setRenderTarget(texelCache.rt);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  camera.layers.mask = mask;
+  mesh.material = terrainLookupMat;
+}
+
 // --- Mirrors (mirrors.js): reflected sunlight ---
 //
 // The reflective surfaces as rectangles, built once the specular textures are
@@ -2251,8 +2359,18 @@ function updateMirrors() {
     const A = lb.data.array[i * LIGHT_VEC4S];
     lights.push({ x: A.x, y: A.y, z: A.z, radius: A.w * VOXEL_SIZE });
   }
-  const n = packMirrors(mirrorRects, playerSprite.position, mirrorPack, MAX_MIRRORS,
-                        { dir: [d.x, d.y, d.z], on: sunLive }, lights);
+  // Only mirrors inside C1's footprint. The cascades follow the player, so a
+  // player (or free cam's subject) far from every mirror packs none, and the
+  // shader's mirror loop runs zero times.
+  const g1 = shadowGrids[Math.min(1, shadowGrids.length - 1)];
+  let area = null;
+  if (g1) {
+    const side = cascadeExtentMetres(g1.level ?? 1);
+    area = { minX: g1.origin.x, maxX: g1.origin.x + side,
+             minZ: g1.origin.z, maxZ: g1.origin.z + side };
+  }
+  const n = area ? packMirrors(mirrorRects, playerSprite.position, mirrorPack, MAX_MIRRORS,
+                               { dir: [d.x, d.y, d.z], on: sunLive }, lights, area) : 0;
   writeMirrorBindings(mirrorBindings, mirrorPack, n);
 }
 
@@ -2556,8 +2674,10 @@ function bxbLight(x, y, z) {
   // The footprint leans toward the sun, so moving the sun moves WHERE the field
   // should be baked, not just how it is lit. Dropping the remembered origin makes
   // the next frame notice and re-origin; without this the grid would keep the
-  // previous sun's lean until the player happened to step a block.
-  shadowOrigins = [];
+  // previous sun's lean until the player happened to step a block. With no
+  // lean (the default) the sun does not move the footprint at all, and the
+  // forced re-origin would only rebake it for nothing.
+  if (sunGridBias) shadowOrigins = [];
   return 'sun toward ' + x.toFixed(2) + ',' + y.toFixed(2) + ',' + z.toFixed(2);
 }
 
@@ -2651,15 +2771,21 @@ async function warmScene() {
 }
 async function compileOffscreen(pairs) {
   const seen = new Set();
-  for (const [mesh, mat] of pairs) {
+  for (const [mesh, mat, target = null] of pairs) {
     if (seen.has(mat)) continue;   // meshes sharing a material share its pipeline
     seen.add(mat);
     const old = mesh.material, culled = mesh.frustumCulled;
+    const oldTarget = renderer.getRenderTarget();
     mesh.material = mat;
     mesh.frustumCulled = false;
     let pending;
+    // A pipeline is per target format: compile against the one it draws into.
+    if (target) renderer.setRenderTarget(target);
     try { pending = renderer.compileAsync(mesh, camera, scene); }
-    finally { mesh.material = old; mesh.frustumCulled = culled; }
+    finally {
+      mesh.material = old; mesh.frustumCulled = culled;
+      if (target) renderer.setRenderTarget(oldTarget);
+    }
     await pending;
     await nextFrame();
   }
@@ -2667,7 +2793,10 @@ async function compileOffscreen(pairs) {
 let shadowBuild = 0;
 
 function buildPerPixelShadows() {
-  ensureShadowGrids();
+  // Turning shadows on builds the field fresh - it did not follow the player
+  // while they were off. A rebuild while they are on does not need it baked
+  // again.
+  if (!shadowsOn || !shadowGrids[0]) ensureShadowGrids();
   const origin = shadowOrigins[0];
   ensureSunUniforms();
   const { node, spriteLight, sun } = createShadowColorNode({
@@ -2694,20 +2823,57 @@ function buildPerPixelShadows() {
   });
   shadowSun = sun;
   // The node applies the albedo itself - specular adds after it, not under it.
-  const terrainMat = createShadowMaterial(worldInstancedMesh, node);
+  // With the texel cache, the terrain's own material looks its colour up and
+  // a second, low-res material does the shading - see renderTexelCache.
+  let lowMat = null, missMat = null;
+  let terrainMat;
+  if (texelCacheOn) {
+    sizeTexelCache();
+    ensureTerrainTwins();
+    worldInstancedMesh.layers.enable(TEXEL_LAYER);
+    worldInstancedMesh.renderOrder = -2;
+    lowMat = new THREE.MeshBasicNodeMaterial();
+    // outputNode, not colorNode: the stored colour must not carry the
+    // per-instance tint, which the lookup material applies once itself.
+    lowMat.outputNode = createTexelCacheWriteNode(node);
+    terrainMat = createShadowMaterial(worldInstancedMesh, createTexelCacheLookupNode(texelCache));
+    terrainMat.stencilWrite = true;
+    terrainMat.stencilFunc = THREE.AlwaysStencilFunc;
+    terrainMat.stencilRef = 1;
+    terrainMat.stencilZPass = THREE.ReplaceStencilOp;
+    missMat = createShadowMaterial(worldInstancedMesh, createTexelMissNode(texelCache, node));
+    missMat.stencilWrite = true;           // enables the test; nothing is written
+    missMat.stencilFunc = THREE.EqualStencilFunc;
+    missMat.stencilRef = 0;
+    missMat.stencilZPass = THREE.KeepStencilOp;
+  } else {
+    terrainMat = createShadowMaterial(worldInstancedMesh, node);
+  }
   const sprites = buildSpriteShadows(spriteLight);
   const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
+  // Compiled against the float target it will draw into.
+  if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt],
+                         [terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
   const id = ++shadowBuild;
   const swap = () => {
     // A newer build, or shadows turned off, while this one compiled.
     if (id !== shadowBuild) {
       terrainMat.dispose();
+      if (lowMat) { lowMat.dispose(); missMat.dispose(); }
       for (const m of sprites.mats) m.dispose();
       return;
     }
     const mesh = worldInstancedMesh;
     if (mesh.material !== mesh.userData.originalMaterial) mesh.material.dispose();
     mesh.material = terrainMat;
+    if (terrainLowMat) terrainLowMat.dispose();
+    terrainLowMat = lowMat;
+    terrainLookupMat = terrainMat;
+    if (terrainTwins.miss) {
+      const oldMiss = terrainTwins.miss.material;
+      if (missMat) terrainTwins.miss.material = missMat;
+      if (oldMiss !== terrainTwins.prepass.material && oldMiss !== missMat) oldMiss.dispose();
+    }
     restoreSpriteMaterials();
     for (const m of spriteMeshes()) {
       const v = sprites.variants.get(m);
@@ -2848,8 +3014,9 @@ const bxbApi = installConsole(createConsole({
         restoreOriginalMaterial(worldInstancedMesh);
         restoreSpriteMaterials();
         shadowsOn = false;
-        shadowOrigins = [];
-        return 'shadows off';
+        // The field stops following; turning shadows back on rebuilds it.
+        // The plain material's AO is the static voxel kind, which needs none.
+        return 'shadows off (static voxel AO)';
       }
       return buildPerPixelShadows();
     }
@@ -3106,18 +3273,27 @@ const bxbApi = installConsole(createConsole({
     }
   },
   ao: {
-    help: 'cone-traced ambient occlusion: on/off, reach in metres, or "only" to view it alone',
-    usage: 'bxb.ao()  toggles  |  bxb.ao(true, 1.5)  |  bxb.ao("only")',
-    run: (a = null, dist = null) => {
-      const was = `${aoOn}${aoOnly}`;
-      if (a === 'only') aoOnly = !aoOnly;
-      else if (a !== null || dist === null) aoOn = a === null ? !aoOn : !!a;
-      if (dist !== null) aoDistance.value = Math.max(0.1, Number(dist));
-      // On/off and the view are compiled in; the distance is a uniform.
-      if (shadowsOn && was !== `${aoOn}${aoOnly}`) buildPerPixelShadows();
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      return `AO ${aoOn ? '6 cones, ' + aoDistance.value.toFixed(2) + ' m' : 'off'}` +
+    help: 'cone-traced ambient occlusion - always on. Reach in metres, or "only" to view it alone',
+    usage: 'bxb.ao(1.5)  reach  |  bxb.ao("only")',
+    run: (a = null) => {
+      if (a === 'only') {
+        aoOnly = !aoOnly;
+        if (shadowsOn) buildPerPixelShadows();   // the view is compiled in
+      } else if (a !== null) aoDistance.value = Math.max(0.1, Number(a));
+      return `AO always on - 6 cones, ${aoDistance.value.toFixed(2)} m` +
              `${aoOnly ? ' - showing the AO term alone (white open, black occluded)' : ''}`;
+    }
+  },
+  texelcache: {
+    help: 'texel-rate shading: shade the terrain in a low-res pass and reuse each texel\'s colour. ' +
+          'A number sets the sample spacing in pixels',
+    usage: "bxb.texelcache()  toggles  |  bxb.texelcache(4)  |  bxb.texelcache('misses')",
+    run: (scale = null) => {
+      if (scale === 'misses') texelCache.showMisses = !texelCache.showMisses;
+      else if (scale !== null) texelCacheScale = Math.max(1, Math.min(8, Math.round(Number(scale))));
+      else texelCacheOn = !texelCacheOn;
+      if (shadowsOn) buildPerPixelShadows();
+      return `texel cache ${texelCacheOn ? `on, 1/${texelCacheScale} per axis` : 'off'}`;
     }
   },
   gifar: {
@@ -3503,6 +3679,12 @@ const flip = (now, want, fn) => (!!now === !!want ? undefined : fn());
 
 settingsPanel = createSettingsPanel({ groups: [
   { title: 'Perf', settings: [
+    { key: 'texelcache', label: 'Texel-rate shading', type: 'toggle',
+      help: 'terrain shaded once per texel in a low-res pass, reused at full res',
+      get: () => texelCacheOn, set: v => flip(texelCacheOn, v, () => bxbApi.texelcache()) },
+    { key: 'texelscale', label: 'Texel cache spacing (px)', type: 'range', min: 2, max: 8, step: 1,
+      help: 'low-res sample spacing; texels smaller than this shade themselves',
+      get: () => texelCacheScale, set: v => bxbApi.texelcache(v) },
     { key: 'gifar', label: 'Far GI every 2nd frame', type: 'toggle',
       help: 'the C1 LPV volume updates at half rate',
       get: () => giFarHalf, set: v => flip(giFarHalf, v, () => bxbApi.gifar()) },
@@ -3567,9 +3749,8 @@ settingsPanel = createSettingsPanel({ groups: [
       set: v => bxbApi.shade(v, sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT) },
     { key: 'ambient', label: 'Ambient', type: 'range', min: 0, max: 1, step: 0.01,
       get: () => (sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT), set: v => bxbApi.ambient(v) },
-    { key: 'ao', label: 'AO', type: 'toggle', get: () => aoOn, set: v => bxbApi.ao(v) },
     { key: 'aodist', label: 'AO reach (m)', type: 'range', min: 0.25, max: 3, step: 0.05,
-      get: () => aoDistance.value, set: v => bxbApi.ao(null, v) },
+      get: () => aoDistance.value, set: v => bxbApi.ao(v) },
     { key: 'aoonly', label: 'View: AO only', type: 'toggle',
       get: () => aoOnly, set: v => flip(aoOnly, v, () => bxbApi.ao('only')) },
     { key: 'spec', label: 'Specular highlights', type: 'toggle',
@@ -3678,4 +3859,21 @@ debugBtn.addEventListener('click', () => { settingsPanel.toggle(); debugBtn.blur
 // needs an async device/adapter init before the first frame, and setAnimationLoop
 // awaits it internally. Calling animate() directly would render before the device
 // exists.
+// --- AO, always on ---
+//
+// Two methods, swapped with shadows. Shadows on: the shaded material traces
+// six cones through the distance field. Shadows off: the terrain's PLAIN
+// material carries the static voxel AO (voxelao.js) as its aoNode - eight
+// block reads a texel, no field, no marches - so the cheap path stays cheap on
+// low-power machines, and nothing is baked or followed while shadows are off.
+// Times the sprites' contact discs (analytic), once the cards have loaded.
+function enableAlwaysOnAO() {
+  if (!worldInstancedMesh) return;
+  const base = worldInstancedMesh.userData.originalMaterial || worldInstancedMesh.material;
+  base.aoNode = createVoxelAONode(terrainTextures, cardsReady ? sunCards : null);
+  base.needsUpdate = true;
+  if (!worldInstancedMesh.userData.originalMaterial) worldInstancedMesh.userData.originalMaterial = base;
+}
+enableAlwaysOnAO();
+
 renderer.setAnimationLoop(animate);

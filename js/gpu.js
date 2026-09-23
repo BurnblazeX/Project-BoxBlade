@@ -7,7 +7,7 @@ import {
   normalize, cross, clamp, cos, sin, smoothstep, length, log2,
   uniformArray, int, dot, select, dFdx, dFdy, textureSize, mix,
   modelWorldMatrix, materialColor, inverseSqrt, frontFacing, sign, sqrt, fract, exp2,
-  cameraPosition, pow, round, reflect
+  cameraPosition, pow, round, reflect, textureLoad, screenCoordinate, Discard
 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE,
          gridIndex, ringSegments, ringSegmentsZ, CASCADE_COUNT,
@@ -19,9 +19,10 @@ import { CARD_RANGE, CARD_PAD, CARD_FADE_START,
          CARD_SUN_REACH } from './cards.js';
 import { BLOCK_METRES } from './world.js';
 import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
-import { terrainSampleTSL, terrainWhite } from './render.js';
+import { terrainSampleTSL, terrainWhite, terrainLayerTSL } from './render.js';
 import { METAL_F0 } from './materials.js';
 import { MIRROR_VEC4S, MIRROR_SUN_BIT } from './mirrors.js';
+import { VOXEL_AO_MIN } from './voxelao.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
 
@@ -1043,6 +1044,49 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
     const b = select(length(bent).greaterThan(float(1e-4)), normalize(bent), n);
     return { vis: v, gi: lpv ? gi : null, bent: b.toVar() };
   };
+}
+
+// The terrain's AO for its PLAIN material - the one it wears with shadows off:
+// the static voxel AO of voxelao.js, this is its shader mirror. No field, no
+// marches: eight occupancy reads from the block-material volume, at the texel
+// centre so it stays one answer per texel. A float for the material's aoNode,
+// which in three's lighting darkens the ambient only, not the sun.
+// cards: the sun's card bindings, for the sprites' contact discs on the
+// ground (createSpriteAOTSL) - analytic, no marches. Null until they load.
+export function createVoxelAONode(terrain, cards = null) {
+  const vol = terrain.blocks;
+  const spriteAO = createSpriteAOTSL(cards);
+  return Fn(() => {
+    const n = axisNormalTSL(normalWorld).toVar();
+    const p = texelLockTSL(positionWorld, n).toVar();
+    const block = boxFaceTSL(p, n).block.toVar();
+    // The face's two tangent axes, and where the texel sits along each, 0..1.
+    const t1 = select(abs(n.x).greaterThan(float(0.5)), vec3(0, 1, 0), vec3(1, 0, 0)).toVar();
+    const t2 = select(abs(n.z).greaterThan(float(0.5)), vec3(0, 1, 0), vec3(0, 0, 1)).toVar();
+    const l = p.div(float(BLOCK_METRES)).sub(block).toVar();
+    const a = l.dot(t1).add(float(0.5)), b = l.dot(t2).add(float(0.5));
+    // Occupancy in the layer in front of the face; off the volume is air.
+    const front = block.add(n).toVar();
+    const occ = (i, j) => {
+      const uvw = front.add(t1.mul(float(i))).add(t2.mul(float(j)))
+        .sub(vol.origin).add(float(0.5)).div(vol.size);
+      const inside = uvw.x.greaterThan(float(0)).and(uvw.y.greaterThan(float(0)))
+        .and(uvw.z.greaterThan(float(0))).and(uvw.x.lessThan(float(1)))
+        .and(uvw.y.lessThan(float(1))).and(uvw.z.lessThan(float(1)));
+      const filled = texture3D(vol.tex, uvw).level(int(0)).r.greaterThan(float(0.5 / 255));
+      return select(inside.and(filled), float(1), float(0)).toVar();
+    };
+    const e = { l: occ(-1, 0), r: occ(1, 0), d: occ(0, -1), u: occ(0, 1) };
+    const corner = (s1, s2, c) => select(s1.mul(s2).greaterThan(float(0.5)), float(0),
+                                         float(3).sub(s1.add(s2).add(c)).div(float(3)));
+    const c00 = corner(e.l, e.d, occ(-1, -1)), c10 = corner(e.r, e.d, occ(1, -1));
+    const c01 = corner(e.l, e.u, occ(-1, 1)), c11 = corner(e.r, e.u, occ(1, 1));
+    const v = mix(mix(c00, c10, a), mix(c01, c11, a), b);
+    const st = boxFaceTSL(p, n).st;
+    const texAO = texture(terrain.normal, st).depth(terrainLayerTSL()).b;
+    const ao = float(VOXEL_AO_MIN).add(float(1 - VOXEL_AO_MIN).mul(v)).mul(texAO);
+    return spriteAO ? ao.mul(spriteAO(p, vec2(1e9, 1e9))) : ao;
+  })();
 }
 
 // --- Sprite contact AO: a soft disc under each sprite ---
@@ -2237,6 +2281,96 @@ function uploadStrips(renderer, tex, grid, rects) {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Texel-rate shading: the terrain shaded once per texel, not once per pixel
+//
+// Everything the terrain shades is texel-locked - one texel, one answer - so
+// every pixel inside a texel runs the identical marches and gets the identical
+// colour. At play zoom a 12.5 cm texel covers many pixels; profiling put the
+// torch, the mirrors and the reflection at ~3 ms of the frame, almost all of
+// it repeats.
+//
+// So the terrain is drawn twice:
+//
+//   1  a LOW-RES pass (1/scale per axis) with the full shading, writing
+//      vec4(colour, texel id) to a float target. Each low-res pixel is one
+//      sample of whatever texel lies under it.
+//   2  the normal full-res pass, which for each pixel computes only its own
+//      texel id (cheap: the lock and a hash), and takes the colour of the
+//      first sample in the 3x3 around it with the same id. Only a pixel with
+//      no matching sample - a texel smaller than the sample spacing, at a far
+//      zoom or a grazing angle - shades itself, in full.
+//
+// Nothing is approximated: a match means the sample's texel IS this pixel's
+// texel, and a texel's colour is the same everywhere in it, bit for bit. No
+// atlas, no paging, no invalidation - the cache is rebuilt every frame, so it
+// is always the current frame's answer.
+//
+// The id is the world texel coordinate, each axis mod 128, plus the face (6):
+// 7 + 7 + 7 + 3 bits, exact as a float. It only has to tell apart the handful
+// of texels in a 3x3 window of samples, which are never 16 m apart.
+// Offset by 2 so no id is 0 (cleared) or 1 (the sky's alpha).
+export const TEXEL_ID_OFFSET = 2;
+export const texelIdTSL = (p, n) => {
+  // Half a texel inside the face, so the along-normal floor is not taken on
+  // the plane itself.
+  const t = p.sub(n.mul(float(VOXEL_METRES * 0.5))).div(float(VOXEL_METRES)).floor();
+  const wrap = v => v.sub(floor(v.div(float(128))).mul(float(128)));
+  const face = select(abs(n.x).greaterThan(float(0.5)), select(n.x.greaterThan(float(0)), float(0), float(1)),
+               select(abs(n.y).greaterThan(float(0.5)), select(n.y.greaterThan(float(0)), float(2), float(3)),
+                      select(n.z.greaterThan(float(0)), float(4), float(5))));
+  return wrap(t.x).add(wrap(t.y).mul(float(128))).add(wrap(t.z).mul(float(16384)))
+    .add(face.mul(float(2097152))).add(float(TEXEL_ID_OFFSET));
+};
+// This terrain fragment's texel id - the same lock the shading takes.
+export const terrainTexelIdTSL = () => {
+  const n = axisNormalTSL(normalWorld).toVar();
+  const p = texelLockTSL(positionWorld, n);
+  return texelIdTSL(p, n);
+};
+
+// The low-res pass's output: the full shading and the texel it belongs to.
+export function createTexelCacheWriteNode(shade) {
+  return vec4(shade, terrainTexelIdTSL());
+}
+
+// The full-res lookup. cache: { tex, scale (vec2 low/full), size (vec2 low) }.
+//
+// A pixel with no matching sample is DISCARDED here, not shaded: the full
+// shading lives in a separate miss pass (createTexelMissNode), drawn after,
+// where a stencil test keeps it off every pixel this pass filled. It cannot
+// live in a branch of this shader - measured, a never-taken branch holding the
+// full shading cost 2.5 ms of 3.5, because a GPU sizes a shader's registers for
+// its worst path, and every pixel then runs with that fewer in flight.
+const TEXEL_CACHE_TAPS = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1],
+                          [1, 1], [-1, 1], [1, -1], [-1, -1]];
+export function createTexelCacheLookupNode(cache) {
+  return Fn(() => {
+    const id = terrainTexelIdTSL().toVar();
+    const lc = floor(screenCoordinate.xy.mul(cache.scale)).toVar();
+    const hi = cache.size.sub(float(1));
+    const out = vec3(0, 0, 0).toVar();
+    const found = float(0).toVar();
+    // Unrolled on purpose: nine loads, the centre first, each skipped once a
+    // match is in hand.
+    for (const [dx, dy] of TEXEL_CACHE_TAPS) {
+      If(found.equal(float(0)), () => {
+        const c = clamp(lc.add(vec2(dx, dy)), vec2(0, 0), hi);
+        const s = textureLoad(cache.tex, ivec2(c)).toVar();
+        If(s.w.equal(id), () => { out.assign(s.xyz); found.assign(float(1)); });
+      });
+    }
+    If(found.equal(float(0)), () => { Discard(); });
+    return out;
+  })();
+}
+
+// The miss pass's colour: the full shading - or, in the miss view, red, so
+// which pixels shade themselves can be seen.
+export function createTexelMissNode(cache, shade) {
+  return cache.showMisses ? vec3(1, 0, 0) : shade;
 }
 
 // Swaps the terrain to a node material whose colour is its own albedo modulated

@@ -60,5 +60,12 @@ const all = packMirrors(rects, { x: 5 * BLOCK_METRES, y: 0, z: 14 * BLOCK_METRES
                         { dir: [0, 1, 0], on: true });
 truthy('mirrors facing up the sun are packed', all > 0);
 ok('nearest first - the floor under the point', out[0], 1);
+const lit = { dir: [0, 1, 0], on: true };
+ok('an area holding the bed packs as before',
+   packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, lit, [],
+               { minX: 0, maxX: 20, minZ: 10, maxZ: 30 }), all);
+ok('an area far from it packs nothing',
+   packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, lit, [],
+               { minX: 100, maxX: 136, minZ: 100, maxZ: 136 }), 0);
 ok('nothing lit, nothing packed',
    packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, { dir: [0, 1, 0], on: false }, []), 0);
