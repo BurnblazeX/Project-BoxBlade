@@ -280,9 +280,11 @@ export function coneTraceSample(grid, p, n, sunDirection, {
 
 // --- The texel lock, mirrored from texelLockTSL ---
 //
-// The shading position, snapped to the centre of the world texel it falls in,
-// across the face only - the component along the normal is left exact, because
-// rounding that would move the origin off the surface the bias is measured from.
+// The shading position, snapped to the centre of the world texel it falls in
+// across the face, and onto the face plane along the normal. n is axis-exact.
+// Faces lie on voxel boundaries, so rounding along the normal lands exactly ON
+// the surface - it used to keep the interpolated value, which drifts per pixel
+// by a rounding error and let one texel's fragments disagree.
 //
 // This is what makes a shadow a property of the SURFACE rather than of the
 // screen: every fragment inside one 12.5 cm texel marches the identical ray, so
@@ -290,10 +292,9 @@ export function coneTraceSample(grid, p, n, sunDirection, {
 // stays painted on the ground under any camera. It is the whole of what the
 // texel atlas was for, without the atlas.
 export function texelLock(p, n, q = VOXEL_METRES) {
-  const snap = (v, axis) => {
-    const a = Math.abs(axis);
-    return Math.floor(v / q) * q + q * 0.5 + (v - (Math.floor(v / q) * q + q * 0.5)) * a;
-  };
+  const snap = (v, axis) => (Math.abs(axis) > 0.5
+    ? Math.round(v / q) * q
+    : Math.floor(v / q) * q + q * 0.5);
   return { x: snap(p.x, n.x), y: snap(p.y, n.y), z: snap(p.z, n.z) };
 }
 

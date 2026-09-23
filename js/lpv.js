@@ -155,3 +155,50 @@ export function averageAlbedo(rgba) {
   }
   return n ? { r: r / n, g: g / n, b: b / n } : { r: 0.5, g: 0.5, b: 0.5 };
 }
+
+// What a block material bounces DIFFUSELY: its mean albedo over the texels
+// that are not metal (LabPBR specular green >= 230), times the fraction that
+// is not. A metal has no diffuse term - its colour is all reflection - so an
+// iron floor bounces almost nothing, and marble bounces its own dark grey.
+// specRgba null means no _s texture: all dielectric.
+export function diffuseAlbedo(rgba, specRgba = null) {
+  const lin = c => {
+    const v = c / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  let r = 0, g = 0, b = 0, n = 0, total = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    if (rgba[i + 3] < 128) continue;
+    total++;
+    if (specRgba && specRgba[i + 1] >= 230) continue;
+    r += lin(rgba[i]); g += lin(rgba[i + 1]); b += lin(rgba[i + 2]); n++;
+  }
+  if (!total) return { r: 0.5, g: 0.5, b: 0.5 };
+  // The mean of the dielectric texels, weighted by how much of the surface
+  // they are: n / total. Written out, that is their sum over the total.
+  return { r: r / total, g: g / total, b: b / total };
+}
+
+// --- Sprites in the LPV ---
+//
+// Sprites are not in the field, so the LPV cannot see them the way it sees the
+// terrain. Each goes in as a lit box instead - its quad's width square, its
+// height tall - which both INJECTS (its bounce colour, into the cells the box
+// overlaps) and OCCLUDES (partial solidity in those cells, so light crossing a
+// crowd is dimmed). fill is how much of that box counts: the sprite is a flat
+// card, mostly air, so its opaque fraction times SPRITE_GI_FILL.
+export const MAX_GI_SPRITES = 16;
+export const SPRITE_GI_FILL = 0.5;
+
+// The overlap of a cell (min corner, side) with an axis-aligned box (centre,
+// half extents), as a fraction of the cell's volume. The CPU mirror of the
+// kernel's test.
+export function boxCellOverlap(cellMin, side, centre, half) {
+  let f = 1;
+  for (let a = 0; a < 3; a++) {
+    const lo = Math.max(cellMin[a], centre[a] - half[a]);
+    const hi = Math.min(cellMin[a] + side, centre[a] + half[a]);
+    f *= Math.max(0, hi - lo) / side;
+  }
+  return f;
+}

@@ -1,7 +1,7 @@
 import { file, section, ok, near, truthy, falsy, note } from './lib/harness.mjs';
 import { createCard, cardDistance, cardFacingFor, cardVisibility,
          cardsVisibility, buildCardAtlas, packCardInstances,
-         cullCardsForLight, CARD_PAD, CARD_RANGE,
+         cullCardsForLight, cardPixelAt, CARD_PAD, CARD_RANGE,
          CARD_LOD_C0_METRES, CARD_LOD_LEVELS, SUN_CARD_LOD_SHIFT,
          SUN_CARD_LOD_MAX } from '../js/cards.js';
 import { VOXEL_METRES, CASCADE_COUNT } from '../js/boxgrid.js';
@@ -164,6 +164,32 @@ const probeY = CARD_PAD + 1;
 near('a stored byte decodes to the distance it was built from',
      decodeDistance(atlas.data[probeY * atlas.width + probeX], CARD_RANGE),
      card.dt[probeY * card.w + (CARD_PAD + 1)], 0.05);
+
+section('the colour atlas shares the distance atlas layout');
+{
+  // A 2x3 sprite, each pixel a distinct red so its position can be read back.
+  const rgba = new Uint8Array(2 * 3 * 4);
+  for (let i = 0; i < 6; i++) rgba.set([i * 40 + 10, 0, 0, 255], i * 4);
+  const coloured = createCard({ mask: new Uint8Array(6).fill(1), w: 2, h: 3,
+                                widthMetres: 2 * MPP, heightMetres: 3 * MPP, rgba });
+  const at = buildCardAtlas([card, coloured]);
+  ok('colour is RGBA over the same size', at.colour.length, at.width * at.height * 4);
+  const r = at.rects[1];
+  const px = (col, row) => at.colour[((r.y + CARD_PAD + row) * at.width + r.x + CARD_PAD + col) * 4];
+  ok('top-left pixel lands at rect + pad', px(0, 0), 10);
+  ok('bottom-right pixel lands where its mask does', px(1, 2), 5 * 40 + 10);
+  ok('the pad is transparent', at.colour[((r.y + 1) * at.width + r.x + 1) * 4 + 3], 0);
+  ok('a card with no rgba leaves its rect transparent',
+     at.colour[((at.rects[0].y + CARD_PAD) * at.width + at.rects[0].x + CARD_PAD) * 4 + 3], 0);
+
+  // Card-local metres to the sprite pixel: centre-origin, b up, row 0 at the top.
+  const pa = (col, row) => cardPixelAt(coloured, (col + 0.5 - 1) * MPP, (1.5 - row - 0.5) * MPP);
+  ok('pixel (0, 0) is the top-left', pa(0, 0).join(), '0,0');
+  ok('pixel (1, 2) is the bottom-right', pa(1, 2).join(), '1,2');
+  ok('flipped, the columns swap',
+     cardPixelAt(coloured, -0.5 * MPP, 0, true).join(), cardPixelAt(coloured, 0.5 * MPP, 0).join());
+  ok('off the card is null', cardPixelAt(coloured, 5 * MPP, 0), null);
+}
 
 section('instances pack to four vec4 each');
 

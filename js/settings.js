@@ -84,6 +84,13 @@ export function createSettingsPanel({ groups, title = 'Debug settings', parent =
   const head = document.createElement('div');
   head.className = 'sp-head';
   head.innerHTML = `<span>${title}</span><span class="sp-hint">drag · dbl-click resets · Alt+V</span>`;
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'sp-close';
+  closeBtn.title = 'Close (Esc)';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', () => close());
+  head.appendChild(closeBtn);
   el.appendChild(head);
 
   // --- Dragging, by the header ---
@@ -102,7 +109,9 @@ export function createSettingsPanel({ groups, title = 'Debug settings', parent =
   let placed = loadPosition();
   let drag = null;
   head.addEventListener('pointerdown', e => {
-    if (e.button !== 0) return;
+    // The close button lives in the header; pressing it must not start a drag,
+    // or pointer capture would steal its click.
+    if (e.button !== 0 || closeBtn.contains(e.target)) return;
     const r = el.getBoundingClientRect();
     drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, id: e.pointerId };
     head.setPointerCapture(e.pointerId);
@@ -122,7 +131,8 @@ export function createSettingsPanel({ groups, title = 'Debug settings', parent =
   head.addEventListener('pointerup', endDrag);
   head.addEventListener('pointercancel', endDrag);
   // Double-click the header to send it back to the corner.
-  head.addEventListener('dblclick', () => {
+  head.addEventListener('dblclick', e => {
+    if (closeBtn.contains(e.target)) return;
     placed = null;
     el.style.left = el.style.top = el.style.right = '';
     try { localStorage.removeItem(POS_KEY); } catch { /* private window */ }

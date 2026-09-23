@@ -25,7 +25,9 @@ import { encodeDistance } from './boxgrid.js';
 // is comfortably past where the falloff has reached 1.
 export const CARD_PAD = 8;
 
-export function createCard({ mask, w, h, widthMetres, heightMetres }) {
+// rgba (optional): the sprite's own pixels, top-down, w x h. Only reflections
+// need it - a reflection ray that lands on a card reads its colour.
+export function createCard({ mask, w, h, widthMetres, heightMetres, rgba = null }) {
   const pw = w + CARD_PAD * 2, ph = h + CARD_PAD * 2;
   const padded = new Uint8Array(pw * ph);
   for (let y = 0; y < h; y++) {
@@ -36,7 +38,7 @@ export function createCard({ mask, w, h, widthMetres, heightMetres }) {
   return {
     dt: signedDistanceTransform(padded, pw, ph),
     w: pw, h: ph, cols: w, rows: h,
-    widthMetres, heightMetres,
+    widthMetres, heightMetres, rgba,
     // Native sprite resolution, NOT reduced to any voxel size. That reduction is
     // what a baked silhouette needs and what made it cascade-dependent; an
     // analytic card has no grid to match.
@@ -66,6 +68,19 @@ export function cardDistance(card, a, b, flip = false) {
   const top = card.dt[ra + xa] + (card.dt[ra + xb] - card.dt[ra + xa]) * tx;
   const bot = card.dt[rb + xa] + (card.dt[rb + xb] - card.dt[rb + xa]) * tx;
   return (top + (bot - top) * ty) * mpp;
+}
+
+// The sprite pixel at card-local (a, b) metres, as [column, row] of the
+// sprite image (row 0 at the top), or null off the sprite. What a reflection
+// ray that crossed the card's plane there sees - nearest, because the art is
+// pixel art. Same mapping as cardDistance, minus the pad and the filter; the
+// TSL hit test in gpu.js (createCardHitTSL) mirrors this.
+export function cardPixelAt(card, a, b, flip = false) {
+  const mpp = card.metresPerPixel;
+  const col = Math.floor((flip ? -a : a) / mpp + card.cols / 2);
+  const row = Math.floor(card.rows / 2 - b / mpp);
+  if (col < 0 || col >= card.cols || row < 0 || row >= card.rows) return null;
+  return [col, row];
 }
 
 // The card's orientation for a given light, as its width direction in XZ.
@@ -241,7 +256,9 @@ export const CARD_RANGE = CARD_PAD;
 export function buildCardAtlas(cards) {
   let width = 0, height = 0;
   for (const c of cards) { width += c.w; height = Math.max(height, c.h); }
-  if (width === 0) return { data: new Uint8Array(1), width: 1, height: 1, rects: [] };
+  if (width === 0) {
+    return { data: new Uint8Array(1), colour: new Uint8Array(4), width: 1, height: 1, rects: [] };
+  }
 
   const data = new Uint8Array(width * height);
   // FAR, not zero. Cards shorter than the atlas leave rows unwritten, and an
@@ -249,6 +266,10 @@ export function buildCardAtlas(cards) {
   // filtering reaches those texels from the edge of a short card, so the default
   // has to mean "nothing near", which is 255.
   data.fill(255);
+  // The sprites' colour, same layout: each at its rect's origin plus CARD_PAD,
+  // the offset its mask sits at in the distance transform - so one rect and
+  // one pixel mapping address both. Transparent wherever there is no sprite.
+  const colour = new Uint8Array(width * height * 4);
   const rects = [];
   let x = 0;
   for (const c of cards) {
@@ -257,10 +278,16 @@ export function buildCardAtlas(cards) {
         data[y * width + x + i] = encodeDistance(c.dt[y * c.w + i], CARD_RANGE);
       }
     }
+    if (c.rgba) {
+      for (let y = 0; y < c.rows; y++) {
+        const row = c.rgba.subarray(y * c.cols * 4, (y + 1) * c.cols * 4);
+        colour.set(row, ((y + CARD_PAD) * width + x + CARD_PAD) * 4);
+      }
+    }
     rects.push({ x, y: 0, w: c.w, h: c.h });
     x += c.w;
   }
-  return { data, width, height, rects };
+  return { data, colour, width, height, rects };
 }
 
 // Four vec4 per card instance, flat, ready for a uniform array.

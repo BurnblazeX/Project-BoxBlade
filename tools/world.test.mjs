@@ -15,7 +15,15 @@ ok('chunk is 12 levels tall', CHUNK_HEIGHT, 12);
 ok('authorable span is -3..8', `${Y_MIN}..${Y_MAX}`, '-3..8');
 
 section('generation - surface only, no sandbox fill');
-ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16);
+ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16 + 14 + 12);
+
+section('reflection test bed');
+ok('floor patch is iron plate', World.get('5,0,14').materialId, 'ironPlate');
+ok('its wall is marble', World.get('5,2,17').materialId, 'marble');
+ok('ordinary ground is grass', World.get('20,0,20').materialId, 'grass');
+truthy('the iron floor is walkable', isStandable(5, 0, 14));
+ok('iron plates stand either side', `${World.get('1,1,15').materialId},${World.get('9,2,15').materialId}`,
+   'ironPlate,ironPlate');
 truthy('nothing generated below ground', [...World.keys()].every(k => Number(k.split(',')[1]) >= 0));
 
 section('standability is derived, not stored');

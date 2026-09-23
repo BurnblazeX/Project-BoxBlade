@@ -7,7 +7,7 @@ import {
   coneTraceSample, GOLDEN_ANGLE,
   fadeWeight, SHADOW_FADE_START, EDGE_FADE_VOXELS,
   sunShade, DEFAULT_AMBIENT, GROUND_REFERENCE_FLOOR,
-  BAYER4, bayer4, quantiseShadow, worldTexelIndex
+  BAYER4, bayer4, quantiseShadow, worldTexelIndex, texelLock
 } from '../js/sun.js';
 
 file('sun.test.mjs - the marched cone and its distance-based softening');
@@ -763,4 +763,20 @@ section('the range limit, stated rather than hidden');
        `${(reach * Math.tan(EL)).toFixed(1)} m tall`);
   truthy('the footprint is smaller than the 12 m march cap on the diagonal',
     Math.hypot(reach, reach) > 12);
+}
+
+section('texel lock: one texel, one position, bit for bit');
+{
+  // Two fragments of the same ground texel, their interpolated y off by a
+  // rounding error either way - the drift that let a texel reflect bands.
+  const up = { x: 0, y: 1, z: 0 };
+  const a = texelLock({ x: 1.01, y: 0.75 - 1e-7, z: 2.02 }, up);
+  const b = texelLock({ x: 1.12, y: 0.75 + 1e-7, z: 2.11 }, up);
+  ok('same texel, identical x', a.x, b.x);
+  ok('same texel, identical y (on the face plane)', a.y, b.y);
+  ok('same texel, identical z', a.z, b.z);
+  ok('y is exactly the face', a.y, 0.75);
+  near('x is the texel centre', a.x, 1.0625, 1e-12);
+  const side = texelLock({ x: 3.75 + 2e-7, y: 1.3, z: 0.4 }, { x: 1, y: 0, z: 0 });
+  ok('a wall face snaps onto its plane', side.x, 3.75);
 }

@@ -2,7 +2,8 @@ import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { GRID_DIM, VOXEL_METRES } from '../js/boxgrid.js';
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, LPV_CELL_METRES, LPV_EXTENT_METRES,
-  cellIndex, cellCoords, propagateStep, lpvShift, shiftVolume, averageAlbedo
+  cellIndex, cellCoords, propagateStep, lpvShift, shiftVolume, averageAlbedo,
+  diffuseAlbedo, boxCellOverlap
 } from '../js/lpv.js';
 
 file('lpv.test.mjs - the light propagation volume, CPU reference');
@@ -92,3 +93,23 @@ section('albedo from a texture');
   truthy('sRGB mid-grey linearises dark', averageAlbedo(new Uint8Array([128, 128, 128, 255])).r < 0.25);
 }
 ok('cell count', LPV_CELLS, 13824);
+
+section('diffuse albedo per material');
+{
+  // Two texels, one mid grey dielectric and one metal: only the dielectric
+  // bounces, weighted by the half of the surface it is.
+  const rgba = new Uint8Array([188, 188, 188, 255, 188, 188, 188, 255]);
+  const all = diffuseAlbedo(rgba);
+  const half = diffuseAlbedo(rgba, new Uint8Array([0, 10, 0, 255, 240, 230, 0, 255]));
+  near('no _s: the plain mean', all.r, averageAlbedo(rgba).r, 1e-9);
+  near('half metal bounces half', half.r, all.r / 2, 1e-9);
+  ok('all metal bounces nothing',
+     diffuseAlbedo(rgba, new Uint8Array([240, 230, 0, 255, 240, 230, 0, 255])).g, 0);
+}
+
+section('sprite box overlap');
+{
+  near('a box covering the cell fills it', boxCellOverlap([0, 0, 0], 1, [0.5, 0.5, 0.5], [1, 1, 1]), 1, 1e-9);
+  near('half in x', boxCellOverlap([0, 0, 0], 1, [0, 0.5, 0.5], [0.5, 1, 1]), 0.5, 1e-9);
+  ok('clear of the cell is zero', boxCellOverlap([0, 0, 0], 1, [3, 0.5, 0.5], [0.5, 0.5, 0.5]), 0);
+}

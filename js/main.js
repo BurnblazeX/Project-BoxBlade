@@ -1,8 +1,9 @@
 import * as THREE from 'three/webgpu';
-import { uniform } from 'three/tsl';
+import { uniform, mix, vec3, positionWorldDirection } from 'three/tsl';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid } from './world.js';
 import { createObject, rollLootTable } from './objects.js';
-import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap } from './render.js';
+import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
+         terrainTextures, terrainWhite, terrainSampleTSL } from './render.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
@@ -10,7 +11,13 @@ import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          VOXEL_METRES, applyHandoff } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
-import { createCardBindings, createCardAtlasTexture, writeCardBindings,
+import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
+         createMirrorBindings, writeMirrorBindings } from './gpu.js';
+import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS } from './mirrors.js';
+import { MATERIALS } from './materials.js';
+import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
+         DEFAULT_SKY_HOUR } from './sky.js';
+import { createCardBindings, createCardAtlasTexture, createCardColourTexture, writeCardBindings,
          runGPUCards, MAX_CARDS, createLightBindings,
          writeLightBindings } from './gpu.js';
 import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
@@ -27,17 +34,18 @@ import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
          pointPenumbraMetres, MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY,
          liveLights, packLight, parseColour, DEFAULT_SHADOW_BUDGET,
          DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight,
-         DEFAULT_CARD_BUDGET } from './lights.js';
+         DEFAULT_CARD_BUDGET, LIGHT_VEC4S } from './lights.js';
 import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
 import { maskFromRGBA, createSilhouetteSet, facingToward,
          AXIS_X, AXIS_Z } from './silhouette.js';
 import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
          cullCardsForLight, cardsVisibility, CARD_PAD, SUN_CARD_LOD_SHIFT,
          SUN_CARD_LOD_MAX } from './cards.js';
-import { spriteNormals, terrainNormals } from './normals.js';
+import { spriteNormals } from './normals.js';
 import { createConsole, installConsole } from './console.js';
 import { createSettingsPanel } from './settings.js';
 import { createLPV } from './gi.js';
+import { diffuseAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
 import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS,
          DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS } from './lpv.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
@@ -111,6 +119,8 @@ const inputRules = {
 
 // --- SCENE SETUP ---
 const scene = new THREE.Scene();
+// The background is the sky (sky.js): the same L2 SH the ambient and the
+// reflection misses read, at the view direction. Built below, with the sky.
 scene.background = new THREE.Color(0x222233);
 
 // WebGPU, not WebGL: the texel-space shading architecture needs compute shaders
@@ -146,7 +156,8 @@ const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
 // ~23 degrees elevation. The old (10,20,10) was ~55 degrees, which put the sun
 // nearly overhead and left every shadow hidden under the block casting it.
 // A low sun is also what makes voxel shadow blockiness legible.
-dirLight.position.set(10, 6, 10);
+// Where the clock puts the sun at the starting hour - see bxb.time.
+dirLight.position.set(...sunForHour(DEFAULT_SKY_HOUR));
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
@@ -305,24 +316,13 @@ function normalMapFor(name, generate) {
   return createNormalTexture(data, w, h);
 }
 
-// The grass texture's normals, once its image has loaded. Polled like the
-// cards, for the same reason (Texture has no load event).
-let terrainNormalTex = null;
 // The grass texture's mean colour, linear - what the terrain bounces into the
-// LPV until the material system gives each block its own albedo.
+// LPV until the material system gives each block its own albedo. Layer 0 of
+// the terrain arrays (render.js); polled, like the cards, until it has loaded.
 let terrainAlbedo = null;
-function resolveTerrainNormal() {
-  if (terrainNormalTex || !worldInstancedMesh) return false;
-  const base = worldInstancedMesh.userData.originalMaterial || worldInstancedMesh.material;
-  const map = base.userData.albedoMap !== undefined ? base.userData.albedoMap : base.map;
-  const img = map && map.image;
-  if (!img || !img.width) return false;
-  terrainAlbedo = averageAlbedo(imageRGBA(img));
-  terrainNormalTex = normalMapFor('terrain_grass', () => ({
-    data: terrainNormals(imageRGBA(img), img.width, img.height),
-    w: img.width, h: img.height
-  }));
-  return true;
+function resolveTerrainAlbedo() {
+  if (terrainAlbedo || !terrainTextures.rgba[0]) return;
+  terrainAlbedo = averageAlbedo(terrainTextures.rgba[0]);
 }
 
 // Textures load asynchronously, so a silhouette cannot be built at module scope.
@@ -455,9 +455,11 @@ function resolveCards() {
     // Per sprite, so one unreadable texture cannot take the rest down with it -
     // and so the reason is reported rather than surfacing as "still loading"
     // forever, which is what it looked like.
-    let mask, w, h;
+    let mask, w, h, rgba;
     try {
-      ({ mask, w, h } = maskFromTexture(img));
+      rgba = imageRGBA(img);
+      w = img.width; h = img.height;
+      mask = maskFromRGBA(rgba, w, h);
     } catch (err) {
       p.error = String(err && err.message || err);
       continue;
@@ -468,7 +470,7 @@ function resolveCards() {
     let solid = 0;
     for (let k = 0; k < mask.length; k++) solid += mask[k];
     p.coverage = solid / mask.length;
-    p.card = createCard({ mask, w, h,
+    p.card = createCard({ mask, w, h, rgba,
                           widthMetres: p.widthMetres, heightMetres: p.heightMetres });
     // From the card's own distance transform: the silhouette the shadow uses
     // is the silhouette the bevel follows.
@@ -558,6 +560,10 @@ function activeProxies() {
 // one orientation. The sun has its own buffer; the point lights share one, each
 // owning the slice its light-list row points at.
 let sunCards = null, lightCards = null;
+// A third set, for reflections: every sprite turned the way its billboard is
+// drawn, toward the camera's heading, with the sprites' colour atlas beside the
+// silhouette one. A reflection ray that crosses one of these sees the sprite.
+let viewCards = null;
 let cardPack = null;
 let cardsReady = false;
 
@@ -567,6 +573,7 @@ function ensureCardBindings() {
   sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
   sunCards.lodMax.value = SUN_CARD_LOD_MAX;
   lightCards = createCardBindings(POINT_CARD_CAPACITY);
+  viewCards = createCardBindings(MAX_CARDS);
   cardPack = new Float32Array(POINT_CARD_CAPACITY * 16);
 }
 
@@ -617,16 +624,19 @@ function cardLod(centre) {
 }
 
 function updateCards() {
-  if (resolveTerrainNormal() && shadowsOn) buildPerPixelShadows();
+  resolveTerrainAlbedo();
   if (pendingCards.length && resolveCards()) {
     // The atlas exists now where it did not before, and the kernel branches on
     // whether there is one - so the material has to be rebuilt once. A one-frame
     // hitch on load, and nothing afterwards.
     cardAtlasTex = createCardAtlasTexture(cardAtlas);
     ensureCardBindings();
-    sunCards.atlas = lightCards.atlas = cardAtlasTex;
-    sunCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
-    lightCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
+    sunCards.atlas = lightCards.atlas = viewCards.atlas = cardAtlasTex;
+    if (viewCards.colour) viewCards.colour.dispose();
+    viewCards.colour = createCardColourTexture(cardAtlas);
+    for (const b of [sunCards, lightCards, viewCards]) {
+      b.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
+    }
     cardsReady = true;
     if (shadowsOn) { buildPerPixelShadows(); }
   }
@@ -636,6 +646,15 @@ function updateCards() {
   // The sun is directional: its "position" is a direction, and everything is
   // within reach of it.
   lastCardCount = writeCardsFor(sunCards, casters, dirLight.position, Infinity, true);
+  // The view cards: the direction from the pivot to the camera IS the way the
+  // billboards face (rotation.y = heading), so every card takes it. Nearest the
+  // camera first, so the cap drops the sprites least likely to be seen.
+  const near = cullCardsForLight(casters, camera.position, Infinity, viewCards.capacity);
+  const facing = facingToward(camera.position.x - pivot.position.x,
+                              camera.position.z - pivot.position.z);
+  for (const c of near) c.facing = facing;
+  writeCardBindings(viewCards, cardPack,
+                    packCardInstances(near, cardAtlas, cardPack, viewCards.capacity));
   // The point lights' cards are packed with the light list, in updateLights -
   // after the torch has moved this frame rather than before.
   frameCasters = casters;
@@ -1464,11 +1483,10 @@ window.addEventListener('pointermove', (e) => {
   }
 });
 
-// Whiteworld strips the terrain's albedo by clearing the map on the ORIGINAL
-// material - applyShadowMaterial reads its albedo from there, so the shadowed
-// path picks it up on rebuild and the unshadowed path picks it up directly.
+// Whiteworld draws the terrain plain white. One uniform, read by both the plain
+// and the shadowed terrain materials (render.js), so toggling it is a write.
 let whiteWorld = false;
-const whiteUniform = uniform(0);
+const whiteUniform = terrainWhite;
 // The GI-only view draws on whiteworld too: the receiving surface goes white so
 // the bounce reads as the colour it is. What the terrain INJECTS is still its
 // real texture's albedo (terrainAlbedo), so green grass still bounces green.
@@ -1476,16 +1494,17 @@ function syncWhite() {
   whiteUniform.value = whiteWorld || giOnly ? 1 : 0;
 }
 function toggleWhiteWorld() {
-  const mesh = worldInstancedMesh;
-  if (!mesh) return 'no terrain yet';
-  const base = mesh.userData.originalMaterial || mesh.material;
-  if (base.userData.albedoMap === undefined) base.userData.albedoMap = base.map;
   whiteWorld = !whiteWorld;
-  base.map = whiteWorld ? null : base.userData.albedoMap;
-  base.needsUpdate = true;
-  // The shadowed material reads this as a uniform, so no rebuild.
   syncWhite();
   return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
+}
+
+async function enableProfilingSetup() {
+  const out = [];
+  if (!perf.visible) out.push(bxbApi.perf());
+  if (!sunCone) out.push(await bxbApi.soften('cone'));
+  if (!shadowsOn) out.push(await bxbApi.shadows());
+  console.log(out.length ? out.join('\n') : 'frame graph, cone trace and marched shadows already on');
 }
 
 let settingsPanel = null;   // built after the console, below
@@ -1566,6 +1585,15 @@ if (key === 'escape' && isDialogueOpen) {
 
   if (keyState.hasOwnProperty(key)) {
     keyState[key] = true;
+  }
+
+  // R: the profiling setup in one press - the frame graph, then the cone-traced
+  // sun, then the marched shadows, in that order, so the shadows build once
+  // with the cone already chosen. It only ever turns things ON: pressing it
+  // again with everything up does nothing.
+  if (key === 'r' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+    enableProfilingSetup();
+    return;
   }
 
   // T: the torch. A held light is the thing the marched field is for - it moves
@@ -1914,6 +1942,7 @@ function animate(time) {
   // The sun's cards. The point lights' are packed in updateLights below, after
   // the torch has moved, so they face where the flame IS this frame.
   if (shadowsOn) updateCards();
+  updateSky();
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
   // remembered boxes into the new coordinates - so running this first would
@@ -1921,6 +1950,8 @@ function animate(time) {
   if (shadowsOn) updateOccluders();
   updateTorchPosition();
   if (shadowsOn) updateLights();
+  // After the light list: the mirrors are culled against where the lights are now.
+  updateMirrors();
   if (shadowsOn) updateGI();
 
   const tRender = performance.now();
@@ -1940,9 +1971,13 @@ let gpuTimePending = false;
 function resolveGPUTime() {
   if (gpuTimePending || !renderer.backend.trackTimestamp) return;
   gpuTimePending = true;
-  renderer.resolveTimestampsAsync('render').then(ms => {
+  // Render and compute (the LPV) are separate query pools; both resolved, so
+  // compute queries do not pile up either.
+  Promise.all([renderer.resolveTimestampsAsync('render'),
+               renderer.resolveTimestampsAsync('compute')]).then(([ms, cms]) => {
     gpuTimePending = false;
     if (typeof ms === 'number') perf.gpu(ms);
+    if (typeof cms === 'number') perf.gpuCompute(cms);
   }, () => { gpuTimePending = false; });
 }
 
@@ -2107,6 +2142,41 @@ let shadowOnly = false; // raw visibility, no albedo or N.L, for judging artifac
 let aoOn = true;
 let aoOnly = false;
 const aoDistance = uniform(AO_DISTANCE);
+// View: the terrain's raw LabPBR specular texel in place of the lit colour.
+// Compiled in, like the other views.
+let specularOnly = false;
+// Specular (gpu.js section 7): GGX highlights from every light, and one
+// reflection ray per texel on smooth surfaces. Both compiled in. The sky is
+// what a ray that leaves the field sees - the background, as a uniform.
+let specularOn = true;
+let reflectionsOn = true;
+// --- The sky (sky.js) ---
+//
+// An authored gradient on a clock, projected to L2 SH whenever the hour or the
+// sun moves, and uploaded as one uniform. The ambient reads it at each texel's
+// bent normal, the background and reflection misses at their direction.
+// bxb.time(h) sets the clock and moves the sun along its arc; bxb.sun still
+// places the sun freely, and the sky's sun glow follows wherever it is.
+const skyBindings = createSkyBindings();
+const SKY_GAIN = skyAmbientGain();
+let skyHour = DEFAULT_SKY_HOUR;
+let skyKey = '';
+function updateSky() {
+  const d = dirLight.position.clone().normalize();
+  const key = `${skyHour.toFixed(3)}|${d.x.toFixed(4)},${d.y.toFixed(4)},${d.z.toFixed(4)}`;
+  if (key === skyKey) return;
+  skyKey = key;
+  const pal = skyPalette(skyHour);
+  const sunDir = [d.x, d.y, d.z];
+  writeSkyBindings(skyBindings, projectSH(dir => skyRadiance(pal, dir, sunDir)), SKY_GAIN);
+  // The sun's own light, from the same keys. The plain (unshadowed) path's
+  // DirectionalLight follows it too, at its own intensity.
+  const [r, g, b] = sunLight(pal, sunDir);
+  sunColourUniform.value.setRGB(r, g, b);
+  dirLight.color.setRGB(r, g, b);
+}
+updateSky();
+scene.backgroundNode = skyShTSL(skyBindings, positionWorldDirection);
 
 // --- GI: the LPV (lpv.js, gi.js) ---
 //
@@ -2133,7 +2203,9 @@ function ensureLPV() {
   for (let level = 0; level < LPV_LEVELS; level++) {
     lpvs.push(createLPV({ cascades: shadowCascades, lights: ensureLightBindings(), level,
                           biasUniform: sunBias, fadeStartUniform: sunFadeStart,
-                          edgeFadeUniform: sunEdgeFade }));
+                          edgeFadeUniform: sunEdgeFade,
+                          sky: skyBindings, ambientUniform: sunAmbient,
+                          blocks: terrainTextures.blocks }));
   }
   return lpvs;
 }
@@ -2142,12 +2214,85 @@ function giBinding() {
   return { levels: lpvs.map(v => v.binding), strength: giStrength };
 }
 
+// --- Mirrors (mirrors.js): reflected sunlight ---
+//
+// The reflective surfaces as rectangles, built once the specular textures are
+// in (which materials reflect is read off their _s), packed nearest the player
+// first. The shader gathers the sun off them onto whatever faces the mirrored
+// sun. A kernel flag, so toggling rebuilds; the rectangles are uniforms.
+// --- Performance ---
+//
+// giFarHalf: the C1 GI volume (1.5 m cells, the far bounce) updates every
+// other frame. Its contents are coarse and slow-changing; the lag is two
+// frames instead of one, which nothing that far away shows.
+let giFarHalf = true;
+let giFrame = 0;
+let mirrorsOn = true;
+let mirrorOnly = false;   // the view: mirror light alone
+let mirrorRects = null;
+const mirrorBindings = createMirrorBindings(MAX_MIRRORS);
+const mirrorPack = new Float32Array(MAX_MIRRORS * 16);
+function updateMirrors() {
+  if (!mirrorRects) {
+    if (!terrainTextures.ready) return;
+    const reflective = new Set(MATERIALS.filter((m, l) => isReflective(terrainTextures.specRgba[l]))
+                                        .map(m => m.id));
+    mirrorRects = buildMirrors(World, reflective);
+  }
+  // Culled to what each mirror can reflect THIS frame: the sun if it faces
+  // it, and the lights that reach it - read back from the light list the
+  // shader sees. See mirrors.js mirrorReach.
+  const d = dirLight.position.clone().normalize();
+  const sunLive = sunOn && (sunColourUniform.value.r + sunColourUniform.value.g
+                            + sunColourUniform.value.b) > 0;
+  const lights = [];
+  const lb = ensureLightBindings();
+  for (let i = 0; i < lb.count.value; i++) {
+    const A = lb.data.array[i * LIGHT_VEC4S];
+    lights.push({ x: A.x, y: A.y, z: A.z, radius: A.w * VOXEL_SIZE });
+  }
+  const n = packMirrors(mirrorRects, playerSprite.position, mirrorPack, MAX_MIRRORS,
+                        { dir: [d.x, d.y, d.z], on: sunLive }, lights);
+  writeMirrorBindings(mirrorBindings, mirrorPack, n);
+}
+
+// Each material's diffuse albedo, once its textures are in (lpv.js
+// diffuseAlbedo) - what a probe landing on that block bounces. null until then.
+let layerAlbedos = null;
+function resolveLayerAlbedos() {
+  if (layerAlbedos || !terrainTextures.ready) return;
+  layerAlbedos = terrainTextures.rgba.map((rgba, l) =>
+    (rgba ? diffuseAlbedo(rgba, terrainTextures.specRgba[l]) : { r: 0.5, g: 0.5, b: 0.5 }));
+}
+
+// The sprites the LPV sees this frame (lpv.js, "Sprites in the LPV"): every
+// card caster, as a lit box - its quad's width square and its height tall -
+// with its texture's mean albedo and a fill of its opaque fraction. The card
+// casters are the sprites that cast shadows, so the same set bounces light.
+function packGISprites(u) {
+  const list = frameCasters || [];
+  const n = Math.min(list.length, MAX_GI_SPRITES);
+  for (let i = 0; i < n; i++) {
+    const c = list[i], t = cardTypes[c.typeIndex];
+    if (!t.albedo) t.albedo = t.card.rgba ? averageAlbedo(t.card.rgba) : { r: 0.5, g: 0.5, b: 0.5 };
+    u.sprites.array[i * 2].set(c.centre.x, c.centre.y, c.centre.z, t.widthMetres / 2);
+    u.sprites.array[i * 2 + 1].set(t.albedo.r, t.albedo.g, t.albedo.b, t.heightMetres / 2);
+    u.spriteFill.array[i] = (t.coverage ?? 0.5) * SPRITE_GI_FILL;
+  }
+  u.spriteCount.value = n;
+}
+
 // One frame of GI, per volume: follow its cascade, then solid / inject /
 // propagate / resolve.
 function updateGI() {
   if (!giOn || !lpvs) return;
   const t0 = performance.now();
+  resolveLayerAlbedos();
+  giFrame++;
   for (const v of lpvs) {
+    // lpvOrigins is only written when a volume updates, so a skipped frame
+    // cannot lose a re-origin: the next update sees the move.
+    if (giFarHalf && v.level > 0 && (giFrame & 1)) continue;
     const o = shadowCascades[v.level].origin.value;
     const at = { x: o.x, y: o.y, z: o.z };
     const was = lpvOrigins[v.level];
@@ -2160,6 +2305,11 @@ function updateGI() {
     const u = v.uniforms;
     u.origin.value.set(at.x, at.y, at.z);
     if (terrainAlbedo) u.albedo.value.set(terrainAlbedo.r, terrainAlbedo.g, terrainAlbedo.b);
+    if (layerAlbedos) {
+      layerAlbedos.forEach((a, l) => u.layerAlbedo.array[l].set(a.r, a.g, a.b, 0));
+    }
+    u.skyGain.value = SKY_GAIN;
+    packGISprites(u);
     u.sunGain.value = sunOn ? 1 : 0;
     u.spread.value = lpvSpread;
     v.slices = lpvSlices;
@@ -2533,12 +2683,18 @@ function buildPerPixelShadows() {
     // is for.
     cards: cardsReady && cardsOn ? sunCards : null,
     lightCards: cardsReady && cardsOn ? lightCards : null,
-    terrainNormal: terrainNormalTex,
+    terrain: terrainTextures, specularOnly,
+    albedo: st => mix(terrainSampleTSL(terrainTextures.albedo, st).rgb, vec3(1, 1, 1), whiteUniform),
+    specular: specularOn, reflections: reflectionsOn,
+    sky: skyBindings,
+    mirrors: mirrorsOn ? mirrorBindings : null, mirrorOnly,
+    viewCards: cardsReady && cardsOn ? viewCards : null,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
     gi: giOn && ensureLPV() ? giBinding() : null, giOnly
   });
   shadowSun = sun;
-  const terrainMat = createShadowMaterial(worldInstancedMesh, node, whiteUniform);
+  // The node applies the albedo itself - specular adds after it, not under it.
+  const terrainMat = createShadowMaterial(worldInstancedMesh, node);
   const sprites = buildSpriteShadows(spriteLight);
   const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
   const id = ++shadowBuild;
@@ -2964,6 +3120,49 @@ const bxbApi = installConsole(createConsole({
              `${aoOnly ? ' - showing the AO term alone (white open, black occluded)' : ''}`;
     }
   },
+  gifar: {
+    help: 'update the far (C1) GI volume every other frame',
+    run: () => {
+      giFarHalf = !giFarHalf;
+      return `far GI volume ${giFarHalf ? 'every other frame' : 'every frame'}`;
+    }
+  },
+  mirrors: {
+    help: 'reflected sunlight: polished surfaces throw the sun onto what faces them. ' +
+          '"only" views it alone',
+    usage: "bxb.mirrors()  toggles  |  bxb.mirrors('only')",
+    run: (a = null) => {
+      if (a === 'only') {
+        mirrorOnly = !mirrorOnly;
+        if (mirrorOnly) mirrorsOn = true;
+      } else mirrorsOn = !mirrorsOn;
+      if (shadowsOn) buildPerPixelShadows();
+      return `mirror light ${mirrorsOn ? 'on' : 'off'}` +
+             (mirrorRects ? ` - ${mirrorRects.length} mirror rectangles` : ' - textures still loading');
+    }
+  },
+  spec: {
+    help: 'specular: GGX highlights and reflections. bxb.spec() toggles both, ' +
+          "bxb.spec('reflect') just the reflection ray",
+    run: (a = null) => {
+      if (a === 'reflect') reflectionsOn = !reflectionsOn;
+      else specularOn = a === null ? !specularOn : !!a;
+      if (!shadowsOn) return 'run bxb.shadows() first';
+      buildPerPixelShadows();
+      return `specular ${specularOn ? 'on' : 'off'}, reflections ` +
+             `${specularOn && reflectionsOn ? 'on' : 'off'}`;
+    }
+  },
+  specular: {
+    help: "view the terrain's LabPBR specular map in place of the lit colour (R smoothness, G F0/metal, B porosity/SSS)",
+    run: () => {
+      specularOnly = !specularOnly;
+      if (!shadowsOn) return 'run bxb.shadows() first';
+      buildPerPixelShadows();
+      return `specular view ${specularOnly ? 'on - red smoothness, green F0 (230+ metal), ' +
+             'blue porosity/SSS' : 'off'}`;
+    }
+  },
   shadowonly: {
     help: 'show the raw sun visibility term with no albedo or N.L, to judge artifacts',
     run: async () => {
@@ -3172,6 +3371,29 @@ const bxbApi = installConsole(createConsole({
              `and not the ray, so this is independent of sun angle.`;
     }
   },
+  internals: {
+    help: 'live references for profiling from the console: card bindings, trees, scene',
+    run: () => ({ scene, renderer, sunCards, lightCards, viewCards, treeMeshes,
+                  playerSprite, enemySprite, perf })
+  },
+  gpu: {
+    help: 'average GPU ms over the last frames (render, compute), for profiling. ' +
+          'bxb.gpu(true) resets the window first and waits for it to refill',
+    usage: 'bxb.gpu()  |  await bxb.gpu(true, 120)',
+    run: async (reset = false, frames = 120) => {
+      if (!perf.visible) perf.toggle();
+      if (reset) {
+        perf.resetGPU();
+        await new Promise(r => setTimeout(r, 200));   // let in-flight resolves land
+        perf.resetGPU();
+        while (perf.gpuStats().render.count < frames) await new Promise(r => setTimeout(r, 50));
+      }
+      const { render, compute } = perf.gpuStats();
+      const f = x => +x.toFixed(3);
+      return { render: f(render.avg), renderP95: f(render.p95), compute: f(compute.avg),
+               total: f(render.avg + compute.avg), frames: render.count };
+    }
+  },
   perf: {
     help: 'toggle the frame time graph',
     run: () => perf.toggle() ? 'perf graph on' : 'perf graph off'
@@ -3240,6 +3462,20 @@ const bxbApi = installConsole(createConsole({
     run: (x, y, z) => bxbLight(x, y, z) +
       (shadowsOn ? '' : ' (run bxb.shadows() to see it)')
   },
+  time: {
+    help: 'time of day in hours: sets the sky palette and moves the sun along its arc. ' +
+          'bxb.time(h, false) changes only the sky',
+    usage: 'bxb.time(17.5)  |  bxb.time(17.5, false)',
+    run: (h = 12, moveSun = true) => {
+      skyHour = ((Number(h) % 24) + 24) % 24;
+      if (moveSun) {
+        const [x, y, z] = sunForHour(skyHour);
+        bxbLight(x, y, z);
+      }
+      updateSky();
+      return `time ${skyHour.toFixed(2)}h${moveSun ? ', sun moved' : ''}`;
+    }
+  },
   sun: {
     help: 'set the sun by angle - elevation 15-25 gives long readable shadows',
     usage: 'bxb.sun(azimuthDeg, elevationDeg)',
@@ -3267,6 +3503,9 @@ const flip = (now, want, fn) => (!!now === !!want ? undefined : fn());
 
 settingsPanel = createSettingsPanel({ groups: [
   { title: 'Perf', settings: [
+    { key: 'gifar', label: 'Far GI every 2nd frame', type: 'toggle',
+      help: 'the C1 LPV volume updates at half rate',
+      get: () => giFarHalf, set: v => flip(giFarHalf, v, () => bxbApi.gifar()) },
     { key: 'budget', label: 'Shadowed lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
       help: 'how many point lights get a shadow march; the rest light unshadowed',
       get: () => shadowBudget, set: v => bxbApi.shadowbudget(v) },
@@ -3333,8 +3572,28 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => aoDistance.value, set: v => bxbApi.ao(null, v) },
     { key: 'aoonly', label: 'View: AO only', type: 'toggle',
       get: () => aoOnly, set: v => flip(aoOnly, v, () => bxbApi.ao('only')) },
+    { key: 'spec', label: 'Specular highlights', type: 'toggle',
+      help: 'GGX from the sun and every light, off the LabPBR _s maps',
+      get: () => specularOn, set: v => bxbApi.spec(!!v) },
+    { key: 'reflect', label: 'Reflections', type: 'toggle',
+      help: 'one ray per texel on smooth surfaces, shading what it hits',
+      get: () => reflectionsOn, set: v => flip(reflectionsOn, v, () => bxbApi.spec('reflect')) },
+    { key: 'mirrors', label: 'Mirror light', type: 'toggle',
+      help: 'polished surfaces throw reflected sunlight onto what faces them',
+      get: () => mirrorsOn, set: v => flip(mirrorsOn, v, () => bxbApi.mirrors()) },
+    { key: 'mirroronly', label: 'View: mirror light only', type: 'toggle',
+      help: 'the reflected sunlight alone, raw - not part of the GI bounce view',
+      get: () => mirrorOnly, set: v => flip(mirrorOnly, v, () => bxbApi.mirrors('only')) },
+    { key: 'specview', label: 'View: specular (LabPBR)', type: 'toggle',
+      help: 'the _s map raw: red smoothness, green F0 (230+ is metal), blue porosity/SSS',
+      get: () => specularOnly, set: v => flip(specularOnly, v, () => bxbApi.specular()) },
     { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
       get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) }
+  ]},
+  { title: 'Sky', settings: [
+    { key: 'time', label: 'Time of day (h)', type: 'range', min: 0, max: 24, step: 0.25,
+      help: 'palette on the clock; moves the sun along its arc',
+      get: () => skyHour, set: v => bxbApi.time(v) }
   ]},
   { title: 'GI', settings: [
     { key: 'gi', label: 'Bounce light (LPV)', type: 'toggle',
@@ -3405,6 +3664,15 @@ settingsPanel = createSettingsPanel({ groups: [
       run: () => JSON.stringify(bxbApi.stats()) }
   ]}
 ]});
+
+// The top-bar Debug button: same toggle as Alt+V. It sits outside every HUD
+// layer, so Alt+U leaves it visible. Pointer events stop here so a click never
+// also walks Bob to the terrain under the button.
+const debugBtn = document.getElementById('btn-debug');
+for (const ev of ['pointerdown', 'pointerup', 'click']) {
+  debugBtn.addEventListener(ev, e => e.stopPropagation());
+}
+debugBtn.addEventListener('click', () => { settingsPanel.toggle(); debugBtn.blur(); });
 
 // setAnimationLoop instead of a manual requestAnimationFrame chain: WebGPURenderer
 // needs an async device/adapter init before the first frame, and setAnimationLoop

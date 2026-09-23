@@ -6,7 +6,8 @@ import {
   attribute, varying, vec2, vec4, ivec2, textureStore, min,
   normalize, cross, clamp, cos, sin, smoothstep, length, log2,
   uniformArray, int, dot, select, dFdx, dFdy, textureSize, mix,
-  modelWorldMatrix, materialColor, inverseSqrt, frontFacing, sign, sqrt, fract, exp2
+  modelWorldMatrix, materialColor, inverseSqrt, frontFacing, sign, sqrt, fract, exp2,
+  cameraPosition, pow, round, reflect
 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE,
          gridIndex, ringSegments, ringSegmentsZ, CASCADE_COUNT,
@@ -18,6 +19,9 @@ import { CARD_RANGE, CARD_PAD, CARD_FADE_START,
          CARD_SUN_REACH } from './cards.js';
 import { BLOCK_METRES } from './world.js';
 import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
+import { terrainSampleTSL, terrainWhite } from './render.js';
+import { METAL_F0 } from './materials.js';
+import { MIRROR_VEC4S, MIRROR_SUN_BIT } from './mirrors.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
 
@@ -158,6 +162,56 @@ export function writeCascadeBindings(b, grid) {
 // footprint edge would otherwise filter in the far side of the ring - real data,
 // but from 18 m away - which sparkled in penumbrae as terrain crossed the edge.
 // This is exactly what clamp-to-edge did before the ring.
+// --- Real shader functions, not inlined copies ---
+//
+// A TSL Fn WITHOUT a layout is pasted inline at every call site. The march
+// helpers are called from many places - the sun, every light, reflection
+// hits, the mirrors, sprites - so the terrain shader held about ten copies of
+// the cascade walk, each three step loops, and compiling it froze the game for
+// tens of seconds. With setLayout each is ONE WGSL function, emitted once per
+// shader and called. Names must be unique per shader, hence the counter; and
+// the per-cascade ones are memoised, so every caller shares one function.
+//
+// PER SHADER, NOT PER BACKEND. three caches a layout function's generated
+// WGSL per backend, keyed by the function node, and hands that same text to
+// every shader that calls it. That is right for its own layout functions,
+// which are pure maths; ours read uniforms and textures (the cascades, the
+// cards, the light list), and the text names them as the FIRST shader to build
+// it did - so every other shader got "no definition for nodeUniform2". The
+// body is built by whichever builder calls it (flowShaderNode), registering
+// its uniforms there correctly, so the fix is only the cache: functions whose
+// layout carries perShader are cached per builder instead.
+const perBuilderFns = new WeakMap();
+const baseBuildFunctionNode = THREE.NodeBuilder.prototype.buildFunctionNode;
+THREE.NodeBuilder.prototype.buildFunctionNode = function (shaderNode) {
+  if (!(shaderNode.layout && shaderNode.layout.perShader)) {
+    return baseBuildFunctionNode.call(this, shaderNode);
+  }
+  let fns = perBuilderFns.get(this);
+  if (!fns) perBuilderFns.set(this, fns = new Map());
+  let fn = fns.get(shaderNode);
+  if (!fn) {
+    fn = new THREE.FunctionNode();
+    const previous = this.currentFunctionNode;
+    this.currentFunctionNode = fn;
+    fn.code = this.buildFunctionCode(shaderNode);
+    this.currentFunctionNode = previous;
+    fns.set(shaderNode, fn);
+  }
+  return fn;
+};
+
+let fnSerial = 0;
+const fnName = base => `${base}_${fnSerial++}`;
+// Every layout here goes through this: a unique name, and per-shader caching.
+const layout = (base, type, inputs) => ({ name: fnName(base), type, inputs, perShader: true });
+const perCascades = new WeakMap();
+function memoCascades(cascades, key, make) {
+  if (!perCascades.has(cascades)) perCascades.set(cascades, {});
+  const m = perCascades.get(cascades);
+  return m[key] || (m[key] = make());
+}
+
 export const ringUV = Fn(([vp, ring]) => {
   const dim = float(GRID_DIM);
   return clamp(vp, vec3(0.5, 0.5, 0.5), vec3(dim.sub(0.5))).add(ring).div(dim);
@@ -345,7 +399,7 @@ const levelLive = (i, skipC0, done) =>
   i === 0 && skipC0 ? done.equal(float(0)).and(skipC0.not()) : done.equal(float(0));
 
 export function createConeTraceSunTSL(cascades) {
-  return Fn(([origin0, dir0, maxDist, coneR, fadeStart, edgeFade]) => {
+  return memoCascades(cascades, 'cone', () => Fn(([origin0, dir0, maxDist, coneR, fadeStart, edgeFade]) => {
     // Pinned: both are reused across passes and levels - see the cone path in
     // createSoftSunTSL for what an unpinned shared node does here.
     const origin = origin0.toVar(), dir = dir0.toVar();
@@ -405,7 +459,10 @@ export function createConeTraceSunTSL(cascades) {
     // that to decide whether the answer is worth storing. See the atlas kernel.
     return vec2(clamp(res, float(0), float(1)), done);
     });
-  });
+  }).setLayout(layout('coneTrace', 'vec2', [
+    { name: 'origin0', type: 'vec3' }, { name: 'dir0', type: 'vec3' },
+    { name: 'maxDist', type: 'float' }, { name: 'coneR', type: 'float' },
+    { name: 'fadeStart', type: 'float' }, { name: 'edgeFade', type: 'float' }])));
 }
 
 // The sampled path's trace. Identical in structure, but returns how much this ray
@@ -415,7 +472,7 @@ export function createConeTraceSunTSL(cascades) {
 // against the CPU sphere trace, and a hit test that sometimes returns 0.6 is not
 // a hit test any more.
 export function createShadowTraceTSL(cascades) {
-  return Fn(([origin0, dir0, maxDist, fadeStart, edgeFade]) => {
+  return memoCascades(cascades, 'shadow', () => Fn(([origin0, dir0, maxDist, fadeStart, edgeFade]) => {
     const origin = origin0.toVar(), dir = dir0.toVar();
     return seamBlend(cascades, origin, skipC0 => {
     const dim = float(GRID_DIM);
@@ -448,7 +505,10 @@ export function createShadowTraceTSL(cascades) {
 
     return vec2(occ, done);
     });
-  });
+  }).setLayout(layout('shadowTrace', 'vec2', [
+    { name: 'origin0', type: 'vec3' }, { name: 'dir0', type: 'vec3' },
+    { name: 'maxDist', type: 'float' }, { name: 'fadeStart', type: 'float' },
+    { name: 'edgeFade', type: 'float' }])));
 }
 
 // ---------------------------------------------------------------------------
@@ -662,100 +722,182 @@ export function createCardsTSL(b, { ranged = false } = {}) {
           const rx = C.x, ry = C.y, rw = C.z, rh = C.w;
           const hw = B.z, hh = B.w;
 
-          // Signed distance to the silhouette at card-local (sa, sb), metres.
-          const distAt = (sa, sb) => {
-            // Card-local metres to atlas pixels, then to UV. CARD_PAD is the
-            // margin the falloff grows into; past it the border value already
-            // reads as fully clear.
-            const pu = sa.div(mpp).add(cols.mul(float(0.5))).add(float(CARD_PAD));
-            const pv = rows.mul(float(0.5)).sub(sb.div(mpp)).add(float(CARD_PAD));
-            // Inset by half a texel on every side. Bilinear filtering samples the
-            // four texels AROUND the coordinate, so clamping to the rect edge
-            // still reaches one texel outside it - into the neighbouring card, or
-            // into the unwritten rows below a short one. That bleed is what put
-            // spurious solid bands across the ground.
-            const su = clamp(pu, float(0.5), rw.sub(float(0.5)));
-            const sv = clamp(pv, float(0.5), rh.sub(float(0.5)));
-            const uvp = vec2(rx.add(su).div(b.atlasSize.x),
-                             ry.add(sv).div(b.atlasSize.y));
-            // Same decode as the boxGrid's, because it is the same encoding - one
-            // distance format in the renderer, not two that can drift.
-            const dPix = decodeFieldTSL(texture(b.atlas, uvp).r, float(CARD_RANGE));
-            // The transform saturates at CARD_PAD pixels, so far from the card it
-            // under-reports the distance and a wide cone reads shadow everywhere.
-            // The silhouette sits inside its own rectangle, so that rectangle's
-            // distance is a valid floor - exact far away, negative and ignored
-            // inside. See cardVisibility for the same step and why it is needed.
-            // Outside only: the rectangle distance is zero inside, and maxing
-            // against zero there would erase the negative distances that are the
-            // silhouette itself.
-            const dRect = length(vec2(max(abs(sa).sub(hw), float(0)),
-                                      max(abs(sb).sub(hh), float(0))));
-            const dtM = dPix.mul(mpp);
-            return select(dRect.greaterThan(float(0)), max(dtM, dRect), dtM);
-          };
+          // EARLY OUT, exact. The card's plane is infinite, so nearly every
+          // ray crosses it somewhere - usually metres off the card, where the
+          // answer is "fully lit" - and every such crossing used to read the
+          // silhouette texture anyway. That was the single largest cost in the
+          // frame (1.7 ms of 3.7 with the torch on, measured). The distance
+          // field is never less than the distance to the card's rectangle, less
+          // the largest cascade snap below; past the cone's radius plus that,
+          // the visibility is exactly 1. Skip it.
+          const outside = length(vec2(max(abs(a).sub(hw), float(0)),
+                                      max(abs(bH).sub(hh), float(0))));
+          const maxSnap = float(VOXEL_METRES).mul(exp2(b.lodMax));
+          If(outside.lessThanEqual(coneSlope.mul(t).add(maxSnap)), () => {
 
-          // CASCADE LOD - the card's resolution follows the level it stands in,
-          // as the terrain's does. lod is set per card on the CPU: its integer
-          // part is the level, its fraction how far into the band toward the
-          // next one. Past C0 the hit point is snapped to that level's voxel
-          // grid, so a distant sprite's shadow is as coarse as the ground's
-          // around it; across the band the two resolutions crossfade, and past
-          // the outermost level the card fades out as terrain shadows do.
-          const l0 = floor(lod), f = lod.sub(l0);
-          // Quality level: the cascade minus this light's shift, capped at its
-          // lodMax - see SUN_CARD_LOD_SHIFT in cards.js.
-          const quantum = l => {
-            const ql = clamp(l.sub(b.lodShift), float(0), b.lodMax);
-            return select(ql.lessThan(float(0.5)), float(0), float(VOXEL_METRES).mul(exp2(ql)));
-          };
-          const snap = (v, half, q) => select(q.greaterThan(float(0)),
-            v.add(half).div(q).floor().add(float(0.5)).mul(q).sub(half), v);
-          const q0 = quantum(l0), q1 = quantum(l0.add(float(1)));
-          const d = distAt(snap(a, hw, q0), snap(bH, hh, q0)).toVar();
-          const lastLevel = float(CASCADE_COUNT - 1);
-          // Only where the two resolutions actually differ - under the sun
-          // the C0/C1 band is full resolution on both sides.
-          If(f.greaterThan(float(0)).and(l0.lessThan(lastLevel)).and(q1.notEqual(q0)), () => {
-            d.assign(mix(d, distAt(snap(a, hw, q1), snap(bH, hh, q1)), f));
+            // Signed distance to the silhouette at card-local (sa, sb), metres.
+            const distAt = (sa, sb) => {
+              // Card-local metres to atlas pixels, then to UV. CARD_PAD is the
+              // margin the falloff grows into; past it the border value already
+              // reads as fully clear.
+              const pu = sa.div(mpp).add(cols.mul(float(0.5))).add(float(CARD_PAD));
+              const pv = rows.mul(float(0.5)).sub(sb.div(mpp)).add(float(CARD_PAD));
+              // Inset by half a texel on every side. Bilinear filtering samples the
+              // four texels AROUND the coordinate, so clamping to the rect edge
+              // still reaches one texel outside it - into the neighbouring card, or
+              // into the unwritten rows below a short one. That bleed is what put
+              // spurious solid bands across the ground.
+              const su = clamp(pu, float(0.5), rw.sub(float(0.5)));
+              const sv = clamp(pv, float(0.5), rh.sub(float(0.5)));
+              const uvp = vec2(rx.add(su).div(b.atlasSize.x),
+                               ry.add(sv).div(b.atlasSize.y));
+              // Same decode as the boxGrid's, because it is the same encoding - one
+              // distance format in the renderer, not two that can drift.
+              const dPix = decodeFieldTSL(texture(b.atlas, uvp).r, float(CARD_RANGE));
+              // The transform saturates at CARD_PAD pixels, so far from the card it
+              // under-reports the distance and a wide cone reads shadow everywhere.
+              // The silhouette sits inside its own rectangle, so that rectangle's
+              // distance is a valid floor - exact far away, negative and ignored
+              // inside. See cardVisibility for the same step and why it is needed.
+              // Outside only: the rectangle distance is zero inside, and maxing
+              // against zero there would erase the negative distances that are the
+              // silhouette itself.
+              const dRect = length(vec2(max(abs(sa).sub(hw), float(0)),
+                                        max(abs(sb).sub(hh), float(0))));
+              const dtM = dPix.mul(mpp);
+              return select(dRect.greaterThan(float(0)), max(dtM, dRect), dtM);
+            };
+
+            // CASCADE LOD - the card's resolution follows the level it stands in,
+            // as the terrain's does. lod is set per card on the CPU: its integer
+            // part is the level, its fraction how far into the band toward the
+            // next one. Past C0 the hit point is snapped to that level's voxel
+            // grid, so a distant sprite's shadow is as coarse as the ground's
+            // around it; across the band the two resolutions crossfade, and past
+            // the outermost level the card fades out as terrain shadows do.
+            const l0 = floor(lod), f = lod.sub(l0);
+            // Quality level: the cascade minus this light's shift, capped at its
+            // lodMax - see SUN_CARD_LOD_SHIFT in cards.js.
+            const quantum = l => {
+              const ql = clamp(l.sub(b.lodShift), float(0), b.lodMax);
+              return select(ql.lessThan(float(0.5)), float(0), float(VOXEL_METRES).mul(exp2(ql)));
+            };
+            const snap = (v, half, q) => select(q.greaterThan(float(0)),
+              v.add(half).div(q).floor().add(float(0.5)).mul(q).sub(half), v);
+            const q0 = quantum(l0), q1 = quantum(l0.add(float(1)));
+            const d = distAt(snap(a, hw, q0), snap(bH, hh, q0)).toVar();
+            const lastLevel = float(CASCADE_COUNT - 1);
+            // Only where the two resolutions actually differ - under the sun
+            // the C0/C1 band is full resolution on both sides.
+            If(f.greaterThan(float(0)).and(l0.lessThan(lastLevel)).and(q1.notEqual(q0)), () => {
+              d.assign(mix(d, distAt(snap(a, hw, q1), snap(bH, hh, q1)), f));
+            });
+            const lodFade = select(l0.greaterThanEqual(lastLevel), float(1).sub(f), float(1));
+
+            const r = coneSlope.mul(t);
+            // Hard when the cone has no width, otherwise d / (R*t) - the very
+            // expression createConeTraceSunTSL uses, so a card's penumbra and a
+            // wall's come from one formula rather than two that look alike.
+            const soft = clamp(d.div(max(r, float(1e-6))), float(0), float(1));
+            const hard = select(d.lessThan(float(0)), float(0), float(1));
+            const raw = select(r.greaterThan(float(0)), soft, hard);
+
+            // FADE, do not cut - the mirror of cardVisibility's tail, and the same
+            // reasoning as fadeWeightTSL. A card faces the light, so t is very
+            // nearly the distance from receiver to caster: the maxDist cap lands as
+            // a straight line across the ground and a tree's shadow simply stops
+            // along it, which reads as a diagonal slice cut out of the shadow.
+            const fade = float(1).sub(
+              smoothstep(maxDist.mul(float(CARD_FADE_START)), maxDist, t));
+            vis.mulAssign(float(1).sub(float(1).sub(raw).mul(fade).mul(lodFade)));
           });
-          const lodFade = select(l0.greaterThanEqual(lastLevel), float(1).sub(f), float(1));
-
-          const r = coneSlope.mul(t);
-          // Hard when the cone has no width, otherwise d / (R*t) - the very
-          // expression createConeTraceSunTSL uses, so a card's penumbra and a
-          // wall's come from one formula rather than two that look alike.
-          const soft = clamp(d.div(max(r, float(1e-6))), float(0), float(1));
-          const hard = select(d.lessThan(float(0)), float(0), float(1));
-          const raw = select(r.greaterThan(float(0)), soft, hard);
-
-          // FADE, do not cut - the mirror of cardVisibility's tail, and the same
-          // reasoning as fadeWeightTSL. A card faces the light, so t is very
-          // nearly the distance from receiver to caster: the maxDist cap lands as
-          // a straight line across the ground and a tree's shadow simply stops
-          // along it, which reads as a diagonal slice cut out of the shadow.
-          const fade = float(1).sub(
-            smoothstep(maxDist.mul(float(CARD_FADE_START)), maxDist, t));
-          vis.mulAssign(float(1).sub(float(1).sub(raw).mul(fade).mul(lodFade)));
         });
       });
     });
 
     return vis;
   };
+  const inputs = [
+    { name: 'rayFrom', type: 'vec3' }, { name: 'dir', type: 'vec3' },
+    { name: 'maxDist', type: 'float' }, { name: 'coneSlope', type: 'float' },
+    { name: 'skip', type: 'vec2' }];
   return ranged
-    ? Fn(([from, dir, maxDist, coneSlope, skip, start, end]) =>
-        body(from, dir, maxDist, coneSlope, skip, start, end))
-    : Fn(([from, dir, maxDist, coneSlope, skip]) =>
-        body(from, dir, maxDist, coneSlope, skip, int(0), b.count));
+    ? Fn(([rayFrom, dir, maxDist, coneSlope, skip, start, end]) =>
+        body(rayFrom, dir, maxDist, coneSlope, skip, start, end))
+      .setLayout(layout('cardsRanged', 'float', [...inputs, { name: 'start', type: 'int' }, { name: 'end', type: 'int' }]))
+    : Fn(([rayFrom, dir, maxDist, coneSlope, skip]) =>
+        body(rayFrom, dir, maxDist, coneSlope, skip, int(0), b.count))
+      .setLayout(layout('cards', 'float', inputs));
 }
 
+// The face normal, exactly on its axis. normalWorld is interpolated and
+// renormalised, so it is off-axis by a rounding error that varies by pixel;
+// the terrain is boxes, so its dominant axis IS the face.
+export const axisNormalTSL = Fn(([v]) => {
+  const a = abs(v).toVar();
+  const nx = a.x.greaterThanEqual(a.y).and(a.x.greaterThanEqual(a.z));
+  const ny = a.y.greaterThan(a.x).and(a.y.greaterThanEqual(a.z));
+  return select(nx, vec3(sign(v.x), 0, 0),
+                select(ny, vec3(0, sign(v.y), 0), vec3(0, 0, sign(v.z))));
+});
+
+// ONE TEXEL, ONE ANSWER - bit for bit. n must be axis-exact (axisNormalTSL):
+// across the face each coordinate snaps to its texel centre, and ALONG the
+// normal it snaps to the face plane itself, which is a voxel boundary (every
+// face of the terrain's boxes is). It used to keep the interpolated value
+// there, and that drifts by a rounding error from pixel to pixel - harmless to
+// a soft shadow, but a reflection ray started a hair differently marches a
+// long way and can land on a different voxel, so one texel reflected bands.
+// Every input is now computed from the same integers, so every fragment of a
+// texel gets the identical float.
 export const texelLockTSL = Fn(([p, n]) => {
   const q = float(VOXEL_METRES);
   const a = abs(n);
   const snapped = p.div(q).floor().add(float(0.5)).mul(q);
-  return snapped.mul(vec3(1, 1, 1).sub(a)).add(p.mul(a));
+  const plane = round(p.div(q)).mul(q);
+  return snapped.mul(vec3(1, 1, 1).sub(a)).add(plane.mul(a));
 });
+
+// --- The sky, as L2 SH (sky.js) ---
+//
+// Nine RGB coefficients, projected on the CPU each frame the sky changes, in
+// one uniform array. Everything that wants the sky evaluates this: the ambient
+// at the bent normal (irradiance), the background and reflection misses at a
+// direction (radiance). gain scales irradiance so the noon sky lights an
+// up-facing surface at exactly the ambient uniform - sky.js skyAmbientGain.
+// The sun's light colour and strength (sky.js sunLight), linear. Module-level,
+// so the shading pass and the LPV injection read the one value.
+export const sunColourUniform = uniform(new THREE.Color(1, 1, 1));
+
+export function createSkyBindings() {
+  return {
+    sh: uniformArray(new Array(9).fill(0).map(() => new THREE.Vector4()), 'vec4'),
+    gain: uniform(float(1))
+  };
+}
+export function writeSkyBindings(b, sh, gain) {
+  for (let i = 0; i < 9; i++) b.sh.array[i].set(sh[i][0], sh[i][1], sh[i][2], 0);
+  b.gain.value = gain;
+  return b;
+}
+// The mirror of evalSH in sky.js: same basis, same order, same band factors.
+export function skyShTSL(b, d, irradiance = false) {
+  const x = d.x, y = d.y, z = d.z;
+  const Y = [
+    float(0.282095),
+    y.mul(0.488603), z.mul(0.488603), x.mul(0.488603),
+    x.mul(y).mul(1.092548), y.mul(z).mul(1.092548), z.mul(z).mul(3).sub(1).mul(0.315392),
+    x.mul(z).mul(1.092548), x.mul(x).sub(y.mul(y)).mul(0.546274)
+  ];
+  const band = [1, 2 / 3, 2 / 3, 2 / 3, 1 / 4, 1 / 4, 1 / 4, 1 / 4, 1 / 4];
+  let out = null;
+  for (let i = 0; i < 9; i++) {
+    const k = irradiance ? band[i] : 1;
+    const term = b.sh.element(int(i)).xyz.mul(Y[i].mul(float(k)));
+    out = out ? out.add(term) : term;
+  }
+  return max(out, vec3(0, 0, 0));
+}
 
 // --- AO: cone-traced ambient occlusion (doc §6.2, the short band) ---
 //
@@ -780,7 +922,7 @@ const AO_TILT = Math.PI / 3;
 const AO_WEIGHT_UP = 0.25, AO_WEIGHT_SIDE = 0.15;
 
 function createAOConeTSL(cascades) {
-  return Fn(([origin, dir, maxDist, coneR]) => {
+  return memoCascades(cascades, 'ao', () => Fn(([origin, dir, maxDist, coneR]) => {
     const dim = float(GRID_DIM);
     // A voxel out, as the sun's cone: at t = 0 the cone has no width.
     const t = float(VOXEL_METRES).toVar();
@@ -808,7 +950,9 @@ function createAOConeTSL(cascades) {
     // x the occlusion; y how far the axis got, z whether it ended on a surface -
     // which is where the GI gather samples the LPV.
     return vec3(occ, min(t, maxDist), hit);
-  });
+  }).setLayout(layout('aoCone', 'vec3', [
+    { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' },
+    { name: 'maxDist', type: 'float' }, { name: 'coneR', type: 'float' }])));
 }
 
 // The GI volumes, sampled trilinearly at a world position. gi.levels holds one
@@ -852,31 +996,53 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
   const cone = createAOConeTSL(cascades);
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
   const R = float(AO_CONE_R);
-  return Fn(([p, n, lift, skip]) => {
+  // A plain function, called inline: it returns three things.
+  //   vis   the visibility, as before
+  //   gi    the gathered bounce (null without an lpv)
+  //   bent  the bent normal - the cone directions weighted by how open each
+  //         is. Where the left is blocked it leans right, so the sky ambient
+  //         read along it comes from the side that can actually see sky.
+  //         Free: the cones were marched anyway.
+  //
+  // A loop, not six unrolled copies, and its count is a node: `single` (a bool
+  // node, or null) drops it to the one cone along the normal, weighted 1, for
+  // shading LOD - see createShadowColorNode's lod.
+  return (p, n, lift, skip, single = null) => {
     const origin = p.add(lift.mul(bias.mul(float(VOXEL_METRES)))).toVar();
     const helper = select(abs(n.y).lessThan(float(0.999)), vec3(0, 1, 0), vec3(1, 0, 0));
     const T = normalize(cross(helper, n)).toVar();
     const B = cross(n, T).toVar();
     const vis = float(1).toVar();
     const gi = vec3(0, 0, 0).toVar();
-    for (let i = 0; i < AO_CONES; i++) {
-      const up = i === 0;
-      const phi = (i - 1) * (2 * Math.PI / 5);
-      const st = up ? 0 : Math.sin(AO_TILT), ct = up ? 1 : Math.cos(AO_TILT);
-      const dir = normalize(T.mul(float(st * Math.cos(phi))).add(B.mul(float(st * Math.sin(phi))))
-                            .add(n.mul(float(ct)))).toVar();
-      const w = float(up ? AO_WEIGHT_UP : AO_WEIGHT_SIDE);
+    const bent = vec3(0, 0, 0).toVar();
+    // single === true compiles the one-cone case in; a node selects at runtime.
+    const count = single === true ? int(1)
+      : single ? select(single, int(1), int(AO_CONES)) : int(AO_CONES);
+    Loop({ start: int(0), end: count, type: 'int', condition: '<', name: 'aoK' }, ({ aoK }) => {
+      // Cone 0 straight up the normal; 1-5 tilted AO_TILT, 72 degrees apart.
+      const up = aoK.equal(int(0));
+      const phi = float(aoK.sub(int(1))).mul(float(2 * Math.PI / 5));
+      const st = select(up, float(0), float(Math.sin(AO_TILT)));
+      const ct = select(up, float(1), float(Math.cos(AO_TILT)));
+      const dir = normalize(T.mul(st.mul(cos(phi))).add(B.mul(st.mul(sin(phi))))
+                            .add(n.mul(ct))).toVar();
+      const w0 = select(up, float(AO_WEIGHT_UP), float(AO_WEIGHT_SIDE));
+      const w = (single === true ? float(1)
+        : single ? select(single, float(1), w0) : w0).toVar();
       const r = cone(origin, dir, distance, R).toVar();
       vis.subAssign(r.x.mul(w));
+      bent.addAssign(dir.mul(float(1).sub(r.x).mul(w)));
       if (lpv) {
         const back = select(r.z.greaterThan(float(0)),
                             max(r.y.sub(float(LPV_CELL_METRES * 0.5)), float(0)), r.y);
         gi.addAssign(lpvSampleTSL(lpv, origin.add(dir.mul(back))).mul(w));
       }
-    }
+    });
     const v = clamp(vis, float(0), float(1));
-    return lpv ? vec4(gi, v) : v;
-  });
+    // Fully enclosed: no open direction, and the ambient is zero anyway.
+    const b = select(length(bent).greaterThan(float(1e-4)), normalize(bent), n);
+    return { vis: v, gi: lpv ? gi : null, bent: b.toVar() };
+  };
 }
 
 // --- Sprite contact AO: a soft disc under each sprite ---
@@ -988,6 +1154,31 @@ export const bumpedNormalTSL = Fn(([n, pos, st, t]) => {
   return normalize(T.mul(s).mul(t.x).add(B.mul(s).mul(t.y)).add(n.mul(t.z)));
 });
 
+// The same, for the terrain, with the frame read off the face instead of
+// reconstructed from derivatives. The terrain is axis-aligned boxes, so every
+// face's tangent (the way u runs) and bitangent (the way v runs) are known -
+// they are BoxGeometry's own uv layout, the table hitAlbedoTSL uses.
+//
+// Why not the derivative frame: bumpedNormalTSL scales T and B by the LONGER
+// of the two, so on a face seen at an angle - where u and v shrink on screen
+// by different amounts - the bent normal leans by a different amount along
+// each axis, and that changes with the view. Reflections, which follow the
+// normal, squished with the camera; and the derivatives are per 2x2 pixel
+// quad, so a texel's pixels did not even agree. This frame is exact and has
+// no view in it: one normal per texel, from any angle.
+//
+//   +x: T -z, B +y    -x: T +z, B +y
+//   +y: T +x, B -z    -y: T +x, B +z
+//   +z: T +x, B +y    -z: T -x, B +y
+export const boxBumpedNormalTSL = Fn(([n, t]) => {
+  const ax = abs(n.x).greaterThan(float(0.5));
+  const ay = abs(n.y).greaterThan(float(0.5));
+  const T = select(ax, vec3(0, 0, n.x.negate()),
+                   select(ay, vec3(1, 0, 0), vec3(n.z, 0, 0)));
+  const B = select(ay, vec3(0, 0, n.y.negate()), vec3(0, 1, 0));
+  return normalize(T.mul(t.x).add(B.mul(t.y)).add(n.mul(t.z)));
+});
+
 // Normal maps are data, not colour: no sRGB, nearest so each art texel has one
 // normal, repeat because block textures tile.
 export function createNormalTexture(data, w, h) {
@@ -996,6 +1187,278 @@ export function createNormalTexture(data, w, h) {
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.needsUpdate = true;
   return tex;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Specular (§6.3): LabPBR decode, GGX highlights, one reflection ray
+//
+// The terrain's specular texel (materials.js has the CPU mirror of the decode)
+// becomes three things per fragment:
+//
+//   highlights  GGX from the sun and every point light, taking the SAME
+//               visibility the diffuse term marched - no extra rays.
+//   reflection  one ray along reflect(-V, N), marched through the field like
+//               any shadow ray. Where it lands, the hit is shaded on the spot:
+//               its block's own texture (looked up in the block-material
+//               volume, render.js), the sun and the light list with their
+//               shadow marches, and the LPV bounce. Past the field, the sky.
+//   fresnel     Schlick, roughness-aware, weighting the reflection; the diffuse
+//               is scaled by what the reflection took, and metals have none.
+//
+// There is no surface-radiance grid yet (§7.4), so the hit is lit on the fly
+// rather than read from a cache. What that costs: one reflection march plus
+// one sun march per reflective fragment, and nothing for any other.
+//
+// Everything is evaluated at the texel-locked position, the view vector too,
+// so a highlight or a reflection lands in whole texels like the shadows do.
+// ---------------------------------------------------------------------------
+export const REFLECT_MAX_DISTANCE = 24;   // metres
+// Rough surfaces fall back from the ray to the ambient estimate over this
+// band of alpha (LabPBR roughness, (1 - smoothness)^2). Grass, at alpha 1,
+// never marches.
+export const REFLECT_ROUGH_START = 0.2;
+export const REFLECT_ROUGH_END = 0.45;
+// GGX with a near-zero alpha is a delta: a highlight one texel wide and
+// thousands bright, flickering in and out as the view moves. The sun is a disc,
+// not a point, so its highlight on a mirror is a disc too - this is that floor.
+export const SPEC_MIN_ALPHA = 0.03;
+// Past this a highlight is clipped white anyway; the cap keeps a torch against
+// polished metal from blooming into a flat white rectangle.
+export const SPEC_MAX = 4;
+
+// LabPBR specular texel (0-1 per channel) -> { alpha, f0, metal }.
+export function decodeSpecularTSL(s, albedo) {
+  const g = s.g.mul(float(255)).toVar();
+  const metal = select(g.greaterThanEqual(float(229.5)), float(1), float(0)).toVar();
+  // 230-237: the standard's predefined metals, F0 from materials.js's n/k table.
+  const idx = clamp(round(g.sub(float(230))), float(0), float(7)).toVar();
+  let table = vec3(...METAL_F0[7]);
+  for (let i = 6; i >= 0; i--) table = select(idx.equal(float(i)), vec3(...METAL_F0[i]), table);
+  // 238-255: some other metal - the albedo is its F0.
+  const metalF0 = select(g.greaterThanEqual(float(237.5)), albedo, table);
+  const f0 = select(metal.greaterThan(float(0.5)), metalF0, vec3(s.g, s.g, s.g)).toVar();
+  const rough = float(1).sub(s.r);
+  return { alpha: rough.mul(rough).toVar(), f0, metal };
+}
+
+// Fresnel for the reflection, Schlick with a roughness term: a rough surface's
+// grazing reflection does not climb all the way to white.
+function fresnelRoughTSL(f0, nv, alpha) {
+  const k = pow(float(1).sub(nv), float(5));
+  return f0.add(max(vec3(float(1).sub(alpha)), f0).sub(f0).mul(k));
+}
+
+// GGX + height-correlated Smith + Schlick, times N.L and PI - the scale the
+// diffuse is in here (albedo x light x N.L: a Lambert BRDF of albedo / PI with
+// the PI folded into the light). Returns a function of the light direction,
+// for the light loop to call per light.
+function specularTSL(n, v, alpha, f0) {
+  const a = max(alpha, float(SPEC_MIN_ALPHA));
+  const a2 = a.mul(a).toVar();
+  const nv = max(n.dot(v), float(1e-4)).toVar();
+  return l => {
+    const h = normalize(l.add(v));
+    const nl = max(n.dot(l), float(0));
+    const nh = max(n.dot(h), float(0));
+    const vh = max(v.dot(h), float(0));
+    const dd = nh.mul(nh).mul(a2.sub(float(1))).add(float(1));
+    const D = a2.div(float(Math.PI).mul(dd).mul(dd));
+    const vis = float(0.5).div(max(
+      nl.mul(sqrt(nv.mul(nv).mul(float(1).sub(a2)).add(a2)))
+        .add(nv.mul(sqrt(nl.mul(nl).mul(float(1).sub(a2)).add(a2)))), float(1e-5)));
+    const F = f0.add(vec3(1, 1, 1).sub(f0).mul(pow(float(1).sub(vh), float(5))));
+    return F.mul(D.mul(vis).mul(nl).mul(float(Math.PI)));
+  };
+}
+
+// The reflection march: finest level first, carrying t, like the shadow
+// traces - but it returns WHERE it stopped. vec4(face normal, t), t < 0 for a
+// miss (left the field or ran out of distance). The normal is the field's
+// gradient at the hit, snapped to its dominant axis: the terrain is boxes, so
+// that is the exact face, and the face is what picks the texture's uv.
+export function createReflectTraceTSL(cascades) {
+  return memoCascades(cascades, 'reflect', () => Fn(([origin0, dir0, maxDist]) => {
+    const origin = origin0.toVar(), dir = dir0.toVar();
+    const dim = float(GRID_DIM);
+    const t = float(0).toVar();
+    const done = float(0).toVar();
+    const out = vec4(0, 0, 0, -1).toVar();
+    for (const { c } of eachCascade(cascades, float(0))) {
+      If(done.equal(float(0)), () => {
+        Loop({ start: 0, end: MAX_TRACE_STEPS, type: 'int', condition: '<' }, () => {
+          const vp = origin.add(dir.mul(t)).sub(c.origin).div(c.voxel).toVar();
+          If(vp.x.lessThan(float(0)).or(vp.y.lessThan(float(0))).or(vp.z.lessThan(float(0)))
+             .or(vp.x.greaterThanEqual(dim)).or(vp.y.greaterThanEqual(dim))
+             .or(vp.z.greaterThanEqual(dim)), () => { Break(); });
+          const at = q => decodeFieldTSL(texture3D(c.tex, ringUV(q, c.ring)).r, c.range);
+          const d = at(vp).toVar();
+          If(d.lessThan(float(HIT_EPS)), () => {
+            const g = vec3(at(vp.add(vec3(1, 0, 0))).sub(at(vp.sub(vec3(1, 0, 0)))),
+                           at(vp.add(vec3(0, 1, 0))).sub(at(vp.sub(vec3(0, 1, 0)))),
+                           at(vp.add(vec3(0, 0, 1))).sub(at(vp.sub(vec3(0, 0, 1))))).toVar();
+            // Inside a solid the gradient can vanish; the ray came from the
+            // open side, so the face it met faces back along it.
+            g.assign(select(length(g).lessThan(float(1e-4)), dir.negate(), g));
+            const ag = abs(g).toVar();
+            const nx = ag.x.greaterThanEqual(ag.y).and(ag.x.greaterThanEqual(ag.z));
+            const ny = ag.y.greaterThan(ag.x).and(ag.y.greaterThanEqual(ag.z));
+            const face = select(nx, vec3(sign(g.x), 0, 0),
+                                select(ny, vec3(0, sign(g.y), 0), vec3(0, 0, sign(g.z))));
+            out.assign(vec4(face, t));
+            done.assign(float(1));
+            Break();
+          });
+          t.addAssign(max(d, float(MIN_STEP)).mul(c.voxel));
+          If(t.greaterThan(maxDist), () => { done.assign(float(1)); Break(); });
+        });
+      });
+    }
+    return out;
+  }).setLayout(layout('reflectTrace', 'vec4', [
+    { name: 'origin0', type: 'vec3' }, { name: 'dir0', type: 'vec3' },
+    { name: 'maxDist', type: 'float' }])));
+}
+
+// Which block a surface point belongs to, and its uv on that face - the uv
+// BoxGeometry itself gives that face (the table in boxBumpedNormalTSL), so a
+// texture read here matches the mesh's own. p on the face, n axis-exact.
+// { block: the block's grid coordinate, st: the face uv }.
+function boxFaceTSL(p, n) {
+  const block = round(p.sub(n.mul(float(VOXEL_METRES * 0.5))).div(float(BLOCK_METRES))).toVar();
+  const l = p.div(float(BLOCK_METRES)).sub(block).toVar();
+  const h = float(0.5);
+  const uvX = vec2(select(n.x.greaterThan(float(0)), l.z.negate(), l.z).add(h), l.y.add(h));
+  const uvY = vec2(l.x.add(h), select(n.y.greaterThan(float(0)), l.z.negate(), l.z).add(h));
+  const uvZ = vec2(select(n.z.greaterThan(float(0)), l.x, l.x.negate()).add(h), l.y.add(h));
+  const st = select(abs(n.x).greaterThan(float(0.5)), uvX,
+                    select(abs(n.y).greaterThan(float(0.5)), uvY, uvZ));
+  return { block, st };
+}
+
+// A reflection hit's albedo: which block it is (render.js's block-material
+// volume), then that block's texture at the face uv - the uv BoxGeometry
+// itself gives that face, so a reflected block shows its texture the right
+// way round. l is the hit in block units, -0.5..0.5 across the block.
+function hitAlbedoTSL(terrain, hp, nh) {
+  const f = boxFaceTSL(hp, nh);
+  const a = texture(terrain.albedo, f.st).depth(blockLayerTSL(terrain, f.block)).level(int(0)).rgb;
+  return mix(a, vec3(1, 1, 1), terrainWhite);
+}
+
+// A block's material layer, from render.js's block-material volume. Stored as
+// layer + 1; 0 is air, and outside the volume reads as layer 0.
+function blockLayerTSL(terrain, block) {
+  const vol = terrain.blocks;
+  const uvw = block.sub(vol.origin).add(float(0.5)).div(vol.size);
+  const code = round(texture3D(vol.tex, uvw).level(int(0)).r.mul(float(255)));
+  return int(max(code.sub(float(1)), float(0)));
+}
+
+// --- Mirrors: reflected sunlight, gathered (mirrors.js) ---
+//
+// The light a polished surface throws onto other surfaces. mirrors.js has the
+// idea: from a receiving texel, the sun mirrored in a mirror's plane is one
+// direction, D = reflect(L, N); if a ray that way lands on the mirror, the
+// receiver sees the sun in it. Then it is lit by:
+//
+//   sun colour x sun scale x max(N_recv . D, 0)       as the direct sun, from D
+//   x F                  the mirror TEXEL's Fresnel at the sun's angle, from its
+//                        own _s: F0 or metal, so a seam that is rough and
+//                        dielectric throws almost nothing and the patch on the
+//                        wall carries the plate's pattern
+//   x smooth             1 over the smooth band, 0 past REFLECT_ROUGH_END - a
+//                        rough surface scatters rather than mirrors
+//   x vis (mirror->sun)  the sun's own cone trace and cards at the hit
+//   x vis (recv->mirror) a cone trace along D, as wide as the sun's, stopped
+//                        short of the mirror so its own face is not a blocker
+//
+// Two marches, and only for a texel whose ray actually lands on a mirror;
+// every other texel pays one plane test per rectangle. The sun only: a point
+// light's mirror image depends on which plane, so it needs its own pass.
+export function createMirrorBindings(capacity) {
+  return {
+    capacity,
+    data: uniformArray(new Array(capacity * MIRROR_VEC4S).fill(0).map(() => new THREE.Vector4()), 'vec4'),
+    count: uniform(int(0))
+  };
+}
+export function writeMirrorBindings(b, packed, count) {
+  for (let i = 0; i < count * MIRROR_VEC4S; i++) {
+    b.data.array[i].set(packed[i * 4], packed[i * 4 + 1], packed[i * 4 + 2], packed[i * 4 + 3]);
+  }
+  b.count.value = count;
+  return b;
+}
+
+// --- Sprites in reflections: the card hit test ---
+//
+// Sprites are not in the field, so a reflection ray cannot land on one by
+// marching. It is tested against the VIEW cards instead - one per sprite,
+// turned the way the drawn billboard faces (toward the camera's heading) - and
+// where it crosses one inside the sprite's opaque pixels, that is a hit. The
+// colour comes from the colour atlas (buildCardAtlas), addressed by the same
+// rect as the silhouette; the pixel mapping mirrors cardPixelAt in cards.js.
+//
+// Nearest-neighbour and a hard alpha cut, like the sprite's own draw: a
+// reflected sprite is the same pixel art, not a filtered copy of it.
+export function createCardColourTexture(atlas) {
+  const tex = new THREE.DataTexture(atlas.colour, atlas.width, atlas.height,
+                                    THREE.RGBAFormat, THREE.UnsignedByteType);
+  tex.minFilter = tex.magFilter = THREE.NearestFilter;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Returns a function, called inline from the shading Fn:
+//   (from, dir, maxDist) -> { col, t, skip }
+// col the sprite's linear colour, t the distance along the ray (< 0 for no
+// hit nearer than maxDist), skip the card's XZ - so the sprite's own lighting
+// can leave its own card out of its shadow test.
+export function createCardHitTSL(b, colourTex) {
+  if (!b || !colourTex) return null;
+  return (from, dir, maxDist) => {
+    const best = maxDist.toVar();
+    const t = float(-1).toVar();
+    const col = vec3(0, 0, 0).toVar();
+    const skip = vec2(1e9, 1e9).toVar();
+    Loop({ start: int(0), end: b.count, type: 'int', condition: '<', name: 'vc' },
+         ({ vc }) => {
+      const base = vc.mul(int(4));
+      const A = b.data.element(base).toVar();
+      const B = b.data.element(base.add(int(1))).toVar();
+      const C = b.data.element(base.add(int(2))).toVar();
+      const D = b.data.element(base.add(int(3))).toVar();
+      const ux = B.x, uz = B.y;
+      const nx = uz.negate(), nz = ux;
+      const denom = dir.x.mul(nx).add(dir.z.mul(nz));
+      If(abs(denom).greaterThan(float(1e-6)), () => {
+        const th = A.x.sub(from.x).mul(nx).add(A.z.sub(from.z).mul(nz)).div(denom).toVar();
+        If(th.greaterThan(float(0)).and(th.lessThan(best)), () => {
+          const h = from.add(dir.mul(th)).sub(A.xyz);
+          const a = h.x.mul(ux).add(h.z.mul(uz)).mul(A.w);
+          const mpp = D.x, cols = D.y, rows = D.z;
+          const pc = floor(a.div(mpp).add(cols.mul(float(0.5))));
+          const pr = floor(rows.mul(float(0.5)).sub(h.y.div(mpp)));
+          If(pc.greaterThanEqual(float(0)).and(pc.lessThan(cols))
+               .and(pr.greaterThanEqual(float(0))).and(pr.lessThan(rows)), () => {
+            const st = vec2(C.x.add(float(CARD_PAD)).add(pc).add(float(0.5)).div(b.atlasSize.x),
+                            C.y.add(float(CARD_PAD)).add(pr).add(float(0.5)).div(b.atlasSize.y));
+            const c = texture(colourTex, st).level(int(0)).toVar();
+            If(c.a.greaterThanEqual(float(0.5)), () => {
+              best.assign(th);
+              t.assign(th);
+              col.assign(c.rgb);
+              skip.assign(A.xz);
+            });
+          });
+        });
+      });
+    });
+    return { col, t, skip };
+  };
 }
 
 export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12,
@@ -1007,7 +1470,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                         cone = false, quantise = true,
                                   fadeStartUniform = null, edgeFadeUniform = null,
                                   cards = null, lightCards = null,
-                                  terrainNormal = null,
+                                  terrain = null, specularOnly = false,
+                                  albedo = null, specular: specOn = true,
+                                  reflections: reflectOn = true, sky = null,
+                                  mirrors = null, mirrorOnly = false,
+                                  viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   aoOnly = false, gi = null, giOnly = false }) {
   // Held as uniforms whose .value is live, so moving the sun is a uniform write
@@ -1031,16 +1498,46 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // { ao, gi }: terrain cones times the sprite discs times the texture's own
   // AO, and the gathered bounce (null without GI). The bounce is scaled by the
   // texture AO too - a crevice in the art receives less of it.
-  const occlusion = (p, n, lift, skip, texAO) => {
-    if (!cones) return { ao: texAO, gi: null };
-    const r = cones(p, n, lift, skip).toVar();
-    let vis = aoOn ? (gi ? r.w : r) : float(1);
+  // bent: the cones' bent normal, or n without cones.
+  // single: one AO cone instead of six (see createAOTSL) - what sprites use.
+  // Measured (1080p): the six cones on the trees' foliage cost 0.34 ms of
+  // 2.35, because an alpha-tested crossed-plane tree shades many layers deep;
+  // on the terrain they cost 0.05. A sprite's AO comes mostly from its contact
+  // disc and its normal map's own AO, so one cone along its normal is plenty.
+  // (A cascade LOD - cheaper shading past C0 - was tried and removed: it was
+  // no faster, and it dropped reflections at distance.)
+  const occlusion = (p, n, lift, skip, texAO, single = false) => {
+    if (!cones) return { ao: texAO, gi: null, bent: n };
+    const r = cones(p, n, lift, skip, single || null);
+    let vis = aoOn ? r.vis : float(1);
     if (spriteAO) vis = vis.mul(spriteAO(p, skip));
     return {
       ao: vis.mul(texAO).toVar(),
-      gi: gi ? r.xyz.mul(gi.strength).mul(texAO).toVar() : null
+      gi: gi ? r.gi.mul(gi.strength).mul(texAO).toVar() : null,
+      bent: aoOn ? r.bent : n
     };
   };
+
+  // --- Ambient: the sky, read along the bent normal ---
+  //
+  // Without a sky it is the flat ambient uniform, as it always was. With one,
+  // the same uniform scales the sky's irradiance (normalised so noon, straight
+  // up, is exactly the uniform), so the ambient takes the sky's colour and
+  // direction: a wall facing the horizon at dusk goes orange, one facing up
+  // goes blue, and an overhang's underside - whose bent normal leans out
+  // toward the open side - is lit from that side. One SH evaluation.
+  //
+  // Deliberately NOT quantised. The ambient is the smoothest light there is;
+  // banding it cut steps into a gradient that has no edges, and the dither
+  // read as crosshatch. Tried and removed.
+  const skyIrradiance = d => (sky
+    ? skyShTSL(sky, d, true).mul(ambient).mul(sky.gain)
+    : vec3(ambient, ambient, ambient));
+  const ambientLight = (bent, ao) => skyIrradiance(bent).mul(ao);
+  // The sun's DIRECT term alone - sunShadeTSL with its ambient zeroed, so the
+  // ambient can come from the sky instead. Scalar.
+  const sunDirect = (visible, n, mode) =>
+    sunShadeTSL({ visible, n, sunDir: sun.dir, ambientUniform: ambient, mode, ao: float(0) });
 
   // Every point light, in one loop over the list. Compiled in whenever there is
   // a list at all: an empty list is a loop of zero iterations, so turning lights
@@ -1050,36 +1547,401 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                              fadeStartUniform, edgeFadeUniform, cards: lightCards })
     : null;
 
+  // The specular path needs the terrain's arrays (its _s texels) and its albedo,
+  // which it now owns: diffuse and specular are no longer one multiply apart.
+  const spec = specOn && terrain && albedo;
+  const reflectTrace = spec && reflectOn ? createReflectTraceTSL(cascades) : null;
+  const reflectMax = float(REFLECT_MAX_DISTANCE);
+  const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
+  // The sun's light, in the units the diffuse term uses. sunShadeTSL's 'ground'
+  // mode divides N.L by a horizontal surface's so the ground reads fully lit
+  // at any elevation; the highlight takes the same scale or it would dim as the
+  // sun sets while the ground beside it did not.
+  const sunLight = () => {
+    const e = float(1).sub(ambient);
+    return shadeMode === 'ground'
+      ? e.div(max(sun.dir.y, float(GROUND_REFERENCE_FLOOR))) : e;
+  };
+
+  // Sprites, for the reflection ray: the view cards (see createCardHitTSL).
+  const spriteHit = reflectTrace ? createCardHitTSL(viewCards, viewCards && viewCards.colour)
+                                 : null;
+
+  // The light at a reflection hit: the sun (with its shadow march - lifted
+  // along `lift`, leaving `skip`'s card out), the light list WITH its shadows,
+  // and the bounce. `mode` as the surface's own shading.
+  //
+  // Shadowed on purpose. It was unshadowed to spare a reflective fragment a
+  // second loop of marches, and the result was a reflection that disagreed
+  // with the thing reflected: a block in a torch's shadow, or round a corner
+  // from a lamp, came back lit in the mirror, and no torch or lamp shadow ever
+  // appeared in one. The loop is the same one the surface itself runs - same
+  // shadow budget, same sprite cards - so the mirror shows what is there.
+  const hitLight = (p, n, lift, skip, mode) => {
+    const light = skyIrradiance(n).toVar();
+    if (sunOn) {
+      const vis = float(0).toVar();
+      If(n.dot(sun.dir).greaterThan(float(0)), () => {
+        vis.assign(sunShadow(p, lift, skip));
+      });
+      light.addAssign(sunColourUniform.mul(sunDirect(vis, n, mode)));
+    }
+    // Lifted along `lift` as the sun's ray is; N.L against the hit's normal.
+    if (pointLight) light.addAssign(pointLight(p, lift, skip, n));
+    if (gi) {
+      light.addAssign(lpvSampleTSL(gi, p.add(n.mul(float(LPV_CELL_METRES * 0.5))))
+                        .mul(gi.strength));
+    }
+    return light;
+  };
+
+  // Reflected light from the mirrors - see createMirrorBindings. Needs the
+  // terrain arrays, for each mirror texel's own reflectivity.
+  //
+  // The sun AND the light list. A point light's mirror image is exact for a
+  // plane, and every rectangle carries its plane: the light at P, reflected in
+  // it, sits at P with the plane's axis flipped across the plane. A receiver
+  // sees the light in that mirror when the line to the image crosses the plane
+  // inside the rectangle; the light then arrives from the image's direction,
+  // attenuated over the WHOLE path (receiver -> mirror -> light, which is the
+  // distance to the image), and is shadowed on both legs.
+  const mirrorTrace = mirrors && terrain && (sunOn || lights)
+    ? createConeTraceSunTSL(cascades) : null;
+  const mirrorFade = fadeStartUniform || uniform(float(SHADOW_FADE_START));
+  const mirrorEdge = edgeFadeUniform || uniform(float(EDGE_FADE_VOXELS));
+  // The point lights' sprite cards, for the mirror->light leg. Ranged, as in
+  // the light loop: each light walks its own slice.
+  const mirrorCards = createCardsTSL(lightCards, { ranged: true });
+  // And the sun's, for the sun's receiver->mirror leg. Both card sets are
+  // turned to face the REAL light, not its mirror image. For a floor that is
+  // exact - the reflection flips height only, so the direction across the
+  // ground is unchanged. For an upright mirror the silhouette is a little off
+  // its angle; for a sprite-sized shadow that does not show.
+  const mirrorSunCards = createCardsTSL(cards);
+
+  // What one mirror texel sends toward the receiver, for light arriving at H
+  // from direction Lh: its Fresnel (its own _s, at the bumped normal's angle
+  // to the light) times smoothness times the normal-map lobe. back is the way
+  // from H to the receiver; minWidth the lobe floor - the source's angular
+  // size. vec3; zero for a rough or a tilted texel.
+  //
+  // The texel's OWN normal matters: the ray was aimed with the flat face
+  // normal, and a bevel or a rivet tilted off it sends the light somewhere
+  // else. So the lobe weighs how closely where this texel really sends it,
+  // reflect(-Lh, Nb), matches `back`. Flat texels pass, tilted ones go dark -
+  // the normal map shows in the patch. (Their light lands somewhere this ray
+  // is not looking; it is not redistributed.)
+  const mirrorTexel = (H, N, Lh, back, minWidth) => {
+    const f = boxFaceTSL(H, N);
+    const layer = blockLayerTSL(terrain, f.block);
+    const s = texture(terrain.specular, f.st).depth(layer).level(int(0));
+    const alb = texture(terrain.albedo, f.st).depth(layer).level(int(0)).rgb;
+    const d = decodeSpecularTSL(s, alb);
+    const smooth = float(1).sub(smoothstep(float(REFLECT_ROUGH_START),
+                                           float(REFLECT_ROUGH_END), d.alpha));
+    const lab = labNormalTSL(texture(terrain.normal, f.st).depth(layer).level(int(0)));
+    const Nb = boxBumpedNormalTSL(N, lab.xyz).toVar();
+    const lb = max(Lh.dot(Nb), float(0)).toVar();
+    const Rb = Lh.negate().add(Nb.mul(lb.mul(float(2))));
+    const width = max(d.alpha, max(minWidth, float(SPEC_MIN_ALPHA)));
+    const aligned = exp2(Rb.dot(back).sub(float(1)).div(width.mul(width)).mul(float(1.4427)));
+    const F = d.f0.add(vec3(1, 1, 1).sub(d.f0).mul(pow(float(1).sub(lb), float(5))));
+    return F.mul(smooth.mul(aligned));
+  };
+
+  // skip: the receiving sprite's own card, so it does not block the light
+  // reaching itself. Terrain passes NO_SKIP.
+  const mirrorLightFn = mirrorTrace ? Fn(([p, nS, lift, skip]) => {
+    const sum = vec3(0, 0, 0).toVar();
+    const origin = p.add(lift.mul(bias.mul(float(VOXEL_METRES)))).toVar();
+    Loop({ start: int(0), end: mirrors.count, type: 'int', condition: '<', name: 'mi' },
+         ({ mi }) => {
+      const row = mi.mul(int(MIRROR_VEC4S));
+      const A = mirrors.data.element(row).toVar();
+      const B = mirrors.data.element(row.add(int(1))).toVar();
+      // What this mirror can reflect, culled on the CPU (mirrors.js
+      // mirrorReach): A.w is a mask - bit i for light i, MIRROR_SUN_BIT for the
+      // sun - and C, E the box its reflected sun can reach. Measured: the
+      // mirror loop was 0.58 ms of 2.35 at 1080p before this, most of it
+      // texels no mirror could ever light.
+      const mask = A.w;
+      const bit = k => floor(mask.div(exp2(k))).mod(float(2)).greaterThan(float(0.5));
+      const C = mirrors.data.element(row.add(int(2)));
+      const E = mirrors.data.element(row.add(int(3)));
+      const axis = int(A.x);
+      const isX = axis.equal(int(0)), isY = axis.equal(int(1));
+      const N = select(isX, vec3(A.y, 0, 0), select(isY, vec3(0, A.y, 0), vec3(0, 0, A.y))).toVar();
+      const pick = v => select(isX, v.x, select(isY, v.y, v.z));
+      const pickU = v => select(isX, v.y, v.x);                   // mirrors.js PLANE_AXES
+      const pickV = v => select(isX.or(isY), v.z, v.y);
+      // The receiver must be on the mirror's reflecting side.
+      const side = pick(origin).sub(A.z).mul(A.y);
+      If(side.greaterThan(float(0)), () => {
+        // Where a ray from the receiver along dir crosses the plane: the
+        // distance, or -1 if it misses the rectangle.
+        const crossing = dir => {
+          const da = pick(dir);
+          const t = A.z.sub(pick(origin)).div(select(abs(da).greaterThan(float(1e-5)), da,
+                                                     float(1e-5))).toVar();
+          const H = origin.add(dir.mul(t));
+          const hu = pickU(H), hv = pickV(H);
+          const inside = t.greaterThan(float(VOXEL_METRES))
+            .and(hu.greaterThanEqual(B.x)).and(hu.lessThanEqual(B.z))
+            .and(hv.greaterThanEqual(B.y)).and(hv.lessThanEqual(B.w));
+          return select(inside, t, float(-1));
+        };
+
+        // --- the sun, mirrored ---
+        if (sunOn) {
+          const L = sun.dir;
+          const D = L.sub(N.mul(L.dot(N).mul(float(2)))).toVar();     // reflect(L, N)
+          const facing = max(nS.dot(D), float(0)).toVar();
+          const inBox = origin.x.greaterThanEqual(C.x).and(origin.y.greaterThanEqual(C.y))
+            .and(origin.z.greaterThanEqual(C.z)).and(origin.x.lessThanEqual(E.x))
+            .and(origin.y.lessThanEqual(E.y)).and(origin.z.lessThanEqual(E.z));
+          If(bit(float(Math.log2(MIRROR_SUN_BIT))).and(inBox)
+               .and(facing.greaterThan(float(0))).and(L.dot(N).greaterThan(float(0))), () => {
+            const t = crossing(D).toVar();
+            If(t.greaterThan(float(0)).and(t.lessThan(float(REFLECT_MAX_DISTANCE))), () => {
+              // The mirror texel: snapped, like every surface point, so one
+              // mirror texel reflects one value.
+              const Hl = texelLockTSL(origin.add(D.mul(t)), N).toVar();
+              const w = mirrorTexel(Hl, N, L, D.negate(), sun.coneRadius.mul(float(2))).toVar();
+              If(w.x.add(w.y).add(w.z).greaterThan(float(1e-3)), () => {
+                const toMirror = mirrorTrace(origin, D, t.sub(float(VOXEL_METRES * 2)),
+                                             sun.coneRadius, mirrorFade, mirrorEdge).x.toVar();
+                // Sprites between the receiver and the mirror - Bob standing on
+                // the floor cuts his shadow into its glare on the wall.
+                if (mirrorSunCards) {
+                  toMirror.mulAssign(mirrorSunCards(origin, D, t, sun.coneRadius, skip));
+                }
+                const toSun = sunShadow(Hl, N, NO_SKIP);
+                sum.addAssign(w.mul(toMirror.mul(toSun).mul(facing))
+                               .mul(sunLight()).mul(sunColourUniform));
+              });
+            });
+          });
+        }
+
+        // --- every point light, mirrored ---
+        if (lights) {
+          Loop({ start: int(0), end: lights.count, type: 'int', condition: '<', name: 'ml' },
+               ({ ml }) => {
+            const base = ml.mul(int(LIGHT_VEC4S));
+            const LA = lights.data.element(base).toVar();
+            const LB = lights.data.element(base.add(int(1))).toVar();
+            const LC = lights.data.element(base.add(int(2))).toVar();
+            const P = LA.xyz, level = LA.w;
+            // In the mask: on the reflecting side and within reach of it.
+            If(bit(float(ml)), () => {
+              // Its image: the plane's axis flipped across the plane. N carries
+              // the rectangle's sign; times the sign again it is the bare axis.
+              const image = P.add(N.mul(A.y).mul(A.z.sub(pick(P)).mul(float(2)))).toVar();
+              const toImage = image.sub(origin).toVar();
+              const dist = max(length(toImage), float(1e-4)).toVar();
+              const D = toImage.div(dist).toVar();
+              // The falloff over the whole path, as the light loop's (lights.js
+              // lightFalloff): log2(1 + u), reaching zero at the radius.
+              const radius = level.mul(float(BLOCK_METRES)).toVar();
+              const u = clamp(float(1).sub(dist.div(max(radius, float(1e-4)))), float(0), float(1));
+              const falloff = log2(float(1).add(u)).mul(level.div(float(MAX_LIGHT_LEVEL))).toVar();
+              const facing = max(nS.dot(D), float(0)).toVar();
+              If(falloff.mul(facing).greaterThan(lights.cutoff), () => {
+                const t = crossing(D).toVar();
+                If(t.greaterThan(float(0)).and(t.lessThan(dist)), () => {
+                  const Hl = texelLockTSL(origin.add(D.mul(t)), N).toVar();
+                  const toLight = P.sub(Hl).toVar();
+                  const legB = max(length(toLight), float(1e-4)).toVar();
+                  const Lh = toLight.div(legB).toVar();
+                  // The flame's angular size from the mirror is the lobe's floor.
+                  const w = mirrorTexel(Hl, N, Lh, D.negate(), LB.w.div(legB)).toVar();
+                  If(w.x.add(w.y).add(w.z).greaterThan(float(1e-3)), () => {
+                    // Both legs shadowed, as the light loop shadows - the same
+                    // budget weight (LC.z) and sprite cards (LC.x, LC.y, LC.w).
+                    // The cone opens to the source over the whole path.
+                    const slope = LB.w.div(dist);
+                    const visible = float(1).toVar();
+                    If(LC.z.greaterThan(float(0)), () => {
+                      const v = mirrorTrace(origin, D, t.sub(float(VOXEL_METRES * 2)), slope,
+                                            mirrorFade, mirrorEdge).x.toVar();
+                      const lift2 = Hl.add(N.mul(bias.mul(float(VOXEL_METRES)))).toVar();
+                      v.mulAssign(mirrorTrace(lift2, Lh, legB, LB.w.div(legB),
+                                              mirrorFade, mirrorEdge).x);
+                      if (mirrorCards) {
+                        // Both legs: receiver->mirror (leaving the receiver's
+                        // own card out) and mirror->light.
+                        const start = int(LC.x).toVar();
+                        const end = start.add(int(LC.y)).toVar();
+                        const cardVis = mirrorCards(origin, D, t, slope, skip, start, end)
+                          .mul(mirrorCards(lift2, Lh, legB, LB.w.div(legB), NO_SKIP, start, end));
+                        v.mulAssign(mix(float(1), cardVis, LC.w));
+                      }
+                      visible.assign(mix(float(1), v, LC.z));
+                    });
+                    sum.addAssign(w.mul(LB.xyz).mul(falloff.mul(facing).mul(visible)));
+                  });
+                });
+              });
+            });
+          });
+        }
+      });
+    });
+    return sum;
+  }).setLayout(layout('mirrorLight', 'vec3', [
+    { name: 'p', type: 'vec3' }, { name: 'nS', type: 'vec3' }, { name: 'lift', type: 'vec3' },
+    { name: 'skip', type: 'vec2' }]))
+    : null;
+  const mirrorLight = (p, n, nS, lift, skip = NO_SKIP) => mirrorLightFn(p, nS, lift, skip);
+
+  // What a reflection ray sees: the nearer of the terrain it marched to and
+  // any sprite card it crosses first. Terrain shows its block's texture; a
+  // sprite its own pixels, lit as the sprites are (Lambert, facing back along
+  // the ray, since the card was turned to be seen). Past the field, the sky.
+  const reflectedTSL = (origin, dir) => {
+    const hit = reflectTrace(origin, dir, reflectMax).toVar();
+    // A miss sees the sky - the same SH the background draws.
+    const col = (sky ? skyShTSL(sky, dir) : vec3(0, 0, 0)).toVar();
+    const sp = spriteHit
+      ? spriteHit(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, reflectMax))
+      : null;
+    const terrainWins = sp ? hit.w.greaterThanEqual(float(0)).and(sp.t.lessThan(float(0)))
+                           : hit.w.greaterThanEqual(float(0));
+    If(terrainWins, () => {
+      const nh = hit.xyz.toVar();
+      const hp = origin.add(dir.mul(hit.w)).toVar();
+      const hpL = texelLockTSL(hp, nh).toVar();
+      col.assign(hitAlbedoTSL(terrain, hpL, nh)
+                   .mul(hitLight(hpL, nh, nh, NO_SKIP, shadeMode)));
+    });
+    if (sp) {
+      If(sp.t.greaterThanEqual(float(0)), () => {
+        const hs = origin.add(dir.mul(sp.t)).toVar();
+        const back = vec3(dir.x.negate(), float(0), dir.z.negate());
+        const ns = select(length(back).greaterThan(float(1e-4)), normalize(back),
+                          vec3(0, 1, 0)).toVar();
+        // Lifted straight up, as the sprites' own shading is - see spriteLight.
+        col.assign(sp.col.mul(hitLight(hs, ns, vec3(0, 1, 0), sp.skip, 'lambert')));
+      });
+    }
+    return col;
+  };
+
+  // Stable per-texel randoms, for the rough-surface jitter below. Hashed from
+  // the world texel, so the grain is painted on and does not crawl.
+  const texelHash = (wt, k) =>
+    fract(sin(wt.dot(vec3(12.9898 + k, 78.233 - k, 37.719 + 2 * k))).mul(float(43758.5453)));
+
   const node = Fn(() => {
     // normalWorld rather than a derivative reconstruction: the terrain is boxes,
     // so the interpolated normal IS the exact face normal, and the marcher needs
     // it to lift the ray origin off the face along the surface rather than along
     // the ray - see SURFACE_BIAS_VOXELS for why that distinction matters at low
     // sun angles.
-    const n = normalize(normalWorld).toVar();
-    // Shading normal: the face normal bent by the block texture's normal map.
-    // The geometric n still lifts rays and decides which faces the sun can
-    // reach at all; only N.L sees the bumps.
-    const lab = terrainNormal ? labNormalTSL(texture(terrainNormal, uv())).toVar() : null;
-    const nS = lab ? bumpedNormalTSL(n, positionWorld, uv(), lab.xyz).toVar() : n;
-    const texAO = lab ? lab.w : float(1);
+    const n = axisNormalTSL(normalWorld).toVar();
     // Locked once, used by every light. Two lights that disagreed about where a
     // surface IS would put their shadows on different texel grids, and the
     // mismatch would read as the torch's shadow crawling against the sun's.
     const p = texelLockTSL(positionWorld, n).toVar();
+    // Every texture read at THIS texel's centre, from the locked position -
+    // not at the fragment's own uv, which at a texel's edge can read the
+    // neighbour's normal or specular while p is still this texel's.
+    const st = terrain ? boxFaceTSL(p, n).st.toVar() : null;
+    const sample = tex => terrainSampleTSL(tex, st);
+    // Shading normal: the face normal bent by the block texture's normal map.
+    // The geometric n still lifts rays and decides which faces the sun can
+    // reach at all; only N.L sees the bumps.
+    // terrain: { normal, specular, albedo, blocks }, from render.js.
+    const lab = terrain ? labNormalTSL(sample(terrain.normal)).toVar() : null;
+    // The face's exact frame, not a derivative one - see boxBumpedNormalTSL.
+    const nS = lab ? boxBumpedNormalTSL(n, lab.xyz).toVar() : n;
+    const texAO = lab ? lab.w : float(1);
+    // The raw LabPBR specular texel: R smoothness, G F0 / metal, B porosity or
+    // SSS - how an authored _s is checked in place.
+    if (specularOnly && terrain) return sample(terrain.specular).rgb;
+    // The views below show a light term; they keep the albedo multiply they
+    // always had.
+    // albedo: a function of the face uv (main.js), so it is read here too.
+    const base = albedo && st ? albedo(st).toVar() : vec3(1, 1, 1);
+    const view = x => base.mul(x);
     // Traced AO times the texture's own. The hemisphere is the geometric face,
     // not the bumped normal - the rays test real geometry.
     const occ = occlusion(p, n, n, NO_SKIP, texAO);
     const ao = occ.ao;
-    if (aoOnly) return vec3(ao, ao, ao);
-    if (giOnly && occ.gi) return occ.gi;
+    if (aoOnly) return view(vec3(ao, ao, ao));
+    if (giOnly && occ.gi) return view(occ.gi);
     // The bounce adds under everything else - it is light, like the others.
     const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
+    // The sky ambient, along the bent normal - bent further by the normal
+    // map, so the bumps catch the sky as they catch the sun.
+    const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao).toVar();
+
+    // The mirror light alone, raw (not times albedo), so what the mirrors
+    // throw can be judged by itself - it is not in the GI bounce view, since
+    // it never goes through the LPV.
+    if (mirrorOnly) return mirrorTrace ? mirrorLight(p, n, nS, n) : vec3(0, 0, 0);
+    // Light thrown here by the mirrors - the iron floor's glare on the wall,
+    // from the sun and every lamp. Added under the sun-on and sun-off paths.
+    const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n).toVar() : null;
+    const plusMirror = col => (mirrored ? col.add(mirrored) : col);
+
+    // The surface's specular response, when it has one. V from the locked
+    // position, so the whole texel shares one view direction.
+    let surf = null;
+    if (spec) {
+      const d = decodeSpecularTSL(sample(terrain.specular), base);
+      const v = normalize(cameraPosition.sub(p)).toVar();
+      surf = { ...d, v, brdf: specularTSL(nS, v, d.alpha, d.f0) };
+    }
+
+    // light: the diffuse light (x albedo). direct: the highlights, summed.
+    const finish = (light, direct) => {
+      if (!surf) return base.mul(light);
+      const nv = max(nS.dot(surf.v), float(1e-4));
+      const F = fresnelRoughTSL(surf.f0, nv, surf.alpha).toVar();
+      // What a rough surface reflects: the ambient light around it, the same
+      // estimate the diffuse ambient uses. Smooth surfaces replace it with the
+      // ray's answer across the rough band.
+      const env = amb.toVar();
+      if (occ.gi) env.addAssign(occ.gi);
+      if (reflectTrace) {
+        const w = float(1).sub(smoothstep(float(REFLECT_ROUGH_START),
+                                          float(REFLECT_ROUGH_END), surf.alpha)).toVar();
+        If(w.greaterThan(float(0)), () => {
+          // The mirror direction, jittered per texel by the roughness - a
+          // glossy surface reflects as a stable grain rather than a blur.
+          // Half a texel inside, so the along-normal floor is not taken on
+          // the face plane itself, where it could round either way.
+          const wt = p.sub(n.mul(float(VOXEL_METRES * 0.5))).div(float(VOXEL_METRES))
+                      .floor().toVar();
+          const jit = vec3(texelHash(wt, 0), texelHash(wt, 1), texelHash(wt, 2))
+                        .sub(float(0.5)).mul(surf.alpha.mul(float(2)));
+          const r0 = reflect(surf.v.negate(), nS).toVar();
+          const rj = normalize(r0.add(jit)).toVar();
+          const dir = select(rj.dot(n).greaterThan(float(0.02)), rj, r0).toVar();
+          const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
+          env.assign(mix(env, reflectedTSL(origin, dir), w));
+        });
+      }
+      const kd = vec3(1, 1, 1).sub(F).mul(float(1).sub(surf.metal));
+      return base.mul(light).mul(kd)
+        .add(min(direct, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX)))
+        .add(F.mul(env).mul(texAO));
+    };
+    const noSpec = vec3(0, 0, 0);
+    // The light list: diffuse, and the highlights from the same visibility.
+    const points = () => {
+      if (!surf) return { diffuse: pointLight(p, n, NO_SKIP, nS), spec: noSpec };
+      return pointLight.withSpecular(p, n, NO_SKIP, nS, surf.brdf);
+    };
+
     // Sun off: no march, no shading term, just the ambient floor for anything a
     // dynamic light does not reach.
     if (!sunOn) {
-      const dark = vec3(ambient, ambient, ambient).mul(ao);
-      return plusGI(pointLight ? dark.add(pointLight(p, n, NO_SKIP, nS)) : dark);
+      const dark = plusMirror(amb);
+      if (!pointLight) return finish(plusGI(dark), noSpec);
+      const pl = points();
+      return finish(plusGI(dark.add(pl.diffuse)), pl.spec);
     }
     // Faces turned from the sun get N.L = 0, so the march result is multiplied
     // away - skip it. Not in shadowOnly, which shows the raw term everywhere.
@@ -1095,10 +1957,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // the shadowed range toward the middle, so acne that is plain here is
     // invisible in the shaded result - which is why it has been hard to name.
     if (shadowOnly) return vec3(visible, visible, visible);
-    const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
-                                  ambientUniform: ambient, mode: shadeMode, ao });
-    if (!pointLight) return plusGI(vec3(sunTerm, sunTerm, sunTerm));
-    return plusGI(vec3(sunTerm, sunTerm, sunTerm).add(pointLight(p, n, NO_SKIP, nS)));
+    const sunLit = plusMirror(amb.add(sunColourUniform.mul(sunDirect(visible, nS, shadeMode))));
+    const sunSpec = surf
+      ? surf.brdf(sun.dir).mul(visible).mul(sunLight()).mul(sunColourUniform) : noSpec;
+    if (!pointLight) return finish(plusGI(sunLit), sunSpec);
+    const pl = points();
+    return finish(plusGI(sunLit.add(pl.diffuse)), sunSpec.add(pl.spec));
   })();
 
   // Sprites: the same lights, shaded at the sprite's own texel centres and
@@ -1121,14 +1985,19 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     If(drawn, () => {
       // Over the shading normal's hemisphere - a billboard has no geometric
       // face in the field, so the way its texels face is the best there is.
-      const occ = occlusion(p, nS, n, skip, texAO);
+      const occ = occlusion(p, nS, n, skip, texAO, true);
       const ao = occ.ao;
       if (aoOnly) { out.assign(vec3(ao, ao, ao)); return; }
       if (giOnly && occ.gi) { out.assign(occ.gi); return; }
       const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
+      if (mirrorOnly) { out.assign(mirrorTrace ? mirrorLight(p, n, nS, n, skip) : vec3(0, 0, 0)); return; }
+      // A sprite by a mirror catches its glare too, sun or lamp. Lifted
+      // straight up, as the sprite's own rays are.
+      const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n, skip) : null;
+      const amb0 = ambientLight(occ.bent, ao);
+      const amb = mirrored ? amb0.add(mirrored) : amb0;
       if (!sunOn) {
-        const dark = vec3(ambient, ambient, ambient).mul(ao);
-        out.assign(plusGI(pointLight ? dark.add(pointLight(p, n, skip, nS)) : dark));
+        out.assign(plusGI(pointLight ? amb.add(pointLight(p, n, skip, nS)) : amb));
         return;
       }
       const visible = sunShadow(p, n, skip);
@@ -1136,9 +2005,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       // Plain Lambert on the normal-mapped normal: a sprite is lit by which way
       // each of its texels faces, so turning the camera round to the sun's far
       // side shows its dark side.
-      const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
-                                    ambientUniform: ambient, mode: 'lambert', ao });
-      const lit = vec3(sunTerm, sunTerm, sunTerm);
+      const lit = amb.add(sunColourUniform.mul(sunDirect(visible, nS, 'lambert')));
       out.assign(plusGI(pointLight ? lit.add(pointLight(p, n, skip, nS)) : lit));
     });
     return out;
@@ -1210,8 +2077,13 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
   // n lifts the ray off the surface; shadeN is what N.L is taken against - the
   // normal-mapped normal. Separate because the lift has to follow the real
   // geometry, and for a sprite that is not the direction it is shaded as facing.
-  return Fn(([p, n, skip, shadeN]) => {
+  //
+  // brdf: null, or a function of the light direction returning the specular
+  // response per unit of light (see specularTSL) - then the same loop, with the
+  // same visibility, also sums each light's highlight.
+  const body = (p, n, skip, shadeN, brdf = null) => {
     const sum = vec3(0, 0, 0).toVar();
+    const spec = brdf ? vec3(0, 0, 0).toVar() : null;
     // Lifted off the face along the NORMAL, the same as the sun's origin and for
     // the same reason - see SURFACE_BIAS_VOXELS. The same for every light.
     const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
@@ -1244,7 +2116,7 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
       // log2(1 + u), mirroring lights.js lightFalloff - exact at both ends and
       // far brighter than a square across the middle, which is what a torch
       // looks like.
-      const falloff = log2(float(1).add(u)).mul(level.div(float(MAX_LIGHT_LEVEL)));
+      const falloff = log2(float(1).add(u)).mul(level.div(float(MAX_LIGHT_LEVEL))).toVar();
       const ndotl = max(shadeN.dot(dir), float(0));
 
       // lights.js coneSlope(): the cone from this fragment to the emitter opens
@@ -1290,11 +2162,25 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
           visible.assign(mix(float(1), v, weight));
         });
         sum.addAssign(B.xyz.mul(amount).mul(visible));
+        // The highlight takes the light's falloff, not the cut-remapped
+        // diffuse amount - brdf carries its own N.L.
+        if (brdf) spec.addAssign(B.xyz.mul(falloff).mul(visible).mul(brdf(dir)));
       });
     });
 
-    return sum;
-  });
+    return brdf ? { diffuse: sum, spec } : sum;
+  };
+
+  // A plain function around the Fn, not the Fn itself: a TSL Fn is a proxy,
+  // and properties hung on it read back as node members, not as these.
+  const fn = Fn(([p, n, skip, shadeN]) => body(p, n, skip, shadeN))
+    .setLayout(layout('pointLights', 'vec3', [
+      { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' },
+      { name: 'skip', type: 'vec2' }, { name: 'shadeN', type: 'vec3' }]));
+  const call = (p, n, skip, shadeN) => fn(p, n, skip, shadeN);
+  // Called inline from inside another Fn, so their vars land in the caller.
+  call.withSpecular = (p, n, skip, shadeN, brdf) => body(p, n, skip, shadeN, brdf);
+  return call;
 }
 
 // A level's footprint travels with the player, or shading only works where it
@@ -1355,8 +2241,8 @@ function uploadStrips(renderer, tex, grid, rects) {
 
 // Swaps the terrain to a node material whose colour is its own albedo modulated
 // by the marched shadow term, keeping the original so it can be restored.
-export function applyShadowMaterial(mesh, shadowNode) {
-  const mat = createShadowMaterial(mesh, shadowNode);
+export function applyShadowMaterial(mesh, shadowNode, albedo = null) {
+  const mat = createShadowMaterial(mesh, shadowNode, albedo);
   if (mesh.material !== mesh.userData.originalMaterial) mesh.material.dispose();
   mesh.material = mat;
   return mat;
@@ -1364,22 +2250,15 @@ export function applyShadowMaterial(mesh, shadowNode) {
 
 // The same material, built but not assigned - so it can be compiled off-screen
 // while the current one keeps drawing.
-// white: a float uniform, 1 for whiteworld - a uniform so toggling it is a
-// write, not a shader rebuild.
-export function createShadowMaterial(mesh, shadowNode, white = null) {
+// albedo: the surface colour node - for the terrain, its per-block layer with
+// whiteworld mixed in (render.js). White when null.
+export function createShadowMaterial(mesh, shadowNode, albedo = null) {
   if (!mesh.userData.originalMaterial) mesh.userData.originalMaterial = mesh.material;
-  const base = mesh.userData.originalMaterial;
-
   const mat = new THREE.MeshBasicNodeMaterial();
   // .rgb, because the shadow node is a vec3 now that a coloured light adds to it.
-  // Whiteworld clears base.map for the unshadowed path, and parks the texture in
-  // userData.albedoMap - so the texture is read from there when it exists.
-  const map = base.userData.albedoMap !== undefined ? base.userData.albedoMap : base.map;
-  let albedo = map ? texture(map, uv()).rgb : vec3(1, 1, 1);
-  if (white && map) albedo = mix(albedo, vec3(1, 1, 1), white);
   // Per-instance tint (arena greying) lives in instanceColor, so it has to be
   // carried across or battle mode loses its reachable-tile shading.
-  mat.colorNode = albedo.mul(shadowNode);
+  mat.colorNode = (albedo || vec3(1, 1, 1)).mul(shadowNode);
   return mat;
 }
 
@@ -1568,7 +2447,8 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       const dither = texture(bayerTex, wt.xz.add(vec2(0, wt.y)).mul(float(0.25))).r;
       return clamp(visible.mul(stepsUniform).add(dither).floor().div(stepsUniform),
                    float(0), float(1));
-    });
+    }).setLayout(layout('sunCone', 'float', [
+      { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' }, { name: 'skip', type: 'vec2' }]));
   }
 
   return Fn(([p, n, skip]) => {
@@ -1622,7 +2502,8 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
     const dither = texture(bayerTex, wt.xz.add(vec2(0, wt.y)).mul(float(0.25))).r;
     return clamp(visible.mul(stepsUniform).add(dither).floor().div(stepsUniform),
                  float(0), float(1));
-  });
+  }).setLayout(layout('sunSampled', 'float', [
+      { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' }, { name: 'skip', type: 'vec2' }]));
 }
 
 // The uniforms the cone needs, as one object, because the sun direction and its

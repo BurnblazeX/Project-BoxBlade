@@ -85,6 +85,8 @@ export function createPerfOverlay(doc = document) {
   const stats = createFrameStats();
   const parts = Object.fromEntries(SECTIONS.map(([k]) => [k, createFrameStats()]));
   const gpu = createFrameStats();
+  // GPU time of the compute passes (the LPV), resolved separately from render.
+  const gpuCompute = createFrameStats();
 
   const canvas = doc.createElement('canvas');
   canvas.width = WIDTH;
@@ -213,11 +215,15 @@ export function createPerfOverlay(doc = document) {
     },
     // GPU time for a frame, in ms, whenever a timestamp resolve lands.
     gpu(ms) { if (visible) gpu.push(ms); },
+    gpuCompute(ms) { if (visible) gpuCompute.push(ms); },
+    // Averages for scripted profiling (bxb.gpu): render and compute, ms.
+    gpuStats: () => ({ render: gpu.stats(), compute: gpuCompute.stats() }),
+    resetGPU() { gpu.reset(); gpuCompute.reset(); },
     toggle() {
       visible = !visible;
       canvas.style.display = visible ? 'block' : 'none';
       if (visible) skipNext = true;
-      else { stats.reset(); gpu.reset(); for (const [k] of SECTIONS) parts[k].reset(); }
+      else { stats.reset(); gpu.reset(); gpuCompute.reset(); for (const [k] of SECTIONS) parts[k].reset(); }
       return visible;
     },
     get visible() { return visible; },

@@ -1,16 +1,20 @@
 import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec3, uniform, instanceIndex,
-  storage, texture3D, textureStore, max, select
+  storage, texture3D, textureStore, max, min, select, normalize, round, uniformArray,
+  length
 } from 'three/tsl';
 import { HIT_EPS, MIN_STEP, cascadeVoxelMetres } from './boxgrid.js';
 import {
   decodeFieldTSL, ringUV, createConeTraceSunTSL, createPointLightsTSL,
-  createSunUniforms, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS
+  createSunUniforms, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
+  sunColourUniform, skyShTSL
 } from './gpu.js';
+import { BLOCK_METRES } from './world.js';
+import { MATERIALS } from './materials.js';
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, FACE_DIRS, SOLID_THRESHOLD,
-  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES
+  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES
 } from './lpv.js';
 
 // --- The LPV on the GPU: solid, inject, propagate, resolve ---
@@ -51,8 +55,12 @@ function neighbour(c, dx, dy, dz) {
 // level: which cascade the volume lies over. C0 gives 0.75 m cells over 18 m,
 // C1 1.5 m cells over 36 m - the same 24^3 and six voxels a cell either way,
 // because each cascade is the same 144^3 at a doubled voxel size.
+// sky: the sky SH bindings (gpu.js createSkyBindings), with ambientUniform its
+// scale. blocks: render.js's block-material volume, so a probe hit bounces its
+// own block's albedo. Either may be null, and the old behaviour stands.
 export function createLPV({ cascades, lights, level = 0, biasUniform = null,
-                            fadeStartUniform = null, edgeFadeUniform = null }) {
+                            fadeStartUniform = null, edgeFadeUniform = null,
+                            sky = null, ambientUniform = null, blocks = null }) {
   const c0 = cascades[level];
   const cellMetres = LPV_CELL_VOXELS * cascadeVoxelMetres(level);
   const buf = (itemSize) => new THREE.StorageBufferAttribute(LPV_CELLS, itemSize);
@@ -77,8 +85,18 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     sunGain: uniform(float(1)),
     slice: uniform(int(0)),
     slices: uniform(int(DEFAULT_LPV_SLICES)),
-    shift: uniform(new THREE.Vector3())
+    shift: uniform(new THREE.Vector3()),
+    // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
+    layerAlbedo: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4'),
+    // Sprites (lpv.js MAX_GI_SPRITES), two vec4 each:
+    //   0  centre xyz, half width        1  albedo rgb (linear), half height
+    // and a fill each (opaque fraction x lpv.js SPRITE_GI_FILL) in spriteFill.
+    sprites: uniformArray(new Array(MAX_GI_SPRITES * 2).fill(0).map(() => new THREE.Vector4()), 'vec4'),
+    spriteFill: uniformArray(new Array(MAX_GI_SPRITES).fill(0), 'float'),
+    spriteCount: uniform(int(0)),
+    skyGain: uniform(float(1))
   };
+  const ambient = ambientUniform || uniform(float(0.17));
   const sun = createSunUniforms(new THREE.Vector3(0, 1, 0));
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
   const fadeStart = fadeStartUniform || uniform(float(SHADOW_FADE_START));
@@ -92,6 +110,18 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const centreOf = c => u.origin.add(
     vec3(float(c.x), float(c.y), float(c.z)).add(float(0.5)).mul(float(cellMetres)));
 
+  // How much of cell c a sprite's box covers, as a fraction of the cell - the
+  // mirror of lpv.js boxCellOverlap.
+  const spriteOverlap = (cellMin, A, B) => {
+    const half = vec3(A.w, B.w, A.w);
+    const lo = max(cellMin, A.xyz.sub(half));
+    const hi = min(cellMin.add(float(cellMetres)), A.xyz.add(half));
+    const e = max(hi.sub(lo), vec3(0, 0, 0)).div(float(cellMetres));
+    return e.x.mul(e.y).mul(e.z);
+  };
+  const minCorner = c => u.origin.add(vec3(float(c.x), float(c.y), float(c.z))
+                                        .mul(float(cellMetres)));
+
   // --- solid: 27 field samples a cell, at voxel centres spread through it ---
   const solidKernel = Fn(() => {
     const c = cellOf(instanceIndex);
@@ -103,7 +133,15 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
       const p = base.add(vec3((ox + 0.5) * vox, (oy + 0.5) * vox, (oz + 0.5) * vox));
       count.addAssign(select(fieldAt(p).lessThan(float(0)), float(1), float(0)));
     }
-    solid.element(c.i).assign(count.div(float(27)));
+    // Plus the sprites standing in it - partly, since a sprite is a flat card.
+    const sprite = float(0).toVar();
+    Loop({ start: int(0), end: u.spriteCount, type: 'int', condition: '<', name: 'sp' },
+         ({ sp }) => {
+      const A = u.sprites.element(sp.mul(int(2))).toVar();
+      const B = u.sprites.element(sp.mul(int(2)).add(int(1))).toVar();
+      sprite.addAssign(spriteOverlap(base, A, B).mul(u.spriteFill.element(sp)));
+    });
+    solid.element(c.i).assign(min(count.div(float(27)).add(sprite), float(1)));
   })().compute(LPV_CELLS).setName(`LPV${level}.Solid`);
 
   // --- inject: light leaving the surfaces around each air cell ---
@@ -119,6 +157,22 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
                                              edgeFadeUniform: edgeFade, cards: null });
   const maxProbe = float(cellMetres);
   const sunReach = float(12);
+  // Sky visibility at a probe hit: one wide cone (45 degree half-angle) up
+  // and out from the surface, over SKY_REACH. Coarse - it is the 0.75 m LPV
+  // it feeds, not a texel - but it keeps an overhang's underside or a room's
+  // interior from bouncing sky it cannot see.
+  const SKY_REACH = float(4);
+  const SKY_CONE = float(1);
+  // The albedo of the block a probe landed on: which block (the block volume),
+  // then that material's diffuse albedo.
+  const blockAlbedo = (p, n) => {
+    if (!blocks) return u.albedo;
+    const bi = round(p.sub(n.mul(c0.voxel.mul(float(0.5)))).div(float(BLOCK_METRES)));
+    const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
+    const code = round(texture3D(blocks.tex, uvw).level(int(0)).r.mul(float(255)));
+    const layer = int(max(code.sub(float(1)), float(0)));
+    return u.layerAlbedo.element(layer).xyz;
+  };
 
   const injectKernel = Fn(() => {
     const c = cellOf(instanceIndex);
@@ -156,12 +210,46 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
               sunLit.assign(coneTrace(origin, sun.dir, sunReach, sun.coneRadius,
                                       fadeStart, edgeFade).x.mul(ndotl).mul(u.sunGain));
             });
-            const lit = vec3(sunLit, sunLit, sunLit).add(pointLights(p, n, NO_SKIP, n));
-            out.addAssign(lit.mul(u.albedo));
+            const lit = sunColourUniform.mul(sunLit).add(pointLights(p, n, NO_SKIP, n)).toVar();
+            // Sky light the surface reflects: its sky irradiance, as the
+            // shading pass computes it, times how much sky it can see. Not the
+            // sky itself - that is the per-fragment ambient already, and
+            // injecting it would count it twice.
+            if (sky) {
+              If(n.y.greaterThan(float(-0.5)), () => {
+                const origin = p.add(n.mul(bias.mul(c0.voxel))).toVar();
+                const up = normalize(n.add(vec3(0, 1, 0)));
+                const vis = coneTrace(origin, up, SKY_REACH, SKY_CONE, fadeStart, edgeFade).x;
+                lit.addAssign(skyShTSL(sky, n, true).mul(ambient).mul(u.skyGain).mul(vis));
+              });
+            }
+            out.addAssign(lit.mul(blockAlbedo(p, n)));
           });
         });
       });
-      E.element(c.i).assign(vec4(out.div(float(6)), 0));
+      // Sprites in this cell: each box that overlaps it injects its bounce -
+      // its albedo lit by the sun (a shadow march from its centre) and the
+      // sky - in proportion to how much of the cell it fills.
+      const spriteE = vec3(0, 0, 0).toVar();
+      const cmin = minCorner(c).toVar();
+      Loop({ start: int(0), end: u.spriteCount, type: 'int', condition: '<', name: 'sp' },
+           ({ sp }) => {
+        const A = u.sprites.element(sp.mul(int(2))).toVar();
+        const B = u.sprites.element(sp.mul(int(2)).add(int(1))).toVar();
+        const w = spriteOverlap(cmin, A, B).mul(u.spriteFill.element(sp)).toVar();
+        If(w.greaterThan(float(0)), () => {
+          // A card faces its viewer, so its Lambert against the sun is taken
+          // as the sun's horizontal share - bright at a low sun, dim overhead.
+          const facing = length(vec2(sun.dir.x, sun.dir.z));
+          const vis = coneTrace(A.xyz, sun.dir, sunReach, sun.coneRadius,
+                                fadeStart, edgeFade).x;
+          const light = sunColourUniform.mul(vis.mul(facing).mul(u.sunGain)).toVar();
+          if (sky) light.addAssign(skyShTSL(sky, vec3(0, 1, 0), true).mul(ambient)
+                                     .mul(u.skyGain).mul(float(0.5)));
+          spriteE.addAssign(B.xyz.mul(light).mul(w));
+        });
+      });
+      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE), 0));
     });
   })().compute(LPV_CELLS).setName(`LPV${level}.Inject`);
 

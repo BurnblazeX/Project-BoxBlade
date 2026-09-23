@@ -67,7 +67,7 @@ export function createTestArea(width, depth) {
       World.set(getVoxelKey(x, GROUND_Y, z), {
         solid: true,
         walkable: true,
-        materialId: null, // populated in the future Material ID phase
+        materialId: 'grass', // an id from materials.js
         occupant: null,
         triggerId: null
       });
@@ -75,6 +75,41 @@ export function createTestArea(width, depth) {
   }
 
   addTestElevation();
+  // Only when the area holds it: the floor patch replaces ground, so it means
+  // nothing past the area's edge. The small test areas the tools build stay
+  // exactly as they were.
+  if (width > 8 && depth > 17) addReflectionTest();
+}
+
+// Reflection test bed: a 5x5 patch of polished iron floor with a polished
+// marble wall standing along its far edge, so the floor has something to
+// mirror and the wall has the floor and the open sky. Both are LabPBR
+// materials with high smoothness (materials.js, and their _s textures). The
+// floor replaces ground blocks rather than sitting on them, so it stays
+// walkable at ground level.
+function addReflectionTest() {
+  const put = (x, y, z, materialId) => World.set(getVoxelKey(x, y, z), {
+    solid: true, walkable: true, materialId, occupant: null, triggerId: null
+  });
+  for (let x = 3; x <= 7; x++) {
+    for (let z = 12; z <= 16; z++) put(x, GROUND_Y, z, 'ironPlate');
+  }
+  // Wall: 2 blocks tall, 7 long, along x at z = 17 - overhanging the patch
+  // by one block each side.
+  for (let x = 2; x <= 8; x++) {
+    for (let y = 1; y <= 2; y++) put(x, y, 17, 'marble');
+  }
+  // Standing iron plates either side, running out from the marble's ends at
+  // right angles: 2 tall, 3 long, on the grass just outside the patch. Their
+  // inner faces look across the floor at each other, so there are mirrors on
+  // three axes - the floor (up), the plates (+x and -x) - and the marble
+  // between them to catch what they throw.
+  for (let z = 14; z <= 16; z++) {
+    for (let y = 1; y <= 2; y++) {
+      put(1, y, z, 'ironPlate');
+      put(9, y, z, 'ironPlate');
+    }
+  }
 }
 
 // Vertical test geometry. Phase A has no slopes, stairs or Jump action, so none
@@ -84,7 +119,7 @@ export function createTestArea(width, depth) {
 // the Jump action is for.
 function addTestElevation() {
   const put = (x, y, z) => World.set(getVoxelKey(x, y, z), {
-    solid: true, walkable: true, materialId: null, occupant: null, triggerId: null
+    solid: true, walkable: true, materialId: 'grass', occupant: null, triggerId: null
   });
 
   // Wall: 2 blocks tall, 7 long, running along z at x = 20.
