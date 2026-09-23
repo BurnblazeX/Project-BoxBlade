@@ -6,19 +6,31 @@ import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, w
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug } from './debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
-         SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres } from './boxgrid.js';
+         SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres,
+         VOXEL_METRES, applyHandoff } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
+import { createCardBindings, createCardAtlasTexture, writeCardBindings,
+         runGPUCards, MAX_CARDS } from './gpu.js';
 import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
-         runGPUMarch, createShadowColorNode, applyShadowMaterial,
-         restoreOriginalMaterial, followShadowGrid,
+         runGPUMarch, createShadowColorNode, createShadowMaterial,
+         restoreOriginalMaterial, followShadowGrid, commitShadowGrid, createSpriteShadowMaterial,
+         createNormalTexture,
          createBayerTexture, writeSunUniforms,
          SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
-         DEFAULT_AMBIENT, cascadeBindings, writeCascadeBindings } from './gpu.js';
+         DEFAULT_AMBIENT, cascadeBindings, writeCascadeBindings, AO_DISTANCE, SEAM_BAND_VOXELS } from './gpu.js';
 import { SUN_ANGULAR_SIZE, penumbraTexels } from './sun.js';
-import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, MAX_LIGHT_LEVEL,
+import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
+         TORCH_SIDE, MAX_LIGHT_LEVEL,
          LIGHT_SOURCE_RADIUS, clampLevel, lightRadiusMetres, colourToRGB,
          pointPenumbraMetres } from './lights.js';
+import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
+import { maskFromRGBA, createSilhouetteSet, facingToward,
+         AXIS_X, AXIS_Z } from './silhouette.js';
+import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
+         cullCardsForLight, cardsVisibility, CARD_PAD, SUN_CARD_LOD_SHIFT,
+         SUN_CARD_LOD_MAX } from './cards.js';
+import { spriteNormals, terrainNormals } from './normals.js';
 import { createConsole, installConsole } from './console.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
@@ -96,7 +108,26 @@ scene.background = new THREE.Color(0x222233);
 // WebGPU, not WebGL: the texel-space shading architecture needs compute shaders
 // and TSL, neither of which WebGL2 can provide. Everything imports from
 // 'three/webgpu' so materials resolve to their NodeMaterial equivalents.
-const renderer = new THREE.WebGPURenderer({ antialias: true });
+//
+// The device is requested here rather than by three, whose own request asks for
+// featureLevel "compatibility" - Firefox does not support that yet, hands back a
+// core adapter anyway and logs a notice on every load. Same features as three
+// would ask for: everything the adapter has. Any failure falls back to letting
+// three do it.
+async function requestGPUDevice() {
+  try {
+    const adapter = navigator.gpu && await navigator.gpu.requestAdapter();
+    return adapter ? await adapter.requestDevice({ requiredFeatures: [...adapter.features] })
+                   : undefined;
+  } catch (err) {
+    console.warn('[renderer] own WebGPU device failed, letting three request one', err);
+    return undefined;
+  }
+}
+// trackTimestamp gives the perf graph the GPU's own frame time. It only takes
+// effect when the device has timestamp-query; without it the graph says so.
+const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: true,
+                                           device: await requestGPUDevice() });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 
@@ -125,6 +156,16 @@ const player = createEntity({
 World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z)).occupant = player.id;
 
 const texLoader = new THREE.TextureLoader();
+// A pixel-art sprite texture of its own. Each character needs one so it can flip
+// independently - and a separate LOAD rather than a clone: Texture.clone() flags
+// the copy for upload at once, while the shared image is still null until the
+// file arrives, and a first frame drawn in that window crashes in three.
+function loadSpriteTexture(url) {
+  const tex = texLoader.load(url);
+  tex.magFilter = tex.minFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
 const bobTexture = texLoader.load(bobTextureUrl);
 bobTexture.magFilter = THREE.NearestFilter;
 bobTexture.minFilter = THREE.NearestFilter;
@@ -155,8 +196,7 @@ function createCharacterMesh(texture) {
 // where the quad is actually penetrating a block. See js/sprites.js.
 const characterClipSamples = makeClipSamples(VOXEL_SIZE, VOXEL_SIZE * 2);
 
-// Clone the texture so this specific character can flip independently
-const playerTex = bobTexture.clone();
+const playerTex = loadSpriteTexture(bobTextureUrl);
 const playerSprite = createCharacterMesh(playerTex);
 
 // An entity's gridPos.y is the block it stands ON, so its sprite sits on that
@@ -189,12 +229,416 @@ const evilBobTexture = texLoader.load(evilBobTextureUrl);
 evilBobTexture.magFilter = THREE.NearestFilter;
 evilBobTexture.minFilter = THREE.NearestFilter;
 evilBobTexture.colorSpace = THREE.SRGBColorSpace;
-// Clone the texture so EvilBob can flip independently
-const enemySprite = createCharacterMesh(evilBobTexture.clone());
+const enemySprite = createCharacterMesh(loadSpriteTexture(evilBobTextureUrl));
 enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
 scene.add(enemySprite);
 
 const enemyAI = createWanderAI(enemy, enemySprite, 4);
+
+// --- Shadow-casting proxies ---
+//
+// A sprite is a camera-facing quad with no thickness, so it is not something the
+// distance field can be baked from directly - see occluders.js for why
+// voxelising the quad itself would make a character's shadow change shape as the
+// camera orbits. Each caster gets a world-locked box instead, and the box is all
+// the grid ever sees.
+//
+// Sized against the sprite quads rather than guessed. The character quad is
+// VOXEL_SIZE x VOXEL_SIZE*2, translated so its base sits at the mesh position -
+// so mesh.position is the FEET, which is what placeOccluder wants. The figure
+// does not fill its quad (pixel art carries transparent padding), so the proxy
+// is narrower and shorter than the geometry: roughly the body, not the canvas.
+const CHARACTER_PROXY = { width: VOXEL_SIZE * 0.5, height: VOXEL_SIZE * 1.6 };
+// A tree's quad is VOXEL_SIZE*2 x VOXEL_SIZE*3, and the same reasoning applies -
+// a trunk and canopy inside a mostly-empty rectangle.
+const TREE_PROXY = { width: VOXEL_SIZE * 0.9, height: VOXEL_SIZE * 2.4 };
+
+// --- Reading the cutout off the sprite ---
+//
+// The only DOM-shaped part of the silhouette path, and the reason it lives here
+// rather than in silhouette.js: a canvas cannot exist in the headless test
+// suite, so the module that does the maths takes a plain mask array and this
+// function is the one thing that has to be trusted by inspection.
+//
+// Drawn at native size with smoothing off. The sprite is 12 x 24 and the voxel
+// grid it is about to become is also 12 x 24 - any scaling here would resample
+// an exact correspondence into an approximate one.
+function imageRGBA(image) {
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(image, 0, 0);
+  return ctx.getImageData(0, 0, image.width, image.height).data;
+}
+
+function maskFromTexture(image) {
+  return { mask: maskFromRGBA(imageRGBA(image), image.width, image.height),
+           w: image.width, h: image.height };
+}
+
+// --- Normal maps ---
+//
+// Generated for every sprite and block texture (normals.js). A hand-authored
+// <texture name>_n.png anywhere under assets/ replaces the generated one - drop
+// it in and it is picked up, nothing to register.
+const normalOverrides = import.meta.glob('../assets/**/*_n.png',
+                                         { eager: true, query: '?url', import: 'default' });
+function normalMapFor(name, generate) {
+  const hit = Object.keys(normalOverrides).find(k => k.endsWith('/' + name + '_n.png'));
+  if (hit) {
+    const tex = texLoader.load(normalOverrides[hit]);
+    tex.minFilter = tex.magFilter = THREE.NearestFilter;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    return tex;
+  }
+  const { data, w, h } = generate();
+  return createNormalTexture(data, w, h);
+}
+
+// The grass texture's normals, once its image has loaded. Polled like the
+// cards, for the same reason (Texture has no load event).
+let terrainNormalTex = null;
+function resolveTerrainNormal() {
+  if (terrainNormalTex || !worldInstancedMesh) return false;
+  const base = worldInstancedMesh.userData.originalMaterial || worldInstancedMesh.material;
+  const map = base.userData.albedoMap !== undefined ? base.userData.albedoMap : base.map;
+  const img = map && map.image;
+  if (!img || !img.width) return false;
+  terrainNormalTex = normalMapFor('terrain_grass', () => ({
+    data: terrainNormals(imageRGBA(img), img.width, img.height),
+    w: img.width, h: img.height
+  }));
+  return true;
+}
+
+// Textures load asynchronously, so a silhouette cannot be built at module scope.
+// Until one arrives the proxy is a box - which is a working shadow, not a
+// placeholder, so there is no first-frame flicker of nothing being cast.
+//
+// RESOLVED BY POLLING, NOT BY AN EVENT, and that is not laziness. THREE.Texture
+// dispatches exactly one event, 'dispose' - there is no 'load', and
+// TextureLoader only assigns texture.image inside ImageLoader's own callback. An
+// addEventListener('load') on the texture therefore never fires, which is how
+// every silhouette here silently stayed a box: the fallback is a working shadow,
+// so nothing looked broken, it just looked rectangular.
+//
+// Checking each frame cannot miss a load the way a missing event can, costs one
+// truthiness test per proxy once resolved, and self-heals if a texture is ever
+// swapped at runtime.
+const pendingSilhouettes = [];
+
+function attachSilhouette(proxy, texture, widthMetres, heightMetres) {
+  pendingSilhouettes.push({ proxy, texture, widthMetres, heightMetres });
+}
+
+function resolveSilhouettes() {
+  for (let i = pendingSilhouettes.length - 1; i >= 0; i--) {
+    const p = pendingSilhouettes[i];
+    const img = p.texture.image;
+    if (!img || !img.width) continue;
+    const { mask, w, h } = maskFromTexture(img);
+    // One per cascade. A single silhouette is expressed in the voxels of the
+    // level it was built for, so sharing it across levels makes the character
+    // twice as wide in C1 and four times in C2 - see createSilhouetteSet.
+    p.proxy.silhouettes = createSilhouetteSet({
+      mask, w, h,
+      widthMetres: p.widthMetres, heightMetres: p.heightMetres
+    });
+    pendingSilhouettes.splice(i, 1);
+  }
+}
+
+// How the cards are turned. 'sun' points each card's normal along the sun's
+// azimuth, so the full silhouette always faces the light and the fixed-facing
+// degeneracy - a card edge-on to the sun casting a line - cannot arise.
+//
+// This is still not a CAMERA-facing proxy, which is what S9 rules out and for a
+// specific reason: a camera-facing card's thickness is camera-relative, so the
+// shadow changes shape as the player orbits. A sun-facing card is world-locked
+// with respect to the viewer and re-orients only when the light moves, which is
+// what a real silhouette does anyway.
+//
+// 'x' and 'z' lock to a world plane instead, kept for comparison.
+let cardMode = 'sun';
+
+function cardFacing() {
+  if (cardMode === 'x') return AXIS_X;
+  if (cardMode === 'z') return AXIS_Z;
+  return facingToward(dirLight.position.x, dirLight.position.z);
+}
+
+// Sprites are turned around by mirroring their UVs - repeat.x goes to -1, see
+// updateSpriteFacing - not by scaling the mesh. So that is where any mirror
+// state has to be read from. One definition rather than one per caller: the
+// cutout and the torch both need it, and a torch that disagreed with the
+// silhouette about which way Bob faces would swap sides a frame early or late.
+const mirrored = sprite => sprite.material.map.repeat.x < 0;
+
+const playerProxy = createOccluder('player', CHARACTER_PROXY);
+const enemyProxy = createOccluder('enemy', CHARACTER_PROXY);
+attachSilhouette(playerProxy, bobTexture, VOXEL_SIZE, VOXEL_SIZE * 2);
+attachSilhouette(enemyProxy, evilBobTexture, VOXEL_SIZE, VOXEL_SIZE * 2);
+// Trees never move, so after the first frame they cost exactly nothing - the
+// snapped box compares equal and applyOccluders does no work. They are in the
+// list for the same reason the characters are: they are sprites, so they are
+// not in the World map, so without a proxy they cast nothing at all.
+const treeProxies = [];
+// The baked proxies are OFF by default: analytic cards (above) are the shadow
+// path now, and running both would have every sprite occlude twice. Kept
+// switchable because the bake is what reflections and GI will need.
+let proxiesOn = false;
+
+// --- Analytic cards: the shadow path sprites actually use ---
+//
+// The distance field is geometry shared by every light, so a sprite baked into
+// it faces one direction and every other light gets the wrong silhouette. These
+// live OUTSIDE the field: each light intersects each card, turned to face that
+// light. See cards.js.
+//
+// The baked proxies above are kept and still work - bxb.proxies() turns them on
+// - but they are off by default now, because the two would double-count. What
+// they are for from here is reflections and GI (S9), which need sprites present
+// in the grid rather than tested against a ray.
+const cardTypes = [];          // { card, typeIndex }, one per sprite texture
+let cardAtlas = null;
+let cardAtlasTex = null;
+const pendingCards = [];
+
+// The texture arrives as a THUNK rather than a value, and that is about module
+// order rather than laziness. These registrations sit next to the rest of the
+// sprite-shadow code, but the textures they name are created wherever their
+// sprite happens to be set up - treeTexture is nearly two hundred lines further
+// down. Naming one directly here reads it during module evaluation, before the
+// const exists, which is a TDZ error at load and not something a build catches.
+//
+// A thunk is evaluated in resolveCards, long after every module-level const has
+// settled, so where a texture is declared stops mattering at all.
+// name is the texture's file name, which is what a normal-map override is
+// matched by.
+function registerCard(key, name, getTexture, widthMetres, heightMetres) {
+  const entry = { key, name, getTexture, widthMetres, heightMetres, card: null,
+                  normalTex: null };
+  pendingCards.push(entry);
+  return entry;
+}
+
+const bobCard = registerCard('bob', 'character_Bob', () => bobTexture,
+                             VOXEL_SIZE, VOXEL_SIZE * 2);
+const evilCard = registerCard('evil', 'character_EvilBob', () => evilBobTexture,
+                              VOXEL_SIZE, VOXEL_SIZE * 2);
+const treeCard = registerCard('tree', 'decor_tree', () => treeTexture,
+                              VOXEL_SIZE * 2, VOXEL_SIZE * 3);
+
+// Same polling as the silhouettes, and for the same reason: THREE.Texture has no
+// 'load' event, so there is nothing to listen to.
+function resolveCards() {
+  let built = false;
+  for (let i = pendingCards.length - 1; i >= 0; i--) {
+    const p = pendingCards[i];
+    const tex = p.getTexture();
+    const img = tex && tex.image;
+    if (!img || !img.width) continue;
+    // Per sprite, so one unreadable texture cannot take the rest down with it -
+    // and so the reason is reported rather than surfacing as "still loading"
+    // forever, which is what it looked like.
+    let mask, w, h;
+    try {
+      ({ mask, w, h } = maskFromTexture(img));
+    } catch (err) {
+      p.error = String(err && err.message || err);
+      continue;
+    }
+    // How much of the sprite is opaque. Kept because a mask that comes back
+    // fully solid is indistinguishable from a working one until you look at the
+    // shadow: every card becomes its own bounding box and casts a slab.
+    let solid = 0;
+    for (let k = 0; k < mask.length; k++) solid += mask[k];
+    p.coverage = solid / mask.length;
+    p.card = createCard({ mask, w, h,
+                          widthMetres: p.widthMetres, heightMetres: p.heightMetres });
+    // From the card's own distance transform: the silhouette the shadow uses
+    // is the silhouette the bevel follows.
+    const card = p.card;
+    p.normalTex = normalMapFor(p.name, () => ({
+      data: spriteNormals(card.dt, card.w, card.cols, card.rows, CARD_PAD), w, h
+    }));
+    p.typeIndex = cardTypes.length;
+    cardTypes.push(p);
+    pendingCards.splice(i, 1);
+    built = true;
+  }
+  if (!built) return false;
+  // Repacked whole rather than appended: the atlas is a handful of small
+  // bitmaps, and a rect that moved would silently point every instance of that
+  // card at the wrong pixels.
+  cardAtlas = buildCardAtlas(cardTypes.map(t => t.card));
+  return true;
+}
+
+// Every sprite that should cast, with no facing yet - the facing is per light
+// and is filled in per light below.
+function cardCasters() {
+  const out = [];
+  const add = (entry, sprite, flip) => {
+    if (!entry || !entry.card || !sprite.visible) return;
+    out.push({
+      card: entry.card, typeIndex: entry.typeIndex,
+      // The card's centre, not its feet: the mask is centred on the quad.
+      centre: { x: sprite.position.x,
+                y: sprite.position.y + entry.heightMetres / 2,
+                z: sprite.position.z },
+      flip, enabled: true
+    });
+  };
+  add(bobCard, playerSprite, mirrored(playerSprite));
+  add(evilCard, enemySprite, mirrored(enemySprite));
+  for (const m of treeMeshes) add(treeCard, m, false);
+  return out;
+}
+
+// Rebuilt each frame rather than kept in sync by hand. The set is small and the
+// alternative is a registration path that has to be remembered at every spawn
+// and despawn - a corpse that keeps casting is exactly the bug that costs.
+function activeProxies() {
+  if (!proxiesOn) return [];
+  const out = [];
+  if (playerSprite.visible) {
+    out.push(placeOccluder(playerProxy, playerSprite.position.x,
+                           playerSprite.position.y, playerSprite.position.z,
+                           mirrored(playerSprite)));
+  }
+  if (enemySprite.visible) {
+    out.push(placeOccluder(enemyProxy, enemySprite.position.x,
+                           enemySprite.position.y, enemySprite.position.z,
+                           mirrored(enemySprite)));
+  }
+  for (let i = 0; i < treeMeshes.length; i++) {
+    const m = treeMeshes[i];
+    if (!m.visible) continue;
+    if (!treeProxies[i]) {
+      treeProxies[i] = createOccluder('tree' + i, TREE_PROXY);
+      // One silhouette per tree rather than one shared: createSilhouette is
+      // cheap and called once, and sameBox compares the object by identity, so a
+      // shared instance would be fine too - but a per-tree one leaves room for
+      // variants (a stump, a dead tree) without restructuring.
+      attachSilhouette(treeProxies[i], treeTexture, VOXEL_SIZE * 2, VOXEL_SIZE * 3);
+    }
+    out.push(placeOccluder(treeProxies[i], m.position.x, m.position.y, m.position.z));
+  }
+  return out;
+}
+
+// Write the proxies into every cascade and report whether anything changed.
+//
+// Every cascade, not just C0: a shadow ray leaves C0 after 18 m and continues in
+// C1, so a caster present only in the fine level would stop casting at exactly
+// the distance the ray crossed over - a character's shadow vanishing partway
+// across the ground for no visible reason.
+//
+// The texture upload is conditional on the SAME flag, which is the point of
+// applyOccluders returning one: a 3 MB Data3DTexture re-upload per cascade per
+// frame would cost more than the bake it is reporting, and in a turn-based scene
+// most frames have nobody mid-step.
+// One binding per LIGHT, not one shared, because the facing is the whole point:
+// a card turned toward the sun is not the card the torch needs, and a single
+// buffer can only hold one orientation.
+let sunCards = null, torchCards = null;
+let cardPack = null;
+let cardsReady = false;
+
+function ensureCardBindings() {
+  if (sunCards) return;
+  sunCards = createCardBindings(MAX_CARDS);
+  sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
+  sunCards.lodMax.value = SUN_CARD_LOD_MAX;
+  torchCards = createCardBindings(MAX_CARDS);
+  cardPack = new Float32Array(MAX_CARDS * 16);
+}
+
+// Fill one light's buffer: cull to what that light can reach, turn each card to
+// face it, pack, upload.
+function writeCardsFor(binding, casters, lightPos, radiusMetres, directional) {
+  const near = cullCardsForLight(casters, lightPos, radiusMetres, binding.capacity);
+  for (const c of near) {
+    // A directional light is the same direction from everywhere, so every card
+    // turns the same way. A point light is in a DIFFERENT direction from every
+    // sprite, which is the case a baked field cannot express at all.
+    c.facing = directional
+      ? facingToward(lightPos.x, lightPos.z)
+      : cardFacingFor(c.centre, lightPos.x, lightPos.z);
+  }
+  const n = packCardInstances(near, cardAtlas, cardPack, binding.capacity);
+  writeCardBindings(binding, cardPack, n);
+  return n;
+}
+
+let lastCardCount = 0;
+
+// Which cascade a card stands in, as the lod createCardsTSL reads: the level,
+// plus how far into the last SEAM_BAND_VOXELS of it toward the next. null when
+// it is outside every level - no terrain shadow reaches there either, so the
+// card is dropped before it costs any fragment anything.
+function cardLod(centre) {
+  for (let l = 0; l < CASCADE_COUNT; l++) {
+    const g = shadowGrids[l];
+    if (!g) return 0;
+    const side = cascadeExtentMetres(l);
+    const ex = Math.min(centre.x - g.origin.x, g.origin.x + side - centre.x);
+    const ez = Math.min(centre.z - g.origin.z, g.origin.z + side - centre.z);
+    if (ex < 0 || ez < 0) continue;
+    const edge = Math.min(ex, ez) / cascadeVoxelMetres(l);
+    const t = Math.min(1, edge / SEAM_BAND_VOXELS);
+    return l + (1 - t * t * (3 - 2 * t));   // 1 - smoothstep, as c0WeightTSL
+  }
+  return null;
+}
+
+function updateCards() {
+  if (resolveTerrainNormal() && shadowsOn) buildPerPixelShadows();
+  if (pendingCards.length && resolveCards()) {
+    // The atlas exists now where it did not before, and the kernel branches on
+    // whether there is one - so the material has to be rebuilt once. A one-frame
+    // hitch on load, and nothing afterwards.
+    cardAtlasTex = createCardAtlasTexture(cardAtlas);
+    ensureCardBindings();
+    sunCards.atlas = torchCards.atlas = cardAtlasTex;
+    sunCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
+    torchCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
+    cardsReady = true;
+    if (shadowsOn) { buildPerPixelShadows(); }
+  }
+  if (!cardsReady || !cardsOn) { lastCardCount = 0; return; }
+
+  const casters = cardCasters().filter(c => (c.lod = cardLod(c.centre)) !== null);
+  // The sun is directional: its "position" is a direction, and everything is
+  // within reach of it.
+  lastCardCount = writeCardsFor(sunCards, casters, dirLight.position, Infinity, true);
+  if (torchOn && torchUniforms) {
+    writeCardsFor(torchCards, casters, torchUniforms.position.value,
+                  lightRadiusMetres(torchLevel), false);
+  } else {
+    torchCards.count.value = 0;
+  }
+}
+
+let cardsOn = true;
+
+function updateOccluders() {
+  // Cheap once everything has loaded, and the only thing that turns a box back
+  // into a cutout - see attachSilhouette for why this is not an event handler.
+  if (pendingSilhouettes.length) resolveSilhouettes();
+
+  const proxies = activeProxies();
+  const facing = cardFacing();
+  for (let l = 0; l < shadowGrids.length; l++) {
+    if (!shadowGrids[l]) continue;
+    if (applyOccluders(shadowGrids[l], proxies, facing)) {
+      updateDistanceTexture(shadowTexes[l]);
+    }
+  }
+}
 
 // --- WORLD OBJECTS (Phase 10: Tree, Chest, Barrel) ---
 // Untextured colored placeholder sprites - no dedicated object art yet.
@@ -443,8 +887,32 @@ function updateCameraTargets() {
 
 // --- MOVEMENT STATE ---
 let currentPath = [];
-const clock = new THREE.Clock();
+const timer = new THREE.Timer();
 const keyState = { w: false, a: false, s: false, d: false };
+
+// --- Free cam (Alt+C, debug) ---
+//
+// Detaches the camera from Bob: WASD flies the pivot instead of walking him,
+// Q/E still turn it. Only the CAMERA moves - the cascades, the boxGrid overlay
+// and everything else that follows the player keep following player.gridPos,
+// so flying away shows the field's footprint staying put around Bob.
+let freeCam = false;
+const FREE_CAM_SPEED = 12;   // m/s
+function moveFreeCam(dt) {
+  let rx = 0, rz = 0;
+  if (keyState.w) rz -= 1;
+  if (keyState.s) rz += 1;
+  if (keyState.a) rx -= 1;
+  if (keyState.d) rx += 1;
+  if (!rx && !rz) return;
+  const len = Math.hypot(rx, rz);
+  // Screen-relative, the same basis Bob walks in.
+  const h = (rotationStep * Math.PI / 2) + cameraConfigs[currentMode].headingOffset;
+  const c = Math.cos(h), s = Math.sin(h);
+  const step = FREE_CAM_SPEED * dt / len;
+  pivot.position.x += (rx * c + rz * s) * step;
+  pivot.position.z += (-rx * s + rz * c) * step;
+}
 
 // --- INPUT HANDLING ---
 const raycaster = new THREE.Raycaster();
@@ -961,14 +1429,59 @@ window.addEventListener('pointermove', (e) => {
   }
 });
 
+// Whiteworld strips the terrain's albedo by clearing the map on the ORIGINAL
+// material - applyShadowMaterial reads its albedo from there, so the shadowed
+// path picks it up on rebuild and the unshadowed path picks it up directly.
+let whiteWorld = false;
+const whiteUniform = uniform(0);
+function toggleWhiteWorld() {
+  const mesh = worldInstancedMesh;
+  if (!mesh) return 'no terrain yet';
+  const base = mesh.userData.originalMaterial || mesh.material;
+  if (base.userData.albedoMap === undefined) base.userData.albedoMap = base.map;
+  whiteWorld = !whiteWorld;
+  base.map = whiteWorld ? null : base.userData.albedoMap;
+  base.needsUpdate = true;
+  // The shadowed material reads this as a uniform, so no rebuild.
+  whiteUniform.value = whiteWorld ? 1 : 0;
+  return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
+}
+
 window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
 
-  // Debug: Alt+X toggles the boxGrid occupancy overlay. Matched on e.code, not
-  // e.key, because holding Alt changes the reported character on several
-  // keyboard layouts while the physical key code stays put. preventDefault
-  // stops Alt from reaching the browser's own menu handling.
+  // Alt+X: whiteworld - terrain drawn plain white so light and shadow can be
+  // judged without the grass texture in the way. Sprites keep their textures.
+  // Matched on e.code, not e.key, because holding Alt changes the reported
+  // character on several keyboard layouts while the physical key code stays put.
+  // preventDefault stops Alt from reaching the browser's own menu handling.
   if (e.altKey && e.code === 'KeyX') {
+    e.preventDefault();
+    console.log(toggleWhiteWorld());
+    return;
+  }
+
+  // Alt+<key> is reserved for debug modes.
+  if (e.altKey && e.code === 'KeyC') {
+    e.preventDefault();
+    freeCam = !freeCam;
+    console.log(freeCam ? 'free cam on - WASD flies the camera, Bob stays put'
+                        : 'free cam off - camera returns to Bob');
+    return;
+  }
+
+  // Alt+U: the whole HUD on and off - title, party, map, chat, battle panels.
+  // Starts hidden (the class is on body in index.html) while graphics work is
+  // the focus.
+  if (e.altKey && e.code === 'KeyU') {
+    e.preventDefault();
+    const hidden = document.body.classList.toggle('ui-hidden');
+    console.log(`UI ${hidden ? 'hidden' : 'shown'}`);
+    return;
+  }
+
+  // Debug: Alt+G toggles the boxGrid occupancy overlay.
+  if (e.altKey && e.code === 'KeyG') {
     e.preventDefault();
     const msg = toggleBoxGridDebug(scene, player.gridPos, worldInstancedMesh,
                                    currentMode, { sunDirection: dirLight.position,
@@ -1084,8 +1597,12 @@ window.addEventListener('resize', () => {
 });
 
 // --- RENDER & GAME LOOP ---
-function animate() {
-  const dt = clock.getDelta();
+function animate(time) {
+  const tStart = performance.now();
+  // Clamped: after a stall (a tab switch, a compile) one huge step would carry
+  // movement through walls and snap every ease to its target.
+  timer.update(time);
+  const dt = Math.min(timer.getDelta(), 0.1);
 
   if (currentMode === 'explore') {
     enemyAI.update(dt, currentHeading);
@@ -1109,7 +1626,7 @@ function animate() {
   // 1. Process Movement Logic
   const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
 
-  if (isWalkingManual && currentMode === 'explore' && currentPath.length > 0) {
+  if (isWalkingManual && !freeCam && currentMode === 'explore' && currentPath.length > 0) {
     currentPath = [];
     currentMoveTargetKey = null;
   }
@@ -1193,7 +1710,7 @@ function animate() {
       enemySprite.position.add(dir.multiplyScalar(step));
     }
   }
-  else if (currentMode === 'explore' && inputRules.explore.keyboard) {
+  else if (currentMode === 'explore' && inputRules.explore.keyboard && !freeCam) {
     let rawDx = 0, rawDz = 0;
     if (keyState.w) rawDz -= 1; 
     if (keyState.s) rawDz += 1; 
@@ -1269,20 +1786,26 @@ function animate() {
   }
 
   // 2. Camera Lerping & Pivot Tracking
-  if (currentMode === 'explore') {
-    pivot.position.lerp(playerSprite.position, 0.1); 
+  // The lerp factors were tuned as "per frame at 60 Hz". Converted to the
+  // equivalent fraction for this frame's dt, so a 240 Hz screen eases at the
+  // same speed as a 60 Hz one instead of four times faster.
+  const ease = 1 - Math.pow(1 - CAMERA_LERP_SPEED, dt * 60);
+  if (freeCam) {
+    moveFreeCam(dt);
+  } else if (currentMode === 'explore') {
+    pivot.position.lerp(playerSprite.position, ease);
   } else {
-    pivot.position.lerp(arenaCenter, 0.1); 
+    pivot.position.lerp(arenaCenter, ease);
   }
 
   const config = cameraConfigs[currentMode];
   const targetHeading = (rotationStep * Math.PI / 2) + config.headingOffset;
   
   // Lerp all camera properties smoothly
-  currentFov += (config.fov - currentFov) * CAMERA_LERP_SPEED;
-  currentPitch += (config.pitch - currentPitch) * CAMERA_LERP_SPEED;
-  currentHeading += (targetHeading - currentHeading) * CAMERA_LERP_SPEED;
-  currentDistance += (config.distance - currentDistance) * CAMERA_LERP_SPEED;
+  currentFov += (config.fov - currentFov) * ease;
+  currentPitch += (config.pitch - currentPitch) * ease;
+  currentHeading += (targetHeading - currentHeading) * ease;
+  currentDistance += (config.distance - currentDistance) * ease;
 
   camera.fov = currentFov;
   camera.updateProjectionMatrix();
@@ -1315,12 +1838,58 @@ function animate() {
   // in the patch the grid happened to be built in. Nothing else has to happen
   // when they move: the terrain material marches the field live, so a re-origin
   // is a texture upload and the next frame is already correct.
-  if (shadowsOn) followShadowGrids();
+  const tGrid = performance.now();
+  const moved = shadowsOn && followShadowGrids();
+  const tCards = performance.now();
+  // Before the torch moves? No - after, so a card is tested against where the
+  // flame IS this frame rather than where it was last one. updateTorchPosition
+  // runs below, so this reads the previous frame's position by one frame, which
+  // at walking speed is under a centimetre and invisible; reordering it would
+  // mean recomputing the torch position twice.
+  if (shadowsOn) updateCards();
+  // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
+  // which wipes the imprint of any proxy standing there, and it translates the
+  // remembered boxes into the new coordinates - so running this first would
+  // write proxies the scroll then destroys, and cost the bake twice.
+  if (shadowsOn) updateOccluders();
   updateTorchPosition();
-  perf.update(dt);
 
+  const tRender = performance.now();
   renderer.render(scene, camera);
+  const tEnd = performance.now();
+  logSpike(tGrid, tCards, tRender, tEnd, moved);
+  perf.update(dt, { logic: tGrid - tStart, grids: tCards - tGrid,
+                    cards: tRender - tCards, submit: tEnd - tRender });
+  resolveGPUTime();
 }
+
+// One resolve in flight at a time: each returns the GPU time of everything
+// rendered since the last, so overlapping them would split frames in two.
+// Resolved every frame even with the graph hidden - unresolved queries fill
+// three's query pool.
+let gpuTimePending = false;
+function resolveGPUTime() {
+  if (gpuTimePending || !renderer.backend.trackTimestamp) return;
+  gpuTimePending = true;
+  renderer.resolveTimestampsAsync('render').then(ms => {
+    gpuTimePending = false;
+    if (typeof ms === 'number') perf.gpu(ms);
+  }, () => { gpuTimePending = false; });
+}
+
+// CPU-side breakdown of any slow frame, so a hitch can be pinned to a stage
+// instead of guessed at. render covers submission, which is where texture
+// uploads and pipeline compiles land. GPU execution time is not in here.
+const SPIKE_MS = 8;
+function logSpike(tGrid, tCards, tRender, tEnd, moved) {
+  const total = tEnd - tGrid;
+  if (!spikeLog || total < SPIKE_MS) return;
+  const f = x => x.toFixed(1);
+  console.log(`[spike] ${f(total)} ms - grids ${f(tCards - tGrid)}` +
+              `${moved ? ' (re-origin)' : ''}, cards+occluders ${f(tRender - tCards)}, ` +
+              `render ${f(tEnd - tRender)}`);
+}
+let spikeLog = false;
 
 // --- DEBUG CONSOLE (bxb) ---
 let shadowsOn = false;
@@ -1346,21 +1915,77 @@ function ensureShadowGrids() {
       : cascadeBindings(shadowTexes[l], shadowGrids[l]);
     shadowOrigins[l] = o;
   }
+  resetFieldWorker();
   return shadowCascades;
+}
+
+// --- Re-origin off the main thread ---
+//
+// The worker mirrors every level and does the scroll-and-strip bake; the strips
+// come back and applyHandoff lands origin, ring and data together. A level with
+// a bake in flight is not re-asked until it lands, and a full bake here bumps
+// the generation so any answer already on its way is dropped - the worker has
+// been reset behind it.
+let fieldWorker = null;
+let fieldGen = 0;
+const fieldInFlight = [];
+let fieldApplied = false;   // for the spike log: a hand-off landed this frame
+
+function resetFieldWorker() {
+  if (!fieldWorker) {
+    try {
+      fieldWorker = new Worker(new URL('./fieldWorker.js', import.meta.url), { type: 'module' });
+    } catch (err) {
+      console.warn('[shadows] no field worker, re-origins stay on the main thread', err);
+      fieldWorker = false;
+      return;
+    }
+    fieldWorker.onmessage = ({ data: m }) => {
+      fieldInFlight[m.level] = false;
+      if (m.gen !== fieldGen || !shadowsOn) return;
+      applyHandoff(shadowGrids[m.level], m);
+      commitShadowGrid(shadowGrids[m.level], shadowTexes[m.level],
+                       shadowCascades[m.level], renderer);
+      shadowOrigins[m.level] = { x: m.x, z: m.z };
+      fieldApplied = true;
+    };
+  }
+  if (!fieldWorker) return;
+  // Every reset, not once. World is static today, but a mirror baking from
+  // stale blocks would hand back strips of terrain that is not there, so any
+  // future terrain edit only has to trigger a reset to reach it.
+  fieldWorker.postMessage({ type: 'world', keys: [...World.keys()] });
+  fieldGen++;
+  fieldInFlight.length = 0;
+  for (let l = 0; l < CASCADE_COUNT; l++) {
+    const o = shadowOrigins[l];
+    fieldWorker.postMessage({ type: 'reset', level: l, x: o.x, z: o.z });
+  }
 }
 
 // Re-origins only the levels that actually moved. C0 moves every block stepped;
 // C1 snaps to a 2-block stride, so it rebuilds half as often - which is most of
 // why a second level is affordable at all.
 function followShadowGrids() {
-  let moved = false;
+  let moved = fieldApplied;
+  fieldApplied = false;
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const want = gridOriginFor(currentMode, player.gridPos, dirLight.position, sunGridBias, l);
     const at = shadowOrigins[l];
     if (at && want.x === at.x && want.z === at.z) continue;
-    followShadowGrid(shadowGrids[l], shadowTexes[l], shadowCascades[l], want);
+    if (fieldWorker) {
+      if (fieldInFlight[l]) continue;
+      fieldInFlight[l] = true;
+      fieldWorker.postMessage({ type: 'scroll', level: l, x: want.x, z: want.z, gen: fieldGen });
+      continue;
+    }
+    followShadowGrid(shadowGrids[l], shadowTexes[l], shadowCascades[l], want, renderer);
     shadowOrigins[l] = want;
     moved = true;
+    // One level per frame: C1 and C2 step on the same frames C0 does, and
+    // stacking all three bakes into one frame is the spike. A coarse level a
+    // frame late is still a correct field - its bindings move with it.
+    break;
   }
   return moved;
 }
@@ -1408,6 +2033,11 @@ let sunAmbient = null;
 // light instead of two. This is what a cave or a night is.
 let sunOn = true;
 let shadowOnly = false; // raw visibility, no albedo or N.L, for judging artifacts
+// Cone-traced AO. On/off is compiled into the kernel; the distance is a
+// uniform. aoOnly shows the AO term alone.
+let aoOn = true;
+let aoOnly = false;
+const aoDistance = uniform(AO_DISTANCE);
 
 // Quantisation is a KERNEL flag, not a uniform, so changing it rebuilds. Off by
 // default now: it was inherited from the sampled path, where a fixed sample
@@ -1427,6 +2057,12 @@ let torchLevel = TORCH_LEVEL;
 // is the knob the penumbra is found by eye with, so a sweep has to be a uniform
 // write rather than a material rebuild.
 let torchSourceRadius = LIGHT_SOURCE_RADIUS;
+// How far out in front of the holder, and to their side, the flame is held, in
+// metres. Plain numbers rather than uniforms: they are read on the CPU when the
+// position is written each frame, so there is nothing on the GPU to rebuild when
+// either changes.
+let torchOffset = TORCH_FORWARD;
+let torchSide = TORCH_SIDE;
 let torchUniforms = null;
 
 function ensureTorchUniforms() {
@@ -1437,18 +2073,59 @@ function ensureTorchUniforms() {
     level: uniform(TORCH_LEVEL),
     sourceRadius: uniform(LIGHT_SOURCE_RADIUS)
   };
-  torchUniforms.level.value = clampLevel(torchLevel);
+  // Off is level 0, not an absent light: the torch is always compiled in, and
+  // at level 0 its falloff is zero everywhere, which skips its march entirely.
+  // So toggling is this write, never a shader rebuild.
+  torchUniforms.level.value = torchOn ? clampLevel(torchLevel) : 0;
   torchUniforms.sourceRadius.value = torchSourceRadius;
   return torchUniforms;
 }
 
 // The flame follows the sprite every frame. Nothing else has to happen: the
 // distance field is geometry, so a light that moves invalidates none of it.
+//
+// Held OUT IN FRONT rather than at the sprite's centre. The character is a
+// silhouette in the distance field now, so a flame at its own position is inside
+// solid geometry - the marcher hits an occluder on the first step and the torch
+// shadows itself. TORCH_FORWARD and TORCH_HEIGHT are what carry it clear.
+const torchForward = new THREE.Vector3();
+
 function updateTorchPosition() {
   if (!torchOn || !torchUniforms) return;
-  torchUniforms.position.value.set(playerSprite.position.x,
-                                   playerSprite.position.y + TORCH_HEIGHT,
-                                   playerSprite.position.z);
+  // The sprite's own +Z in world space, which is where it is facing - it is
+  // yawed to meet the camera every frame, so this is "toward the viewer" without
+  // having to re-derive it from currentHeading. Reading the orientation the
+  // sprite actually has, rather than the one it was asked for, keeps the flame
+  // from lagging a frame behind on a camera spin.
+  playerSprite.getWorldDirection(torchForward);
+  // Flattened. getWorldDirection carries the character's pitch lean as well as
+  // its yaw, and letting that through would bob the flame up and down as the
+  // camera tilts - the offset is meant to be horizontal.
+  torchForward.y = 0;
+  if (torchForward.lengthSq() < 1e-8) torchForward.set(0, 0, 1);
+  else torchForward.normalize();
+
+  // The sprite's own right, in world space: X = up cross Z for a right-handed
+  // basis, which for a flattened forward is (fz, -fx). Taken from the forward
+  // vector rather than from currentHeading for the same reason forward itself is
+  // - one source of truth for where the sprite is actually pointing.
+  const rightX = torchForward.z, rightZ = -torchForward.x;
+  // Bob mirrors when he turns, so the hand holding the torch swaps with him.
+  //
+  // mirrored() is true when he faces RIGHT (updateSpriteFacing sets repeat.x to
+  // -1 for that), and the torch LEADS - it goes to the side he is facing, so
+  // facing right puts it on screen-right. Which side reads as correct is a call
+  // about the art rather than about the geometry, so torchSide may be negative
+  // and bxb.torchside() flips it without a rebuild.
+  const side = torchSide * (mirrored(playerSprite) ? 1 : -1);
+
+  const ox = torchForward.x * torchOffset + rightX * side;
+  const oz = torchForward.z * torchOffset + rightZ * side;
+
+  torchUniforms.position.value.set(
+    playerSprite.position.x + ox,
+    playerSprite.position.y + TORCH_HEIGHT,
+    playerSprite.position.z + oz);
 }
 
 function ensureSunUniforms() {
@@ -1479,21 +2156,159 @@ function bxbLight(x, y, z) {
 // count is baked into the material, so bxb.soften() has to rebuild it, and
 // reaching back through globalThis.bxb to do that would make the console the
 // owner of state main.js owns.
+// Sprites receive the same lights as the terrain. One lit material per ORIGINAL
+// material, so the trees' four planes and eight trees still share one.
+let spriteShadowMats = [];
+function spriteMeshes() {
+  return [playerSprite, enemySprite, ...treeMeshes.flatMap(g => g.children)];
+}
+function restoreSpriteMaterials() {
+  for (const m of spriteMeshes()) {
+    if (!m.userData.originalMaterial) continue;
+    m.material = m.userData.originalMaterial;
+    if (m.userData.depthVariants) {
+      m.userData.depthVariants = null;
+      // The plain material missed any clip transitions while it was parked.
+      const top = !!m.userData.drawingOnTop;
+      if (m.material.depthTest === top) {
+        m.material.depthTest = m.material.depthWrite = !top;
+        m.material.needsUpdate = true;
+      }
+    }
+  }
+  for (const mat of spriteShadowMats) mat.dispose();
+  spriteShadowMats = [];
+}
+// The characters also get an always-on-top variant for the clip fix in
+// sprites.js - compiled here with the rest, so leaning into a wall never
+// compiles anything.
+const clippingSprites = () => [playerSprite, enemySprite];
+// Null until that sprite's card has resolved; the sprite is shaded flat until
+// the rebuild that follows.
+const spriteNormalFor = m =>
+  (m === playerSprite ? bobCard : m === enemySprite ? evilCard : treeCard).normalTex;
+function buildSpriteShadows(spriteLight) {
+  const made = new Map();
+  const pairs = [];
+  const variants = new Map();
+  for (const m of spriteMeshes()) {
+    const base = m.userData.originalMaterial || m.material;
+    m.userData.originalMaterial = base;
+    if (!made.has(base)) {
+      const mat = createSpriteShadowMaterial(base, spriteLight, spriteNormalFor(m));
+      mat.depthTest = mat.depthWrite = true;
+      made.set(base, mat);
+    }
+    pairs.push([m, made.get(base)]);
+  }
+  const mats = [...made.values()];
+  for (const m of clippingSprites()) {
+    const top = createSpriteShadowMaterial(m.userData.originalMaterial, spriteLight,
+                                           spriteNormalFor(m));
+    top.depthTest = top.depthWrite = false;
+    variants.set(m, { normal: made.get(m.userData.originalMaterial), onTop: top });
+    pairs.push([m, top]);
+    mats.push(top);
+  }
+  return { pairs, mats, variants };
+}
+
+// Compile the new materials before anything visible uses them, so the swap
+// costs nothing and the previous materials keep drawing meanwhile.
+//
+// Against the REAL mesh in the REAL scene: compileAsync keys its cache on the
+// scene it is handed, so compiling stand-ins in a scratch scene produced
+// pipelines the actual render never looked up. The new material is put on the
+// mesh only for the synchronous part of the call - which is where the render
+// object is captured - and taken off again before any frame can draw it. Culling
+// is lifted for the same span, or an off-screen sprite would be skipped and
+// compile on first sight instead.
+//
+// One material per frame: building the node graph into WGSL is synchronous
+// JavaScript, and doing all four in one frame is a hitch of its own.
+const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+
+// Compile everything in the scene that has not been drawn yet, with culling
+// lifted - otherwise a sprite first seen on walking into new ground compiles
+// its pipeline right then, which is the hitch. Anything already compiled is a
+// cache hit, so this is cheap to repeat.
+async function warmScene() {
+  const lifted = [];
+  scene.traverse(o => { if (o.frustumCulled) { lifted.push(o); o.frustumCulled = false; } });
+  let pending;
+  try { pending = renderer.compileAsync(scene, camera); }
+  finally { for (const o of lifted) o.frustumCulled = true; }
+  await pending;
+}
+async function compileOffscreen(pairs) {
+  const seen = new Set();
+  for (const [mesh, mat] of pairs) {
+    if (seen.has(mat)) continue;   // meshes sharing a material share its pipeline
+    seen.add(mat);
+    const old = mesh.material, culled = mesh.frustumCulled;
+    mesh.material = mat;
+    mesh.frustumCulled = false;
+    let pending;
+    try { pending = renderer.compileAsync(mesh, camera, scene); }
+    finally { mesh.material = old; mesh.frustumCulled = culled; }
+    await pending;
+    await nextFrame();
+  }
+}
+let shadowBuild = 0;
+
 function buildPerPixelShadows() {
   ensureShadowGrids();
   const origin = shadowOrigins[0];
   ensureSunUniforms();
-  const { node, sun } = createShadowColorNode({
+  const { node, spriteLight, sun } = createShadowColorNode({
     cascades: shadowCascades,
     sunDirection: dirLight.position,
     rays: sunRays, angular: sunAngular, cone: sunCone, quantise: sunQuantise,
     bayerTex: sunBayer, stepsUniform: sunSteps, biasUniform: sunBias,
     fadeStartUniform: sunFadeStart, edgeFadeUniform: sunEdgeFade,
     ambientUniform: sunAmbient, shadeMode, shadowOnly, sun: sunOn,
-    torch: torchOn ? ensureTorchUniforms() : null
+    torch: ensureTorchUniforms(),
+    // Sprites are not in the field; they are these. Null until the textures have
+    // loaded and the atlas is built, which is what the rebuild in updateCards
+    // is for.
+    cards: cardsReady && cardsOn ? sunCards : null,
+    torchCards: cardsReady && cardsOn ? torchCards : null,
+    terrainNormal: terrainNormalTex,
+    ao: aoOn, aoDistanceUniform: aoDistance, aoOnly
   });
   shadowSun = sun;
-  applyShadowMaterial(worldInstancedMesh, node);
+  const terrainMat = createShadowMaterial(worldInstancedMesh, node, whiteUniform);
+  const sprites = buildSpriteShadows(spriteLight);
+  const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
+  const id = ++shadowBuild;
+  const swap = () => {
+    // A newer build, or shadows turned off, while this one compiled.
+    if (id !== shadowBuild) {
+      terrainMat.dispose();
+      for (const m of sprites.mats) m.dispose();
+      return;
+    }
+    const mesh = worldInstancedMesh;
+    if (mesh.material !== mesh.userData.originalMaterial) mesh.material.dispose();
+    mesh.material = terrainMat;
+    restoreSpriteMaterials();
+    for (const m of spriteMeshes()) {
+      const v = sprites.variants.get(m);
+      if (v) {
+        m.userData.depthVariants = v;
+        m.material = m.userData.drawingOnTop ? v.onTop : v.normal;
+      } else {
+        m.material = pairs.find(([pm]) => pm === m)[1];
+      }
+    }
+    spriteShadowMats = sprites.mats;
+    warmScene();
+  };
+  compileOffscreen(pairs).then(swap, err => {
+    console.warn('[shadows] background compile failed, swapping anyway', err);
+    swap();
+  });
   shadowsOn = true;
   updateTorchPosition();
   return `shadows on - ${sunCone ? 'one cone trace' : sunRays + ' sun ray' +
@@ -1503,28 +2318,35 @@ function buildPerPixelShadows() {
          (sunRays === 1 ? '. bxb.soften() for a penumbra.' : '');
 }
 
-// Toggling or re-levelling the torch is a material rebuild, because whether
-// there is a second light at all is baked into the kernel. Off is genuinely
-// free; on costs one more march per fragment, capped at the light's own radius.
-function toggleTorch(level = null, flame = null) {
+// Toggling or re-levelling the torch is a uniform write - see ensureTorchUniforms.
+// Off costs a branch per fragment; on costs one more march, capped at the
+// light's own radius.
+function toggleTorch(level = null, flame = null, forward = null) {
   if (flame !== null) torchSourceRadius = Math.max(0, flame);
+  if (forward !== null) torchOffset = Math.max(0, forward);
   if (level !== null) torchLevel = clampLevel(level);
-  // A flame-size sweep on a lit torch is a uniform write, so it must not be
-  // mistaken for a toggle.
-  const sizeOnly = level === null && flame !== null;
+  // A flame-size or reach sweep on a lit torch is a CPU-side write - the flame
+  // radius is a uniform, the offset is read when the position is set - so
+  // neither must be mistaken for a toggle.
+  const sizeOnly = level === null && (flame !== null || forward !== null);
   if (!sizeOnly) torchOn = level === null ? !torchOn : torchLevel > 0;
-  if (torchOn) ensureTorchUniforms();
-  if (!sizeOnly && shadowsOn) {
-    restoreOriginalMaterial(worldInstancedMesh);
-    buildPerPixelShadows();
-  }
+  ensureTorchUniforms();
   if (!torchOn) return 'torch off';
   if (!shadowsOn) return `torch level ${torchLevel} - run bxb.shadows() to see it`;
   // What to expect, so the softening can be checked rather than admired: a
   // penumbra that does NOT shrink as the torch backs away is the sun's cone
   // left in by mistake, not a flame that is too small.
   const at = (h, d) => pointPenumbraMetres(h, d, torchSourceRadius).toFixed(2);
-  return `torch on - level ${torchLevel}/${MAX_LIGHT_LEVEL}, reaching ` +
+  // Named explicitly because a flame that vanishes when the offset is wound to
+  // zero is not a broken light - it is the light sitting inside the character's
+  // own silhouette and being occluded by it.
+  const held = `held ${torchOffset.toFixed(2)} m in front and ` +
+               `${torchSide.toFixed(2)} m to Bob's ` +
+               `${(torchSide < 0) === mirrored(playerSprite) ? 'left' : 'right'}` +
+               ` while he faces ${mirrored(playerSprite) ? 'right' : 'left'}` +
+               ` (bxb.torchside() flips which), ` +
+               `${TORCH_HEIGHT.toFixed(2)} m up`;
+  return `torch on - ${held}, level ${torchLevel}/${MAX_LIGHT_LEVEL}, reaching ` +
          `${torchLevel} blocks (${lightRadiusMetres(torchLevel).toFixed(1)} m), ` +
          `#${TORCH_COLOUR.toString(16).toUpperCase()}, ` +
          `${(torchSourceRadius * 2).toFixed(2)} m flame. Soft by CONE TRACE, the ` +
@@ -1539,7 +2361,6 @@ function toggleTorch(level = null, flame = null) {
 
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
-
 installConsole(createConsole({
   compute: {
     help: 'run the WebGPU compute smoke test',
@@ -1605,12 +2426,210 @@ installConsole(createConsole({
     help: 'toggle marched shadows on the terrain (one light, locked per texel)',
     run: () => {
       if (shadowsOn) {
+        shadowBuild++;   // drop any build still compiling
         restoreOriginalMaterial(worldInstancedMesh);
+        restoreSpriteMaterials();
         shadowsOn = false;
         shadowOrigins = [];
         return 'shadows off';
       }
       return buildPerPixelShadows();
+    }
+  },
+  proxies: {
+    help: 'toggle the shadow-casting proxies for sprites, or resize the character box',
+    usage: 'bxb.proxies()  |  bxb.proxies(0.75, 2.4)  - width and height in metres',
+    run: (w = null, h = null) => {
+      if (w !== null) CHARACTER_PROXY.width = Math.max(0.05, w);
+      if (h !== null) CHARACTER_PROXY.height = Math.max(0.05, h);
+      const sizeOnly = w !== null || h !== null;
+      if (sizeOnly) {
+        // A resize is not a toggle. The box is remembered by its snapped extent,
+        // so changing the size makes every proxy compare unequal next frame and
+        // rewrite itself - no invalidation needed beyond setting the number.
+        playerProxy.width = enemyProxy.width = CHARACTER_PROXY.width;
+        playerProxy.height = enemyProxy.height = CHARACTER_PROXY.height;
+      } else {
+        proxiesOn = !proxiesOn;
+      }
+      if (!proxiesOn) return 'proxies off - sprites cast nothing, terrain still does';
+      if (!shadowsOn) return 'proxies on - run bxb.shadows() to see them';
+      // Which path each proxy is actually on. A silhouette that failed to build
+      // falls back to its box silently and still casts, so without this the
+      // difference between "the cutout is working" and "the cutout never loaded"
+      // is a judgement call about how blocky a shadow looks.
+      const sil = playerProxy.silhouettes && playerProxy.silhouettes[0];
+      const shape = sil
+        ? `CUTOUT ${playerProxy.silhouettes.map(v => v.cols + 'x' + v.rows).join(' / ')}` +
+          ` per cascade, facing ${cardMode}`
+        : `BOX ${CHARACTER_PROXY.width.toFixed(2)} x ` +
+          `${CHARACTER_PROXY.height.toFixed(2)} m (cutout not loaded yet)`;
+      const trees = treeProxies.filter(p => p && p.silhouettes).length;
+      return `proxies on - characters cast as ${shape}, ` +
+             `${trees}/${treeProxies.length} trees as cutouts. ` +
+             `Expect the shadow to STEP a texel at a time as you walk, not slide, ` +
+             `and to have a GAP between the legs - that gap is the whole ` +
+             `difference from a box. bxb.cardface() to compare sun-facing ` +
+             `cards against ones locked to a world plane.`;
+    }
+  },
+  cardparity: {
+    help: 'run the same rays through the card shader and the CPU reference and diff them',
+    run: async (n = 128, line = false) => {
+      if (!cardsReady) return 'no cards yet - bxb.shadows() first, then retry';
+      const casters = cardCasters();
+      for (const c of casters) {
+        c.facing = facingToward(dirLight.position.x, dirLight.position.z);
+      }
+      const near = cullCardsForLight(casters, dirLight.position, Infinity,
+                                     sunCards.capacity);
+      const count = packCardInstances(near, cardAtlas, cardPack, sunCards.capacity);
+      writeCardBindings(sunCards, cardPack, count);
+
+      // Spread over the ground around the player, along the sun. The rays that
+      // matter are the ones that graze a card, so the sample box is sized to the
+      // sprites rather than to the map.
+      const L = dirLight.position.clone().normalize();
+      const slope = sunAngular ? Math.tan(sunAngular / 2) : 0.06;
+      const samples = [];
+      if (line) {
+        // A WALK down-sun from the player instead of a scatter. Random points
+        // report whether the two agree on average; a line reports WHERE they
+        // stop agreeing, which is what a visible edge needs.
+        for (let i = 0; i < n; i++) {
+          const d = (i / (n - 1)) * 24;
+          samples.push({
+            from: { x: playerSprite.position.x - L.x * d, y: 0.8,
+                    z: playerSprite.position.z - L.z * d },
+            dir: { x: L.x, y: L.y, z: L.z }, maxDist: 12
+          });
+        }
+      } else {
+        for (let i = 0; i < n; i++) {
+          samples.push({
+            from: { x: playerSprite.position.x + (Math.random() - 0.5) * 12,
+                    y: 0.75 + Math.random() * 2,
+                    z: playerSprite.position.z + (Math.random() - 0.5) * 12 },
+            dir: { x: L.x, y: L.y, z: L.z },
+            maxDist: 12
+          });
+        }
+      }
+
+      const gpu = await runGPUCards(renderer, sunCards, samples, slope);
+      if (line) {
+        const rows = samples.map((sm, i) => {
+          const cpu = cardsVisibility(near, sm.from, sm.dir, 12, slope);
+          return `${((i / (n - 1)) * 24).toFixed(1).padStart(5)}m cpu ` +
+                 `${cpu.toFixed(3)} gpu ${gpu[i].toFixed(3)}` +
+                 (Math.abs(cpu - gpu[i]) > 0.1 ? '  <-- DIVERGE' : '');
+        });
+        return rows.join(String.fromCharCode(10));
+      }
+      let worst = 0, worstAt = -1, sum = 0, shadowed = 0;
+      for (let i = 0; i < n; i++) {
+        const cpu = cardsVisibility(near, samples[i].from, samples[i].dir, 12, slope);
+        if (cpu < 0.99) shadowed++;
+        const e = Math.abs(cpu - gpu[i]);
+        sum += e;
+        if (e > worst) { worst = e; worstAt = i; }
+      }
+      const s0 = samples[worstAt];
+      return `${count} cards, ${n} rays, ${shadowed} shadowed on CPU. ` +
+             `mean |diff| ${(sum / n).toFixed(4)}, worst ${worst.toFixed(4)} ` +
+             `at (${s0.from.x.toFixed(2)}, ${s0.from.y.toFixed(2)}, ` +
+             `${s0.from.z.toFixed(2)}) cpu ${cardsVisibility(near, s0.from, s0.dir, 12, slope).toFixed(3)} ` +
+             `gpu ${gpu[worstAt].toFixed(3)}. A worst above ~0.05 means the ` +
+             `shader and the reference disagree, not that either is noisy.`;
+    }
+  },
+  cards: {
+    help: 'analytic sprite shadows - each light gets the cutout turned to face IT',
+    usage: 'bxb.cards()  toggles',
+    run: () => {
+      cardsOn = !cardsOn;
+      // Build on demand rather than waiting for a frame. The resolve normally
+      // rides the render loop, which does not run while the window is hidden -
+      // so asking about the cards from a paused tab would report them as still
+      // loading forever, which is a property of the tab and not of the cards.
+      if (cardsOn) updateCards();
+      // Whether the pass has a card loop in it at all is baked into the kernel,
+      // so this is a material rebuild rather than a uniform write - the same
+      // trade the torch makes, and for the same reason: off has to be free.
+      if (shadowsOn) { buildPerPixelShadows(); }
+      if (!cardsOn) return 'sprite cards off - nothing but terrain casts';
+      if (!cardsReady) {
+        // Say WHY, not just that it has not happened. "Still loading" covers a
+        // texture that genuinely has not arrived and one whose image is never
+        // going to be readable, and those need opposite fixes.
+        const st = pendingCards.map(p => {
+          const t = p.getTexture();
+          const im = t && t.image;
+          return `${p.key}:${p.error ? 'FAILED ' + p.error :
+                  !t ? 'no-texture' :
+                  !im ? 'no-image' :
+                  !im.width ? 'width-0' : 'ready-but-unbuilt'}`;
+        }).join(' ');
+        return `cards on - no atlas. pending ${pendingCards.length}, ` +
+               `built ${cardTypes.length}. ${st || '(nothing pending - the ' +
+               'build ran and then something after it failed)'}`;
+      }
+      const cov = cardTypes.map(t =>
+        `${t.key} ${t.card.cols}x${t.card.rows} ${(t.coverage * 100).toFixed(0)}% opaque`
+      ).join(', ');
+      return `cards on - [${cov}] in a ` +
+             `${cardAtlas.width}x${cardAtlas.height} atlas, ${lastCardCount} ` +
+             `casting this frame, cap ${MAX_CARDS} per light. Each light tests ` +
+             `the cutout turned to face IT, so a torch and the sun disagree ` +
+             `about which way Bob is side-on - which is the point, and what a ` +
+             `single baked field cannot do. Analytic, so there is no voxel size ` +
+             `and no cascade seam.`;
+    }
+  },
+  spikes: {
+    help: 'log a CPU breakdown of every frame over 8 ms to the console',
+    run: () => {
+      spikeLog = !spikeLog;
+      return `spike log ${spikeLog ? 'on' : 'off'}`;
+    }
+  },
+  torchside: {
+    help: 'which side of Bob the torch is held, and how far - negative swaps sides',
+    usage: 'bxb.torchside()  flips  |  bxb.torchside(0.3)  |  bxb.torchside(-0.3)',
+    run: (m = null) => {
+      // Sign only, or sign and distance. Flipping is the common case - which
+      // side reads right depends on the sprite art, not on the geometry, so it
+      // is settled by eye rather than derived.
+      torchSide = m === null ? -torchSide : m;
+      if (!torchOn) return `torch side ${torchSide.toFixed(2)} m - bxb.torch() to light it`;
+      const facing = mirrored(playerSprite) ? 'right' : 'left';
+      const at = (torchSide < 0) === mirrored(playerSprite) ? 'left' : 'right';
+      return `torch ${Math.abs(torchSide).toFixed(2)} m to screen-${at} ` +
+             `while Bob faces ${facing}. Turn him round and it should swap; ` +
+             `if it does not move at all the sprite is not mirroring.`;
+    }
+  },
+  cardface: {
+    help: 'how the sprite cutouts are turned - toward the sun, or locked to a world plane',
+    usage: 'bxb.cardface()  cycles sun -> x -> z  |  bxb.cardface("sun")',
+    run: (mode = null) => {
+      const order = { sun: 'x', x: 'z', z: 'sun' };
+      cardMode = mode && order[mode] !== undefined ? mode : order[cardMode];
+      // Nothing to invalidate by hand: the facing is part of the remembered box,
+      // so sameBox sees it change and every cutout rewrites itself next frame.
+      if (cardMode === 'sun') {
+        const f = cardFacing();
+        return `cutouts face the SUN - card normal along its azimuth ` +
+               `(${(-f.uz).toFixed(2)}, ${f.ux.toFixed(2)}). The full ` +
+               `silhouette always faces the light, so it cannot thin to a line. ` +
+               `bxb.cardface() to lock it to a world plane and see the ` +
+               `difference; move the sun with bxb.light() and the cutouts turn ` +
+               `with it.`;
+      }
+      return `cutouts LOCKED to the ${cardMode === 'x' ? 'XY' : 'ZY'} plane. ` +
+             `Swing the sun round with bxb.light() and watch the shadow thin ` +
+             `toward a line as it goes edge-on - that degeneracy is exactly what ` +
+             `the sun-facing mode exists to remove.`;
     }
   },
   soften: {
@@ -1638,7 +2657,7 @@ installConsole(createConsole({
 
       // The technique and the ray count are both baked into the kernel, so this
       // is a material swap rather than a uniform write.
-      if (shadowsOn) { restoreOriginalMaterial(worldInstancedMesh); buildPerPixelShadows(); }
+      if (shadowsOn) { buildPerPixelShadows(); }
 
       if (!sunCone && sunRays === 1) {
         return 'hard sun - one ray down the cone axis, which is exactly what ' +
@@ -1668,12 +2687,26 @@ installConsole(createConsole({
              `occluder shape, at ${sunRays}x the rays. ` + expect;
     }
   },
+  ao: {
+    help: 'cone-traced ambient occlusion: on/off, reach in metres, or "only" to view it alone',
+    usage: 'bxb.ao()  toggles  |  bxb.ao(true, 1.5)  |  bxb.ao("only")',
+    run: (a = null, dist = null) => {
+      const was = `${aoOn}${aoOnly}`;
+      if (a === 'only') aoOnly = !aoOnly;
+      else if (a !== null || dist === null) aoOn = a === null ? !aoOn : !!a;
+      if (dist !== null) aoDistance.value = Math.max(0.1, Number(dist));
+      // On/off and the view are compiled in; the distance is a uniform.
+      if (shadowsOn && was !== `${aoOn}${aoOnly}`) buildPerPixelShadows();
+      if (!shadowsOn) return 'run bxb.shadows() first';
+      return `AO ${aoOn ? '6 cones, ' + aoDistance.value.toFixed(2) + ' m' : 'off'}` +
+             `${aoOnly ? ' - showing the AO term alone (white open, black occluded)' : ''}`;
+    }
+  },
   shadowonly: {
     help: 'show the raw sun visibility term with no albedo or N.L, to judge artifacts',
     run: async () => {
       shadowOnly = !shadowOnly;
       if (!shadowsOn) return 'run bxb.shadows() first';
-      restoreOriginalMaterial(worldInstancedMesh);
       buildPerPixelShadows();
       return shadowOnly
         ? 'shadow term only: white is lit, black is occluded. Self-shadowing ' +
@@ -1703,7 +2736,7 @@ installConsole(createConsole({
     usage: 'bxb.daylight()  |  bxb.daylight(false)',
     run: (on = !sunOn) => {
       sunOn = !!on;
-      if (shadowsOn) { restoreOriginalMaterial(worldInstancedMesh); buildPerPixelShadows(); }
+      if (shadowsOn) { buildPerPixelShadows(); }
       return sunOn
         ? 'sun on'
         : 'sun off - ambient only, plus any dynamic light. The sun march is ' +
@@ -1712,10 +2745,11 @@ installConsole(createConsole({
     }
   },
   torch: {
-    help: 'toggle the torch, set its 4-bit level (0-15), or resize its flame',
-    usage: 'bxb.torch()  |  bxb.torch(15)  |  bxb.torch(0) off  |  bxb.torch(12, 0.5) flame diameter in m',
-    run: (level = null, flameDiameter = null) =>
-      toggleTorch(level, flameDiameter === null ? null : flameDiameter / 2)
+    help: 'toggle the torch, set its level (0-15), flame size, or how far out it is held',
+    usage: 'bxb.torch()  |  bxb.torch(15)  |  bxb.torch(0) off  |  ' +
+           'bxb.torch(12, 0.5) flame diameter in m  |  bxb.torch(12, 0.5, 0.45) reach in m',
+    run: (level = null, flameDiameter = null, forward = null) =>
+      toggleTorch(level, flameDiameter === null ? null : flameDiameter / 2, forward)
   },
   gridbias: {
     help: 'how far the shading footprint leans toward the sun, in blocks',
@@ -1747,7 +2781,7 @@ installConsole(createConsole({
       sunAmbient.value = ambient;
       // Ambient is a uniform, the mode is a kernel branch - so only the latter
       // costs a rebuild.
-      if (shadowsOn) { restoreOriginalMaterial(worldInstancedMesh); buildPerPixelShadows(); }
+      if (shadowsOn) { buildPerPixelShadows(); }
       if (!shadowsOn) return 'run bxb.shadows() first';
       const el = Math.asin(Math.max(-1, Math.min(1,
         dirLight.position.clone().normalize().y))) * 180 / Math.PI;
@@ -1806,7 +2840,7 @@ installConsole(createConsole({
     run: () => perf.toggle() ? 'perf graph on' : 'perf graph off'
   },
   grid: {
-    help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+X)',
+    help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+G)',
     run: () => toggleBoxGridDebug(
       scene, player.gridPos, worldInstancedMesh, currentMode,
       { sunDirection: dirLight.position, bias: sunGridBias }

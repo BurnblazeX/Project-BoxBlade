@@ -1,7 +1,7 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
 import { createTestArea, BLOCK_METRES } from '../js/world.js';
 import {
-  createBoxGrid, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
+  createBoxGrid, gridIndex, scrollForHandoff, applyHandoff, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
   DISTANCE_RANGE, FAR_BYTE, encodeDistance, decodeDistance,
   distanceAt, isOccupied, sampleDistance, boxDistance,
   sphereTrace, marchOccupancy, voxelCentreToWorld, createBoxGridAt
@@ -212,6 +212,15 @@ truthy('and byte-for-byte identical, with no stale band left behind',
        reused.data.every((v, i) => v === fresh.data[i]));
 
 section('a re-origin that slides is a scroll, not a rebake');
+// Compared in LOGICAL coordinates: the field is a ring in x and z, so a scrolled
+// grid holds the same voxels as a fresh bake at a different physical offset.
+const sameLogical = (a, b) => {
+  for (let vz = 0; vz < GRID_DIM; vz++)
+    for (let vy = 0; vy < GRID_DIM; vy++)
+      for (let vx = 0; vx < GRID_DIM; vx++)
+        if (a.data[gridIndex(a, vx, vy, vz)] !== b.data[gridIndex(b, vx, vy, vz)]) return false;
+  return true;
+};
 // The hitch this removes: a full bake is 18.8 ms at C0, which at 240 Hz is four
 // or five dropped frames on every block stepped. Sliding the overlap into place
 // and baking only the strip that scrolled in is about a twelfth of that.
@@ -225,7 +234,7 @@ for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -
   createBoxGridAt(10 + dx, 10 + dz, slid);
   const baked = createBoxGridAt(10 + dx, 10 + dz);
   truthy(`scrolling by (${dx}, ${dz}) matches a fresh bake byte for byte`,
-         slid.data.every((v, i) => v === baked.data[i]));
+         sameLogical(slid, baked));
   ok(`  and keeps the occupancy count exact`, slid.occupiedCount, baked.occupiedCount);
 }
 // The coarse level scrolls by its own voxel stride, not C0's - a level that
@@ -236,7 +245,38 @@ for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -
   createBoxGridAt(12, 14, slid, 1);
   const baked = createBoxGridAt(12, 14, null, 1);
   truthy('C1 scrolls by its own voxel size',
-         slid.data.every((v, i) => v === baked.data[i]));
+         sameLogical(slid, baked));
+}
+// C2 has 3 voxels per block, so half a block is 1.5 voxels. filledBlocks must
+// still be whole voxel coordinates - fractional starts had the boxGrid overlay
+// indexing the grid between voxels and dropping most of C2's surface.
+{
+  const c2 = createBoxGridAt(0, 0, null, 2);
+  truthy('C2 block ranges start on whole voxels', c2.filledBlocks.every(Number.isInteger));
+}
+
+// The field worker's hand-off: a mirror scrolls and bakes, only the strips come
+// back, and the main grid applies them. Must land byte-identical (logically) to
+// a fresh bake - including after the mirror is reset to a DIFFERENT ring, which
+// is what a main-thread full bake does to it.
+{
+  const main = createBoxGridAt(10, 10);
+  let mirror = createBoxGridAt(10, 10);
+  let ok1 = true;
+  const moves = [[11, 10], [11, 11], [12, 12], 'reset', [13, 12], [12, 11], [60, 60], [61, 60]];
+  let at = [12, 12];
+  for (const mv of moves) {
+    if (mv === 'reset') {
+      createBoxGridAt(at[0] + 3, at[1], main);        // main full-bakes elsewhere...
+      createBoxGridAt(at[0], at[1], main);            // ...and back, keeping its ring
+      mirror = createBoxGridAt(at[0], at[1]);          // mirror resets to ring 0
+      continue;
+    }
+    at = mv;
+    applyHandoff(main, scrollForHandoff(mirror, mv[0], mv[1]));
+    if (!sameLogical(main, createBoxGridAt(mv[0], mv[1]))) ok1 = false;
+  }
+  truthy('worker hand-off matches a fresh bake, across rings and a jump', ok1);
 }
 // A jump too far to share anything has to fall back to a full bake rather than
 // scrolling in garbage from the far side of the buffer.
@@ -245,5 +285,5 @@ for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -
   createBoxGridAt(60, 60, jumped);
   const baked = createBoxGridAt(60, 60);
   truthy('and a jump past the footprint rebakes instead',
-         jumped.data.every((v, i) => v === baked.data[i]));
+         sameLogical(jumped, baked));
 }

@@ -139,10 +139,135 @@ export function createBoxGridAt(originBlockX, originBlockZ, reuse = null, level 
   const sx = dx * per, sz = dz * per;
   const slid = prior && (sx !== 0 || sz !== 0) &&
                Math.abs(sx) < GRID_DIM && Math.abs(sz) < GRID_DIM;
-  if (slid) populateDistanceField(grid, scrollField(grid, sx, sz));
-  else if (prior && sx === 0 && sz === 0) populateDistanceField(grid, []);
-  else populateDistanceField(grid);
+  if (slid) {
+    const strips = ringScroll(grid, sx, sz);
+    populateDistanceField(grid, strips);
+    // What the GPU copy has to be told about - see followShadowGrid.
+    grid.uploadRects = strips;
+    // Two pieces of bookkeeping the dynamic occluders of occluders.js depend on,
+    // both of which are facts about the GRID rather than about the occluders,
+    // which is why they are settled here rather than there:
+    //
+    //   the stored proxy boxes are in grid coordinates, and the scroll has just
+    //   moved those coordinates out from under them - so translate, don't
+    //   discard. A proxy that did not move in the WORLD then still compares
+    //   equal next frame and costs nothing, which is the difference between a
+    //   block step being free and a block step re-writing every character in
+    //   the scene.
+    //
+    //   the strip bake has just cleared what slid in to static truth, which
+    //   destroys the imprint of any proxy standing there - without that proxy
+    //   having moved, so nothing else would notice. Hand the strips over and
+    //   applyOccluders re-writes whatever they touched.
+    translateOccluderBoxes(grid, sx, sz);
+    grid.scrollStrips = strips;
+  }
+  else if (prior && sx === 0 && sz === 0) {
+    populateDistanceField(grid, []);
+    grid.uploadRects = [];
+  }
+  else {
+    populateDistanceField(grid);
+    grid.uploadRects = null;   // everything changed: a full upload
+    // A full bake is not a scroll: nothing was retained, so every imprint is
+    // gone and every proxy has to be written again from nothing.
+    grid.occluderBoxes = null;
+    grid.scrollStrips = null;
+  }
   return grid;
+}
+
+// Slide the remembered dynamic-occluder boxes along with the field. Kept beside
+// scrollField because it is the same move applied to the other thing that stores
+// grid coordinates; see the call above for why it is a translate and not a drop.
+// --- Handing a scroll between threads ---
+//
+// The field worker keeps its own mirror of each level and does the scroll and
+// strip bake there; only the freshly baked strips come back. packRects and
+// unpackRects agree on one order - rect by rect, then z, y, x in LOGICAL
+// coordinates - so the two sides can have different rings and still agree.
+export function packRects(grid, rects) {
+  let n = 0;
+  for (const r of rects) n += (r.x1 - r.x0) * (r.y1 - r.y0) * (r.z1 - r.z0);
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const r of rects) {
+    const segs = ringSegments(grid, r.x0, r.x1 - 1);
+    for (let vz = r.z0; vz < r.z1; vz++) {
+      for (let vy = r.y0; vy < r.y1; vy++) {
+        for (const [a, b] of segs) {
+          const base = gridIndex(grid, a, vy, vz);
+          out.set(grid.data.subarray(base, base + b - a + 1), o);
+          o += b - a + 1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export function unpackRects(grid, rects, buf) {
+  let o = 0;
+  for (const r of rects) {
+    const segs = ringSegments(grid, r.x0, r.x1 - 1);
+    for (let vz = r.z0; vz < r.z1; vz++) {
+      for (let vy = r.y0; vy < r.y1; vy++) {
+        for (const [a, b] of segs) {
+          const len = b - a + 1;
+          grid.data.set(buf.subarray(o, o + len), gridIndex(grid, a, vy, vz));
+          o += len;
+        }
+      }
+    }
+  }
+}
+
+// Worker side: re-origin the mirror and describe the result.
+export function scrollForHandoff(grid, x, z) {
+  createBoxGridAt(x, z, grid, grid.level);
+  // null means the mirror did a full rebake - a jump too far to slide - so the
+  // whole grid goes back, still in logical order.
+  const full = grid.uploadRects === null;
+  const rects = full
+    ? [{ x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM }]
+    : grid.uploadRects;
+  return { x, z, full, rects, data: packRects(grid, rects),
+           occupiedCount: grid.occupiedCount, filledBlocks: grid.filledBlocks };
+}
+
+// Main side: the same end state createBoxGridAt would have reached, without
+// the bake - origin, ring and the new strips land together, so the shader never
+// sees an origin whose strip has not arrived. The ring is this grid's OWN: the
+// mirror's can differ (a main-thread full bake keeps the ring, the mirror's
+// reset starts at zero), which is why the strips travel in logical order.
+export function applyHandoff(grid, m) {
+  const per = grid.voxelsPerBlock || TEXELS_PER_BLOCK;
+  const sx = (m.x - grid.originBlock.x) * per, sz = (m.z - grid.originBlock.z) * per;
+  grid.origin.x = blockMinCorner(m.x);
+  grid.origin.z = blockMinCorner(m.z);
+  grid.originBlock.x = m.x;
+  grid.originBlock.z = m.z;
+  grid.occupiedCount = m.occupiedCount;
+  grid.filledBlocks = m.filledBlocks;
+  if (m.full) {
+    unpackRects(grid, m.rects, m.data);
+    grid.uploadRects = null;
+    grid.occluderBoxes = null;
+    grid.scrollStrips = null;
+    return grid;
+  }
+  ringScroll(grid, sx, sz);
+  unpackRects(grid, m.rects, m.data);
+  translateOccluderBoxes(grid, sx, sz);
+  grid.scrollStrips = m.rects;
+  grid.uploadRects = m.rects;
+  return grid;
+}
+
+export function translateOccluderBoxes(grid, sx, sz) {
+  const boxes = grid.occluderBoxes;
+  if (!boxes) return;
+  for (const b of boxes.values()) { b.cx -= sx; b.cz -= sz; }
 }
 
 // Slide the field by (sx, sz) voxels and report what scrolled in.
@@ -273,6 +398,56 @@ export function voxelIndex(vx, vy, vz) {
   return vx + vy * GRID_DIM + vz * GRID_DIM * GRID_DIM;
 }
 
+// --- The ring ---
+//
+// X and Z are stored as a ring buffer: logical voxel v lives at physical
+// (v + ring) mod GRID_DIM. A re-origin then moves the ring instead of the data,
+// so a step writes only the strip that scrolled in - on the CPU AND in the GPU
+// upload, which used to be all 3 MB of every level on every block stepped. Y
+// never scrolls, so it is not ringed. The shader applies the same offset and
+// samples with repeat wrapping, so filtering across the physical seam reads the
+// logical neighbour.
+//
+// Everything that indexes grid.data by logical coordinate goes through
+// gridIndex; the hot loops walk ringSegments so their idx++ never crosses the
+// physical seam.
+export function gridIndex(grid, vx, vy, vz) {
+  let px = vx + (grid.ringX || 0); if (px >= GRID_DIM) px -= GRID_DIM;
+  let pz = vz + (grid.ringZ || 0); if (pz >= GRID_DIM) pz -= GRID_DIM;
+  return px + vy * GRID_DIM + pz * GRID_DIM * GRID_DIM;
+}
+
+// A logical x range [x0, x1] inclusive, as at most two runs that are each
+// contiguous in memory.
+export function ringSegments(grid, x0, x1) {
+  const cut = GRID_DIM - (grid.ringX || 0);   // first logical x that wraps to 0
+  if (x1 < cut || x0 >= cut) return [[x0, x1]];
+  return [[x0, cut - 1], [cut, x1]];
+}
+
+// The same for z, for the GPU strip copy, which needs physical boxes.
+export function ringSegmentsZ(grid, z0, z1) {
+  const cut = GRID_DIM - (grid.ringZ || 0);
+  if (z1 < cut || z0 >= cut) return [[z0, z1]];
+  return [[z0, cut - 1], [cut, z1]];
+}
+
+const wrap = v => ((v % GRID_DIM) + GRID_DIM) % GRID_DIM;
+
+// The ring's scroll: new[v] = old[v + s] with no data moved, and the same dirty
+// strips scrollField reports.
+export function ringScroll(grid, sx, sz) {
+  grid.ringX = wrap((grid.ringX || 0) + sx);
+  grid.ringZ = wrap((grid.ringZ || 0) + sz);
+  const rects = [];
+  const full = { x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM };
+  if (sx > 0) rects.push({ ...full, x0: GRID_DIM - sx });
+  else if (sx < 0) rects.push({ ...full, x1: -sx });
+  if (sz > 0) rects.push({ ...full, z0: GRID_DIM - sz });
+  else if (sz < 0) rects.push({ ...full, z1: -sz });
+  return rects;
+}
+
 export function inBounds(vx, vy, vz) {
   return vx >= 0 && vy >= 0 && vz >= 0 && vx < GRID_DIM && vy < GRID_DIM && vz < GRID_DIM;
 }
@@ -356,7 +531,7 @@ export function decodeDistance(byte, range = DISTANCE_RANGE) {
 export function distanceAt(grid, vx, vy, vz) {
   const range = grid.range || DISTANCE_RANGE;
   if (!inBounds(vx, vy, vz)) return range;
-  return decodeDistance(grid.data[voxelIndex(vx, vy, vz)], range);
+  return decodeDistance(grid.data[gridIndex(grid, vx, vy, vz)], range);
 }
 
 // Kept as the binary view of the field, because a voxel centre is never exactly
@@ -364,7 +539,7 @@ export function distanceAt(grid, vx, vy, vz) {
 // so the sign is unambiguous here even though the field is continuous.
 export function isOccupied(grid, vx, vy, vz) {
   if (!inBounds(vx, vy, vz)) return false;
-  return grid.data[voxelIndex(vx, vy, vz)] < SOLID_THRESHOLD;
+  return grid.data[gridIndex(grid, vx, vy, vz)] < SOLID_THRESHOLD;
 }
 
 // Trilinear sample in world space, the CPU mirror of what texture3D with linear
@@ -430,6 +605,87 @@ export function voxelCentreToWorld(grid, vx, vy, vz) {
 // on screen. Grid population and atlas shading have deliberately different
 // visibility criteria: an off-screen torch-lit wall still has to be present
 // here, or off-screen reflections silently degrade later.
+// Min-in one axis-aligned box, in VOXEL units, over the given rects.
+//
+// Lifted out of populateDistanceField so that the static bake and the dynamic
+// occluders of occluders.js run the identical kernel. Two implementations of
+// "write a box into the field" would be two chances to disagree about the
+// encoding, the band width or the min - and a proxy whose distances were a
+// half-voxel off the terrain's would show as a character's shadow sitting at a
+// different depth from the wall's beside it.
+//
+// Evaluate over the box plus the one-voxel band the clamp allows, and take the
+// MINIMUM with whatever is already there. Minimum of distances is union of
+// shapes, which is what makes a pile of blocks one continuous surface with
+// correct distances along shared faces, edges and corners - and the byte
+// encoding is monotonic in distance, so the bytes can be compared directly
+// without decoding either side.
+//
+// Written out rather than calling boxDistance per voxel: this is the hot loop of
+// the whole bake (~230k voxels for a ground footprint, every block the player
+// steps), and the per-axis terms are constant across the loop that encloses
+// them. Math.hypot is also avoided deliberately - its overflow-safe scaling
+// costs several times a plain sqrt, and these operands are all within a voxel or
+// two of zero.
+export function minBoxVoxels(grid, cx, cy, cz, hx, hy, hz, rects,
+                             range = grid.range || DISTANCE_RANGE) {
+  const data = grid.data;
+  const invRange = 1 / range;
+  // The band, as a voxel box, before any rect clips it.
+  const bLo = (v, h) => Math.ceil(v - h - range);
+  const bHi = (v, h) => Math.floor(v + h + range);
+  const bx0 = bLo(cx, hx), bx1 = bHi(cx, hx);
+  const by0 = bLo(cy, hy), by1 = bHi(cy, hy);
+  const bz0 = bLo(cz, hz), bz1 = bHi(cz, hz);
+
+  for (const r of rects) {
+    const x0 = Math.max(r.x0, bx0), x1 = Math.min(r.x1 - 1, bx1);
+    const y0 = Math.max(r.y0, by0), y1 = Math.min(r.y1 - 1, by1);
+    const z0 = Math.max(r.z0, bz0), z1 = Math.min(r.z1 - 1, bz1);
+    if (x0 > x1 || y0 > y1 || z0 > z1) continue;
+    const segs = ringSegments(grid, x0, x1);
+
+    // The band is a BOX while the clamp is a SPHERE, so its corners are in
+    // principle wasted work - a voxel at the corner of an eight-voxel band is
+    // 8*sqrt(3) = 13.9 voxels out, past the clamp, so it encodes to FAR_BYTE and
+    // the min against an already-cleared grid is a no-op. Clipping each row to the
+    // sphere was tried and MEASURED SLOWER: 19.9 ms against 16.9. The rows are 28
+    // voxels long, so a sqrt and four clamps per row cost more than the handful of
+    // iterations they save - and for a flat ground slab most rows sit inside the
+    // box's own y and z extent, where there is nothing to clip at all. Left as a
+    // plain box on the strength of the measurement.
+    for (let vz = z0; vz <= z1; vz++) {
+      const qz = Math.abs(vz + 0.5 - cz) - hz;
+      const pz = qz > 0 ? qz * qz : 0;
+      for (let vy = y0; vy <= y1; vy++) {
+        const qy = Math.abs(vy + 0.5 - cy) - hy;
+        const py = qy > 0 ? qy * qy : 0;
+        const qyz = qy > qz ? qy : qz;
+        const pyz = py + pz;
+        // Physically contiguous runs: a row can wrap in the ring.
+        for (const [sx0, sx1] of segs) {
+          let idx = gridIndex(grid, sx0, vy, vz);
+          for (let vx = sx0; vx <= sx1; vx++, idx++) {
+            const qx = Math.abs(vx + 0.5 - cx) - hx;
+            const outside = qx > 0 ? Math.sqrt(pyz + qx * qx) : Math.sqrt(pyz);
+            const mx = qx > qyz ? qx : qyz;
+            const d = outside + (mx < 0 ? mx : 0);
+            // encodeDistance, inlined. This copy is the one that used to fold the
+            // clamp in at a hard-coded +-1 and so pinned the whole field to one
+            // voxel whatever DISTANCE_RANGE said; sdf.test.mjs now asserts the two
+            // agree byte for byte over the range.
+            const t = (d < 0 ? -d : d) * invRange;
+            const c = t >= 1 ? (d < 0 ? -1 : 1)
+                             : (d < 0 ? -Math.sqrt(t) : Math.sqrt(t));
+            const b = ((c + 1) * 127.5 + 0.5) | 0;
+            if (b < data[idx]) data[idx] = b;
+          }
+        }
+      }
+    }
+  }
+}
+
 export function populateDistanceField(grid, dirty = null) {
   // `dirty` is the list of voxel rects this call is responsible for, in grid
   // coordinates - what scrollField() just exposed. null means the whole grid,
@@ -453,10 +709,13 @@ export function populateDistanceField(grid, dirty = null) {
   for (const r of rects) {
     if (r.x0 === 0 && r.x1 === GRID_DIM && r.y0 === 0 && r.y1 === GRID_DIM &&
         r.z0 === 0 && r.z1 === GRID_DIM) { grid.data.fill(FAR_BYTE); continue; }
+    const segs = ringSegments(grid, r.x0, r.x1 - 1);
     for (let vz = r.z0; vz < r.z1; vz++) {
       for (let vy = r.y0; vy < r.y1; vy++) {
-        const base = voxelIndex(r.x0, vy, vz);
-        grid.data.fill(FAR_BYTE, base, base + (r.x1 - r.x0));
+        for (const [a, b] of segs) {
+          const base = gridIndex(grid, a, vy, vz);
+          grid.data.fill(FAR_BYTE, base, base + (b - a + 1));
+        }
       }
     }
   }
@@ -515,81 +774,18 @@ export function populateDistanceField(grid, dirty = null) {
     const supported = World.has(getVoxelKey(bx, by - 1, bz));
     const dyStart = supported ? 0 : per / 2;
     const height = per - dyStart;
-    blocks.push(vx0, vy0 + dyStart, vz0);
+    // Floored: C2 has 3 voxels per block, so half a block is 1.5 voxels, and a
+    // fractional start here had the overlay indexing the grid at non-integer
+    // coordinates - read as empty, which dropped most of C2's surface. The
+    // field is unaffected; the box itself is placed continuously below.
+    blocks.push(vx0, vy0 + Math.floor(dyStart), vz0);
 
     // The box in voxel units, as a centre and a half-extent.
     const cx = vx0 + per / 2;
     const cy = vy0 + dyStart + height / 2;
     const cz = vz0 + per / 2;
-    const hx = per / 2, hy = height / 2, hz = per / 2;
 
-    // Evaluate over the box plus the one-voxel band the clamp allows, and take
-    // the MINIMUM with whatever is already there. Minimum of distances is union
-    // of shapes, which is what makes a pile of blocks one continuous surface
-    // with correct distances along shared faces, edges and corners - and the
-    // byte encoding is monotonic in distance, so the bytes can be compared
-    // directly without decoding either side.
-    // Written out rather than calling boxDistance per voxel: this is the hot
-    // loop of the whole bake (~230k voxels for a ground footprint, every block
-    // the player steps), and the per-axis terms are constant across the loop
-    // that encloses them. Math.hypot is also avoided deliberately - its
-    // overflow-safe scaling costs several times a plain sqrt, and these operands
-    // are all within a voxel or two of zero.
-    const data = grid.data;
-    const invRange = 1 / range;
-    // The band, as a voxel box, before any rect clips it.
-    const bLo = (v, h) => Math.ceil(v - h - range);
-    const bHi = (v, h) => Math.floor(v + h + range);
-    const bx0 = bLo(cx, hx), bx1 = bHi(cx, hx);
-    const by0 = bLo(cy, hy), by1 = bHi(cy, hy);
-    const bz0 = bLo(cz, hz), bz1 = bHi(cz, hz);
-
-    for (const r of rects) {
-    const x0 = Math.max(r.x0, bx0), x1 = Math.min(r.x1 - 1, bx1);
-    const y0 = Math.max(r.y0, by0), y1 = Math.min(r.y1 - 1, by1);
-    const z0 = Math.max(r.z0, bz0), z1 = Math.min(r.z1 - 1, bz1);
-    if (x0 > x1 || y0 > y1 || z0 > z1) continue;
-
-    // The band is a BOX while the clamp is a SPHERE, so its corners are in
-    // principle wasted work - a voxel at the corner of an eight-voxel band is
-    // 8*sqrt(3) = 13.9 voxels out, past the clamp, so it encodes to FAR_BYTE and
-    // the min against an already-cleared grid is a no-op. Clipping each row to the
-    // sphere was tried and MEASURED SLOWER: 19.9 ms against 16.9. The rows are 28
-    // voxels long, so a sqrt and four clamps per row cost more than the handful of
-    // iterations they save - and for a flat ground slab most rows sit inside the
-    // box's own y and z extent, where there is nothing to clip at all. Left as a
-    // plain box on the strength of the measurement.
-    for (let vz = z0; vz <= z1; vz++) {
-      const qz = Math.abs(vz + 0.5 - cz) - hz;
-      const pz = qz > 0 ? qz * qz : 0;
-      for (let vy = y0; vy <= y1; vy++) {
-        const qy = Math.abs(vy + 0.5 - cy) - hy;
-        const py = qy > 0 ? qy * qy : 0;
-        const qyz = qy > qz ? qy : qz;
-        const pyz = py + pz;
-        let idx = voxelIndex(x0, vy, vz);
-        for (let vx = x0; vx <= x1; vx++, idx++) {
-          const qx = Math.abs(vx + 0.5 - cx) - hx;
-          const outside = qx > 0 ? Math.sqrt(pyz + qx * qx) : Math.sqrt(pyz);
-          const mx = qx > qyz ? qx : qyz;
-          const d = outside + (mx < 0 ? mx : 0);
-          // encodeDistance, inlined. This copy is the one that used to fold the
-          // clamp in at a hard-coded +-1 and so pinned the whole field to one
-          // voxel whatever DISTANCE_RANGE said; sdf.test.mjs now asserts the two
-          // agree byte for byte over the range.
-          const t = (d < 0 ? -d : d) * invRange;
-          const c = t >= 1 ? (d < 0 ? -1 : 1)
-                           : (d < 0 ? -Math.sqrt(t) : Math.sqrt(t));
-          const b = ((c + 1) * 127.5 + 0.5) | 0;
-          if (b < data[idx]) data[idx] = b;
-        }
-      }
-    }
-    }
-
-    // Counted from the box itself rather than by scanning the written band:
-    // bands overlap between neighbouring blocks, boxes never do. Neighbours
-    // pulled in for their band alone are not occupancy in this chunk.
+    minBoxVoxels(grid, cx, cy, cz, per / 2, height / 2, per / 2, rects, range);
     if (inFootprint) filled += per * height * per;
   }
 

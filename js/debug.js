@@ -3,7 +3,7 @@ import { createBoxGridAt, gridOriginFor, isOccupied, GRID_DIM,
          voxelCentreToWorld, CASCADE_COUNT, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, SUN_BIAS_BLOCKS } from './boxgrid.js';
 
-// --- boxGrid debug visualisation (Alt+X) ---
+// --- boxGrid debug visualisation (Alt+G) ---
 //
 // Draws the occupancy grid as it actually exists in memory: one cube per
 // occupied voxel at 12.5 cm, with a checkerboard tint so individual voxels stay

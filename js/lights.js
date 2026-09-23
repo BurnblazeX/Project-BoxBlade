@@ -123,7 +123,28 @@ export const TORCH_LEVEL = 12;
 // How far above the character's feet the flame sits, in metres. Roughly hand
 // height on a 1.5 m block, so contact shadows fall the way a held light's do
 // rather than radiating from the ground.
-export const TORCH_HEIGHT = 0.9;
+export const TORCH_HEIGHT = 1.5;
+
+// How far in FRONT of the character the flame sits, in metres - toward the
+// camera, which is where the sprite faces.
+//
+// Together with TORCH_HEIGHT this is what keeps the flame out of its holder's
+// own silhouette card: held high and out front, it clears the figure without a
+// push along the card's normal - which, being tied to the sun rather than the
+// camera, landed the flame at different distances on either side of Bob.
+export const TORCH_FORWARD = 0.4;
+
+// How far to the character's own side the flame is held, in metres.
+//
+// A torch is held in a HAND, not out of the middle of the chest, so it sits off
+// to one side - and the side it sits on has to follow the character. Bob's
+// sprite mirrors when he turns around, so everything about him swaps sides; a
+// flame that stayed put while the art flipped would read as the torch passing
+// through him.
+//
+// Kept well inside the figure's half-width (0.625 m at torch height) so the
+// flame stays over the body rather than floating out past the shoulder.
+export const TORCH_SIDE = 0.3;
 
 export function colourToRGB(hex) {
   return {

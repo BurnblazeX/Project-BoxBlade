@@ -83,7 +83,7 @@ falsy('state says hidden', isBoxGridDebugVisible());
 section('explore mode - footprint follows the player');
 toggleBoxGridDebug(scene, { x: 8, y: 0, z: 8 }, terrain, 'explore');
 const addedBefore = added.length;
-const explore0 = added[added.length - 1].count;
+const explore0 = added[added.length - CASCADE_COUNT].count;   // this toggle's C0 mesh
 ok('origin is the player minus half a footprint', `${getBoxGridDebugOrigin().x},${getBoxGridDebugOrigin().z}`, '2,2');
 
 falsy('standing still does not rebuild', refreshBoxGridDebug(scene, { x: 8, y: 0, z: 8 }, 'explore'));
@@ -119,7 +119,7 @@ truthy('entering the next chunk does move it',
        refreshBoxGridDebug(scene, { x: 20, y: 0, z: 10 }, 'battle'));
 refreshBoxGridDebug(scene, { x: 20, y: 0, z: 10 }, 'battle'); // finish the split
 ok('now the next chunk', `${getBoxGridDebugOrigin().x},${getBoxGridDebugOrigin().z}`, '12,0');
-const battleWall = added[added.length - 1].count;
+const battleWall = added[added.length - CASCADE_COUNT].count;
 truthy('the chunk holding the wall draws more surface', battleWall > explore0);
 note(`explore at (8,8): ${explore0.toLocaleString()} | battle chunk with the wall: ${battleWall.toLocaleString()}`);
 

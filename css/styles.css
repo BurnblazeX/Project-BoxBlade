@@ -22,3 +22,12 @@ body, html {
   pointer-events: none; 
   text-shadow: 1px 1px 2px black;
 }
+/* Alt+U hides every HUD layer for graphics work. A class on body rather than
+   per-element display writes, so it never fights the mode code that shows and
+   hides the battle layer and the dialogue panel. */
+body.ui-hidden #ui-layer,
+body.ui-hidden #persistent-ui-layer,
+body.ui-hidden #battle-ui-layer,
+body.ui-hidden #dialogue-panel {
+  display: none !important;
+}

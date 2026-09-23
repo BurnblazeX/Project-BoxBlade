@@ -53,9 +53,15 @@ export function updateCharacterClipping(mesh, samples) {
   if (clipping === mesh.userData.drawingOnTop) return clipping; // only touch state on a transition
 
   mesh.userData.drawingOnTop = clipping;
+  mesh.renderOrder = clipping ? CHARACTER_RENDER_ORDER : 0;
+  // Lit materials come as a prebuilt pair. Flipping depth state on a lit
+  // material means a fresh pipeline - a shader compile of 100 ms or more, the
+  // first time a character leans into a wall - where swapping to a variant
+  // compiled in advance costs nothing.
+  const v = mesh.userData.depthVariants;
+  if (v) { mesh.material = clipping ? v.onTop : v.normal; return clipping; }
   mesh.material.depthTest = !clipping;
   mesh.material.depthWrite = !clipping;
-  mesh.renderOrder = clipping ? CHARACTER_RENDER_ORDER : 0;
   // Depth state is baked into the render pipeline, so the material must be
   // rebuilt. Gated on the transition above, so this costs nothing per frame.
   mesh.material.needsUpdate = true;
