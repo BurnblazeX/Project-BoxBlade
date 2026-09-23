@@ -31,3 +31,73 @@ body.ui-hidden #battle-ui-layer,
 body.ui-hidden #dialogue-panel {
   display: none !important;
 }
+
+/* Alt+V debug settings panel (js/settings.js). */
+#settings-panel {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  width: 340px;
+  max-height: calc(100vh - 24px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(16, 18, 24, 0.92);
+  border: 1px solid #333a48;
+  border-radius: 6px;
+  color: #d8dce6;
+  font: 12px/1.35 monospace;
+  z-index: 50;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+}
+#settings-panel[hidden] { display: none; }
+#settings-panel .sp-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid #333a48;
+  font-weight: bold;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+#settings-panel .sp-head.sp-dragging { cursor: grabbing; }
+#settings-panel .sp-hint { color: #7d8597; font-weight: normal; }
+#settings-panel .sp-body { overflow-y: auto; padding: 4px 0; }
+#settings-panel .sp-group summary {
+  cursor: pointer;
+  padding: 5px 10px;
+  color: #9fb4ff;
+  user-select: none;
+}
+#settings-panel .sp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 10px 3px 20px;
+  min-height: 22px;
+}
+#settings-panel .sp-row:hover { background: rgba(255, 255, 255, 0.04); }
+#settings-panel .sp-label { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#settings-panel .sp-range { display: flex; align-items: center; gap: 6px; }
+#settings-panel .sp-range input { width: 120px; }
+#settings-panel .sp-value { width: 44px; text-align: right; color: #fff; }
+#settings-panel select,
+#settings-panel button {
+  background: #242a36;
+  color: #d8dce6;
+  border: 1px solid #3c4557;
+  border-radius: 3px;
+  font: inherit;
+  padding: 1px 6px;
+}
+#settings-panel button { cursor: pointer; }
+#settings-panel button:hover { background: #2f3747; }
+#settings-panel .sp-status {
+  border-top: 1px solid #333a48;
+  padding: 6px 10px;
+  color: #9aa3b5;
+  min-height: 16px;
+  max-height: 64px;
+  overflow: hidden;
+}

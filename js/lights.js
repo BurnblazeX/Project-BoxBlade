@@ -153,3 +153,134 @@ export function colourToRGB(hex) {
     b: (hex & 255) / 255
   };
 }
+
+// --- The light list: lights are DATA, not kernel variants ---
+//
+// Every point light in the scene is a row in one uniform array, and the shading
+// kernel loops over however many rows are live. Adding, moving, recolouring or
+// removing a light is a write to that array - never a material rebuild - and a
+// scene with no point lights runs a loop of zero iterations.
+//
+// Sixteen is the §7.1 budget. It is a cap on lights SHADED per frame, not on
+// lights that exist: a scene may place any number and the nearest-first order
+// the caller supplies decides which sixteen are live.
+export const MAX_LIGHTS = 16;
+
+// Three vec4 per light:
+//   0  position xyz, level
+//   1  colour rgb,   source radius (metres)
+//   2  card start,   card count, shadow weight, 0
+//      - its slice of the shared card buffer, and how much of its shadow is
+//        applied (0 = unshadowed, no march; see the shadow budget below)
+export const LIGHT_VEC4S = 3;
+export const LIGHT_FLOATS = LIGHT_VEC4S * 4;
+
+// Point lights share one card buffer, each taking a slice. The per-light cap is
+// the same 64 the sun has; the total is what keeps the uniform block small
+// (256 cards is 16 KB) - a scene with sixteen lights all crowded by sprites
+// hands the later lights fewer cards, rather than growing the buffer.
+export const POINT_CARD_CAPACITY = 256;
+
+// '#ffd800', 'ffd800', 0xffd800 - all the same colour.
+export function parseColour(c) {
+  if (typeof c === 'number') return c & 0xffffff;
+  if (typeof c === 'string') {
+    const n = parseInt(c.replace(/^#/, ''), 16);
+    if (Number.isFinite(n)) return n & 0xffffff;
+  }
+  return TORCH_COLOUR;
+}
+
+// The lights that will actually be shaded: lit ones only, at most `capacity`,
+// in the order given. Level 0 is off, and off costs nothing - it never reaches
+// the array, so the kernel's loop does not even visit it.
+export function liveLights(lights, capacity = MAX_LIGHTS) {
+  const out = [];
+  for (const l of lights) {
+    if (!l || clampLevel(l.level) <= 0) continue;
+    out.push(l);
+    if (out.length >= capacity) break;
+  }
+  return out;
+}
+
+// One light into its three vec4. cardStart/cardCount are the slice of the
+// shared card buffer that was turned to face THIS light.
+export function packLight(out, index, light, cardStart = 0, cardCount = 0,
+                          shadowWeight = 1) {
+  const o = index * LIGHT_FLOATS;
+  const { r, g, b } = colourToRGB(parseColour(light.colour));
+  out[o + 0] = light.position.x;
+  out[o + 1] = light.position.y;
+  out[o + 2] = light.position.z;
+  out[o + 3] = clampLevel(light.level);
+  out[o + 4] = r; out[o + 5] = g; out[o + 6] = b;
+  out[o + 7] = light.sourceRadius ?? LIGHT_SOURCE_RADIUS;
+  out[o + 8] = cardStart;
+  out[o + 9] = cardCount;
+  out[o + 10] = Math.max(0, Math.min(1, shadowWeight));
+  out[o + 11] = 0;
+  return out;
+}
+
+// --- Perf: the contribution cutoff ---
+//
+// A light's contribution is falloff x N.L, and across the outer part of its
+// radius that is a sliver of light that still paid for a full march. The cutoff
+// takes it off the top: (amount - cutoff) / (1 - cutoff), floored at zero. A
+// remap rather than a threshold, so the light still reaches zero continuously -
+// a plain `amount > cutoff` gate would leave a ring of brightness `cutoff`
+// where the march stops.
+//
+// 1/100 is under a third of one 8-bit step at full brightness, and the whole
+// band it removes is the part of a light nobody can see.
+export const DEFAULT_LIGHT_CUTOFF = 1 / 100;
+
+export function cutAmount(amount, cutoff = DEFAULT_LIGHT_CUTOFF) {
+  if (cutoff <= 0) return Math.max(0, amount);
+  return Math.max(0, amount - cutoff) / (1 - cutoff);
+}
+
+// --- Perf: the shadow budget ---
+//
+// How many point lights get a shadow march each frame. The rest still light
+// surfaces, unshadowed. Cost then scales with the budget rather than the light
+// count, which is what a scene full of lamps needs, and once GI lands the LPV
+// carries the unshadowed lights' bounce regardless.
+//
+// Which lights: the ones that matter most where the player is looking - the
+// contribution each would make at the focus point, as lightContribution
+// computes it. A light that does not reach the focus scores its level alone,
+// below every light that does, so a bright far lamp still outranks a dim one.
+export const DEFAULT_SHADOW_BUDGET = 9;
+
+// Seconds for a light's shadow to fade in or out when it enters or leaves the
+// budget, so walking past a lamp does not pop its shadows on and off.
+export const SHADOW_FADE_SECONDS = 0.25;
+
+export function shadowScore(light, focus) {
+  const dx = light.position.x - focus.x;
+  const dy = light.position.y - focus.y;
+  const dz = light.position.z - focus.z;
+  const c = lightContribution(Math.hypot(dx, dy, dz), light.level);
+  // Contribution is 0..1; reaching lights land above 1, the rest below it.
+  return c > 0 ? 1 + c : clampLevel(light.level) / (MAX_LIGHT_LEVEL + 1);
+}
+
+// The set of lights (by identity) that get shadows this frame.
+export function pickShadowed(lights, focus, budget = DEFAULT_SHADOW_BUDGET) {
+  const n = Math.max(0, Math.floor(budget));
+  if (n >= lights.length) return new Set(lights);
+  const ranked = lights.map(l => ({ l, s: shadowScore(l, focus) }))
+                       .sort((a, b) => b.s - a.s);
+  return new Set(ranked.slice(0, n).map(r => r.l));
+}
+
+// Step a shadow weight toward 1 (in the budget) or 0 (out), linearly, taking
+// SHADOW_FADE_SECONDS for the full swing.
+export function easeShadowWeight(w, shadowed, dt, fade = SHADOW_FADE_SECONDS) {
+  const target = shadowed ? 1 : 0;
+  if (fade <= 0) return target;
+  const step = dt / fade;
+  return target > w ? Math.min(target, w + step) : Math.max(target, w - step);
+}

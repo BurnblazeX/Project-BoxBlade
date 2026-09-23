@@ -4,7 +4,10 @@ import {
   LIGHT_BITS, LIGHT_LEVELS, MAX_LIGHT_LEVEL, clampLevel,
   lightRadiusBlocks, lightRadiusMetres, lightIntensity, lightFalloff,
   lightContribution, TORCH_COLOUR, colourToRGB,
-  LIGHT_SOURCE_RADIUS, coneSlope, pointPenumbraMetres
+  LIGHT_SOURCE_RADIUS, coneSlope, pointPenumbraMetres,
+  MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY, liveLights, packLight, parseColour,
+  cutAmount, DEFAULT_LIGHT_CUTOFF, shadowScore, pickShadowed, easeShadowWeight,
+  SHADOW_FADE_SECONDS
 } from '../js/lights.js';
 
 file('lights.test.mjs - the 4-bit level every dynamic light carries');
@@ -124,3 +127,79 @@ near('an occluder at the light smears the whole flame',
      pointPenumbraMetres(4, 4), LIGHT_SOURCE_RADIUS * 2, 1e-12);
 falsy('a zero-size flame casts no penumbra at all',
       pointPenumbraMetres(2, 5, 0) > 0);
+
+section('the light list');
+// Sixteen is the §7.1 budget, and the card buffer the point lights share has to
+// hold at least the sun's per-light cap for one of them.
+ok('sixteen lights', MAX_LIGHTS, 16);
+ok('three vec4 per light', LIGHT_FLOATS, 12);
+truthy('the shared card buffer holds a full light', POINT_CARD_CAPACITY >= 64);
+
+ok('hex string with #', parseColour('#ff8800'), 0xff8800);
+ok('hex string without', parseColour('4da6ff'), 0x4da6ff);
+ok('number', parseColour(0x123456), 0x123456);
+ok('garbage falls back to the torch', parseColour('zz'), TORCH_COLOUR);
+
+const at = (x) => ({ x, y: 1, z: 0 });
+const L = (level, x = 0) => ({ position: at(x), level, colour: 0xffffff });
+// Off is level 0, and off must never reach the GPU - that is what makes an
+// unlit torch free rather than a march multiplied by zero.
+ok('level 0 is dropped', liveLights([L(0), L(5), L(0)]).length, 1);
+ok('capped at the budget', liveLights(Array.from({ length: 20 }, () => L(3))).length, 16);
+{
+  const a = L(4, 1), b = L(9, 2);
+  const live = liveLights([L(0), a, b]);
+  truthy('order is kept - the caller decides priority', live[0] === a && live[1] === b);
+}
+
+{
+  const out = new Float32Array(LIGHT_FLOATS * 2);
+  packLight(out, 1, { position: { x: 3, y: 4, z: 5 }, level: 20,
+                      colour: '#ff0000', sourceRadius: 0.5 }, 7, 9);
+  const o = LIGHT_FLOATS;
+  ok('row 1 lands at its offset, row 0 untouched', out[0], 0);
+  ok('position', [out[o], out[o + 1], out[o + 2]].join(), '3,4,5');
+  ok('level is clamped on the way in', out[o + 3], 15);
+  ok('colour as linear 0..1', [out[o + 4], out[o + 5], out[o + 6]].join(), '1,0,0');
+  ok('source radius', out[o + 7], 0.5);
+  ok('card slice', [out[o + 8], out[o + 9]].join(), '7,9');
+  ok('shadow weight defaults to fully shadowed', out[o + 10], 1);
+  packLight(out, 0, { position: { x: 0, y: 0, z: 0 }, level: 3 });
+  near('source radius defaults to the flame', out[7], LIGHT_SOURCE_RADIUS, 1e-6);
+}
+
+section('the contribution cutoff');
+// A remap, not a gate: the light must still reach zero continuously, or the
+// edge of the march shows as a ring.
+ok('zero cutoff changes nothing', cutAmount(0.3, 0), 0.3);
+ok('at the cutoff it is exactly zero', cutAmount(DEFAULT_LIGHT_CUTOFF), 0);
+ok('below it, zero', cutAmount(DEFAULT_LIGHT_CUTOFF / 2), 0);
+near('full brightness stays full', cutAmount(1), 1, 1e-12);
+truthy('continuous just above the cutoff',
+       cutAmount(DEFAULT_LIGHT_CUTOFF + 1e-6) < 1e-5);
+truthy('monotonic', cutAmount(0.4) < cutAmount(0.5));
+
+section('the shadow budget');
+{
+  const focus = { x: 0, y: 0, z: 0 };
+  const lamp = (x, level) => ({ position: { x, y: 0, z: 0 }, level });
+  const near1 = lamp(1, 8), mid = lamp(6, 8), far = lamp(40, 15), dim = lamp(40, 2);
+  truthy('a light reaching the focus outranks one that does not',
+         shadowScore(mid, focus) > shadowScore(far, focus));
+  truthy('nearer outranks further at the same level',
+         shadowScore(near1, focus) > shadowScore(mid, focus));
+  truthy('out of reach, brighter still outranks dimmer',
+         shadowScore(far, focus) > shadowScore(dim, focus));
+  const picked = pickShadowed([dim, far, mid, near1], focus, 2);
+  truthy('budget 2 picks the two that reach', picked.has(near1) && picked.has(mid) && picked.size === 2);
+  ok('budget 0 shadows nothing', pickShadowed([near1, mid], focus, 0).size, 0);
+  ok('a budget past the count shadows everything', pickShadowed([near1, mid], focus, 16).size, 2);
+}
+{
+  const half = SHADOW_FADE_SECONDS / 2;
+  near('fades in over the fade time', easeShadowWeight(0, true, half), 0.5, 1e-12);
+  near('and out', easeShadowWeight(1, false, half), 0.5, 1e-12);
+  ok('never overshoots', easeShadowWeight(0.9, true, 10), 1);
+  ok('never undershoots', easeShadowWeight(0.1, false, 10), 0);
+  ok('zero fade snaps', easeShadowWeight(0, true, 0.001, 0), 1);
+}

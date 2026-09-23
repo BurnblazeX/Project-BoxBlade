@@ -4,14 +4,15 @@ import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPat
 import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap } from './render.js';
 import { createWanderAI } from './ai.js';
-import { toggleBoxGridDebug, refreshBoxGridDebug } from './debug.js';
+import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres,
          VOXEL_METRES, applyHandoff } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
 import { createCardBindings, createCardAtlasTexture, writeCardBindings,
-         runGPUCards, MAX_CARDS } from './gpu.js';
+         runGPUCards, MAX_CARDS, createLightBindings,
+         writeLightBindings } from './gpu.js';
 import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
          runGPUMarch, createShadowColorNode, createShadowMaterial,
          restoreOriginalMaterial, followShadowGrid, commitShadowGrid, createSpriteShadowMaterial,
@@ -22,8 +23,10 @@ import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
 import { SUN_ANGULAR_SIZE, penumbraTexels } from './sun.js';
 import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
          TORCH_SIDE, MAX_LIGHT_LEVEL,
-         LIGHT_SOURCE_RADIUS, clampLevel, lightRadiusMetres, colourToRGB,
-         pointPenumbraMetres } from './lights.js';
+         LIGHT_SOURCE_RADIUS, clampLevel, lightRadiusMetres,
+         pointPenumbraMetres, MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY,
+         liveLights, packLight, parseColour, DEFAULT_SHADOW_BUDGET,
+         DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight } from './lights.js';
 import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
 import { maskFromRGBA, createSilhouetteSet, facingToward,
          AXIS_X, AXIS_Z } from './silhouette.js';
@@ -32,6 +35,7 @@ import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
          SUN_CARD_LOD_MAX } from './cards.js';
 import { spriteNormals, terrainNormals } from './normals.js';
 import { createConsole, installConsole } from './console.js';
+import { createSettingsPanel } from './settings.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
@@ -541,10 +545,11 @@ function activeProxies() {
 // applyOccluders returning one: a 3 MB Data3DTexture re-upload per cascade per
 // frame would cost more than the bake it is reporting, and in a turn-based scene
 // most frames have nobody mid-step.
-// One binding per LIGHT, not one shared, because the facing is the whole point:
-// a card turned toward the sun is not the card the torch needs, and a single
-// buffer can only hold one orientation.
-let sunCards = null, torchCards = null;
+// One slice per LIGHT, because the facing is the whole point: a card turned
+// toward the sun is not the card the torch needs, and one slice can only hold
+// one orientation. The sun has its own buffer; the point lights share one, each
+// owning the slice its light-list row points at.
+let sunCards = null, lightCards = null;
 let cardPack = null;
 let cardsReady = false;
 
@@ -553,14 +558,24 @@ function ensureCardBindings() {
   sunCards = createCardBindings(MAX_CARDS);
   sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
   sunCards.lodMax.value = SUN_CARD_LOD_MAX;
-  torchCards = createCardBindings(MAX_CARDS);
-  cardPack = new Float32Array(MAX_CARDS * 16);
+  lightCards = createCardBindings(POINT_CARD_CAPACITY);
+  cardPack = new Float32Array(POINT_CARD_CAPACITY * 16);
 }
 
 // Fill one light's buffer: cull to what that light can reach, turn each card to
 // face it, pack, upload.
 function writeCardsFor(binding, casters, lightPos, radiusMetres, directional) {
-  const near = cullCardsForLight(casters, lightPos, radiusMetres, binding.capacity);
+  const n = packCardsFor(casters, lightPos, radiusMetres, directional,
+                         cardPack, binding.capacity);
+  writeCardBindings(binding, cardPack, n);
+  return n;
+}
+
+// Cull, face and pack one light's cards into `out`, at most `capacity` of them.
+// Returns how many were written. Split from the upload so the point lights can
+// pack their slices back to back into one buffer.
+function packCardsFor(casters, lightPos, radiusMetres, directional, out, capacity) {
+  const near = cullCardsForLight(casters, lightPos, radiusMetres, capacity);
   for (const c of near) {
     // A directional light is the same direction from everywhere, so every card
     // turns the same way. A point light is in a DIFFERENT direction from every
@@ -569,9 +584,7 @@ function writeCardsFor(binding, casters, lightPos, radiusMetres, directional) {
       ? facingToward(lightPos.x, lightPos.z)
       : cardFacingFor(c.centre, lightPos.x, lightPos.z);
   }
-  const n = packCardInstances(near, cardAtlas, cardPack, binding.capacity);
-  writeCardBindings(binding, cardPack, n);
-  return n;
+  return packCardInstances(near, cardAtlas, out, capacity);
 }
 
 let lastCardCount = 0;
@@ -603,25 +616,23 @@ function updateCards() {
     // hitch on load, and nothing afterwards.
     cardAtlasTex = createCardAtlasTexture(cardAtlas);
     ensureCardBindings();
-    sunCards.atlas = torchCards.atlas = cardAtlasTex;
+    sunCards.atlas = lightCards.atlas = cardAtlasTex;
     sunCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
-    torchCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
+    lightCards.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
     cardsReady = true;
     if (shadowsOn) { buildPerPixelShadows(); }
   }
-  if (!cardsReady || !cardsOn) { lastCardCount = 0; return; }
+  if (!cardsReady || !cardsOn) { lastCardCount = 0; frameCasters = null; return; }
 
   const casters = cardCasters().filter(c => (c.lod = cardLod(c.centre)) !== null);
   // The sun is directional: its "position" is a direction, and everything is
   // within reach of it.
   lastCardCount = writeCardsFor(sunCards, casters, dirLight.position, Infinity, true);
-  if (torchOn && torchUniforms) {
-    writeCardsFor(torchCards, casters, torchUniforms.position.value,
-                  lightRadiusMetres(torchLevel), false);
-  } else {
-    torchCards.count.value = 0;
-  }
+  // The point lights' cards are packed with the light list, in updateLights -
+  // after the torch has moved this frame rather than before.
+  frameCasters = casters;
 }
+let frameCasters = null;
 
 let cardsOn = true;
 
@@ -1447,8 +1458,23 @@ function toggleWhiteWorld() {
   return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
 }
 
+let settingsPanel = null;   // built after the console, below
+
 window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
+
+  // Alt+V: the debug settings panel - every renderer knob in one place.
+  if (e.altKey && e.code === 'KeyV') {
+    e.preventDefault();
+    if (settingsPanel) settingsPanel.toggle();
+    return;
+  }
+  if (settingsPanel && settingsPanel.isOpen) {
+    if (key === 'escape') { settingsPanel.close(); return; }
+    // Arrow keys on a focused slider, typing in a select - none of it is a
+    // game key.
+    if (settingsPanel.el.contains(e.target)) return;
+  }
 
   // Alt+X: whiteworld - terrain drawn plain white so light and shadow can be
   // judged without the grass texture in the way. Sprites keep their textures.
@@ -1477,6 +1503,20 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     const hidden = document.body.classList.toggle('ui-hidden');
     console.log(`UI ${hidden ? 'hidden' : 'shown'}`);
+    return;
+  }
+
+  // Alt+L: drop a lamp where Bob's torch would be. Alt+Shift+L clears them all.
+  if (e.altKey && e.code === 'KeyL') {
+    e.preventDefault();
+    if (e.shiftKey) {
+      for (const l of [...placedLights]) removeLamp(l);
+      console.log('lamps cleared');
+    } else {
+      const l = addLamp();
+      console.log(`lamp dropped - ${describeLight(l, placedLights.length)}` +
+                  (shadowsOn ? '' : ' - bxb.shadows() to see it'));
+    }
     return;
   }
 
@@ -1841,11 +1881,8 @@ function animate(time) {
   const tGrid = performance.now();
   const moved = shadowsOn && followShadowGrids();
   const tCards = performance.now();
-  // Before the torch moves? No - after, so a card is tested against where the
-  // flame IS this frame rather than where it was last one. updateTorchPosition
-  // runs below, so this reads the previous frame's position by one frame, which
-  // at walking speed is under a centimetre and invisible; reordering it would
-  // mean recomputing the torch position twice.
+  // The sun's cards. The point lights' are packed in updateLights below, after
+  // the torch has moved, so they face where the flame IS this frame.
   if (shadowsOn) updateCards();
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
@@ -1853,6 +1890,7 @@ function animate(time) {
   // write proxies the scroll then destroys, and cost the bake twice.
   if (shadowsOn) updateOccluders();
   updateTorchPosition();
+  if (shadowsOn) updateLights();
 
   const tRender = performance.now();
   renderer.render(scene, camera);
@@ -2046,11 +2084,9 @@ const aoDistance = uniform(AO_DISTANCE);
 let sunQuantise = false;
 // --- The torch: a dynamic point light on the player ---
 //
-// A level of 0 means off, and off is a KERNEL flag rather than a uniform set to
-// zero: with no torch the material has no second march in it at all. Toggling
-// costs a material swap, which is a one-frame hitch on a keypress and nothing
-// during play - whereas a march that always runs and multiplies out to zero
-// would be paid on every fragment of every frame forever.
+// The torch is row 0 of the light list whenever it is lit, and nothing more
+// special than that: off means it is left out of the list, which costs the
+// kernel nothing, and on is one more row. No material rebuild either way.
 let torchOn = false;
 let torchLevel = TORCH_LEVEL;
 // How big the flame is, in metres. A uniform rather than a kernel constant: it
@@ -2063,22 +2099,134 @@ let torchSourceRadius = LIGHT_SOURCE_RADIUS;
 // either changes.
 let torchOffset = TORCH_FORWARD;
 let torchSide = TORCH_SIDE;
-let torchUniforms = null;
+const torchLight = {
+  name: 'torch', position: new THREE.Vector3(), level: 0,
+  colour: TORCH_COLOUR, sourceRadius: LIGHT_SOURCE_RADIUS
+};
 
-function ensureTorchUniforms() {
-  const c = colourToRGB(TORCH_COLOUR);
-  torchUniforms = torchUniforms || {
-    position: uniform(new THREE.Vector3()),
-    colour: uniform(new THREE.Vector3(c.r, c.g, c.b)),
-    level: uniform(TORCH_LEVEL),
-    sourceRadius: uniform(LIGHT_SOURCE_RADIUS)
-  };
-  // Off is level 0, not an absent light: the torch is always compiled in, and
-  // at level 0 its falloff is zero everywhere, which skips its march entirely.
-  // So toggling is this write, never a shader rebuild.
-  torchUniforms.level.value = torchOn ? clampLevel(torchLevel) : 0;
-  torchUniforms.sourceRadius.value = torchSourceRadius;
-  return torchUniforms;
+// Off is level 0, which liveLights drops before the list reaches the GPU.
+function syncTorchLight() {
+  torchLight.level = torchOn ? clampLevel(torchLevel) : 0;
+  torchLight.sourceRadius = torchSourceRadius;
+  return torchLight;
+}
+
+// --- Placed lights: everything that is not the torch ---
+//
+// Plain records, the same shape as torchLight. Each carries a small unlit marker
+// so it can be found in the scene; the marker is display only - it is not in the
+// field and casts nothing.
+const placedLights = [];
+let lightBindings = null;
+let lightPack = null;
+let lastLightCount = 0;
+let lastLightCards = 0;
+let lastShadowedCount = 0;
+// Perf settings. The budget is CPU-side - it decides which rows get a shadow
+// weight - and the cutoff is a uniform on the bindings, so neither rebuilds.
+let shadowBudget = DEFAULT_SHADOW_BUDGET;
+let lastLightTime = 0;
+
+function ensureLightBindings() {
+  if (lightBindings) return lightBindings;
+  lightBindings = createLightBindings(MAX_LIGHTS);
+  lightBindings.cutoff.value = DEFAULT_LIGHT_CUTOFF;
+  lightPack = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
+  return lightBindings;
+}
+
+// The list, packed and uploaded, with each light's cards packed into its slice
+// of the shared card buffer. Once per frame, after the torch has moved.
+function updateLights() {
+  if (!lightBindings) return;
+  const live = liveLights([syncTorchLight(), ...placedLights], MAX_LIGHTS);
+  const withCards = frameCasters && lightCards && cardsReady && cardsOn;
+  // The shadow budget: which lights get a march, ranked by what they give the
+  // player's surroundings. Each light's weight eases toward in or out, so a
+  // light crossing the budget fades its shadow rather than popping it.
+  const now = performance.now();
+  const dt = lastLightTime ? Math.min(0.1, (now - lastLightTime) / 1000) : 0;
+  lastLightTime = now;
+  const shadowed = pickShadowed(live, playerSprite.position, shadowBudget);
+  let used = 0, marching = 0;
+  for (let i = 0; i < live.length; i++) {
+    const l = live[i];
+    const start = used;
+    let count = 0;
+    // A new light starts at its target rather than fading in from nothing.
+    l.shadowWeight = l.shadowWeight === undefined ? (shadowed.has(l) ? 1 : 0)
+                   : easeShadowWeight(l.shadowWeight, shadowed.has(l), dt);
+    if (l.shadowWeight > 0) marching++;
+    // An unshadowed light needs no cards - they are only ever read by its march.
+    if (withCards && l.shadowWeight > 0) {
+      const room = Math.min(MAX_CARDS, POINT_CARD_CAPACITY - used);
+      if (room > 0) {
+        count = packCardsFor(frameCasters, l.position, lightRadiusMetres(l.level),
+                             false, cardPack.subarray(used * 16), room);
+        used += count;
+      }
+    }
+    packLight(lightPack, i, l, start, count, l.shadowWeight);
+  }
+  if (withCards) writeCardBindings(lightCards, cardPack, used);
+  writeLightBindings(lightBindings, lightPack, live.length);
+  lastLightCount = live.length;
+  lastLightCards = used;
+  lastShadowedCount = marching;
+}
+
+function lampMarker(colour) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 6),
+                           new THREE.MeshBasicMaterial({ color: colour }));
+  m.raycast = () => {};   // never picked by the hover / click raycasts
+  return m;
+}
+
+// A few colours to cycle through when a lamp is dropped without one, picked to
+// be tellable apart where they overlap.
+const LAMP_COLOURS = [0xff8a3d, 0x4da6ff, 0x7dff6a, 0xff5ad1, 0xfff1c9];
+// The level Alt+L and a bare bxb.lamp() drop at - set from the settings panel.
+let lampLevel = 10;
+
+function addLamp({ level = lampLevel, colour = null, position = null,
+                   sourceRadius = LIGHT_SOURCE_RADIUS } = {}) {
+  const c = colour === null
+    ? LAMP_COLOURS[placedLights.length % LAMP_COLOURS.length]
+    : parseColour(colour);
+  const pos = position ? new THREE.Vector3(position.x, position.y, position.z)
+                       : heldLightPosition(new THREE.Vector3());
+  const lamp = { name: 'lamp', position: pos, level: clampLevel(level),
+                 colour: c, sourceRadius, marker: lampMarker(c) };
+  lamp.marker.position.copy(pos);
+  scene.add(lamp.marker);
+  placedLights.push(lamp);
+  return lamp;
+}
+
+function removeLamp(lamp) {
+  const i = placedLights.indexOf(lamp);
+  if (i < 0) return;
+  placedLights.splice(i, 1);
+  scene.remove(lamp.marker);
+  lamp.marker.geometry.dispose();
+  lamp.marker.material.dispose();
+}
+
+function describeLight(l, i) {
+  const p = l.position;
+  return `${i}: ${l.name} L${l.level} #${parseColour(l.colour).toString(16).padStart(6, '0')} ` +
+         `at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}), ` +
+         `${lightRadiusMetres(l.level).toFixed(1)} m reach`;
+}
+
+function listLights() {
+  const all = [syncTorchLight(), ...placedLights];
+  const live = new Set(liveLights(all, MAX_LIGHTS));
+  const rows = all.map((l, i) => describeLight(l, i) + (live.has(l) ? '' : '  (not shaded)'));
+  return `${live.size}/${MAX_LIGHTS} lights shaded, ${lastShadowedCount} with ` +
+         `shadows (budget ${shadowBudget}), ${lastLightCards} point-light ` +
+         `cards this frame (cap ${MAX_CARDS} per light, ${POINT_CARD_CAPACITY} ` +
+         `shared)\n` + rows.join('\n');
 }
 
 // The flame follows the sprite every frame. Nothing else has to happen: the
@@ -2091,7 +2239,13 @@ function ensureTorchUniforms() {
 const torchForward = new THREE.Vector3();
 
 function updateTorchPosition() {
-  if (!torchOn || !torchUniforms) return;
+  if (!torchOn) return;
+  heldLightPosition(torchLight.position);
+}
+
+// Where a light held by Bob sits right now. The torch follows this every frame;
+// a dropped lamp stays where it was when dropped.
+function heldLightPosition(out) {
   // The sprite's own +Z in world space, which is where it is facing - it is
   // yawed to meet the camera every frame, so this is "toward the viewer" without
   // having to re-derive it from currentHeading. Reading the orientation the
@@ -2122,7 +2276,7 @@ function updateTorchPosition() {
   const ox = torchForward.x * torchOffset + rightX * side;
   const oz = torchForward.z * torchOffset + rightZ * side;
 
-  torchUniforms.position.value.set(
+  return out.set(
     playerSprite.position.x + ox,
     playerSprite.position.y + TORCH_HEIGHT,
     playerSprite.position.z + oz);
@@ -2268,12 +2422,12 @@ function buildPerPixelShadows() {
     bayerTex: sunBayer, stepsUniform: sunSteps, biasUniform: sunBias,
     fadeStartUniform: sunFadeStart, edgeFadeUniform: sunEdgeFade,
     ambientUniform: sunAmbient, shadeMode, shadowOnly, sun: sunOn,
-    torch: ensureTorchUniforms(),
+    lights: ensureLightBindings(),
     // Sprites are not in the field; they are these. Null until the textures have
     // loaded and the atlas is built, which is what the rebuild in updateCards
     // is for.
     cards: cardsReady && cardsOn ? sunCards : null,
-    torchCards: cardsReady && cardsOn ? torchCards : null,
+    lightCards: cardsReady && cardsOn ? lightCards : null,
     terrainNormal: terrainNormalTex,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly
   });
@@ -2311,6 +2465,7 @@ function buildPerPixelShadows() {
   });
   shadowsOn = true;
   updateTorchPosition();
+  updateLights();
   return `shadows on - ${sunCone ? 'one cone trace' : sunRays + ' sun ray' +
            (sunRays === 1 ? '' : 's')} per texel, ` +
          `12m march cap, grid covering blocks ` +
@@ -2318,9 +2473,9 @@ function buildPerPixelShadows() {
          (sunRays === 1 ? '. bxb.soften() for a penumbra.' : '');
 }
 
-// Toggling or re-levelling the torch is a uniform write - see ensureTorchUniforms.
-// Off costs a branch per fragment; on costs one more march, capped at the
-// light's own radius.
+// Toggling or re-levelling the torch is a light-list write - see syncTorchLight.
+// Off leaves it out of the list, which costs nothing; on costs one more march,
+// capped at the light's own radius.
 function toggleTorch(level = null, flame = null, forward = null) {
   if (flame !== null) torchSourceRadius = Math.max(0, flame);
   if (forward !== null) torchOffset = Math.max(0, forward);
@@ -2330,7 +2485,8 @@ function toggleTorch(level = null, flame = null, forward = null) {
   // neither must be mistaken for a toggle.
   const sizeOnly = level === null && (flame !== null || forward !== null);
   if (!sizeOnly) torchOn = level === null ? !torchOn : torchLevel > 0;
-  ensureTorchUniforms();
+  syncTorchLight();
+  updateTorchPosition();
   if (!torchOn) return 'torch off';
   if (!shadowsOn) return `torch level ${torchLevel} - run bxb.shadows() to see it`;
   // What to expect, so the softening can be checked rather than admired: a
@@ -2361,7 +2517,7 @@ function toggleTorch(level = null, flame = null, forward = null) {
 
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
-installConsole(createConsole({
+const bxbApi = installConsole(createConsole({
   compute: {
     help: 'run the WebGPU compute smoke test',
     run: () => runComputeSmokeTest(renderer)
@@ -2751,6 +2907,51 @@ installConsole(createConsole({
     run: (level = null, flameDiameter = null, forward = null) =>
       toggleTorch(level, flameDiameter === null ? null : flameDiameter / 2, forward)
   },
+  lamp: {
+    help: 'drop a point light where Bob holds the torch (Alt+L). Level 1-15, any colour',
+    usage: "bxb.lamp()  |  bxb.lamp(12)  |  bxb.lamp(12, '#ff8800')  |  " +
+           "bxb.lamp(12, '#ff8800', x, y, z) at world metres",
+    run: (level = lampLevel, colour = null, x = null, y = null, z = null) => {
+      const position = x === null ? null : { x, y: y ?? 1.5, z: z ?? 0 };
+      const l = addLamp({ level, colour, position });
+      return `lamp ${describeLight(l, placedLights.length)}` +
+             (shadowsOn ? '' : ' - bxb.shadows() to see it');
+    }
+  },
+  lamps: {
+    help: 'list every light, or clear/remove placed lamps',
+    usage: "bxb.lamps()  |  bxb.lamps('clear')  |  bxb.lamps('pop')  |  bxb.lamps(i, level) re-level",
+    run: (op = null, level = null) => {
+      if (op === 'clear') { for (const l of [...placedLights]) removeLamp(l); return 'lamps cleared'; }
+      if (op === 'pop') { if (placedLights.length) removeLamp(placedLights.at(-1)); return listLights(); }
+      // Row 0 is the torch, so placed lamp i is row i.
+      if (typeof op === 'number' && level !== null) {
+        const l = placedLights[op - 1];
+        if (!l) return `no lamp ${op} - rows start at 1, row 0 is the torch`;
+        l.level = clampLevel(level);
+      }
+      return listLights();
+    }
+  },
+  shadowbudget: {
+    help: 'how many point lights get a shadow march per frame; the rest light unshadowed',
+    usage: 'bxb.shadowbudget(9)  |  bxb.shadowbudget(16) every light',
+    run: (n = DEFAULT_SHADOW_BUDGET) => {
+      shadowBudget = Math.max(0, Math.min(MAX_LIGHTS, Math.round(n)));
+      return `shadow budget ${shadowBudget} - the ${shadowBudget} lights that ` +
+             `give Bob's surroundings the most get a march, the rest light ` +
+             `unshadowed. Changes fade over a quarter second.`;
+    }
+  },
+  lightcutoff: {
+    help: 'the faint outer band of each light that is not marched (0 = none)',
+    usage: 'bxb.lightcutoff(1/100)  |  bxb.lightcutoff(0)',
+    run: (c = DEFAULT_LIGHT_CUTOFF) => {
+      ensureLightBindings().cutoff.value = Math.max(0, Math.min(0.5, Number(c) || 0));
+      return `light cutoff ${lightBindings.cutoff.value.toFixed(4)} - contribution ` +
+             `below this is dropped and the rest rescaled, so the edge stays smooth`;
+    }
+  },
   gridbias: {
     help: 'how far the shading footprint leans toward the sun, in blocks',
     usage: 'bxb.gridbias(blocks)  |  bxb.gridbias(0) to centre it on the player',
@@ -2913,6 +3114,142 @@ installConsole(createConsole({
     }
   }
 }));
+
+// --- The settings panel (Alt+V) ---
+//
+// Every setting routes through the same bxb command the console uses, so the
+// two cannot drift - the panel is a front end, not a second owner of the state.
+// Ranges marked live:false rebuild the material, so they apply on release.
+function sunAngles() {
+  const d = dirLight.position.clone().normalize();
+  const az = (Math.atan2(d.x, d.z) * 180 / Math.PI + 360) % 360;
+  const el = Math.asin(Math.max(-1, Math.min(1, d.y))) * 180 / Math.PI;
+  return { az, el };
+}
+const softSteps = () => (sunQuantise && sunSteps ? sunSteps.value : 0);
+const flip = (now, want, fn) => (!!now === !!want ? undefined : fn());
+
+settingsPanel = createSettingsPanel({ groups: [
+  { title: 'Perf', settings: [
+    { key: 'budget', label: 'Shadowed lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
+      help: 'how many point lights get a shadow march; the rest light unshadowed',
+      get: () => shadowBudget, set: v => bxbApi.shadowbudget(v) },
+    { key: 'cutoff', label: 'Light cutoff', type: 'range', min: 0, max: 0.1, step: 0.005,
+      help: 'faint outer band of each light that is not marched',
+      get: () => (lightBindings ? lightBindings.cutoff.value : DEFAULT_LIGHT_CUTOFF),
+      format: v => (v > 0 ? '1/' + Math.round(1 / v) : 'off'),
+      set: v => bxbApi.lightcutoff(v) },
+    { key: 'perf', label: 'Frame graph', type: 'toggle',
+      get: () => perf.visible, set: v => flip(perf.visible, v, () => bxbApi.perf()) },
+    { key: 'spikes', label: 'Log spikes > 8 ms', type: 'toggle',
+      get: () => spikeLog, set: v => flip(spikeLog, v, () => bxbApi.spikes()) }
+  ]},
+  { title: 'Shadows', settings: [
+    { key: 'shadows', label: 'Marched shadows', type: 'toggle',
+      get: () => shadowsOn, set: v => flip(shadowsOn, v, () => bxbApi.shadows()) },
+    { key: 'daylight', label: 'Daylight (sun)', type: 'toggle',
+      get: () => sunOn, set: v => bxbApi.daylight(v) },
+    { key: 'soften', label: 'Soft sun', type: 'select',
+      options: [{ value: 'cone', label: 'cone trace' }, { value: 1, label: 'hard (1 ray)' },
+                { value: 4, label: '4 rays' }, { value: 16, label: '16 rays' },
+                { value: 32, label: '32 rays' }],
+      help: 'cone is one analytic ray; a count samples that many over the disc',
+      get: () => (sunCone ? 'cone' : sunRays),
+      set: v => bxbApi.soften(v, sunAngular, softSteps()) },
+    { key: 'disc', label: 'Sun disc (rad)', type: 'range', min: 0, max: 0.2, step: 0.005,
+      live: false, get: () => sunAngular,
+      set: v => bxbApi.soften(sunCone ? 'cone' : sunRays, v, softSteps()) },
+    { key: 'steps', label: 'Quantise steps', type: 'range', min: 0, max: 8, step: 1,
+      live: false, format: v => (v ? String(v) : 'off'), get: softSteps,
+      set: v => bxbApi.soften(sunCone ? 'cone' : sunRays, sunAngular, v) },
+    { key: 'sunbias', label: 'Ray bias (voxels)', type: 'range', min: 0, max: 4, step: 0.05,
+      get: () => (sunBias ? sunBias.value : SURFACE_BIAS_VOXELS), set: v => bxbApi.sunbias(v) },
+    { key: 'fadestart', label: 'Fade start', type: 'range', min: 0.5, max: 1, step: 0.01,
+      get: () => (sunFadeStart ? sunFadeStart.value : SHADOW_FADE_START),
+      set: v => bxbApi.fade(v, sunEdgeFade ? sunEdgeFade.value : EDGE_FADE_VOXELS) },
+    { key: 'edgefade', label: 'Edge fade (voxels)', type: 'range', min: 0, max: 24, step: 1,
+      get: () => (sunEdgeFade ? sunEdgeFade.value : EDGE_FADE_VOXELS),
+      set: v => bxbApi.fade(sunFadeStart ? sunFadeStart.value : SHADOW_FADE_START, v) },
+    { key: 'gridbias', label: 'Grid lean (blocks)', type: 'range', min: -6, max: 6, step: 1,
+      live: false, get: () => sunGridBias, set: v => bxbApi.gridbias(v) },
+    { key: 'shadowonly', label: 'View: sun term only', type: 'toggle',
+      get: () => shadowOnly, set: v => flip(shadowOnly, v, () => bxbApi.shadowonly()) }
+  ]},
+  { title: 'Sun', settings: [
+    { key: 'az', label: 'Azimuth', type: 'range', min: 0, max: 359, step: 1, live: false,
+      format: v => v.toFixed(0) + '°',
+      get: () => sunAngles().az, set: v => bxbApi.sun(v, sunAngles().el) },
+    { key: 'el', label: 'Elevation', type: 'range', min: 1, max: 89, step: 1, live: false,
+      format: v => v.toFixed(0) + '°',
+      get: () => sunAngles().el, set: v => bxbApi.sun(sunAngles().az, v) }
+  ]},
+  { title: 'Shading', settings: [
+    { key: 'shade', label: 'N·L mode', type: 'select', options: ['ground', 'lambert', 'flat'],
+      get: () => shadeMode,
+      set: v => bxbApi.shade(v, sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT) },
+    { key: 'ambient', label: 'Ambient', type: 'range', min: 0, max: 1, step: 0.01,
+      get: () => (sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT), set: v => bxbApi.ambient(v) },
+    { key: 'ao', label: 'AO', type: 'toggle', get: () => aoOn, set: v => bxbApi.ao(v) },
+    { key: 'aodist', label: 'AO reach (m)', type: 'range', min: 0.25, max: 3, step: 0.05,
+      get: () => aoDistance.value, set: v => bxbApi.ao(null, v) },
+    { key: 'aoonly', label: 'View: AO only', type: 'toggle',
+      get: () => aoOnly, set: v => flip(aoOnly, v, () => bxbApi.ao('only')) },
+    { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
+      get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) }
+  ]},
+  { title: 'Sprites', settings: [
+    { key: 'cards', label: 'Card shadows', type: 'toggle',
+      get: () => cardsOn, set: v => flip(cardsOn, v, () => bxbApi.cards()) },
+    { key: 'cardface', label: 'Cutout facing', type: 'select', options: ['sun', 'x', 'z'],
+      get: () => cardMode, set: v => bxbApi.cardface(v) },
+    { key: 'proxies', label: 'Baked proxies', type: 'toggle',
+      help: 'sprites voxelised into the field - off by default, kept for GI / reflections',
+      get: () => proxiesOn, set: v => flip(proxiesOn, v, () => bxbApi.proxies()) }
+  ]},
+  { title: 'Torch & lamps', settings: [
+    { key: 'torch', label: 'Torch (T)', type: 'toggle',
+      get: () => torchOn, set: v => flip(torchOn, v, () => toggleTorch()) },
+    { key: 'torchlevel', label: 'Torch level', type: 'range', min: 1, max: MAX_LIGHT_LEVEL, step: 1,
+      get: () => torchLevel,
+      // Re-levelling an unlit torch must not light it, which toggleTorch(level) would.
+      set: v => { torchLevel = clampLevel(v); syncTorchLight(); } },
+    { key: 'flame', label: 'Flame size (m)', type: 'range', min: 0, max: 1, step: 0.05,
+      get: () => torchSourceRadius * 2,
+      set: v => { torchSourceRadius = v / 2; syncTorchLight(); } },
+    { key: 'forward', label: 'Held forward (m)', type: 'range', min: 0, max: 1, step: 0.05,
+      get: () => torchOffset, set: v => { torchOffset = v; updateTorchPosition(); } },
+    { key: 'side', label: 'Held side (m)', type: 'range', min: -0.6, max: 0.6, step: 0.05,
+      get: () => torchSide, set: v => { torchSide = v; updateTorchPosition(); } },
+    { key: 'lamplevel', label: 'New lamp level', type: 'range', min: 1, max: MAX_LIGHT_LEVEL, step: 1,
+      get: () => lampLevel, set: v => { lampLevel = clampLevel(v); } },
+    { key: 'droplamp', label: 'Drop lamp (Alt+L)', type: 'action', button: 'Drop',
+      run: () => bxbApi.lamp() },
+    { key: 'poplamp', label: 'Remove last lamp', type: 'action', button: 'Remove',
+      run: () => bxbApi.lamps('pop') },
+    { key: 'clearlamps', label: 'Clear lamps', type: 'action', button: 'Clear',
+      run: () => bxbApi.lamps('clear') },
+    { key: 'listlights', label: 'List lights', type: 'action', button: 'List',
+      run: () => { const t = bxbApi.lamps(); console.log(t); return t; } }
+  ]},
+  { title: 'Debug', settings: [
+    { key: 'grid', label: 'boxGrid overlay (Alt+G)', type: 'toggle',
+      get: () => isBoxGridDebugVisible(),
+      set: v => flip(isBoxGridDebugVisible(), v, () => bxbApi.grid()) },
+    { key: 'freecam', label: 'Free cam (Alt+C)', type: 'toggle',
+      get: () => freeCam, set: v => { freeCam = !!v; } },
+    { key: 'hud', label: 'HUD (Alt+U)', type: 'toggle',
+      get: () => !document.body.classList.contains('ui-hidden'),
+      set: v => { document.body.classList.toggle('ui-hidden', !v); } },
+    { key: 'parity', label: 'GPU/CPU march parity', type: 'action', button: 'Run',
+      run: () => bxbApi.parity() },
+    { key: 'cardparity', label: 'Card parity', type: 'action', button: 'Run',
+      run: () => bxbApi.cardparity() },
+    { key: 'compute', label: 'Compute smoke test', type: 'action', button: 'Run',
+      run: () => bxbApi.compute() },
+    { key: 'stats', label: 'Print stats', type: 'action', button: 'Print',
+      run: () => JSON.stringify(bxbApi.stats()) }
+  ]}
+]});
 
 // setAnimationLoop instead of a manual requestAnimationFrame chain: WebGPURenderer
 // needs an async device/adapter init before the first frame, and setAnimationLoop

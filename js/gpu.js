@@ -13,7 +13,7 @@ import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE,
          HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from './boxgrid.js';
 import { BAYER4, SUN_ANGULAR_SIZE, coneOffsets, coneRadius,
          sunBasis } from './sun.js';
-import { MAX_LIGHT_LEVEL } from './lights.js';
+import { MAX_LIGHT_LEVEL, MAX_LIGHTS, LIGHT_VEC4S, DEFAULT_LIGHT_CUTOFF } from './lights.js';
 import { CARD_RANGE, CARD_PAD, CARD_FADE_START,
          CARD_SUN_REACH } from './cards.js';
 import { BLOCK_METRES } from './world.js';
@@ -617,16 +617,20 @@ export function writeCardBindings(b, packed, count) {
 // Multiplied rather than min'd, matching cardsVisibility(): two sprites
 // overlapping a ray each take their own bite, where min would let the nearer
 // one hide the further.
-export function createCardsTSL(b) {
+//
+// ranged: the Fn takes two more arguments, the first card and one past the last,
+// for a buffer shared between lights where each owns a slice - see the point
+// light loop. Unranged it walks the whole buffer, as the sun's does.
+export function createCardsTSL(b, { ranged = false } = {}) {
   // No atlas means no cards in this pass at all, and the caller drops the
   // multiply rather than compiling a loop that can never run.
   if (!b || !b.atlas) return null;
   // skip is the XZ of the card to leave out: a sprite shading itself must not
   // be occluded by its own card. Terrain passes a point far off the map.
-  return Fn(([from, dir, maxDist, coneSlope, skip]) => {
+  const body = (from, dir, maxDist, coneSlope, skip, start, end) => {
     const vis = float(1).toVar();
 
-    Loop({ start: int(0), end: b.count, type: 'int', condition: '<' }, ({ i }) => {
+    Loop({ start, end, type: 'int', condition: '<' }, ({ i }) => {
       const base = i.mul(int(4));
       const A = b.data.element(base);
       const B = b.data.element(base.add(int(1)));
@@ -737,7 +741,12 @@ export function createCardsTSL(b) {
     });
 
     return vis;
-  });
+  };
+  return ranged
+    ? Fn(([from, dir, maxDist, coneSlope, skip, start, end]) =>
+        body(from, dir, maxDist, coneSlope, skip, start, end))
+    : Fn(([from, dir, maxDist, coneSlope, skip]) =>
+        body(from, dir, maxDist, coneSlope, skip, int(0), b.count));
 }
 
 export const texelLockTSL = Fn(([p, n]) => {
@@ -942,13 +951,13 @@ export function createNormalTexture(data, w, h) {
 
 export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12,
                                         ambientUniform = null, shadeMode = 'ground',
-                                        rays = 1, shadowOnly = false, torch = null, sun: sunOn = true,
+                                        rays = 1, shadowOnly = false, lights = null, sun: sunOn = true,
                                         angular = SUN_ANGULAR_SIZE,
                                         bayerTex = null, stepsUniform = null,
                                         biasUniform = null,
                                         cone = false, quantise = true,
                                   fadeStartUniform = null, edgeFadeUniform = null,
-                                  cards = null, torchCards = null,
+                                  cards = null, lightCards = null,
                                   terrainNormal = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   aoOnly = false }) {
@@ -971,10 +980,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const rtao = cones ? (p, n, lift, skip) =>
     spriteAO ? cones(p, n, lift, skip).mul(spriteAO(p, skip)) : cones(p, n, lift, skip) : null;
 
-  const pointLight = torch
-    ? createPointLightTSL({ cascades, torch, biasUniform,
-                            fadeStartUniform, edgeFadeUniform,
-                            cards: torchCards || cards })
+  // Every point light, in one loop over the list. Compiled in whenever there is
+  // a list at all: an empty list is a loop of zero iterations, so turning lights
+  // on and off is a uniform write rather than a rebuild.
+  const pointLight = lights
+    ? createPointLightsTSL({ cascades, lights, biasUniform,
+                             fadeStartUniform, edgeFadeUniform, cards: lightCards })
     : null;
 
   const node = Fn(() => {
@@ -1002,7 +1013,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // dynamic light does not reach.
     if (!sunOn) {
       const dark = vec3(ambient, ambient, ambient).mul(ao);
-      return torch ? dark.add(pointLight(p, n, NO_SKIP, nS)) : dark;
+      return pointLight ? dark.add(pointLight(p, n, NO_SKIP, nS)) : dark;
     }
     // Faces turned from the sun get N.L = 0, so the march result is multiplied
     // away - skip it. Not in shadowOnly, which shows the raw term everywhere.
@@ -1020,7 +1031,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     if (shadowOnly) return vec3(visible, visible, visible);
     const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
                                   ambientUniform: ambient, mode: shadeMode, ao });
-    if (!torch) return vec3(sunTerm, sunTerm, sunTerm);
+    if (!pointLight) return vec3(sunTerm, sunTerm, sunTerm);
     return vec3(sunTerm, sunTerm, sunTerm).add(pointLight(p, n, NO_SKIP, nS));
   })();
 
@@ -1048,7 +1059,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       if (aoOnly) { out.assign(vec3(ao, ao, ao)); return; }
       if (!sunOn) {
         const dark = vec3(ambient, ambient, ambient).mul(ao);
-        out.assign(torch ? dark.add(pointLight(p, n, skip, nS)) : dark);
+        out.assign(pointLight ? dark.add(pointLight(p, n, skip, nS)) : dark);
         return;
       }
       const visible = sunShadow(p, n, skip);
@@ -1059,16 +1070,16 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const sunTerm = sunShadeTSL({ visible, n: nS, sunDir: sun.dir,
                                     ambientUniform: ambient, mode: 'lambert', ao });
       const lit = vec3(sunTerm, sunTerm, sunTerm);
-      out.assign(torch ? lit.add(pointLight(p, n, skip, nS)) : lit);
+      out.assign(pointLight ? lit.add(pointLight(p, n, skip, nS)) : lit);
     });
     return out;
   })();
 
-  return { node, spriteLight, sun, cascades, torch,
+  return { node, spriteLight, sun, cascades, lights,
            maxDistUniform: maxDist, ambientUniform: ambient };
 }
 
-// --- A dynamic point light, marched through the same field ---
+// --- Dynamic point lights, marched through the same field ---
 //
 // The reason a moving light is affordable at all, and it is worth being explicit
 // because it is the opposite of how a shadow map behaves: the distance field is
@@ -1082,11 +1093,40 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
 // cannot shadow it. Combined with the windowed falloff reaching zero exactly at
 // the radius, a level-15 torch is a 22.5 m ray at worst and a level-0 torch is
 // no ray at all.
-function createPointLightTSL({ cascades, torch, biasUniform, fadeStartUniform,
-                               edgeFadeUniform, cards = null }) {
-  // The binding in, the kernel built here: whether there are cards at all is a
-  // compile-time property of this pass, like the torch itself.
-  const cardsFn = createCardsTSL(cards);
+
+// --- The light list, bound ---
+//
+// LIGHT_VEC4S vec4 per light, laid out as lights.js packLight writes them. A
+// uniform array for the same reason the cards are one: 16 lights is 768 bytes,
+// and a uniform read is the cheaper of the two in a per-fragment loop.
+export function createLightBindings(capacity = MAX_LIGHTS) {
+  return {
+    capacity,
+    data: uniformArray(new Array(capacity * LIGHT_VEC4S).fill(0)
+                         .map(() => new THREE.Vector4()), 'vec4'),
+    count: uniform(int(0)),
+    // lights.js cutAmount: the sliver of each light's reach not worth a march.
+    cutoff: uniform(float(DEFAULT_LIGHT_CUTOFF))
+  };
+}
+
+export function writeLightBindings(b, packed, count) {
+  const v = b.data.array;
+  const n = Math.min(count, b.capacity);
+  for (let i = 0; i < n * LIGHT_VEC4S; i++) {
+    v[i].set(packed[i * 4], packed[i * 4 + 1], packed[i * 4 + 2], packed[i * 4 + 3]);
+  }
+  b.count.value = n;
+  return b;
+}
+
+// Returns Fn([p, n, skip, shadeN]) -> the summed colour of every live light.
+// The body is the single torch's, unchanged, run once per row of the list.
+function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
+                                edgeFadeUniform, cards = null }) {
+  // Ranged: the point lights share one card buffer and each walks only the
+  // slice that was turned to face it.
+  const cardsFn = createCardsTSL(cards, { ranged: true });
   // The SUN'S cone marcher, unchanged. Its cone radius is slope * t, and a
   // point light's cone is also linear in t - it just has a different slope, and
   // one that varies per fragment rather than being a uniform. So there is one
@@ -1102,55 +1142,86 @@ function createPointLightTSL({ cascades, torch, biasUniform, fadeStartUniform,
   // normal-mapped normal. Separate because the lift has to follow the real
   // geometry, and for a sprite that is not the direction it is shaded as facing.
   return Fn(([p, n, skip, shadeN]) => {
-    const toLight = torch.position.sub(p).toVar();
-    // max() rather than a branch: a fragment exactly at the light would divide
-    // by zero, and the answer there is arbitrary anyway.
-    const dist = max(length(toLight), float(1e-4)).toVar();
-    const dir = toLight.div(dist).toVar();
-
-    // lights.js: the level IS the radius in blocks, and (1 - d/R)^2 reaches zero
-    // at exactly that radius, so the light ends where the level says and the
-    // boundary has no ring.
-    const radius = torch.level.mul(float(BLOCK_METRES));
-    const u = clamp(float(1).sub(dist.div(max(radius, float(1e-4)))),
-                    float(0), float(1));
-    // log2(1 + u), mirroring lights.js lightFalloff - exact at both ends and far
-    // brighter than a square across the middle, which is what a torch looks like.
-    const falloff = log2(float(1).add(u)).mul(torch.level.div(float(MAX_LIGHT_LEVEL)));
-
-    const ndotl = max(shadeN.dot(dir), float(0));
+    const sum = vec3(0, 0, 0).toVar();
     // Lifted off the face along the NORMAL, the same as the sun's origin and for
-    // the same reason - see SURFACE_BIAS_VOXELS.
-    // origin, slope and reach are all shared between the march and the cards, so
-    // all three are pinned as variables here - otherwise TSL hoists each one at
-    // its first reuse, inside a cascade loop that may never run, and the cards
-    // read it unassigned. See the sun's cone path.
+    // the same reason - see SURFACE_BIAS_VOXELS. The same for every light.
     const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
 
-    // lights.js coneSlope(): the cone from this fragment to the emitter opens to
-    // sourceRadius at the light, so its slope is sourceRadius / D. Unlike the
-    // sun's, this is per fragment - which is the whole difference between a
-    // light that is 150 million km away and one in the player's hand.
-    const slope = torch.sourceRadius.div(dist).toVar();
-    // Capped at the nearer of the light and its own radius: nothing past either
-    // can take away light that is already zero there.
-    const reach = min(dist, radius).toVar();
+    // Named: the marcher and the card loop inside both use the default `i`, and
+    // an inlined inner loop's `i` would shadow this one's.
+    Loop({ start: int(0), end: lights.count, type: 'int', condition: '<', name: 'li' },
+         ({ li }) => {
+      const base = li.mul(int(LIGHT_VEC4S));
+      // Read into variables up front, for the same shadowing reason: an
+      // element() left as an expression is re-emitted at each use, inside the
+      // inner loops.
+      const A = lights.data.element(base).toVar();
+      const B = lights.data.element(base.add(int(1))).toVar();
+      const C = lights.data.element(base.add(int(2))).toVar();
+      const level = A.w;
 
-    // Only march where the light can arrive at all. Outside the radius, or on a
-    // face turned away, the result is multiplied by zero - and without this gate
-    // every such fragment still paid a march of up to the full radius.
-    const amount = falloff.mul(ndotl).toVar();
-    const visible = float(0).toVar();
-    If(amount.greaterThan(float(0)), () => {
-      visible.assign(trace(origin, dir, reach, slope, fadeStart, edgeFade).x);
-      // Sprites are not in the field, so they are tested here - against cards
-      // turned to face THIS light, which is the whole reason they left the
-      // field. Same ray, same cap, same cone slope, so a sprite's penumbra under
-      // a torch matches a wall's rather than being a second approximation of it.
-      if (cardsFn) visible.mulAssign(cardsFn(origin, dir, reach, slope, skip));
+      const toLight = A.xyz.sub(p).toVar();
+      // max() rather than a branch: a fragment exactly at the light would divide
+      // by zero, and the answer there is arbitrary anyway.
+      const dist = max(length(toLight), float(1e-4)).toVar();
+      const dir = toLight.div(dist).toVar();
+
+      // lights.js: the level IS the radius in blocks, and the falloff reaches
+      // zero at exactly that radius, so the light ends where the level says and
+      // the boundary has no ring.
+      const radius = level.mul(float(BLOCK_METRES)).toVar();
+      const u = clamp(float(1).sub(dist.div(max(radius, float(1e-4)))),
+                      float(0), float(1));
+      // log2(1 + u), mirroring lights.js lightFalloff - exact at both ends and
+      // far brighter than a square across the middle, which is what a torch
+      // looks like.
+      const falloff = log2(float(1).add(u)).mul(level.div(float(MAX_LIGHT_LEVEL)));
+      const ndotl = max(shadeN.dot(dir), float(0));
+
+      // lights.js coneSlope(): the cone from this fragment to the emitter opens
+      // to sourceRadius at the light, so its slope is sourceRadius / D. Unlike
+      // the sun's, this is per fragment - which is the whole difference between
+      // a light 150 million km away and one in the player's hand.
+      const slope = B.w.div(dist).toVar();
+      // Capped at the nearer of the light and its own radius: nothing past
+      // either can take away light that is already zero there.
+      const reach = min(dist, radius).toVar();
+
+      // Only march where the light can arrive at all. Outside the radius, or on
+      // a face turned away, the result is multiplied by zero - and without this
+      // gate every such fragment paid a march of up to the full radius, per
+      // light. This is also the per-fragment cull §7.1 describes: a light that
+      // does not reach here costs its distance test and nothing more.
+      //
+      // The cutoff remap (lights.js cutAmount) moves the gate inward, so the
+      // faint outer band of the light is not marched either, and stays
+      // continuous at the new edge rather than leaving a ring.
+      const cut = lights.cutoff;
+      const amount = max(falloff.mul(ndotl).sub(cut), float(0))
+                       .div(float(1).sub(cut)).toVar();
+      If(amount.greaterThan(float(0)), () => {
+        // C.z is the shadow weight: 0 for a light outside the shadow budget,
+        // which lights the surface unshadowed and marches nothing; between 0
+        // and 1 while it fades in or out of the budget.
+        const weight = C.z;
+        const visible = float(1).toVar();
+        If(weight.greaterThan(float(0)), () => {
+          const v = trace(origin, dir, reach, slope, fadeStart, edgeFade).x.toVar();
+          // Sprites are not in the field, so they are tested here - against the
+          // cards turned to face THIS light. Same ray, same cap, same cone slope,
+          // so a sprite's penumbra matches a wall's.
+          if (cardsFn) {
+            const start = int(C.x).toVar();
+            v.mulAssign(cardsFn(origin, dir, reach, slope, skip,
+                                start, start.add(int(C.y))));
+          }
+          visible.assign(mix(float(1), v, weight));
+        });
+        sum.addAssign(B.xyz.mul(amount).mul(visible));
+      });
     });
 
-    return torch.colour.mul(amount).mul(visible);
+    return sum;
   });
 }
 
