@@ -9,7 +9,8 @@ import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from '
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres,
          VOXEL_METRES, applyHandoff } from './boxgrid.js';
-import { makeClipSamples, updateCharacterClipping } from './sprites.js';
+import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
+         crossedPlanesGeometry } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createVoxelAONode } from './gpu.js';
@@ -47,6 +48,9 @@ import { spriteNormals } from './normals.js';
 import { createConsole, installConsole } from './console.js';
 import { createSettingsPanel } from './settings.js';
 import { createLPV } from './gi.js';
+import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from './shadowsets.js';
+import { classifyTextureAlpha, registerCutout, syncCutout, wantsTransparent,
+         cutoutsEnabled, setCutoutsEnabled } from './cutout.js';
 import { diffuseAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
 import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS,
          DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS } from './lpv.js';
@@ -182,8 +186,10 @@ const texLoader = new THREE.TextureLoader();
 // independently - and a separate LOAD rather than a clone: Texture.clone() flags
 // the copy for upload at once, while the shared image is still null until the
 // file arrives, and a first frame drawn in that window crashes in three.
+// The alpha is classified on load: binary alpha lets a cutout draw opaque
+// (js/cutout.js).
 function loadSpriteTexture(url) {
-  const tex = texLoader.load(url);
+  const tex = texLoader.load(url, classifyTextureAlpha);
   tex.magFilter = tex.minFilter = THREE.NearestFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -201,7 +207,7 @@ bobTexture.colorSpace = THREE.SRGBColorSpace;
 // tree's fixed planes; staying fully vertical (no lean at all) looked squished
 // under this game's steep camera angles. The cap is a middle ground.
 const MAX_CHARACTER_TILT = THREE.MathUtils.degToRad(22.5);
-const characterGeo = new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE * 2); // 2 voxels tall
+const characterGeo = addSpriteTangent(new THREE.PlaneGeometry(VOXEL_SIZE, VOXEL_SIZE * 2)); // 2 voxels tall
 characterGeo.translate(0, VOXEL_SIZE, 0); 
 
 function createCharacterMesh(texture) {
@@ -211,6 +217,9 @@ function createCharacterMesh(texture) {
   const mesh = new THREE.Mesh(characterGeo, material);
   mesh.rotation.order = 'YXZ'; // yaw (heading) applied before pitch (lean), so lean tilts around the already-yawed local X axis
   mesh.userData.drawingOnTop = false;
+  // Opaque once its alpha is known to be binary - except while clipping, when
+  // it has to draw last, in the transparent pass.
+  registerCutout(material, () => mesh.userData.drawingOnTop);
   return mesh;
 }
 
@@ -572,11 +581,11 @@ let cardsReady = false;
 
 function ensureCardBindings() {
   if (sunCards) return;
-  sunCards = createCardBindings(MAX_CARDS);
+  sunCards = createCardBindings(MAX_CARDS, 'bxbSunCards');
   sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
   sunCards.lodMax.value = SUN_CARD_LOD_MAX;
-  lightCards = createCardBindings(POINT_CARD_CAPACITY);
-  viewCards = createCardBindings(MAX_CARDS);
+  lightCards = createCardBindings(POINT_CARD_CAPACITY, 'bxbLightCards');
+  viewCards = createCardBindings(MAX_CARDS, 'bxbViewCards');
   cardPack = new Float32Array(POINT_CARD_CAPACITY * 16);
 }
 
@@ -700,10 +709,7 @@ function createObjectSprite(color) {
   return sprite;
 }
 
-const treeTexture = texLoader.load(treeTextureUrl);
-treeTexture.magFilter = THREE.NearestFilter;
-treeTexture.minFilter = THREE.NearestFilter;
-treeTexture.colorSpace = THREE.SRGBColorSpace;
+const treeTexture = loadSpriteTexture(treeTextureUrl);
 
 // Decor (tree): fixed-orientation ground-planted cutout, NOT a camera-facing
 // Sprite - meshes stay put as the camera rotates, like cardboard planted in
@@ -715,12 +721,20 @@ treeTexture.colorSpace = THREE.SRGBColorSpace;
 // (local Y = world up, normal along world Z), so the first plane needs no rotation.
 // 2 voxels wide and 3 voxels tall, vs. the 1-block-tall character sprites.
 // (A horizontal top face is planned too, once that texture exists - not yet.)
-const treePlaneGeo = new THREE.PlaneGeometry(VOXEL_SIZE * 2, VOXEL_SIZE * 3);
+const TREE_ANGLES = [0, Math.PI / 2, Math.PI / 4, (3 * Math.PI) / 4];
+const treePlaneGeo = addSpriteTangent(new THREE.PlaneGeometry(VOXEL_SIZE * 2, VOXEL_SIZE * 3));
 treePlaneGeo.translate(0, VOXEL_SIZE * 1.5, 0); // anchor the bottom edge at local origin, like the sprites' center.set(0.5, 0)
+// The same four planes as one geometry: one draw a tree instead of four. The
+// separate planes are kept for bxb.treemerge(), to A/B the two.
+const treeCrossGeo = crossedPlanesGeometry(VOXEL_SIZE * 2, VOXEL_SIZE * 3, TREE_ANGLES);
+let treeMerge = true;
 const treeMaterial = new THREE.MeshBasicMaterial({
   map: treeTexture, transparent: true, side: THREE.DoubleSide,
   alphaTest: 0.5 // discard fully-transparent pixels before the depth test, so they don't occlude what's behind
 });
+// Four DoubleSide planes a tree: transparent, each is drawn twice (back faces,
+// then front). Opaque once the texture's alpha is known to be binary.
+registerCutout(treeMaterial);
 const treeMeshes = [];
 const worldObjects = [];
 
@@ -734,16 +748,16 @@ function createTreeAt(gridPos, id) {
     blocking: true
   });
 
+  // The group is the tree: position, visibility, picking and cards all use it.
+  // What draws it is either one merged mesh or the four planes.
   const treeMesh = new THREE.Group();
-  treeMesh.add(
-    new THREE.Mesh(treePlaneGeo, treeMaterial),
-    new THREE.Mesh(treePlaneGeo, treeMaterial),
-    new THREE.Mesh(treePlaneGeo, treeMaterial),
-    new THREE.Mesh(treePlaneGeo, treeMaterial)
-  );
-  treeMesh.children[1].rotation.y = Math.PI / 2;
-  treeMesh.children[2].rotation.y = Math.PI / 4;
-  treeMesh.children[3].rotation.y = (3 * Math.PI) / 4;
+  const planes = TREE_ANGLES.map(a => {
+    const m = new THREE.Mesh(treePlaneGeo, treeMaterial);
+    m.rotation.y = a;
+    return m;
+  });
+  treeMesh.userData.drawn = { merged: [new THREE.Mesh(treeCrossGeo, treeMaterial)], planes };
+  treeMesh.add(...(treeMerge ? treeMesh.userData.drawn.merged : planes));
   treeMesh.position.copy(getSpriteWorldPos(treeObject.gridPos));
   scene.add(treeMesh);
 
@@ -753,6 +767,25 @@ function createTreeAt(gridPos, id) {
   worldObjects.push({ data: treeObject, mesh: treeMesh });
   treeMeshes.push(treeMesh);
   return treeObject;
+}
+
+// Swaps every tree between the merged mesh and the four planes. All of a
+// tree's meshes share one material - plain, or the lit one - so the incoming
+// meshes take it over and nothing is rebuilt.
+function setTreeMerge(on) {
+  treeMerge = !!on;
+  for (const tree of treeMeshes) {
+    const { merged, planes } = tree.userData.drawn;
+    const out = tree.children.slice();
+    const into = treeMerge ? merged : planes;
+    if (out[0] === into[0]) continue;
+    for (const m of into) {
+      m.material = out[0].material;
+      m.userData.originalMaterial = out[0].userData.originalMaterial;
+    }
+    tree.remove(...out);
+    tree.add(...into);
+  }
 }
 
 function createTrees(treePositions) {
@@ -1511,12 +1544,44 @@ function toggleWhiteWorld() {
   return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
 }
 
-async function enableProfilingSetup() {
-  const out = [];
-  if (!perf.visible) out.push(bxbApi.perf());
-  if (!sunCone) out.push(await bxbApi.soften('cone'));
-  if (!shadowsOn) out.push(await bxbApi.shadows());
-  console.log(out.length ? out.join('\n') : 'frame graph, cone trace and marched shadows already on');
+// R and the "advanced effects" button. One at a time: a second press while a
+// turn-on is compiling is ignored rather than queued.
+let effectsBusy = false;
+// By id, not a module const: bxb.shadows() can run before the button's wiring.
+function syncEffectsButton() {
+  const btn = document.getElementById('btn-effects');
+  if (!btn) return;
+  btn.textContent = shadowsOn ? 'Disable advanced effects' : 'Enable advanced effects';
+  btn.disabled = effectsBusy;
+}
+async function toggleAdvancedEffects() {
+  if (effectsBusy) return;
+  effectsBusy = true;
+  syncEffectsButton();
+  let notice = null;
+  try {
+    if (shadowsOn) {
+      console.log(await bxbApi.shadows());
+      return;
+    }
+    const out = [];
+    if (!perf.visible) out.push(bxbApi.perf());
+    if (!sunCone) out.push(await bxbApi.soften('cone'));
+    if (shadowTurnOnCompiles()) {
+      notice = showNotice('Preparing shaders\u2026');
+      // Two frames, so the notice is on screen before the compile holds them.
+      await nextFrame(); await nextFrame();
+    }
+    out.push(await bxbApi.shadows());
+    await shadowBuildDone;
+    // The GI's compute kernels compile on their first dispatch, the next frame.
+    if (notice) { await nextFrame(); await nextFrame(); }
+    console.log(out.join('\n'));
+  } finally {
+    if (notice) notice.remove();
+    effectsBusy = false;
+    syncEffectsButton();
+  }
 }
 
 let settingsPanel = null;   // built after the console, below
@@ -1599,12 +1664,15 @@ if (key === 'escape' && isDialogueOpen) {
     keyState[key] = true;
   }
 
-  // R: the profiling setup in one press - the frame graph, then the cone-traced
-  // sun, then the marched shadows, in that order, so the shadows build once
-  // with the cone already chosen. It only ever turns things ON: pressing it
-  // again with everything up does nothing.
+  // R: every advanced effect on or off. On: the frame graph, then the
+  // cone-traced sun, then the marched shadows (and with them AO cones, GI,
+  // reflections, mirrors), in that order, so the shadows build once with the
+  // cone already chosen. Off: shadows off - the plain materials and static
+  // voxel AO; the frame graph stays up. The first turn-on compiles, behind a
+  // "Preparing shaders" notice; after that the set is kept, so both directions
+  // are a swap. The button beside Debug does the same.
   if (key === 'r' && !e.altKey && !e.ctrlKey && !e.metaKey) {
-    enableProfilingSetup();
+    toggleAdvancedEffects();
     return;
   }
 
@@ -2123,8 +2191,9 @@ let sunRays = 1;
 // Which way the penumbra is obtained. false samples the solar disc with sunRays
 // rays; true gets the whole thing from a single cone trace against the widened
 // field. Both are the same march and the same field - see gpu.js for the one
-// thing the cone gives up, which is occluder shape.
-let sunCone = false;
+// thing the cone gives up, which is occluder shape. The cone is the default:
+// it is what R turns on, and so what the load-time compile builds.
+let sunCone = true;
 let sunAngular = SUN_ANGULAR_SIZE;
 let sunBayer = null;
 let sunSteps = null;    // quantisation levels for the soft tail
@@ -2334,6 +2403,10 @@ function renderTexelCache() {
 // other frame. Its contents are coarse and slow-changing; the lag is two
 // frames instead of one, which nothing that far away shows.
 let giFarHalf = true;
+// giBatch: each GI volume's kernels go to the GPU as one compute pass and one
+// submit, not eleven. Same kernels, same order, same result; off submits them
+// one by one as before, for A/B.
+let giBatch = true;
 let giFrame = 0;
 let mirrorsOn = true;
 let mirrorOnly = false;   // the view: mirror light alone
@@ -2432,7 +2505,7 @@ function updateGI() {
     u.spread.value = lpvSpread;
     v.slices = lpvSlices;
     writeSunUniforms(v.sun, dirLight.position, sunAngular);
-    v.update(renderer, { shift, iterations: lpvIterations });
+    v.update(renderer, { shift, iterations: lpvIterations, batch: giBatch });
   }
   lastGIms = performance.now() - t0;
 }
@@ -2686,8 +2759,8 @@ function bxbLight(x, y, z) {
 // reaching back through globalThis.bxb to do that would make the console the
 // owner of state main.js owns.
 // Sprites receive the same lights as the terrain. One lit material per ORIGINAL
-// material, so the trees' four planes and eight trees still share one.
-let spriteShadowMats = [];
+// material, so the trees' planes and all eight trees still share one. The lit
+// materials belong to their shadow set (see obtainShadowSet), which disposes them.
 function spriteMeshes() {
   return [playerSprite, enemySprite, ...treeMeshes.flatMap(g => g.children)];
 }
@@ -2704,9 +2777,10 @@ function restoreSpriteMaterials() {
         m.material.needsUpdate = true;
       }
     }
+    // Its transparent flag too - the clip state, or bxb.cutouts(), may have
+    // moved on while it was parked.
+    syncCutout(m.material);
   }
-  for (const mat of spriteShadowMats) mat.dispose();
-  spriteShadowMats = [];
 }
 // The characters also get an always-on-top variant for the clip fix in
 // sprites.js - compiled here with the rest, so leaning into a wall never
@@ -2726,6 +2800,10 @@ function buildSpriteShadows(spriteLight) {
     if (!made.has(base)) {
       const mat = createSpriteShadowMaterial(base, spriteLight, spriteNormalFor(m));
       mat.depthTest = mat.depthWrite = true;
+      // Opaque when its texture's alpha is binary (js/cutout.js). Set from the
+      // texture, not copied from base: a character parked mid-clip has a
+      // transparent base, and this is the variant for NOT clipping.
+      mat.transparent = wantsTransparent(base);
       made.set(base, mat);
     }
     pairs.push([m, made.get(base)]);
@@ -2735,11 +2813,13 @@ function buildSpriteShadows(spriteLight) {
     const top = createSpriteShadowMaterial(m.userData.originalMaterial, spriteLight,
                                            spriteNormalFor(m));
     top.depthTest = top.depthWrite = false;
+    // Always transparent: drawn last, over everything, is the transparent pass.
+    top.transparent = true;
     variants.set(m, { normal: made.get(m.userData.originalMaterial), onTop: top });
     pairs.push([m, top]);
     mats.push(top);
   }
-  return { pairs, mats, variants };
+  return { pairs, mats, variants, made };
 }
 
 // Compile the new materials before anything visible uses them, so the swap
@@ -2792,14 +2872,21 @@ async function compileOffscreen(pairs) {
 }
 let shadowBuild = 0;
 
-function buildPerPixelShadows() {
-  // Turning shadows on builds the field fresh - it did not follow the player
-  // while they were off. A rebuild while they are on does not need it baked
-  // again.
-  if (!shadowsOn || !shadowGrids[0]) ensureShadowGrids();
-  const origin = shadowOrigins[0];
-  ensureSunUniforms();
-  const { node, spriteLight, sun } = createShadowColorNode({
+// --- Shadow material sets, kept compiled (js/shadowsets.js) ---
+//
+// A set is everything one build makes: the terrain's material (and the texel
+// cache's low-res and miss materials), the sprites' lit materials, and the sun
+// uniforms they read. Kept after shadows go off, and after a rebuild replaces
+// it, so turning shadows back on - or flipping a setting back - is a swap, not
+// a compile. The newest SHADOW_SETS_KEPT are kept. bxb.shadowcache() turns
+// keeping off: each set is then disposed as soon as it is replaced, as before.
+const SHADOW_SETS_KEPT = 2;
+const shadowSets = createSetCache(SHADOW_SETS_KEPT);
+let shadowCacheOn = true;
+let activeShadowSet = null;
+
+function shadowNodeOptions() {
+  return {
     cascades: shadowCascades,
     sunDirection: dirLight.position,
     rays: sunRays, angular: sunAngular, cone: sunCone, quantise: sunQuantise,
@@ -2820,18 +2907,58 @@ function buildPerPixelShadows() {
     viewCards: cardsReady && cardsOn ? viewCards : null,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
     gi: giOn && ensureLPV() ? giBinding() : null, giOnly
-  });
-  shadowSun = sun;
+  };
+}
+
+// Everything a set's shaders depend on: the node options, the terrain mesh and
+// the texel cache, and per sprite its plain material, its normal map and
+// whether it draws opaque.
+function shadowSetKeyParts(opts) {
+  const parts = {};
+  for (const [k, v] of Object.entries(opts)) parts[k] = keyPart(v);
+  // The terrain bag also carries load progress (ready, the per-layer pixels the
+  // GI averages), which no shader reads - keying on it would miss the cache
+  // whenever textures finished loading between two builds. Only the textures
+  // the shaders bind.
+  const t = terrainTextures;
+  parts.terrain = keyPart([t.albedo, t.normal, t.specular, t.blocks]);
+  parts.mesh = keyPart(worldInstancedMesh);
+  parts.texelCache = keyPart([texelCacheOn, texelCacheOn ? texelCache.rt : null]);
+  parts.sprites = keyPart(spriteMeshes().map(m => {
+    const base = m.userData.originalMaterial || m.material;
+    return [base, spriteNormalFor(m), wantsTransparent(base)];
+  }));
+  return parts;
+}
+
+function disposeShadowSet(set) {
+  for (const m of set.mats) m.dispose();
+}
+
+// The set for the current settings: kept, or built and compiling. set.ready
+// resolves once it is compiled, either way.
+function obtainShadowSet() {
+  if (texelCacheOn) { sizeTexelCache(); ensureTerrainTwins(); }
+  const opts = shadowNodeOptions();
+  const parts = shadowSetKeyParts(opts);
+  const key = keyPart(parts);
+  const kept = shadowCacheOn ? shadowSets.get(key) : null;
+  if (kept) return kept;
+  // A compile is the hitch this cache exists to avoid, so say what forced it:
+  // which inputs differ from the newest kept set.
+  const newest = shadowSets.values().pop();
+  if (newest) {
+    console.log(`[shadows] compiling a new shader set - differs from the kept one in: ` +
+                diffKeyParts(parts, newest.parts).join(', '));
+  }
+
+  const { node, spriteLight, sun } = createShadowColorNode(opts);
   // The node applies the albedo itself - specular adds after it, not under it.
   // With the texel cache, the terrain's own material looks its colour up and
   // a second, low-res material does the shading - see renderTexelCache.
   let lowMat = null, missMat = null;
   let terrainMat;
   if (texelCacheOn) {
-    sizeTexelCache();
-    ensureTerrainTwins();
-    worldInstancedMesh.layers.enable(TEXEL_LAYER);
-    worldInstancedMesh.renderOrder = -2;
     lowMat = new THREE.MeshBasicNodeMaterial();
     // outputNode, not colorNode: the stored colour must not carry the
     // per-instance tint, which the lookup material applies once itself.
@@ -2854,44 +2981,144 @@ function buildPerPixelShadows() {
   // Compiled against the float target it will draw into.
   if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt],
                          [terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
+  const set = {
+    key, parts, sun, terrainMat, lowMat, missMat,
+    made: sprites.made, variants: sprites.variants,
+    mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []), ...sprites.mats],
+    compiled: false
+  };
+  set.ready = compileOffscreen(pairs).catch(err => {
+    console.warn('[shadows] background compile failed, swapping anyway', err);
+  }).then(() => {
+    set.compiled = true;
+    for (const old of shadowSets.evict(activeShadowSet)) disposeShadowSet(old);
+  });
+  if (shadowCacheOn) shadowSets.set(key, set);
+  return set;
+}
+
+// Puts a compiled set on the meshes.
+function applyShadowSet(set) {
+  const prev = activeShadowSet;
+  const mesh = worldInstancedMesh;
+  if (set.lowMat) {
+    mesh.layers.enable(TEXEL_LAYER);
+    mesh.renderOrder = -2;
+  }
+  mesh.material = set.terrainMat;
+  terrainLowMat = set.lowMat;
+  terrainLookupMat = set.terrainMat;
+  if (terrainTwins.miss && set.missMat) terrainTwins.miss.material = set.missMat;
+  restoreSpriteMaterials();
+  for (const m of spriteMeshes()) {
+    const v = set.variants.get(m);
+    if (v) {
+      m.userData.depthVariants = v;
+      m.material = m.userData.drawingOnTop ? v.onTop : v.normal;
+    } else {
+      const base = m.userData.originalMaterial || m.material;
+      const lit = set.made.get(base);
+      if (lit) { m.userData.originalMaterial = base; m.material = lit; }
+    }
+  }
+  // A kept set's sun uniforms were last written when it was last shown.
+  shadowSun = set.sun;
+  writeSunUniforms(shadowSun, dirLight.position, sunAngular);
+  activeShadowSet = set;
+  // Replaced and not kept: disposed now, as before the cache.
+  if (prev && prev !== set && !shadowSets.has(prev.key)) disposeShadowSet(prev);
+  warmScene();
+  // And the plain materials, so turning shadows off swaps without compiling.
+  // Cheap while they are still compiled; if not, compiled now, while this
+  // turn-on is already the moment that paid.
+  warmPlainMaterials();
+}
+
+async function warmPlainMaterials() {
+  const pairs = [];
+  const base = worldInstancedMesh.userData.originalMaterial;
+  if (base) pairs.push([worldInstancedMesh, base]);
+  for (const m of spriteMeshes()) {
+    if (m.userData.originalMaterial) pairs.push([m, m.userData.originalMaterial]);
+  }
+  await compileOffscreen(pairs);
+}
+
+// Back to the plain materials. The set is kept (or disposed, cache off).
+function removeShadowSet() {
+  const set = activeShadowSet;
+  const mesh = worldInstancedMesh;
+  if (mesh.userData.originalMaterial) mesh.material = mesh.userData.originalMaterial;
+  restoreSpriteMaterials();
+  activeShadowSet = null;
+  if (set && !shadowSets.has(set.key)) disposeShadowSet(set);
+}
+
+// bxb.shadowcache(): off disposes every kept set but the one showing, and
+// from then on each set is disposed as soon as it is replaced.
+function setShadowCache(on) {
+  shadowCacheOn = !!on;
+  if (shadowCacheOn) return;
+  for (const s of shadowSets.drain(activeShadowSet)) {
+    if (s.compiled) disposeShadowSet(s);
+  }
+  if (activeShadowSet) shadowSets.delete(activeShadowSet.key);
+}
+
+// --- "Preparing shaders" ---
+//
+// Turning the effects on compiles two big pipelines (and the GI's compute
+// kernels on their first dispatch), and a compile blocks frames in both
+// browsers - nothing makes it background work (doc §0). So when a turn-on has
+// to compile, it says so first: the notice goes up, two frames pass so it is
+// actually on screen, and it comes down once the set is compiled and showing.
+// A turn-on that finds its set kept (shadowsets.js) is a swap, and shows none.
+function showNotice(text) {
+  const notice = document.createElement('div');
+  notice.textContent = text;
+  Object.assign(notice.style, {
+    position: 'fixed', left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+    zIndex: '10000', padding: '10px 18px', borderRadius: '4px',
+    background: 'rgba(0,0,0,0.75)', color: '#e5e7eb',
+    font: '14px monospace', pointerEvents: 'none'
+  });
+  document.body.appendChild(notice);
+  return notice;
+}
+
+// Whether turning shadows on now would compile: no kept, compiled set for the
+// settings as they stand. Before the first turn-on there are no cascades to
+// key on, and that first one always compiles.
+function shadowTurnOnCompiles() {
+  if (!shadowCacheOn || !shadowGrids[0]) return true;
+  ensureSunUniforms();
+  const kept = shadowSets.peek(keyPart(shadowSetKeyParts(shadowNodeOptions())));
+  return !kept || !kept.compiled;
+}
+
+// Resolves once the latest build is compiled and on screen (or superseded).
+let shadowBuildDone = Promise.resolve();
+
+function buildPerPixelShadows() {
+  // Turning shadows on builds the field fresh - it did not follow the player
+  // while they were off. A rebuild while they are on does not need it baked
+  // again.
+  if (!shadowsOn || !shadowGrids[0]) ensureShadowGrids();
+  const origin = shadowOrigins[0];
+  ensureSunUniforms();
+  const set = obtainShadowSet();
   const id = ++shadowBuild;
-  const swap = () => {
-    // A newer build, or shadows turned off, while this one compiled.
+  shadowBuildDone = set.ready.then(() => {
+    // A newer build, or shadows turned off, while this one compiled. A kept
+    // set stays in the cache; one nothing holds is disposed.
     if (id !== shadowBuild) {
-      terrainMat.dispose();
-      if (lowMat) { lowMat.dispose(); missMat.dispose(); }
-      for (const m of sprites.mats) m.dispose();
+      if (!shadowSets.has(set.key) && set !== activeShadowSet) disposeShadowSet(set);
       return;
     }
-    const mesh = worldInstancedMesh;
-    if (mesh.material !== mesh.userData.originalMaterial) mesh.material.dispose();
-    mesh.material = terrainMat;
-    if (terrainLowMat) terrainLowMat.dispose();
-    terrainLowMat = lowMat;
-    terrainLookupMat = terrainMat;
-    if (terrainTwins.miss) {
-      const oldMiss = terrainTwins.miss.material;
-      if (missMat) terrainTwins.miss.material = missMat;
-      if (oldMiss !== terrainTwins.prepass.material && oldMiss !== missMat) oldMiss.dispose();
-    }
-    restoreSpriteMaterials();
-    for (const m of spriteMeshes()) {
-      const v = sprites.variants.get(m);
-      if (v) {
-        m.userData.depthVariants = v;
-        m.material = m.userData.drawingOnTop ? v.onTop : v.normal;
-      } else {
-        m.material = pairs.find(([pm]) => pm === m)[1];
-      }
-    }
-    spriteShadowMats = sprites.mats;
-    warmScene();
-  };
-  compileOffscreen(pairs).then(swap, err => {
-    console.warn('[shadows] background compile failed, swapping anyway', err);
-    swap();
+    applyShadowSet(set);
   });
   shadowsOn = true;
+  syncEffectsButton();
   updateTorchPosition();
   updateLights();
   return `shadows on - ${sunCone ? 'one cone trace' : sunRays + ' sun ray' +
@@ -2945,6 +3172,8 @@ function toggleTorch(level = null, flame = null, forward = null) {
 
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
+// On from the start; bxb.perf() still hides it.
+perf.toggle();
 const bxbApi = installConsole(createConsole({
   compute: {
     help: 'run the WebGPU compute smoke test',
@@ -3011,9 +3240,9 @@ const bxbApi = installConsole(createConsole({
     run: () => {
       if (shadowsOn) {
         shadowBuild++;   // drop any build still compiling
-        restoreOriginalMaterial(worldInstancedMesh);
-        restoreSpriteMaterials();
+        removeShadowSet();
         shadowsOn = false;
+        syncEffectsButton();
         // The field stops following; turning shadows back on rebuilds it.
         // The plain material's AO is the static voxel kind, which needs none.
         return 'shadows off (static voxel AO)';
@@ -3296,6 +3525,36 @@ const bxbApi = installConsole(createConsole({
       return `texel cache ${texelCacheOn ? `on, 1/${texelCacheScale} per axis` : 'off'}`;
     }
   },
+  shadowcache: {
+    help: 'keep compiled shadow material sets, so toggling shadows (or a setting) back is a swap. Off: dispose on replace, as before',
+    run: () => {
+      setShadowCache(!shadowCacheOn);
+      return `shadow sets ${shadowCacheOn ? `kept (newest ${SHADOW_SETS_KEPT})` : 'disposed when replaced'}`;
+    }
+  },
+  treemerge: {
+    help: "each tree's four planes as one mesh (one draw); off draws the four planes",
+    run: () => {
+      setTreeMerge(!treeMerge);
+      return `trees ${treeMerge ? 'merged: one draw each' : 'four planes each'}`;
+    }
+  },
+  cutouts: {
+    help: 'binary-alpha sprites (trees, characters) drawn opaque: same pixels, half the draws. Off: all transparent',
+    run: () => {
+      setCutoutsEnabled(!cutoutsEnabled());
+      // The lit variants take their flag at build time.
+      if (shadowsOn) buildPerPixelShadows();
+      return `cutout sprites ${cutoutsEnabled() ? 'opaque (binary alpha only)' : 'transparent, as before'}`;
+    }
+  },
+  gibatch: {
+    help: "submit each GI volume's kernels as one compute pass (off: one submit per kernel)",
+    run: () => {
+      giBatch = !giBatch;
+      return `GI kernels ${giBatch ? 'batched: one submit per volume' : 'one submit per kernel'}`;
+    }
+  },
   gifar: {
     help: 'update the far (C1) GI volume every other frame',
     run: () => {
@@ -3570,9 +3829,44 @@ const bxbApi = installConsole(createConsole({
                total: f(render.avg + compute.avg), frames: render.count };
     }
   },
+  wgsl: {
+    help: "hash of each drawn material's WGSL, to compare across runs; flags names that change per run. " +
+          "bxb.wgsl('text') also returns the source",
+    usage: "await bxb.wgsl()  |  await bxb.wgsl('text')",
+    run: async (mode = null) => {
+      const objects = [worldInstancedMesh, ...(terrainTwins.miss ? [terrainTwins.miss] : []),
+                       ...spriteMeshes()];
+      const seen = new Set();
+      const rows = [];
+      for (const o of objects) {
+        if (!o || seen.has(o.material)) continue;
+        seen.add(o.material);
+        const { vertexShader: vs, fragmentShader: fs } =
+          await renderer.debug.getShaderAsync(scene, camera, o);
+        const unstable = unstableNames(vs + fs);
+        rows.push({ object: o.name || o.type, material: o.material.type,
+                    vs: hashText(vs), fs: hashText(fs), fsKB: +(fs.length / 1024).toFixed(1),
+                    unstable: unstable.join(' ') || '-',
+                    ...(mode === 'text' ? { vsText: vs, fsText: fs } : {}) });
+      }
+      console.table(rows.map(({ vsText, fsText, ...r }) => r));
+      const bad = rows.filter(r => r.unstable !== '-').length;
+      console.log(bad ? `[wgsl] ${bad} shader(s) carry per-run names - they will miss the pipeline cache`
+                      : '[wgsl] no per-run names; hashes should match across runs');
+      return rows;
+    }
+  },
   perf: {
     help: 'toggle the frame time graph',
     run: () => perf.toggle() ? 'perf graph on' : 'perf graph off'
+  },
+  perfhz: {
+    help: 'frame graph repaints per second (every frame is still sampled); 0 repaints every frame',
+    usage: 'bxb.perfhz(10)  |  bxb.perfhz(0)',
+    run: (hz = null) => {
+      if (hz !== null) perf.drawHz = hz;
+      return `frame graph repaints ${perf.drawHz > 0 ? perf.drawHz + ' times a second' : 'every frame'}`;
+    }
   },
   grid: {
     help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+G)',
@@ -3685,6 +3979,18 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'texelscale', label: 'Texel cache spacing (px)', type: 'range', min: 2, max: 8, step: 1,
       help: 'low-res sample spacing; texels smaller than this shade themselves',
       get: () => texelCacheScale, set: v => bxbApi.texelcache(v) },
+    { key: 'shadowcache', label: 'Keep shadow materials', type: 'toggle',
+      help: 'compiled shadow sets are kept, so toggling back is a swap',
+      get: () => shadowCacheOn, set: v => flip(shadowCacheOn, v, () => bxbApi.shadowcache()) },
+    { key: 'treemerge', label: 'Merged tree planes', type: 'toggle',
+      help: "each tree's four planes drawn as one mesh",
+      get: () => treeMerge, set: v => flip(treeMerge, v, () => bxbApi.treemerge()) },
+    { key: 'cutouts', label: 'Opaque cutout sprites', type: 'toggle',
+      help: 'binary-alpha sprites draw in the opaque pass: one draw, not two',
+      get: () => cutoutsEnabled(), set: v => flip(cutoutsEnabled(), v, () => bxbApi.cutouts()) },
+    { key: 'gibatch', label: 'Batch GI kernels', type: 'toggle',
+      help: "one compute pass and submit per GI volume instead of one per kernel",
+      get: () => giBatch, set: v => flip(giBatch, v, () => bxbApi.gibatch()) },
     { key: 'gifar', label: 'Far GI every 2nd frame', type: 'toggle',
       help: 'the C1 LPV volume updates at half rate',
       get: () => giFarHalf, set: v => flip(giFarHalf, v, () => bxbApi.gifar()) },
@@ -3854,6 +4160,16 @@ for (const ev of ['pointerdown', 'pointerup', 'click']) {
   debugBtn.addEventListener(ev, e => e.stopPropagation());
 }
 debugBtn.addEventListener('click', () => { settingsPanel.toggle(); debugBtn.blur(); });
+
+// Beside it: the advanced effects, exactly as R. Labelled with what a click
+// will do, and followed by syncEffectsButton, since R and bxb.shadows() can
+// change the state too.
+const effectsBtn = document.getElementById('btn-effects');
+for (const ev of ['pointerdown', 'pointerup', 'click']) {
+  effectsBtn.addEventListener(ev, e => e.stopPropagation());
+}
+effectsBtn.addEventListener('click', () => { toggleAdvancedEffects(); effectsBtn.blur(); });
+syncEffectsButton();
 
 // setAnimationLoop instead of a manual requestAnimationFrame chain: WebGPURenderer
 // needs an async device/adapter init before the first frame, and setAnimationLoop

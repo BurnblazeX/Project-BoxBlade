@@ -78,6 +78,27 @@ export const SECTIONS = [
   ['submit', '#fbbf24']    // renderer.render: encoding and submission
 ];
 const GPU_COLOUR = '#f8fafc';
+export const DEFAULT_DRAW_HZ = 60;
+// Frame times jitter around vsync: at exactly 60 fps a frame can land a hair
+// before the 16.67 ms mark, and a strict test would then skip every other one
+// and repaint at 30. A millisecond of slack keeps 60 fps at 60 repaints.
+const REDRAW_SLACK_MS = 1;
+
+// The repaint schedule: at most hz a second, and never more than once a frame
+// (it is only asked once a frame), so a game below hz repaints every frame.
+// due is when the next repaint is owed; it advances by whole intervals, so at
+// 144 fps the repaints average 60 a second rather than rounding down to 48.
+// Returns { draw, due }. hz 0 repaints every frame.
+export function nextRedraw(now, due, hz) {
+  if (!(hz > 0)) return { draw: true, due: now };
+  if (now < due - REDRAW_SLACK_MS) return { draw: false, due };
+  const interval = 1000 / hz;
+  let next = due + interval;
+  // Fallen behind (a slow frame, a hitch, the first repaint): restart from now
+  // rather than repainting on every frame to catch up.
+  if (next <= now) next = now + interval;
+  return { draw: true, due: next };
+}
 const BREAK_TOP = 30 + GRAPH_H + 10;
 const HEIGHT = BREAK_TOP + GRAPH_H + 44;
 
@@ -108,6 +129,13 @@ export function createPerfOverlay(doc = document) {
   let visible = false;
   let skipNext = false;
   let renderer = null;
+  // Repaints a second, at most. Every frame is still SAMPLED - the stats,
+  // percentiles and averages are exactly what they were - only the picture
+  // refreshes less at high frame rates. Drawing every frame cost ~11% of
+  // Firefox's WebGPU thread (doc §0) and lowered the fps it reported.
+  // 0 repaints every frame.
+  let drawHz = DEFAULT_DRAW_HZ;
+  let drawDue = -Infinity;
 
   function draw() {
     const s = stats.stats();
@@ -129,12 +157,19 @@ export function createPerfOverlay(doc = document) {
       ctx.moveTo(0, y); ctx.lineTo(WIDTH, y); ctx.stroke();
     }
 
+    // One path and one fill per colour, not a fillRect per bar: in Firefox 2D
+    // canvas is remoted to the same GPU-process thread as WebGPU, and there the
+    // cost is per call. Same rectangles, same pixels.
     const barW = WIDTH / stats.capacity;
+    const bars = new Map();
     for (let i = 0; i < arr.length; i++) {
       const h = Math.min(GRAPH_H, (arr[i] / scaleMax) * GRAPH_H);
-      ctx.fillStyle = barColour(arr[i]);
-      ctx.fillRect(i * barW, top + GRAPH_H - h, Math.max(1, barW), h);
+      const colour = barColour(arr[i]);
+      let path = bars.get(colour);
+      if (!path) bars.set(colour, path = new Path2D());
+      path.rect(i * barW, top + GRAPH_H - h, Math.max(1, barW), h);
     }
+    for (const [colour, path] of bars) { ctx.fillStyle = colour; ctx.fill(path); }
 
     ctx.fillStyle = '#e5e7eb';
     ctx.font = '11px monospace';
@@ -154,16 +189,17 @@ export function createPerfOverlay(doc = document) {
     const y0 = BREAK_TOP + GRAPH_H;
     const barW = WIDTH / stats.capacity;
     const n = cols[0].length;
+    const paths = SECTIONS.map(() => new Path2D());
     for (let i = 0; i < n; i++) {
       let acc = 0;
       for (let k = 0; k < SECTIONS.length; k++) {
         const v = cols[k][i] || 0;
         const h = (v / scale) * GRAPH_H;
-        ctx.fillStyle = SECTIONS[k][1];
-        ctx.fillRect(i * barW, y0 - acc - h, Math.max(1, barW), h);
+        paths[k].rect(i * barW, y0 - acc - h, Math.max(1, barW), h);
         acc += h;
       }
     }
+    SECTIONS.forEach(([, colour], k) => { ctx.fillStyle = colour; ctx.fill(paths[k]); });
     // GPU time arrives a frame or two late and at its own cadence, so it is its
     // own series, right-aligned with the newest frame.
     if (g.length > 1) {
@@ -211,8 +247,14 @@ export function createPerfOverlay(doc = document) {
       if (skipNext) { skipNext = false; return; }
       stats.push(dt * 1000);
       for (const [k] of SECTIONS) parts[k].push(sections ? sections[k] || 0 : 0);
+      const now = performance.now();
+      const r = nextRedraw(now, drawDue, drawHz);
+      drawDue = r.due;
+      if (!r.draw) return;
       draw();
     },
+    get drawHz() { return drawHz; },
+    set drawHz(hz) { drawHz = Math.max(0, Number(hz) || 0); drawDue = -Infinity; },
     // GPU time for a frame, in ms, whenever a timestamp resolve lands.
     gpu(ms) { if (visible) gpu.push(ms); },
     gpuCompute(ms) { if (visible) gpuCompute.push(ms); },
@@ -222,7 +264,7 @@ export function createPerfOverlay(doc = document) {
     toggle() {
       visible = !visible;
       canvas.style.display = visible ? 'block' : 'none';
-      if (visible) skipNext = true;
+      if (visible) { skipNext = true; drawDue = -Infinity; }
       else { stats.reset(); gpu.reset(); gpuCompute.reset(); for (const [k] of SECTIONS) parts[k].reset(); }
       return visible;
     },

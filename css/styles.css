@@ -34,12 +34,16 @@ body.ui-hidden #dialogue-panel {
 
 /* Top-bar Debug button - opens the Alt+V panel. Not part of the HUD, so
    Alt+U does not hide it. */
-#btn-debug {
+#top-bar {
   position: fixed;
   top: 8px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 49;
+  display: flex;
+  gap: 6px;
+}
+#btn-debug, #btn-effects {
   padding: 4px 14px;
   background: rgba(16, 18, 24, 0.85);
   border: 1px solid #333a48;
@@ -48,7 +52,8 @@ body.ui-hidden #dialogue-panel {
   font: 12px monospace;
   cursor: pointer;
 }
-#btn-debug:hover { background: rgba(40, 46, 60, 0.95); color: #9fb4ff; }
+#btn-debug:hover, #btn-effects:hover { background: rgba(40, 46, 60, 0.95); color: #9fb4ff; }
+#btn-effects:disabled { opacity: 0.6; cursor: wait; }
 
 /* Alt+V debug settings panel (js/settings.js). */
 #settings-panel {

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { file, section, ok, truthy, falsy, note } from './lib/harness.mjs';
+import { file, section, ok, near, truthy, falsy, note } from './lib/harness.mjs';
 import { createTestArea, BLOCK_METRES } from '../js/world.js';
 import { makeClipSamples, isQuadClipping, updateCharacterClipping, CHARACTER_RENDER_ORDER } from '../js/sprites.js';
 
@@ -92,4 +92,45 @@ if (nowClipping) {
   ok('and restores render order', mesh.renderOrder, 0);
 } else {
   note('SKIPPED transition asserts: that heading did not clip');
+}
+
+section('sprite geometry - merged crossed planes');
+{
+  const { addSpriteTangent, crossedPlanesGeometry } = await import('../js/sprites.js');
+  const plane = addSpriteTangent(new THREE.PlaneGeometry(1, 2));
+  const pt = plane.attributes.tangent;
+  ok('a plain quad gets a tangent per vertex', pt.count, plane.attributes.position.count);
+  truthy('the tangent is exactly +x', [0, 1, 2, 3].every(i =>
+    pt.getX(i) === 1 && pt.getY(i) === 0 && pt.getZ(i) === 0 && pt.getW(i) === 1));
+
+  const angles = [0, Math.PI / 2, Math.PI / 4, 3 * Math.PI / 4];
+  const W = 2 * BLOCK_METRES / 12, H = 3 * BLOCK_METRES / 12;
+  const g = crossedPlanesGeometry(W, H, angles);
+  ok('four quads of four vertices', g.attributes.position.count, 16);
+  ok('four quads of two triangles', g.index.count, 24);
+
+  // Each plane must match the separate mesh it replaces: a translated plane,
+  // rotated about Y by its angle, with its normal and tangent turned with it.
+  let match = true;
+  angles.forEach((a, k) => {
+    const ref = addSpriteTangent(new THREE.PlaneGeometry(W, H));
+    ref.translate(0, H / 2, 0);
+    const m = new THREE.Matrix4().makeRotationY(a);
+    const n = new THREE.Vector3(), t = new THREE.Vector3(), p = new THREE.Vector3();
+    for (let i = 0; i < 4; i++) {
+      const j = k * 4 + i;
+      p.fromBufferAttribute(ref.attributes.position, i).applyMatrix4(m);
+      n.set(0, 0, 1).transformDirection(m);
+      t.set(1, 0, 0).transformDirection(m);
+      const close = (v, attr) => Math.abs(v.x - attr.getX(j)) < 1e-6 &&
+        Math.abs(v.y - attr.getY(j)) < 1e-6 && Math.abs(v.z - attr.getZ(j)) < 1e-6;
+      if (!close(p, g.attributes.position) || !close(n, g.attributes.normal) ||
+          !close(t, g.attributes.tangent) ||
+          g.attributes.uv.getX(j) !== ref.attributes.uv.getX(i) ||
+          g.attributes.uv.getY(j) !== ref.attributes.uv.getY(i)) match = false;
+    }
+  });
+  truthy('every vertex matches its separate, rotated plane', match);
+  ok('bottom edge on the origin', g.boundingBox.min.y, 0);
+  near('top at the plane height', g.boundingBox.max.y, H, 1e-6);
 }

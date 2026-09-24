@@ -65,10 +65,13 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const cellMetres = LPV_CELL_VOXELS * cascadeVoxelMetres(level);
   const buf = (itemSize) => new THREE.StorageBufferAttribute(LPV_CELLS, itemSize);
   const solidBuf = buf(1), eBuf = buf(4), aBuf = buf(4), bBuf = buf(4);
-  const solid = storage(solidBuf, 'float', LPV_CELLS);
-  const E = storage(eBuf, 'vec4', LPV_CELLS);
-  const A = storage(aBuf, 'vec4', LPV_CELLS);
-  const B = storage(bBuf, 'vec4', LPV_CELLS);
+  // Named: an unnamed buffer is NodeBuffer_<global node id> in the WGSL, and
+  // that id depends on how many nodes existed before - so the shader text, and
+  // with it the browser's pipeline cache key, changed from run to run.
+  const solid = storage(solidBuf, 'float', LPV_CELLS).setName(`bxbLpv${level}Solid`);
+  const E = storage(eBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}E`);
+  const A = storage(aBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}A`);
+  const B = storage(bBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}B`);
 
   const tex = new THREE.Storage3DTexture(D, D, D);
   tex.type = THREE.HalfFloatType;
@@ -87,12 +90,15 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     slices: uniform(int(DEFAULT_LPV_SLICES)),
     shift: uniform(new THREE.Vector3()),
     // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
-    layerAlbedo: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4'),
+    layerAlbedo: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
+      .setName(`bxbLpv${level}Albedo`),
     // Sprites (lpv.js MAX_GI_SPRITES), two vec4 each:
     //   0  centre xyz, half width        1  albedo rgb (linear), half height
     // and a fill each (opaque fraction x lpv.js SPRITE_GI_FILL) in spriteFill.
-    sprites: uniformArray(new Array(MAX_GI_SPRITES * 2).fill(0).map(() => new THREE.Vector4()), 'vec4'),
-    spriteFill: uniformArray(new Array(MAX_GI_SPRITES).fill(0), 'float'),
+    sprites: uniformArray(new Array(MAX_GI_SPRITES * 2).fill(0).map(() => new THREE.Vector4()), 'vec4')
+      .setName(`bxbLpv${level}Sprites`),
+    spriteFill: uniformArray(new Array(MAX_GI_SPRITES).fill(0), 'float')
+      .setName(`bxbLpv${level}SpriteFill`),
     spriteCount: uniform(int(0)),
     skyGain: uniform(float(1))
   };
@@ -312,6 +318,29 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // Kept on the CPU: the uniform is overwritten with 1 on a full inject.
   let sliceCount = DEFAULT_LPV_SLICES;
 
+  // The frame's kernels, in order, as one list. renderer.compute(list) records
+  // them all into ONE compute pass and submits once; WebGPU orders the
+  // dispatches within a pass and makes each one's storage writes visible to the
+  // next, so the ping-pong is exactly what separate calls computed. Separate
+  // calls were a pass and a submit each - 11 a volume, and each submit costs
+  // ~140 us of GPU-process time whatever it holds (doc §0, profiles).
+  // Every uniform the kernels read is written before the list is submitted,
+  // and none changes partway through it, so batching cannot change a value.
+  // Cached, not rebuilt per frame: three keys the pass's state on the array.
+  const lists = new Map();
+  const kernelList = (prefix, iterations) => {
+    const key = `${prefix}:${iterations}`;
+    let list = lists.get(key);
+    if (!list) {
+      list = prefix === 'reset' ? [clearA] : prefix === 'shift' ? [shiftKernel, copyBA] : [];
+      list.push(solidKernel, injectKernel);
+      for (let k = 0; k < iterations; k += 2) list.push(aToB, bToA);
+      list.push(resolveKernel);
+      lists.set(key, list);
+    }
+    return list;
+  };
+
   return {
     tex, uniforms: u, sun, level, cellMetres,
     // What the shading pass needs to sample it: see lpvSampleTSL in gpu.js.
@@ -323,31 +352,29 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
 
     // One frame. shift is lpv.js lpvShift's answer, 'reset' for a jump the
     // volume cannot follow, or null when C0 did not move.
-    update(renderer, { shift = null, iterations = 8, fullInject = false } = {}) {
+    // batch false submits each kernel on its own, as before - the same list in
+    // the same order, so the two can be A/B'd (bxb.gibatch()).
+    update(renderer, { shift = null, iterations = 8, fullInject = false, batch = true } = {}) {
+      let prefix = '';
       if (shift === 'reset') {
-        renderer.compute(clearA);
+        prefix = 'reset';
         fullInject = true;
       } else if (shift) {
         u.shift.value.set(shift.x, shift.y, shift.z);
-        renderer.compute(shiftKernel);
-        renderer.compute(copyBA);
+        prefix = 'shift';
         fullInject = true;
       }
-      renderer.compute(solidKernel);
       const slices = Math.max(1, sliceCount);
       // A full inject is one dispatch with a single slice covering every cell:
       // the old injection is in the wrong cells after a shift.
       u.slices.value = fullInject ? 1 : slices;
       u.slice.value = fullInject ? 0 : frame % slices;
-      renderer.compute(injectKernel);
       frame++;
       // Even, so the answer always ends in A, where resolve reads it.
       const n = Math.max(2, iterations + (iterations % 2));
-      for (let k = 0; k < n; k += 2) {
-        renderer.compute(aToB);
-        renderer.compute(bToA);
-      }
-      renderer.compute(resolveKernel);
+      const list = kernelList(prefix, n);
+      if (batch) renderer.compute(list);
+      else for (const k of list) renderer.compute(k);
     },
 
     dispose() {

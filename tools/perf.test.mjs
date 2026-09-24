@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { createFrameStats } from '../js/perf.js';
+import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ } from '../js/perf.js';
 import { createConsole, installConsole } from '../js/console.js';
 
 file('perf.test.mjs - frame stats ring buffer and bxb console');
@@ -67,3 +67,24 @@ installConsole(api, target);
 truthy('installs under the bxb namespace', !!target.bxb);
 ok('and exposes the commands', target.bxb.tp(1, 2), '1,2');
 falsy('does not leak other globals', Object.keys(target).length !== 1);
+
+section('overlay repaint throttle');
+ok('capped at 60 a second', DEFAULT_DRAW_HZ, 60);
+truthy('first repaint is immediate', nextRedraw(0, -Infinity, 60).draw);
+// Repaints over one second of frames at a given fps, with a little jitter.
+const repaints = (fps, jitter = 0) => {
+  let due = -Infinity, n = 0;
+  for (let i = 1; i <= fps; i++) {
+    const now = i * 1000 / fps + (i % 2 ? jitter : -jitter);
+    const r = nextRedraw(now, due, 60);
+    due = r.due;
+    if (r.draw) n++;
+  }
+  return n;
+};
+ok('240 fps: 60 repaints', repaints(240), 60);
+ok('144 fps: 60 repaints, not 48', repaints(144), 60);
+ok('60 fps with vsync jitter: every frame', repaints(60, 0.3), 60);
+ok('45 fps: every frame (the game rate)', repaints(45), 45);
+ok('20 fps: every frame', repaints(20), 20);
+truthy('0 Hz repaints every frame', nextRedraw(1000.1, 5000, 0).draw);

@@ -41,7 +41,7 @@ import { VOXEL_AO_MIN } from './voxelao.js';
 // ---------------------------------------------------------------------------
 export async function runComputeSmokeTest(renderer, count = 64) {
   const buffer = new THREE.StorageBufferAttribute(count, 1);
-  const target = storage(buffer, 'float', count);
+  const target = storage(buffer, 'float', count).setName('bxbSmoke');
 
   const kernel = Fn(() => {
     // Deliberately not a constant: index-dependent output catches a dispatch
@@ -183,6 +183,13 @@ export function writeCascadeBindings(b, grid) {
 // its uniforms there correctly, so the fix is only the cache: functions whose
 // layout carries perShader are cached per builder instead.
 const perBuilderFns = new WeakMap();
+// Per builder too: how many functions of each base name it has named. A name is
+// base_n, n counting that base's functions in THIS shader in the order they are
+// first used - so the same graph gives the same WGSL every run. (A global
+// serial was unique too, but it counted every function made before, in any
+// build, so the text - and the browser's pipeline cache key - varied between
+// runs with what had been built earlier.)
+const perBuilderNames = new WeakMap();
 const baseBuildFunctionNode = THREE.NodeBuilder.prototype.buildFunctionNode;
 THREE.NodeBuilder.prototype.buildFunctionNode = function (shaderNode) {
   if (!(shaderNode.layout && shaderNode.layout.perShader)) {
@@ -193,10 +200,23 @@ THREE.NodeBuilder.prototype.buildFunctionNode = function (shaderNode) {
   let fn = fns.get(shaderNode);
   if (!fn) {
     fn = new THREE.FunctionNode();
+    let counts = perBuilderNames.get(this);
+    if (!counts) perBuilderNames.set(this, counts = new Map());
+    const layout = shaderNode.layout;
+    const n = counts.get(layout.baseName) || 0;
+    counts.set(layout.baseName, n + 1);
+    // Only read while the code is generated (the call sites take the name from
+    // the code), so it is set for that and put back.
+    const resting = layout.name;
+    layout.name = `${layout.baseName}_${n}`;
     const previous = this.currentFunctionNode;
     this.currentFunctionNode = fn;
-    fn.code = this.buildFunctionCode(shaderNode);
-    this.currentFunctionNode = previous;
+    try {
+      fn.code = this.buildFunctionCode(shaderNode);
+    } finally {
+      this.currentFunctionNode = previous;
+      layout.name = resting;
+    }
     fns.set(shaderNode, fn);
   }
   return fn;
@@ -205,7 +225,8 @@ THREE.NodeBuilder.prototype.buildFunctionNode = function (shaderNode) {
 let fnSerial = 0;
 const fnName = base => `${base}_${fnSerial++}`;
 // Every layout here goes through this: a unique name, and per-shader caching.
-const layout = (base, type, inputs) => ({ name: fnName(base), type, inputs, perShader: true });
+const layout = (base, type, inputs) => ({ name: fnName(base), baseName: base, type, inputs,
+                                         perShader: true });
 const perCascades = new WeakMap();
 function memoCascades(cascades, key, make) {
   if (!perCascades.has(cascades)) perCascades.set(cascades, {});
@@ -533,9 +554,9 @@ export async function runGPUMarch(renderer, occTex, grid, rays) {
     dirBuf.array.set([r.dir.x / len, r.dir.y / len, r.dir.z / len, r.maxDist], i * 4);
   }
 
-  const origins = storage(originBuf, 'vec4', n);
-  const dirs = storage(dirBuf, 'vec4', n);
-  const out = storage(outBuf, 'float', n);
+  const origins = storage(originBuf, 'vec4', n).setName('bxbParityOrigins');
+  const dirs = storage(dirBuf, 'vec4', n).setName('bxbParityDirs');
+  const out = storage(outBuf, 'float', n).setName('bxbParityOut');
   const gridOrigin = uniform(new THREE.Vector3(grid.origin.x, grid.origin.y, grid.origin.z));
   const ring = uniform(new THREE.Vector3(grid.ringX || 0, 0, grid.ringZ || 0));
 
@@ -632,14 +653,15 @@ export const MAX_CARDS = 64;
 // The sun's cards reach far past the march cap - see CARD_SUN_REACH.
 export const CARD_SUN_MAX = CARD_SUN_REACH;
 
-export function createCardBindings(capacity = MAX_CARDS) {
+// name: the buffer's name in WGSL, unique per shader - see bufferName.
+export function createCardBindings(capacity = MAX_CARDS, name = 'bxbCards') {
   return {
     capacity,
     // Four vec4 per card, flat. A uniform array rather than a storage buffer:
     // 64 cards is 4 KB, far inside the uniform limit, and a uniform read is the
     // cheaper of the two in a per-fragment loop.
     data: uniformArray(new Array(capacity * 4).fill(0).map(() => new THREE.Vector4()),
-                       'vec4'),
+                       'vec4').setName(name),
     count: uniform(int(0)),
     // How many levels finer than its cascade this light draws a card - see the
     // LOD block in createCardsTSL. The sun uses 1, point lights 0.
@@ -872,7 +894,7 @@ export const sunColourUniform = uniform(new THREE.Color(1, 1, 1));
 
 export function createSkyBindings() {
   return {
-    sh: uniformArray(new Array(9).fill(0).map(() => new THREE.Vector4()), 'vec4'),
+    sh: uniformArray(new Array(9).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSkySH'),
     gain: uniform(float(1))
   };
 }
@@ -1147,10 +1169,20 @@ export const spriteTexelLockTSL = Fn(([p, st, size]) => {
 // a mirrored sprite (map.repeat.x = -1) runs u backwards across the quad, and a
 // back face faces the other way. No normal map: the quad's own facing.
 // Returns { n, ao }: the world normal and the texture's baked AO (LabPBR blue).
+// The quad's frame comes from its vertices' own normal and tangent, passed
+// flat - the exact attribute values, not interpolated - so a plain quad
+// (tangent +x, normal +z) computes precisely what reading the model matrix's
+// axes did, and a tree's four planes can share ONE mesh and one draw, each
+// plane still facing its own way (sprites.js crossedPlanesGeometry). Every
+// sprite geometry must carry a tangent (sprites.js addSpriteTangent).
 function spriteShadeNormalTSL(map, normalTex) {
-  const right = normalize(modelWorldMatrix.mul(vec4(1, 0, 0, 0)).xyz);
+  const tan = varying(attribute('tangent', 'vec4').xyz, 'vSpriteTangent')
+    .setInterpolation(THREE.InterpolationSamplingType.FLAT);
+  const nrm = varying(attribute('normal', 'vec3'), 'vSpriteNormal')
+    .setInterpolation(THREE.InterpolationSamplingType.FLAT);
+  const right = normalize(modelWorldMatrix.mul(vec4(tan, 0)).xyz);
   const up = normalize(modelWorldMatrix.mul(vec4(0, 1, 0, 0)).xyz);
-  const fwd = normalize(modelWorldMatrix.mul(vec4(0, 0, 1, 0)).xyz);
+  const fwd = normalize(modelWorldMatrix.mul(vec4(nrm, 0)).xyz);
   const face = select(frontFacing, fwd, fwd.negate());
   if (!normalTex) return { n: face, ao: float(1) };
   // Live references to the map's own repeat and offset, so flipping the sprite
@@ -1422,7 +1454,8 @@ function blockLayerTSL(terrain, block) {
 export function createMirrorBindings(capacity) {
   return {
     capacity,
-    data: uniformArray(new Array(capacity * MIRROR_VEC4S).fill(0).map(() => new THREE.Vector4()), 'vec4'),
+    data: uniformArray(new Array(capacity * MIRROR_VEC4S).fill(0).map(() => new THREE.Vector4()), 'vec4')
+      .setName('bxbMirrors'),
     count: uniform(int(0))
   };
 }
@@ -2083,7 +2116,7 @@ export function createLightBindings(capacity = MAX_LIGHTS) {
   return {
     capacity,
     data: uniformArray(new Array(capacity * LIGHT_VEC4S).fill(0)
-                         .map(() => new THREE.Vector4()), 'vec4'),
+                         .map(() => new THREE.Vector4()), 'vec4').setName('bxbLights'),
     count: uniform(int(0)),
     // lights.js cutAmount: the sliver of each light's reach not worth a march.
     cutoff: uniform(float(DEFAULT_LIGHT_CUTOFF))
@@ -2685,9 +2718,9 @@ export async function runGPUCards(renderer, bindings, samples, coneSlope) {
     dirBuf.array.set([s.dir.x, s.dir.y, s.dir.z, s.maxDist], i * 4);
   }
 
-  const froms = storage(fromBuf, 'vec4', n);
-  const dirs = storage(dirBuf, 'vec4', n);
-  const out = storage(outBuf, 'float', n);
+  const froms = storage(fromBuf, 'vec4', n).setName('bxbConeFroms');
+  const dirs = storage(dirBuf, 'vec4', n).setName('bxbConeDirs');
+  const out = storage(outBuf, 'float', n).setName('bxbConeOut');
   const slope = uniform(float(coneSlope));
   const cardsFn = createCardsTSL(bindings);
 
