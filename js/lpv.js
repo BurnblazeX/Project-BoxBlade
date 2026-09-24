@@ -1,4 +1,5 @@
 import { GRID_DIM } from './boxgrid.js';
+import { DEFAULT_SPECULAR, decodeSpecular } from './materials.js';
 
 // --- The light propagation volume: GI's long band (doc §6.2) ---
 //
@@ -85,7 +86,9 @@ export const FACE_DIRS = [
 //
 // L and E are Float32Array(LPV_CELLS * 4) (rgb + unused), solid is
 // Float32Array(LPV_CELLS) in 0..1. Writes into out, returns it.
-export function propagateStep(L, E, solid, alpha, out, dim = LPV_DIM) {
+// trans: optional, per cell, the rgb its light is multiplied by (glass - see
+// glassCellTransmit); 4 floats a cell like L. null for none.
+export function propagateStep(L, E, solid, alpha, out, dim = LPV_DIM, trans = null) {
   const at = (x, y, z) => x + y * dim + z * dim * dim;
   for (let z = 0; z < dim; z++) {
     for (let y = 0; y < dim; y++) {
@@ -101,9 +104,11 @@ export function propagateStep(L, E, solid, alpha, out, dim = LPV_DIM) {
           r += w * L[n * 4]; g += w * L[n * 4 + 1]; b += w * L[n * 4 + 2];
         }
         const k = alpha / 6;
-        out[c * 4] = open * (E[c * 4] + k * r);
-        out[c * 4 + 1] = open * (E[c * 4 + 1] + k * g);
-        out[c * 4 + 2] = open * (E[c * 4 + 2] + k * b);
+        const tr = trans ? trans[c * 4] : 1, tg = trans ? trans[c * 4 + 1] : 1;
+        const tb = trans ? trans[c * 4 + 2] : 1;
+        out[c * 4] = open * (E[c * 4] + k * r) * tr;
+        out[c * 4 + 1] = open * (E[c * 4 + 1] + k * g) * tg;
+        out[c * 4 + 2] = open * (E[c * 4 + 2] + k * b) * tb;
         out[c * 4 + 3] = 0;
       }
     }
@@ -177,6 +182,53 @@ export function diffuseAlbedo(rgba, specRgba = null) {
   // The mean of the dielectric texels, weighted by how much of the surface
   // they are: n / total. Written out, that is their sum over the total.
   return { r: r / total, g: g / total, b: b / total };
+}
+
+// What a block material bounces SPECULARLY, into the LPV: its mean F0 over
+// its opaque texels (metal's from the LabPBR table or its albedo, a dielectric's
+// grey), as the diffuse share above is its mean diffuse albedo - so metal, which
+// bounces nothing diffusely, bounces this. The LPV holds no direction, so a
+// reflection goes in as a glow at the surface.
+//
+// mirrored: the mirror light (gpu.js createMirrorLightTSL) carries a smooth
+// texel's reflection to where it lands, and the GI then bounces it from THERE
+// (gi.js) - so a smooth texel's share must not also go in here, or it would be
+// counted twice. Each texel then counts only as far as it is too rough for the
+// mirror light: 1 - smooth, over the same band (REFLECT_ROUGH_*).
+export const REFLECT_ROUGH_START = 0.2;   // gpu.js REFLECT_ROUGH_START
+export const REFLECT_ROUGH_END = 0.45;    // gpu.js REFLECT_ROUGH_END
+export function specularAlbedo(rgba, specRgba = null, { mirrored = false } = {}) {
+  const lin = c => {
+    const v = c / 255;
+    return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  const smoothstep = (a, b, x) => {
+    const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+    return t * t * (3 - 2 * t);
+  };
+  let r = 0, g = 0, b = 0, total = 0;
+  for (let i = 0; i < rgba.length; i += 4) {
+    if (rgba[i + 3] < 128) continue;
+    total++;
+    const s = specRgba ? [specRgba[i], specRgba[i + 1], specRgba[i + 2], specRgba[i + 3]]
+                       : DEFAULT_SPECULAR;
+    const d = decodeSpecular(s, [lin(rgba[i]), lin(rgba[i + 1]), lin(rgba[i + 2])]);
+    const w = mirrored ? smoothstep(REFLECT_ROUGH_START, REFLECT_ROUGH_END, d.roughness) : 1;
+    r += d.f0[0] * w; g += d.f0[1] * w; b += d.f0[2] * w;
+  }
+  if (!total) return { r: 0.04, g: 0.04, b: 0.04 };
+  return { r: r / total, g: g / total, b: b / total };
+}
+
+// How light through one cell of glass is tinted: the glass's tint through a
+// block (its mean linear albedo), to the power of the cell's share of a block -
+// the Beer-Lambert of gpu.js glassTransmitTSL - blended by how much of the cell
+// is glass. The LPV's propagation multiplies each cell's light by this
+// (propagateStep's trans), so a room behind stained glass fills with its colour.
+export function glassCellTransmit(tint, cellMetres, glassFraction, blockMetres = 1.5) {
+  const k = cellMetres / blockMetres;
+  const t = c => 1 + (Math.pow(Math.max(c, 1e-3), k) - 1) * glassFraction;
+  return { r: t(tint.r), g: t(tint.g), b: t(tint.b) };
 }
 
 // --- Sprites in the LPV ---

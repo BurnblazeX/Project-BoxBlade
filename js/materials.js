@@ -20,10 +20,37 @@ export const MATERIALS = [
   // Polished black marble: a dielectric mirror-ish finish (see its _s).
   { id: 'marble',    texture: 'terrain_marble' },
   // Polished iron plate: LabPBR metal 230.
-  { id: 'ironPlate', texture: 'terrain_ironPlate' }
+  { id: 'ironPlate', texture: 'terrain_ironPlate' },
+  // Clear glass (tools/make-glass-textures.py). glass: true puts it in the
+  // field's glass channel and draws it with the glass mesh, whose shading traces
+  // through it; its albedo is the tint what passes through takes on.
+  { id: 'glass',     texture: 'terrain_glass', glass: true },
+  // Stained glass: four coloured panes in lead. Its texels colour the light
+  // through it - in the view and in the shadows it casts.
+  { id: 'stainedGlass', texture: 'terrain_stainedGlass', glass: true },
+  // Frosted glass: rough (smoothness 155, alpha 0.15), so what shows through it
+  // is jittered per texel into a stable grain.
+  { id: 'frostedGlass', texture: 'terrain_frostedGlass', glass: true }
 ];
 
 const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
+
+// What the two faces of a glass slab let through, of light meeting the first at
+// |cos| cosI: each reflects F (Schlick, from its F0), so (1 - F)^2. The CPU
+// mirror of gpu.js glassSurfaceTransmitTSL, which a shadow ray through glass
+// takes - head-on it is (1 - 0.04)^2 = 0.92 for glass, and at grazing, nothing.
+export function glassSurfaceTransmit(f0, cosI) {
+  const c = Math.min(1, Math.max(0, cosI));
+  const F = f0 + (1 - f0) * Math.pow(1 - c, 5);
+  return (1 - F) * (1 - F);
+}
+
+// Glass: a material with glass: true. Baked into the field's glass distance
+// instead of its opaque one (boxgrid.js FIELD_CHANNELS).
+export function isGlassMaterial(id) {
+  const i = id == null ? -1 : layerById.get(id);
+  return i != null && i >= 0 && MATERIALS[i].glass === true;
+}
 
 export function materialLayer(id) {
   return id == null ? 0 : (layerById.get(id) ?? 0);

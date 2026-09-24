@@ -113,3 +113,42 @@ section('sprite box overlap');
   near('half in x', boxCellOverlap([0, 0, 0], 1, [0, 0.5, 0.5], [0.5, 1, 1]), 0.5, 1e-9);
   ok('clear of the cell is zero', boxCellOverlap([0, 0, 0], 1, [3, 0.5, 0.5], [0.5, 0.5, 0.5]), 0);
 }
+
+section('specular share in the bounce (specularAlbedo)');
+{
+  const { specularAlbedo, glassCellTransmit, propagateStep, LPV_CELLS } = await import('../js/lpv.js');
+  const tex = (n, rgba) => { const a = new Uint8Array(n * 4); for (let i = 0; i < n; i++) a.set(rgba, i * 4); return a; };
+  const albedo = tex(4, [128, 128, 128, 255]);
+  // Polished iron (LabPBR metal 230, smoothness 255): its F0, not nothing.
+  const iron = specularAlbedo(albedo, tex(4, [255, 230, 0, 255]));
+  truthy('polished iron bounces its reflectance', iron.r > 0.4 && iron.g > 0.4);
+  // The same iron with the mirror light on: smooth, so all of it is the
+  // mirror light's to carry - none left for here.
+  const ironMirrored = specularAlbedo(albedo, tex(4, [255, 230, 0, 255]), { mirrored: true });
+  near('... but none of it while the mirror light carries it', ironMirrored.r, 0, 1e-9);
+  // Rough iron (smoothness 0): too rough for the mirror light, so all of it stays.
+  const rough = specularAlbedo(albedo, tex(4, [0, 230, 0, 255]), { mirrored: true });
+  near('rough iron keeps its share either way', rough.r, iron.r, 1e-9);
+  // A dielectric with no _s: the default grey 0.04.
+  near('no specular texture: 0.04', specularAlbedo(albedo).g, 10 / 255, 1e-9);
+
+  section('glass tints the light the LPV carries through it');
+  const clear = glassCellTransmit({ r: 1, g: 1, b: 1 }, 0.75, 1);
+  near('clear glass passes everything', clear.r, 1, 1e-9);
+  const red = glassCellTransmit({ r: 0.8, g: 0.2, b: 0.2 }, 0.75, 1);
+  near('a half-block cell of red glass: tint^0.5', red.g, Math.sqrt(0.2), 1e-9);
+  near('no glass in the cell: untouched', glassCellTransmit({ r: 0.8, g: 0.2, b: 0.2 }, 0.75, 0).g, 1, 1e-9);
+
+  // propagateStep with trans: the tinted cell's light is multiplied by it.
+  const dim = 3, cells = dim * dim * dim;
+  const L = new Float32Array(cells * 4).fill(1), E = new Float32Array(cells * 4);
+  const solid = new Float32Array(cells), out = new Float32Array(cells * 4);
+  const trans = new Float32Array(cells * 4).fill(1);
+  const mid = 1 + 1 * dim + 1 * dim * dim;
+  trans[mid * 4 + 1] = 0.5;
+  propagateStep(L, E, solid, 0.5, out, dim, trans);
+  near('the glass cell\'s green is halved', out[mid * 4 + 1], out[mid * 4] * 0.5, 1e-9);
+  const plain = new Float32Array(cells * 4);
+  propagateStep(L, E, solid, 0.5, plain, dim);
+  near('without trans nothing changes', plain[mid * 4], out[mid * 4], 1e-9);
+}

@@ -37,13 +37,15 @@ function measure(level) {
 
   let saturated = 0, graded = 0, solid = 0;
   const range = grid.range;
-  for (let i = 0; i < grid.data.length; i++) {
+  // The opaque distance only: every other byte (G, glass) is interleaved.
+  const voxels = grid.data.length / 2;
+  for (let i = 0; i < grid.data.length; i += 2) {
     const b = grid.data[i];
     if (b === 255) saturated++;
     else if (b < 128) solid++;
     else graded++;
   }
-  const pct = n => +(n / grid.data.length * 100).toFixed(1);
+  const pct = n => +(n / voxels * 100).toFixed(1);
   // C1 snaps to a 2-block stride, so it re-bakes half as often as C0 - what
   // matters per block stepped is the amortised figure, not the raw one.
   const everyNBlocks = 1 << level;

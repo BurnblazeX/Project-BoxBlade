@@ -55,6 +55,24 @@ export function getColumnTop(x, z) {
   return null;
 }
 
+// --- The field worker's copy of the world ---
+//
+// The worker bakes the field too (fieldWorker.js), so it needs what the bake
+// reads: which blocks exist, and which of them are glass - glass goes in the
+// field's glass distance, not its opaque one. Keys alone lost the second part,
+// and every strip the worker baked put glass back in as rock: glass that left
+// C0 and came back returned solid, casting a shadow.
+export function worldMirrorEntries(world = World) {
+  const out = [];
+  for (const [key, block] of world) out.push([key, block ? block.materialId ?? null : null]);
+  return out;
+}
+
+export function loadWorldMirror(entries, world = World) {
+  world.clear();
+  for (const [key, materialId] of entries) world.set(key, { materialId });
+}
+
 export function createTestArea(width, depth) {
   World.clear();
 
@@ -79,6 +97,29 @@ export function createTestArea(width, depth) {
   // nothing past the area's edge. The small test areas the tools build stay
   // exactly as they were.
   if (width > 8 && depth > 17) addReflectionTest();
+  if (width > 16 && depth > 13) addGlassTest();
+}
+
+// Glass test bed: the thick case - a single 1.5 m cube, about five feet of
+// solid glass - on the grass beside the reflection bed, and a window: a wall
+// of glass one block thick, 3 wide and 2 tall, in front of the trees at
+// z = 8-9, so sprites are seen through it.
+//
+// Beside them, in a row along z = 13: a 2 x 2 stained-glass window, whose
+// panes colour the light that falls through it, and a frosted cube. Kept off
+// the tiles the sprite tests use as open ground (e.g. 18, 11).
+function addGlassTest() {
+  const put = (x, y, z, materialId = 'glass') => World.set(getVoxelKey(x, y, z), {
+    solid: true, walkable: true, materialId, occupant: null, triggerId: null
+  });
+  put(12, 1, 13);
+  for (let x = 13; x <= 15; x++) {
+    for (let y = 1; y <= 2; y++) put(x, y, 11);
+  }
+  for (let x = 16; x <= 17; x++) {
+    for (let y = 1; y <= 2; y++) put(x, y, 13, 'stainedGlass');
+  }
+  put(10, 1, 13, 'frostedGlass');
 }
 
 // Reflection test bed: a 5x5 patch of polished iron floor with a polished

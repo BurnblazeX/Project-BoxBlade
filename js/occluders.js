@@ -1,5 +1,5 @@
 import { GRID_DIM, DISTANCE_RANGE, minBoxVoxels, populateDistanceField,
-         voxelIndex, gridIndex } from './boxgrid.js';
+         voxelIndex, gridIndex, FIELD_CHANNELS } from './boxgrid.js';
 import { minSilhouetteVoxels, AXIS_X } from './silhouette.js';
 
 // --- Dynamic occluders: the things that move and still cast ---
@@ -315,5 +315,5 @@ export function applyOccluders(grid, occluders, facing = AXIS_X) {
 export function occluderVoxelByte(grid, vx, vy, vz) {
   if (vx < 0 || vy < 0 || vz < 0 ||
       vx >= GRID_DIM || vy >= GRID_DIM || vz >= GRID_DIM) return null;
-  return grid.data[gridIndex(grid, vx, vy, vz)];
+  return grid.data[gridIndex(grid, vx, vy, vz) * FIELD_CHANNELS];
 }

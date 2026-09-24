@@ -1,4 +1,5 @@
 import { World, getVoxelKey, CHUNK_SIZE, Y_MIN, CHUNK_HEIGHT, BLOCK_METRES } from './world.js';
+import { isGlassMaterial } from './materials.js';
 
 // --- boxGrid: the fine occupancy / light field ---
 //
@@ -89,6 +90,27 @@ if (CHUNK_HEIGHT * TEXELS_PER_BLOCK !== GRID_DIM) {
   throw new Error(`boxGrid is not cubic: ${GRID_DIM} wide but ${CHUNK_HEIGHT * TEXELS_PER_BLOCK} tall`);
 }
 
+// --- Two distances per voxel ---
+//
+// Each voxel holds TWO bytes, interleaved - the layout an RG8 3D texture
+// expects, so grid.data is handed to the GPU as it is:
+//
+//   R (channel 0)  distance to the nearest OPAQUE solid
+//   G (channel 1)  distance to the nearest GLASS, negative inside it
+//
+// Split because glass must not look solid to the things that read R: a soft
+// shadow's penumbra comes from how close a ray passes to what blocks it, and
+// glass does not block. Everything that read the one distance before reads R
+// and is unchanged - the shaders sample .r - so a world with no glass bakes and
+// shades exactly as it did. G is for what glass needs: refraction finding its
+// surfaces, and light passing through it.
+//
+// gridIndex is still a VOXEL index; a voxel's bytes are at 2*index (R) and
+// 2*index + 1 (G).
+export const FIELD_CHANNELS = 2;
+export const OPAQUE_CHANNEL = 0;
+export const GLASS_CHANNEL = 1;
+
 // A block at grid coordinate b is rendered centred on b * BLOCK_METRES, so its
 // minimum corner sits half a block lower.
 function blockMinCorner(b) {
@@ -101,7 +123,7 @@ function blockMinCorner(b) {
 // every time the origin moves is a visible hitch for no reason.
 export function createBoxGridAt(originBlockX, originBlockZ, reuse = null, level = 0) {
   const grid = reuse || {
-    data: new Uint8Array(GRID_DIM * GRID_DIM * GRID_DIM),
+    data: new Uint8Array(GRID_DIM * GRID_DIM * GRID_DIM * FIELD_CHANNELS),
     dim: GRID_DIM,
     level,
     voxelsPerBlock: cascadeVoxelsPerBlock(level),
@@ -187,18 +209,20 @@ export function createBoxGridAt(originBlockX, originBlockZ, reuse = null, level 
 // unpackRects agree on one order - rect by rect, then z, y, x in LOGICAL
 // coordinates - so the two sides can have different rings and still agree.
 export function packRects(grid, rects) {
+  const C = FIELD_CHANNELS;
   let n = 0;
   for (const r of rects) n += (r.x1 - r.x0) * (r.y1 - r.y0) * (r.z1 - r.z0);
-  const out = new Uint8Array(n);
+  const out = new Uint8Array(n * C);
   let o = 0;
   for (const r of rects) {
     const segs = ringSegments(grid, r.x0, r.x1 - 1);
     for (let vz = r.z0; vz < r.z1; vz++) {
       for (let vy = r.y0; vy < r.y1; vy++) {
         for (const [a, b] of segs) {
-          const base = gridIndex(grid, a, vy, vz);
-          out.set(grid.data.subarray(base, base + b - a + 1), o);
-          o += b - a + 1;
+          const base = gridIndex(grid, a, vy, vz) * C;
+          const len = (b - a + 1) * C;
+          out.set(grid.data.subarray(base, base + len), o);
+          o += len;
         }
       }
     }
@@ -213,8 +237,8 @@ export function unpackRects(grid, rects, buf) {
     for (let vz = r.z0; vz < r.z1; vz++) {
       for (let vy = r.y0; vy < r.y1; vy++) {
         for (const [a, b] of segs) {
-          const len = b - a + 1;
-          grid.data.set(buf.subarray(o, o + len), gridIndex(grid, a, vy, vz));
+          const len = (b - a + 1) * FIELD_CHANNELS;
+          grid.data.set(buf.subarray(o, o + len), gridIndex(grid, a, vy, vz) * FIELD_CHANNELS);
           o += len;
         }
       }
@@ -232,7 +256,8 @@ export function scrollForHandoff(grid, x, z) {
     ? [{ x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM }]
     : grid.uploadRects;
   return { x, z, full, rects, data: packRects(grid, rects),
-           occupiedCount: grid.occupiedCount, filledBlocks: grid.filledBlocks };
+           occupiedCount: grid.occupiedCount, filledBlocks: grid.filledBlocks,
+           glassBlocks: grid.glassBlocks };
 }
 
 // Main side: the same end state createBoxGridAt would have reached, without
@@ -249,6 +274,7 @@ export function applyHandoff(grid, m) {
   grid.originBlock.z = m.z;
   grid.occupiedCount = m.occupiedCount;
   grid.filledBlocks = m.filledBlocks;
+  grid.glassBlocks = m.glassBlocks || [];
   if (m.full) {
     unpackRects(grid, m.rects, m.data);
     grid.uploadRects = null;
@@ -299,9 +325,10 @@ export function scrollField(grid, sx, sz) {
     for (let i = 0; i < z1 - z0; i++) {
       const vz = ahead ? z0 + i : z1 - 1 - i;
       for (let vy = 0; vy < GRID_DIM; vy++) {
-        const dst = voxelIndex(x0, vy, vz);
-        const src = voxelIndex(x0 + sx, vy, vz + sz);
-        data.copyWithin(dst, src, src + width);
+        const C = FIELD_CHANNELS;
+        const dst = voxelIndex(x0, vy, vz) * C;
+        const src = voxelIndex(x0 + sx, vy, vz + sz) * C;
+        data.copyWithin(dst, src, src + width * C);
       }
     }
   }
@@ -537,10 +564,15 @@ export function decodeDistance(byte, range = DISTANCE_RANGE) {
 
 // Distance at a voxel centre, in voxels. Outside the grid reads as open air, so
 // a ray that leaves never reports a hit on the way out.
-export function distanceAt(grid, vx, vy, vz) {
+export function distanceAt(grid, vx, vy, vz, channel = OPAQUE_CHANNEL) {
   const range = grid.range || DISTANCE_RANGE;
   if (!inBounds(vx, vy, vz)) return range;
-  return decodeDistance(grid.data[gridIndex(grid, vx, vy, vz)], range);
+  return decodeDistance(grid.data[gridIndex(grid, vx, vy, vz) * FIELD_CHANNELS + channel], range);
+}
+
+// The glass channel, the same way.
+export function glassDistanceAt(grid, vx, vy, vz) {
+  return distanceAt(grid, vx, vy, vz, GLASS_CHANNEL);
 }
 
 // Kept as the binary view of the field, because a voxel centre is never exactly
@@ -548,7 +580,13 @@ export function distanceAt(grid, vx, vy, vz) {
 // so the sign is unambiguous here even though the field is continuous.
 export function isOccupied(grid, vx, vy, vz) {
   if (!inBounds(vx, vy, vz)) return false;
-  return grid.data[gridIndex(grid, vx, vy, vz)] < SOLID_THRESHOLD;
+  return grid.data[gridIndex(grid, vx, vy, vz) * FIELD_CHANNELS] < SOLID_THRESHOLD;
+}
+
+// The same for the glass channel: a voxel inside glass.
+export function isGlassVoxel(grid, vx, vy, vz) {
+  if (!inBounds(vx, vy, vz)) return false;
+  return grid.data[gridIndex(grid, vx, vy, vz) * FIELD_CHANNELS + GLASS_CHANNEL] < SOLID_THRESHOLD;
 }
 
 // Trilinear sample in world space, the CPU mirror of what texture3D with linear
@@ -556,7 +594,7 @@ export function isOccupied(grid, vx, vy, vz) {
 // way that interpolating occupancy never was: between a solid voxel centre at
 // -0.5 and its air neighbour at +0.5 the zero-crossing lands exactly on the
 // shared face, which is where the surface actually is.
-export function sampleDistance(grid, wx, wy, wz) {
+export function sampleDistance(grid, wx, wy, wz, channel = OPAQUE_CHANNEL) {
   const p = worldToVoxelFloat(grid, wx, wy, wz);
   // Texel centres sit at voxel index + 0.5, so shift into centre-relative space.
   const fx = p.x - 0.5, fy = p.y - 0.5, fz = p.z - 0.5;
@@ -564,7 +602,7 @@ export function sampleDistance(grid, wx, wy, wz) {
   const tx = fx - x0, ty = fy - y0, tz = fz - z0;
   const lerp = (a, b, t) => a + (b - a) * t;
 
-  const d = (dx, dy, dz) => distanceAt(grid, x0 + dx, y0 + dy, z0 + dz);
+  const d = (dx, dy, dz) => distanceAt(grid, x0 + dx, y0 + dy, z0 + dz, channel);
   const y00 = lerp(d(0, 0, 0), d(1, 0, 0), tx), y10 = lerp(d(0, 1, 0), d(1, 1, 0), tx);
   const y01 = lerp(d(0, 0, 1), d(1, 0, 1), tx), y11 = lerp(d(0, 1, 1), d(1, 1, 1), tx);
   return lerp(lerp(y00, y10, ty), lerp(y01, y11, ty), tz);
@@ -636,9 +674,12 @@ export function voxelCentreToWorld(grid, vx, vy, vz) {
 // them. Math.hypot is also avoided deliberately - its overflow-safe scaling
 // costs several times a plain sqrt, and these operands are all within a voxel or
 // two of zero.
+// channel: which distance the box is written into - OPAQUE_CHANNEL for rock,
+// GLASS_CHANNEL for glass.
 export function minBoxVoxels(grid, cx, cy, cz, hx, hy, hz, rects,
-                             range = grid.range || DISTANCE_RANGE) {
+                             range = grid.range || DISTANCE_RANGE, channel = OPAQUE_CHANNEL) {
   const data = grid.data;
+  const C = FIELD_CHANNELS;
   const invRange = 1 / range;
   // The band, as a voxel box, before any rect clips it.
   const bLo = (v, h) => Math.ceil(v - h - range);
@@ -673,8 +714,8 @@ export function minBoxVoxels(grid, cx, cy, cz, hx, hy, hz, rects,
         const pyz = py + pz;
         // Physically contiguous runs: a row can wrap in the ring.
         for (const [sx0, sx1] of segs) {
-          let idx = gridIndex(grid, sx0, vy, vz);
-          for (let vx = sx0; vx <= sx1; vx++, idx++) {
+          let idx = gridIndex(grid, sx0, vy, vz) * C + channel;
+          for (let vx = sx0; vx <= sx1; vx++, idx += C) {
             const qx = Math.abs(vx + 0.5 - cx) - hx;
             const outside = qx > 0 ? Math.sqrt(pyz + qx * qx) : Math.sqrt(pyz);
             const mx = qx > qyz ? qx : qyz;
@@ -722,19 +763,25 @@ export function populateDistanceField(grid, dirty = null) {
     for (let vz = r.z0; vz < r.z1; vz++) {
       for (let vy = r.y0; vy < r.y1; vy++) {
         for (const [a, b] of segs) {
-          const base = gridIndex(grid, a, vy, vz);
-          grid.data.fill(FAR_BYTE, base, base + (b - a + 1));
+          const base = gridIndex(grid, a, vy, vz) * FIELD_CHANNELS;
+          grid.data.fill(FAR_BYTE, base, base + (b - a + 1) * FIELD_CHANNELS);
         }
       }
     }
   }
 
   let filled = 0;
+  let glassFilled = 0;
   // The voxel origin of every block that landed in this chunk. Scanning for
   // surface voxels only needs to visit these ranges, not all 144^3 cells.
+  // Glass blocks separately: the overlay (debug.js) draws them in their own colour.
   const blocks = [];
+  const glassBlocks = [];
+  // Which blocks are glass. grid.isGlass overrides it (the tests); otherwise
+  // it is the block's material.
+  const glassBlock = grid.isGlass || (block => isGlassMaterial(block && block.materialId));
 
-  for (const key of World.keys()) {
+  for (const [key, block] of World) {
     const [bx, by, bz] = key.split(',').map(Number);
 
     const vx0 = (bx - grid.originBlock.x) * per;
@@ -773,6 +820,17 @@ export function populateDistanceField(grid, dirty = null) {
     const inFootprint = vx0 >= 0 && vy0 >= 0 && vz0 >= 0 &&
                         vx0 < GRID_DIM && vy0 < GRID_DIM && vz0 < GRID_DIM;
 
+    // GLASS goes into G, whole: it is seen through, so its underside is as
+    // visible as any other face, and a ray inside it must find the true exit.
+    // It is not in R at all - see FIELD_CHANNELS.
+    if (glassBlock(block)) {
+      minBoxVoxels(grid, vx0 + per / 2, vy0 + per / 2, vz0 + per / 2,
+                   per / 2, per / 2, per / 2, rects, range, GLASS_CHANNEL);
+      if (inFootprint) glassFilled += per * per * per;
+      glassBlocks.push(vx0, vy0, vz0);
+      continue;
+    }
+
     // A block with nothing beneath it - surface ground over empty space, the
     // common case now that there is no sub-surface fill - only needs its top
     // half voxelised. Nothing is ever below to march a ray up from, and the
@@ -780,6 +838,8 @@ export function populateDistanceField(grid, dirty = null) {
     // occupancy outright. 12 divides evenly by 2, so the split lands on a
     // voxel boundary with nothing left over. Under the SDF this is not a
     // special case any more, just a box of a different height.
+    // Glass below counts as support, and must: the underside shows through
+    // glass, so a block standing on it keeps its full height in the field.
     const supported = World.has(getVoxelKey(bx, by - 1, bz));
     const dyStart = supported ? 0 : per / 2;
     const height = per - dyStart;
@@ -799,7 +859,9 @@ export function populateDistanceField(grid, dirty = null) {
   }
 
   grid.occupiedCount = filled;
+  grid.glassCount = glassFilled;
   grid.filledBlocks = blocks;
+  grid.glassBlocks = glassBlocks;
   return filled;
 }
 
@@ -844,6 +906,143 @@ export function sphereTrace(grid, origin, dir, maxDistance) {
     if (t > maxDistance) return { hit: false, distance: t, steps };
   }
   return { hit: false, distance: t, steps: MAX_TRACE_STEPS, exhausted: true };
+}
+
+// The CPU mirror of gpu.js blockFaceTSL: the block-grid plane p is nearest to,
+// among those the ray is not parallel to, a tie going to the one it crosses
+// most squarely. leaving: normal along dir, else against it.
+export function blockFaceNormal(p, dir, leaving) {
+  const axes = ['x', 'y', 'z'];
+  let best = null, bestBack = Infinity;
+  for (const a of axes) {
+    const b = p[a] / BLOCK_METRES + 0.5;
+    const f = b - Math.floor(b);
+    const ad = Math.abs(dir[a]);
+    const score = Math.min(f, 1 - f) * BLOCK_METRES - ad * 1e-3 + (ad < 1e-3 ? 1e3 : 0);
+    if (score < bestBack) { bestBack = score; best = a; }
+  }
+  const s = Math.sign(dir[best]) * (leaving ? 1 : -1);
+  return { x: best === 'x' ? s : 0, y: best === 'y' ? s : 0, z: best === 'z' ? s : 0 };
+}
+
+// --- CPU reference: the march through glass ---
+//
+// The mirror of gpu.js createGlassMarchTSL, one cascade: from a point inside
+// glass along dir, step by the smaller of the glass distance's depth (-G) and
+// the opaque distance (R), until an opaque surface is met (what the glass shows)
+// or the glass surface is reached (the exit). Returns { kind: 'opaque' | 'exit'
+// | 'none', distance, normal } - the normal axis-snapped from the gradient of
+// the channel that ended it, the exit's pointing out.
+export function marchThroughGlass(grid, origin, dir, maxDistance) {
+  const len = Math.hypot(dir.x, dir.y, dir.z);
+  const d = { x: dir.x / len, y: dir.y / len, z: dir.z / len };
+  const axisOf = g => {
+    const a = [Math.abs(g.x), Math.abs(g.y), Math.abs(g.z)];
+    if (a[0] >= a[1] && a[0] >= a[2]) return { x: Math.sign(g.x), y: 0, z: 0 };
+    if (a[1] > a[0] && a[1] >= a[2]) return { x: 0, y: Math.sign(g.y), z: 0 };
+    return { x: 0, y: 0, z: Math.sign(g.z) };
+  };
+  const gradAt = (p, channel) => {
+    const e = grid.voxelSize;
+    const f = (dx, dy, dz) => sampleDistance(grid, p.x + dx, p.y + dy, p.z + dz, channel);
+    return { x: f(e, 0, 0) - f(-e, 0, 0), y: f(0, e, 0) - f(0, -e, 0), z: f(0, 0, e) - f(0, 0, -e) };
+  };
+  let t = 0;
+  for (let steps = 0; steps < MAX_TRACE_STEPS; steps++) {
+    const p = { x: origin.x + d.x * t, y: origin.y + d.y * t, z: origin.z + d.z * t };
+    const v = worldToVoxelFloat(grid, p.x, p.y, p.z);
+    if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= GRID_DIM || v.y >= GRID_DIM || v.z >= GRID_DIM) break;
+    const dR = sampleDistance(grid, p.x, p.y, p.z, OPAQUE_CHANNEL);
+    const dG = sampleDistance(grid, p.x, p.y, p.z, GLASS_CHANNEL);
+    if (dR < HIT_EPS) return { kind: 'opaque', distance: t, normal: axisOf(gradAt(p, OPAQUE_CHANNEL)) };
+    if (dG > -HIT_EPS) return { kind: 'exit', distance: t, normal: axisOf(gradAt(p, GLASS_CHANNEL)) };
+    t += Math.max(Math.min(-dG, dR), MIN_STEP) * grid.voxelSize;
+    if (t > maxDistance) break;
+  }
+  return { kind: 'none', distance: t, normal: null };
+}
+
+// --- CPU reference: metres of glass on a shadow ray ---
+//
+// The glass variant of the cone march (gpu.js createConeTraceSunTSL), reduced to
+// what it adds: step by the nearer of the opaque and glass distances, count the
+// metres spent inside glass (G < 0), stop at an opaque hit or maxDistance. The
+// shader turns the count into a tint (glassTransmitTSL). One cascade.
+export function glassOnRay(grid, origin, dir, maxDistance) {
+  const len = Math.hypot(dir.x, dir.y, dir.z);
+  const d = { x: dir.x / len, y: dir.y / len, z: dir.z / len };
+  let t = grid.voxelSize, inGlass = 0;
+  for (let steps = 0; steps < MAX_TRACE_STEPS; steps++) {
+    const p = { x: origin.x + d.x * t, y: origin.y + d.y * t, z: origin.z + d.z * t };
+    const v = worldToVoxelFloat(grid, p.x, p.y, p.z);
+    if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= GRID_DIM || v.y >= GRID_DIM || v.z >= GRID_DIM) break;
+    const dR = sampleDistance(grid, p.x, p.y, p.z, OPAQUE_CHANNEL);
+    if (dR < HIT_EPS) return { blocked: true, inGlass };
+    const dG = sampleDistance(grid, p.x, p.y, p.z, GLASS_CHANNEL);
+    const step = Math.max(Math.min(dR, Math.abs(dG)), MIN_STEP) * grid.voxelSize;
+    if (dG < 0) inGlass += step;
+    t += step;
+    if (t > maxDistance) break;
+  }
+  return { blocked: false, inGlass };
+}
+
+// --- CPU reference: the walk through glass, block by block ---
+//
+// The mirror of the walk in gpu.js glassNode: from p on a glass face (n its
+// outward normal), along dir (already refracted in), stepping block to block.
+// Glass: go on. Air: refract out through that face, or past the critical angle
+// reflect back in (up to maxBounces). Anything else: an opaque block, whose
+// face the glass shows. Returns { kind: 'opaque' | 'exit' | 'trapped', length,
+// bounces, point, normal, dir } - normal is the face crossed (the exit's
+// pointing out, the opaque's toward the ray), dir the ray out for an exit.
+export function refractVec(i, n, eta) {
+  const d = i.x * n.x + i.y * n.y + i.z * n.z;
+  const k = 1 - eta * eta * (1 - d * d);
+  if (k < 0) return null;
+  const s = eta * d + Math.sqrt(k);
+  return { x: eta * i.x - s * n.x, y: eta * i.y - s * n.y, z: eta * i.z - s * n.z };
+}
+
+export function walkThroughGlass(p, n, dir, ior, { maxSteps = 32, maxBounces = 4,
+                                                   isGlass = isGlassMaterial } = {}) {
+  const B = BLOCK_METRES;
+  const key = c => getVoxelKey(c.x, c.y, c.z);
+  let pos = { ...p }, d = { ...dir }, len = 0, bounces = 0;
+  const h = VOXEL_METRES * 0.5;
+  let cell = { x: Math.floor((p.x - n.x * h) / B + 0.5),
+               y: Math.floor((p.y - n.y * h) / B + 0.5),
+               z: Math.floor((p.z - n.z * h) / B + 0.5) };
+  for (let i = 0; i < maxSteps; i++) {
+    let best = null, bt = Infinity;
+    for (const a of ['x', 'y', 'z']) {
+      if (Math.abs(d[a]) < 1e-6) continue;
+      const s = Math.sign(d[a]);
+      const t = ((cell[a] + 0.5 * s) * B - pos[a]) / d[a];
+      if (t < bt) { bt = t; best = a; }
+    }
+    bt = Math.max(bt, 0);
+    const npos = { x: pos.x + d.x * bt, y: pos.y + d.y * bt, z: pos.z + d.z * bt };
+    const s = Math.sign(d[best]);
+    const nx = { x: best === 'x' ? s : 0, y: best === 'y' ? s : 0, z: best === 'z' ? s : 0 };
+    const next = { x: cell.x + nx.x, y: cell.y + nx.y, z: cell.z + nx.z };
+    const block = World.get(key(next));
+    len += bt;
+    if (block && isGlass(block.materialId)) { pos = npos; cell = next; continue; }
+    if (!block) {
+      const out = refractVec(d, { x: -nx.x, y: -nx.y, z: -nx.z }, ior);
+      if (out) return { kind: 'exit', length: len, bounces, point: npos, normal: nx, dir: out };
+      bounces++;
+      if (bounces > maxBounces) return { kind: 'trapped', length: len, bounces, point: npos, normal: nx, dir: d };
+      const dn = d.x * nx.x + d.y * nx.y + d.z * nx.z;
+      d = { x: d.x - 2 * dn * nx.x, y: d.y - 2 * dn * nx.y, z: d.z - 2 * dn * nx.z };
+      pos = npos;
+      continue;
+    }
+    return { kind: 'opaque', length: len, bounces, point: npos,
+             normal: { x: -nx.x, y: -nx.y, z: -nx.z }, dir: d };
+  }
+  return { kind: 'trapped', length: len, bounces, point: pos, normal: null, dir: d };
 }
 
 // --- CPU reference DDA (Amanatides-Woo) ---

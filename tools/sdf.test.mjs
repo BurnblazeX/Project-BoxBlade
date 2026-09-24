@@ -74,7 +74,7 @@ section('the baked field');
 createTestArea(40, 40);
 const g = createBoxGrid(0, 0);
 
-ok('still one byte per voxel, 2.85 MB', (g.data.length / 1048576).toFixed(2), '2.85');
+ok('two bytes per voxel (opaque, glass), 5.70 MB', (g.data.length / 1048576).toFixed(2), '5.70');
 // Ground only: createTestArea lays the slab, the wall and pillar come from
 // addTestElevation and sit outside chunk (0,0) anyway.
 ok('unsupported ground fills its top half only', g.occupiedCount,
@@ -217,8 +217,11 @@ section('a re-origin that slides is a scroll, not a rebake');
 const sameLogical = (a, b) => {
   for (let vz = 0; vz < GRID_DIM; vz++)
     for (let vy = 0; vy < GRID_DIM; vy++)
-      for (let vx = 0; vx < GRID_DIM; vx++)
-        if (a.data[gridIndex(a, vx, vy, vz)] !== b.data[gridIndex(b, vx, vy, vz)]) return false;
+      for (let vx = 0; vx < GRID_DIM; vx++) {
+        // Both channels: opaque (R) and glass (G).
+        const ia = gridIndex(a, vx, vy, vz) * 2, ib = gridIndex(b, vx, vy, vz) * 2;
+        if (a.data[ia] !== b.data[ib] || a.data[ia + 1] !== b.data[ib + 1]) return false;
+      }
   return true;
 };
 // The hitch this removes: a full bake is 18.8 ms at C0, which at 240 Hz is four

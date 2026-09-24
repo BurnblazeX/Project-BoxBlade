@@ -129,7 +129,7 @@ section('the band is cleared, not just the box');
 // what it should read. What has to hold is that it reads what it would have read
 // had no proxy ever stood there.
 const shell = worldToVoxel(grid, STAND.x + 0.5, CHEST, STAND.z);
-const shellIdx = gridIndex(grid, shell.vx, shell.vy, shell.vz);
+const shellIdx = gridIndex(grid, shell.vx, shell.vy, shell.vz) * 2;   // its opaque byte
 note(`shell voxel holds ${grid.data[shellIdx]}, clean field holds ${clean[shellIdx]}`);
 ok('a voxel in the old proxy band is back to its static value',
    grid.data[shellIdx], clean[shellIdx]);

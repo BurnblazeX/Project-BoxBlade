@@ -34,15 +34,22 @@ export function isReflective(specRgba) {
 const PLANE_AXES = [[1, 2], [0, 2], [0, 1]];
 
 // world: a Map of 'x,y,z' -> block (world.js World). reflective: a Set of
-// materialIds. Returns rectangles, in metres:
-//   { axis, sign, plane, min: [u, v], max: [u, v] }
+// materialIds. isGlass: materialId -> bool, for glass's back-face glare.
+// Returns rectangles, in metres:
+//   { axis, sign, plane, min: [u, v], max: [u, v], thickness }
 // where plane is the face's coordinate along axis and u, v run along
-// PLANE_AXES[axis].
-export function buildMirrors(world, reflective) {
+// PLANE_AXES[axis]. thickness: for a glass face, the metres of glass behind it
+// to a back face with air beyond - the slab the second (back-face) reflection
+// crosses twice; 0 for anything else, or for glass whose back rests on
+// something (a back face against the ground is no mirror). Faces are grouped
+// by plane AND thickness, so glass never merges with a coplanar marble face,
+// nor two slabs of different depth.
+export function buildMirrors(world, reflective, isGlass = () => false) {
   const groups = new Map();
   for (const [key, block] of world) {
     if (!reflective.has(block.materialId)) continue;
     const c = key.split(',').map(Number);
+    const glass = isGlass(block.materialId);
     for (let axis = 0; axis < 3; axis++) {
       for (const sign of [1, -1]) {
         const nb = c.slice(); nb[axis] += sign;
@@ -50,9 +57,21 @@ export function buildMirrors(world, reflective) {
         // The underside of the ground layer faces the void under the world -
         // nothing is ever there to receive from it.
         if (axis === 1 && sign === -1 && c[1] <= GROUND_Y) continue;
+        let thickness = 0;
+        if (glass) {
+          // Walk back through the glass behind this face.
+          const q = c.slice();
+          let k = 0;
+          for (; k < 16; k++) {
+            const b = world.get(q.join(','));
+            if (!b || !isGlass(b.materialId)) break;
+            q[axis] -= sign;
+          }
+          thickness = world.has(q.join(',')) ? 0 : k * BLOCK_METRES;
+        }
         const [ua, va] = PLANE_AXES[axis];
-        const g = `${axis},${sign},${c[axis]}`;
-        if (!groups.has(g)) groups.set(g, { axis, sign, level: c[axis], cells: new Set() });
+        const g = `${axis},${sign},${c[axis]},${glass ? 'g' + thickness : 'o'}`;
+        if (!groups.has(g)) groups.set(g, { axis, sign, level: c[axis], thickness, cells: new Set() });
         groups.get(g).cells.add(`${c[ua]},${c[va]}`);
       }
     }
@@ -79,7 +98,8 @@ export function buildMirrors(world, reflective) {
         axis: g.axis, sign: g.sign,
         plane: (g.level + 0.5 * g.sign) * BLOCK_METRES,
         min: [(u0 - 0.5) * BLOCK_METRES, (v0 - 0.5) * BLOCK_METRES],
-        max: [(u1 + 0.5) * BLOCK_METRES, (v1 + 0.5) * BLOCK_METRES]
+        max: [(u1 + 0.5) * BLOCK_METRES, (v1 + 0.5) * BLOCK_METRES],
+        thickness: g.thickness
       });
     }
   }
@@ -133,7 +153,7 @@ export function mirrorReach(r, sun, lights) {
 
 // Nearest `capacity` to a point that reflect anything, packed four vec4 each:
 //   0  axis, sign, plane, mask          1  umin, vmin, umax, vmax
-//   2  sun box min xyz, 0               3  sun box max xyz, 0
+//   2  sun box min xyz, glass thickness 3  sun box max xyz, 0
 // A rectangle's footprint on the ground, { minX, maxX, minZ, maxZ }, metres.
 export function mirrorFootprint(r) {
   const [ua, va] = PLANE_AXES[r.axis];
@@ -170,7 +190,7 @@ export function packMirrors(rects, near, out, capacity = MAX_MIRRORS,
   live.forEach(({ r, reach }, i) => {
     const bmin = reach.box ? reach.box[0] : [0, 0, 0], bmax = reach.box ? reach.box[1] : [0, 0, 0];
     out.set([r.axis, r.sign, r.plane, reach.mask, r.min[0], r.min[1], r.max[0], r.max[1],
-             bmin[0], bmin[1], bmin[2], 0, bmax[0], bmax[1], bmax[2], 0], i * 16);
+             bmin[0], bmin[1], bmin[2], r.thickness || 0, bmax[0], bmax[1], bmax[2], 0], i * 16);
   });
   return live.length;
 }

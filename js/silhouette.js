@@ -1,4 +1,4 @@
-import { voxelIndex, gridIndex, ringSegments, GRID_DIM, DISTANCE_RANGE,
+import { voxelIndex, gridIndex, ringSegments, GRID_DIM, DISTANCE_RANGE, FIELD_CHANNELS,
          CASCADE_COUNT, cascadeVoxelMetres } from './boxgrid.js';
 
 // --- Tracing against the cutout, not against a box ---
@@ -366,8 +366,9 @@ export function minSilhouetteVoxels(grid, sil, cx, cy, cz, rects, flip = false,
         const v = vy + 0.5 - cy;
         // Physically contiguous runs: a row can wrap in the ring.
         for (const [sx0, sx1] of segs) {
-          let idx = gridIndex(grid, sx0, vy, vz);
-          for (let vx = sx0; vx <= sx1; vx++, idx++) {
+          // The opaque channel (R): a proxy is an opaque caster.
+          let idx = gridIndex(grid, sx0, vy, vz) * FIELD_CHANNELS;
+          for (let vx = sx0; vx <= sx1; vx++, idx += FIELD_CHANNELS) {
             const dx = vx + 0.5 - cx;
             const d = silhouetteDistance(sil, dx * ux + dz * uz, v,
                                          dx * nx + dz * nz, flip);

@@ -1,5 +1,5 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
-import { World, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
+import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
          findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory,
          pathDistance, attackRange, getAbilityModifier,
          BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/world.js';
@@ -15,7 +15,15 @@ ok('chunk is 12 levels tall', CHUNK_HEIGHT, 12);
 ok('authorable span is -3..8', `${Y_MIN}..${Y_MAX}`, '-3..8');
 
 section('generation - surface only, no sandbox fill');
-ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16 + 14 + 12);
+// + 12: the glass test bed (a cube, a 3 x 2 window, a 2 x 2 stained window,
+// a frosted cube).
+ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16 + 14 + 12 + 12);
+
+section('glass test bed');
+ok('the cube is glass', World.get(getVoxelKey(12, 1, 13))?.materialId, 'glass');
+ok('the window is glass, 2 tall', World.get(getVoxelKey(14, 2, 11))?.materialId, 'glass');
+ok('the stained window', World.get(getVoxelKey(17, 2, 13))?.materialId, 'stainedGlass');
+ok('the frosted cube', World.get(getVoxelKey(10, 1, 13))?.materialId, 'frostedGlass');
 
 section('reflection test bed');
 ok('floor patch is iron plate', World.get('5,0,14').materialId, 'ironPlate');

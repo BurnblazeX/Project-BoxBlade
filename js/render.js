@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
-import { attribute, texture, uv, int, mix, vec3, uniform } from 'three/tsl';
+import { attribute, texture, uv, int, mix, vec3, uniform, select, positionLocal } from 'three/tsl';
 import { World, BLOCK_METRES } from './world.js';
-import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer } from './materials.js';
+import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial } from './materials.js';
 import { terrainNormals } from './normals.js';
 
 // Every block texture, by URL, so Vite bundles them - albedo, _n and _s alike.
@@ -15,6 +15,11 @@ function textureUrl(name) {
 export const VOXEL_SIZE = BLOCK_METRES; // single source of truth is world.js
 
 export let worldInstancedMesh = null;
+// Glass blocks, drawn by a mesh of their own: it shares the terrain's geometry
+// and instance buffers (so picking, arena hiding and tinting need nothing
+// new), and each material keeps only its own blocks - see terrainKeepTSL.
+// null when the world holds no glass, so a map without any pays nothing.
+export let glassInstancedMesh = null;
 export const voxelIndexMap = new Map(); // grid key -> instance ID
 const instanceKeyByIndex = [];          // instance ID -> grid key (raycast picking)
 
@@ -57,6 +62,17 @@ export const terrainWhite = uniform(0);
 
 // The block's material layer, in the fragment: a per-instance attribute.
 export const terrainLayerTSL = () => int(attribute('blockLayer', 'float').add(0.5));
+// Which blocks a terrain material draws: glass or not, by the per-instance
+// blockGlass flag. The others collapse to a point - zero-area triangles, no
+// fragments - so the terrain shader never carries glass shading (a never-taken
+// branch still costs registers: doc §0), and glass never runs the terrain's.
+// Applied after instancing (NodeMaterial.setupPosition), so positionLocal is
+// already the placed block.
+export const terrainKeepTSL = glass => {
+  const isGlass = attribute('blockGlass', 'float').greaterThan(0.5);
+  return select(glass ? isGlass : isGlass.not(), positionLocal, vec3(0, 0, 0));
+};
+
 // A terrain array sampled at this fragment's own layer - at st when given
 // (the shaded path passes its texel's centre), else the mesh uv.
 export const terrainSampleTSL = (tex, st = null) =>
@@ -203,10 +219,14 @@ export function initWorldRender(scene) {
   // Which material each block draws with - its layer in the texture arrays.
   const layers = new THREE.InstancedBufferAttribute(new Float32Array(renderCount), 1);
   geometry.setAttribute('blockLayer', layers);
+  // 1 for glass blocks: terrainKeepTSL sends each to its own mesh.
+  const glassFlags = new THREE.InstancedBufferAttribute(new Float32Array(renderCount), 1);
+  geometry.setAttribute('blockGlass', glassFlags);
   // The unshadowed path. Standard lighting, but the colour is the block's own
   // layer - a plain `map` would put layer 0 on everything.
   const material = new THREE.MeshStandardNodeMaterial({ roughness: 0.9, metalness: 0.0 });
   material.colorNode = mix(terrainSampleTSL(terrainTextures.albedo).rgb, vec3(1, 1, 1), terrainWhite);
+  material.positionNode = terrainKeepTSL(false);
 
   worldInstancedMesh = new THREE.InstancedMesh(geometry, material, renderCount);
   worldInstancedMesh.receiveShadow = true;
@@ -215,6 +235,7 @@ export function initWorldRender(scene) {
   const matrix = new THREE.Matrix4();
   const position = new THREE.Vector3();
   let instanceIndex = 0;
+  let glassCount = 0;
 
   for (const key of World.keys()) {
     const [gx, gy, gz] = key.split(',').map(Number);
@@ -229,11 +250,37 @@ export function initWorldRender(scene) {
     instanceKeyByIndex[instanceIndex] = key;
     worldInstancedMesh.setColorAt(instanceIndex, new THREE.Color(0xffffff));
     layers.setX(instanceIndex, materialLayer(World.get(key).materialId));
+    const glass = isGlassMaterial(World.get(key).materialId);
+    glassFlags.setX(instanceIndex, glass ? 1 : 0);
+    if (glass) glassCount++;
     instanceIndex++;
   }
   worldInstancedMesh.instanceMatrix.needsUpdate = true;
   if (worldInstancedMesh.instanceColor) worldInstancedMesh.instanceColor.needsUpdate = true;
   scene.add(worldInstancedMesh);
+
+  glassInstancedMesh = null;
+  if (glassCount > 0) {
+    // The unshadowed path's glass: plainly see-through, blended - there is no
+    // field to trace without shadows. With them on, main.js swaps in the
+    // traced material (gpu.js glassNode).
+    // Rough, as the plain terrain is (0.9): the unshadowed path has no specular
+    // anywhere - marble and iron show none there either - so glass does not
+    // get three's highlight from the directional light.
+    const glassMat = new THREE.MeshStandardNodeMaterial({
+      roughness: 0.9, metalness: 0.0, transparent: true, opacity: 0.35, depthWrite: false
+    });
+    glassMat.colorNode = mix(terrainSampleTSL(terrainTextures.albedo).rgb, vec3(1, 1, 1), terrainWhite);
+    glassMat.positionNode = terrainKeepTSL(true);
+    const g = new THREE.InstancedMesh(geometry, glassMat, renderCount);
+    g.instanceMatrix = worldInstancedMesh.instanceMatrix;
+    g.instanceColor = worldInstancedMesh.instanceColor;
+    g.frustumCulled = false;
+    g.raycast = () => {};          // picking stays on the terrain mesh, glass included
+    g.name = 'glass';
+    scene.add(g);
+    glassInstancedMesh = g;
+  }
 }
 
 const _matrix = new THREE.Matrix4();

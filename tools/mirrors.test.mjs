@@ -69,3 +69,26 @@ ok('an area far from it packs nothing',
                { minX: 100, maxX: 136, minZ: 100, maxZ: 136 }), 0);
 ok('nothing lit, nothing packed',
    packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, { dir: [0, 1, 0], on: false }, []), 0);
+
+section('glass rectangles: thickness for the back-face glare');
+{
+  const { buildMirrors } = await import('../js/mirrors.js');
+  const { isGlassMaterial } = await import('../js/materials.js');
+  const { createTestArea, World: W, BLOCK_METRES: B } = await import('../js/world.js');
+  createTestArea(36, 36);
+  const glassRects = buildMirrors(W, new Set(['glass', 'marble', 'ironPlate']), isGlassMaterial)
+    .filter(r => r.thickness !== undefined);
+  // The window (x 13-15, y 1-2, z 11): its +z face has one block of glass
+  // behind it and air beyond - a slab.
+  const front = glassRects.find(r => r.axis === 2 && r.sign === 1 && Math.abs(r.plane - 11.5 * B) < 1e-9);
+  ok('the window\'s front face is one block thick', front && front.thickness, B);
+  // Its top face rests, through the glass, on the ground: no clean back face.
+  const top = glassRects.find(r => r.axis === 1 && r.sign === 1 && Math.abs(r.plane - 2.5 * B) < 1e-9 &&
+                                   r.min[0] >= 12.5 * B && r.max[0] <= 15.5 * B);
+  ok('its top face has no back face (the ground)', top && top.thickness, 0);
+  // Marble and iron carry none.
+  const marble = glassRects.find(r => r.axis === 2 && Math.abs(r.plane - 16.5 * B) < 1e-9);
+  ok('a marble face has no thickness', marble && marble.thickness, 0);
+  // Glass never merges into a coplanar non-glass rectangle.
+  truthy('every glass face is its own rectangle group', glassRects.length > 0);
+}

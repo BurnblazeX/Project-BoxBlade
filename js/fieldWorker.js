@@ -1,4 +1,4 @@
-import { World } from './world.js';
+import { loadWorldMirror } from './world.js';
 import { createBoxGridAt, scrollForHandoff } from './boxgrid.js';
 
 // --- The field worker ---
@@ -8,14 +8,13 @@ import { createBoxGridAt, scrollForHandoff } from './boxgrid.js';
 // them with applyHandoff. Messages are handled in order, so a reset queued
 // after a scroll always wins.
 //
-// The bake reads World for which blocks exist and nothing else, so the mirror's
-// World holds keys only.
+// The bake reads World for which blocks exist and which are glass, so the
+// mirror's World holds each key with its material (world.js worldMirrorEntries).
 const grids = [];
 
 self.onmessage = ({ data: m }) => {
   if (m.type === 'world') {
-    World.clear();
-    for (const k of m.keys) World.set(k, true);
+    loadWorldMirror(m.blocks);
   } else if (m.type === 'reset') {
     grids[m.level] = createBoxGridAt(m.x, m.z, null, m.level);
   } else if (m.type === 'scroll') {

@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { createBoxGridAt, gridOriginFor, isOccupied, GRID_DIM,
+import { createBoxGridAt, gridOriginFor, isOccupied, isGlassVoxel, GRID_DIM,
          voxelCentreToWorld, CASCADE_COUNT, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, SUN_BIAS_BLOCKS } from './boxgrid.js';
 
@@ -60,23 +60,27 @@ let _generation = 0;
 const _m = new THREE.Matrix4();
 const _colour = new THREE.Color();
 
-function surfaceMask(grid, x, y, z) {
-  if (!isOccupied(grid, x, y, z)) return 0;
+// occ: which channel's occupancy - the opaque field's, or the glass one's.
+function surfaceMask(grid, x, y, z, occ = isOccupied) {
+  if (!occ(grid, x, y, z)) return 0;
   // Bit per exposed face. A voxel exposed ONLY downwards can never be seen from
   // a camera that lives above the world, so it is skipped: that is the entire
   // underside of every slab.
   let mask = 0;
-  if (!isOccupied(grid, x + 1, y, z)) mask |= 1;
-  if (!isOccupied(grid, x - 1, y, z)) mask |= 2;
-  if (!isOccupied(grid, x, y + 1, z)) mask |= 4;
-  if (!isOccupied(grid, x, y, z + 1)) mask |= 8;
-  if (!isOccupied(grid, x, y, z - 1)) mask |= 16;
+  if (!occ(grid, x + 1, y, z)) mask |= 1;
+  if (!occ(grid, x - 1, y, z)) mask |= 2;
+  if (!occ(grid, x, y + 1, z)) mask |= 4;
+  if (!occ(grid, x, y, z + 1)) mask |= 8;
+  if (!occ(grid, x, y, z - 1)) mask |= 16;
   return mask;
 }
 
+// Glass is drawn from the field's glass channel, pale cyan, so it reads as
+// glass among the height-ramped rock.
+const GLASS_HUE = 0.5, GLASS_SAT = 0.55, GLASS_LIGHT = 0.72;
+
 function fill(mesh, grid, clip = null) {
   let i = 0;
-  const b = grid.filledBlocks;
   // Per LEVEL, not the C0 constant: a coarse cascade fills six voxels per block
   // per axis, and walking twelve would run off the end of each block's range
   // into its neighbour's.
@@ -84,6 +88,10 @@ function fill(mesh, grid, clip = null) {
   _generation = (_generation + 1) & 0xff;
   if (_generation === 0) { _seen.fill(0); _generation = 1; } // wrapped, retire old stamps
 
+  // Rock first, then glass: each from its own block list and its own channel.
+  for (const glass of [false, true]) {
+  const b = glass ? (grid.glassBlocks || []) : grid.filledBlocks;
+  const occ = glass ? isGlassVoxel : isOccupied;
   // Visit only the voxel ranges that blocks actually filled. Scanning all
   // 144^3 cells meant ~18M neighbour lookups per rebuild; this is ~12x fewer.
   for (let k = 0; k < b.length; k += 3) {
@@ -97,7 +105,7 @@ function fill(mesh, grid, clip = null) {
           // the grid and must be skipped rather than wrapped.
           if (vx < 0 || vy < 0 || vz < 0 ||
               vx >= GRID_DIM || vz >= GRID_DIM) continue;
-          if (!surfaceMask(grid, vx, vy, vz)) continue;
+          if (!surfaceMask(grid, vx, vy, vz, occ)) continue;
 
           // Blocks overlap at shared faces, so the same voxel can be reached
           // from two ranges.
@@ -118,12 +126,14 @@ function fill(mesh, grid, clip = null) {
           // thickness, read at a glance. Lightness alternates on a 3D
           // checkerboard so neighbouring voxels never share a shade.
           const checker = ((vx + vy + vz) & 1) ? CHECKER_LIGHTNESS : 0;
-          _colour.setHSL((vy / GRID_DIM) * 0.75, 0.75, 0.48 + checker);
+          if (glass) _colour.setHSL(GLASS_HUE, GLASS_SAT, GLASS_LIGHT + checker * 0.5);
+          else _colour.setHSL((vy / GRID_DIM) * 0.75, 0.75, 0.48 + checker);
           mesh.setColorAt(i, _colour);
           i++;
         }
       }
     }
+  }
   }
   mesh.count = i;
   mesh.instanceMatrix.needsUpdate = true;

@@ -18,7 +18,7 @@ ok('12 texels per block', TEXELS_PER_BLOCK, 12);
 ok('grid is 144 cubed', GRID_DIM, 144);
 near('voxel is 12.5cm', VOXEL_METRES, 0.125);
 ok('C0 covers exactly one chunk', GRID_DIM / TEXELS_PER_BLOCK, 12);
-ok('occupancy is 2.85 MB', (g.data.length / 1048576).toFixed(2), '2.85');
+ok('two distances per voxel (opaque, glass): 5.70 MB', (g.data.length / 1048576).toFixed(2), '5.70');
 
 section('voxelisation');
 // Ground blocks have nothing beneath them, so only their top half fills:

@@ -1,8 +1,9 @@
 import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3, positionWorldDirection } from 'three/tsl';
-import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid } from './world.js';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid, worldMirrorEntries } from './world.js';
 import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
+         glassInstancedMesh, terrainKeepTSL,
          terrainTextures, terrainWhite, terrainSampleTSL } from './render.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
@@ -17,9 +18,11 @@ import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createVoxelAONode } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
-         createMirrorBindings, writeMirrorBindings } from './gpu.js';
+         createMirrorBindings, writeMirrorBindings, setHitBounds,
+         GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
+         glassBackGlare } from './gpu.js';
 import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS } from './mirrors.js';
-import { MATERIALS } from './materials.js';
+import { MATERIALS, isGlassMaterial } from './materials.js';
 import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
          DEFAULT_SKY_HOUR } from './sky.js';
 import { createCardBindings, createCardAtlasTexture, createCardColourTexture, writeCardBindings,
@@ -53,7 +56,7 @@ import { createLPV } from './gi.js';
 import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from './shadowsets.js';
 import { classifyTextureAlpha, registerCutout, syncCutout, wantsTransparent,
          cutoutsEnabled, setCutoutsEnabled } from './cutout.js';
-import { diffuseAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
+import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
 import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS,
          DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS } from './lpv.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
@@ -870,6 +873,19 @@ worldObjects.push({ data: barrel, mesh: barrelSprite });
 // Mirrors how enemySprite/updateVoxelVisibility hide things outside the arena:
 // in explore mode everything shows; in battle, only objects inside the current
 // arena chunk render at all.
+// Reflections and the view through glass land only on what battle shows:
+// the arena's blocks, as a box in world metres (gpu.js hitBounds). Block b
+// spans (b - 0.5) to (b + 0.5) blocks.
+let currentArenaBounds = null;
+function setArenaHitBounds(bounds) {
+  if (!bounds) { setHitBounds(null); return; }
+  const lo = b => (b - 0.5) * VOXEL_SIZE, hi = b => (b + 0.5) * VOXEL_SIZE;
+  setHitBounds({
+    min: { x: lo(bounds.minX), y: lo(bounds.minY), z: lo(bounds.minZ) },
+    max: { x: hi(bounds.maxX), y: hi(bounds.maxY), z: hi(bounds.maxZ) }
+  });
+}
+
 function updateObjectVisibility(arenaMap, isBattle) {
   for (const { data, mesh } of worldObjects) {
     mesh.visible = !isBattle || arenaMap.has(getVoxelKey(data.gridPos.x, data.gridPos.y, data.gridPos.z));
@@ -1083,6 +1099,7 @@ function endBattleSequence(message) {
   currentArenaMap = null;
   updateVoxelVisibility(null, false);
   updateObjectVisibility(null, false);
+  setArenaHitBounds(null);
 
   if (!isDefeated(enemy)) enemyAI.isPaused = false;
   
@@ -1387,6 +1404,7 @@ document.getElementById('btn-fight').addEventListener('click', () => {
   // Enter Battle Centered on PLAYER'S chunk (since enemy was pulled into it)
   const battleData = enterBattle(player.gridPos);
   currentArenaMap = battleData.arena;
+  currentArenaBounds = battleData.bounds;
   
   const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
   const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
@@ -1394,6 +1412,7 @@ document.getElementById('btn-fight').addEventListener('click', () => {
   
   updateVoxelVisibility(currentArenaMap, true);
   updateObjectVisibility(currentArenaMap, true);
+  setArenaHitBounds(currentArenaBounds);
   refreshReachableTiles();
 
   // PHASE 7: Roll Initiative & Start Turn Queue
@@ -1716,6 +1735,7 @@ if (key === 'escape' && isDialogueOpen) {
       
       const battleData = enterBattle(player.gridPos);
       currentArenaMap = battleData.arena;
+      currentArenaBounds = battleData.bounds;
       
       const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
       const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
@@ -1723,6 +1743,7 @@ if (key === 'escape' && isDialogueOpen) {
       
       updateVoxelVisibility(currentArenaMap, true);
       updateObjectVisibility(currentArenaMap, true);
+      setArenaHitBounds(currentArenaBounds);
 
       // FIX: Only the player starts in combat automatically
       battleParticipants = [player];
@@ -1754,6 +1775,7 @@ if (key === 'escape' && isDialogueOpen) {
       currentArenaMap = null;
       updateVoxelVisibility(null, false);
       updateObjectVisibility(null, false);
+      setArenaHitBounds(null);
       refreshReachableTiles();
 
       if (!isDefeated(enemy)) {
@@ -2154,7 +2176,7 @@ function resetFieldWorker() {
   // Every reset, not once. World is static today, but a mirror baking from
   // stale blocks would hand back strips of terrain that is not there, so any
   // future terrain edit only has to trigger a reset to reach it.
-  fieldWorker.postMessage({ type: 'world', keys: [...World.keys()] });
+  fieldWorker.postMessage({ type: 'world', blocks: worldMirrorEntries(World) });
   fieldGen++;
   fieldInFlight.length = 0;
   for (let l = 0; l < CASCADE_COUNT; l++) {
@@ -2305,7 +2327,11 @@ function ensureLPV() {
                           biasUniform: sunBias, fadeStartUniform: sunFadeStart,
                           edgeFadeUniform: sunEdgeFade,
                           sky: skyBindings, ambientUniform: sunAmbient,
-                          blocks: terrainTextures.blocks }));
+                          blocks: terrainTextures.blocks,
+                          glass: glassInstancedMesh ? terrainTextures : false,
+                          // The mirror light at each probe hit, so what the
+                          // mirrors throw bounces from where it lands.
+                          terrain: terrainTextures, mirrors: mirrorBindings }));
   }
   return lpvs;
 }
@@ -2333,6 +2359,8 @@ const texelCache = {
 };
 let terrainLowMat = null;      // the low-res pass's material, when the cache is on
 let terrainLookupMat = null;   // the terrain's material it belongs with
+let glassLowMat = null;        // the same pair for the glass mesh
+let glassLookupMat = null;
 
 // The full-res terrain is three draws of the same instances, in this order:
 //
@@ -2363,8 +2391,12 @@ function terrainTwin(material, renderOrder) {
 function ensureTerrainTwins() {
   if (terrainTwins.prepass) return terrainTwins;
   const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
+  // The prepass keeps every block, glass included: glass is the front surface
+  // wherever it is, so the terrain behind it fails the depth test and is never
+  // shaded.
   terrainTwins.prepass = terrainTwin(depthOnly, -3);
   terrainTwins.miss = terrainTwin(depthOnly, -1);   // real material set per build
+  if (glassInstancedMesh) terrainTwins.glassMiss = terrainTwin(depthOnly, -1);
   return terrainTwins;
 }
 const _drawSize = new THREE.Vector2();
@@ -2389,20 +2421,27 @@ function renderTexelCache() {
   const mesh = worldInstancedMesh;
   const active = texelCacheOn && shadowsOn && terrainLowMat && mesh
     && mesh.material === terrainLookupMat;
+  // Glass joins the same cache: its own low-res, lookup and miss materials,
+  // the same target and ids (a glass texel is a world texel), one prepass.
+  const glass = glassInstancedMesh;
+  const glassActive = !!active && glass && glassLowMat && glass.material === glassLookupMat;
   // The twins follow the terrain's own visibility (the grid overlay hides it).
   if (terrainTwins.prepass) {
     terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible;
   }
+  if (terrainTwins.glassMiss) terrainTwins.glassMiss.visible = !!glassActive && mesh.visible;
   if (!active) return;
   sizeTexelCache();
   const mask = camera.layers.mask;
   mesh.material = terrainLowMat;
+  if (glassActive) glass.material = glassLowMat;
   camera.layers.set(TEXEL_LAYER);
   renderer.setRenderTarget(texelCache.rt);
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
   camera.layers.mask = mask;
   mesh.material = terrainLookupMat;
+  if (glassActive) glass.material = glassLookupMat;
 }
 
 // --- Mirrors (mirrors.js): reflected sunlight ---
@@ -2422,6 +2461,18 @@ let giFarHalf = true;
 // one by one as before, for A/B.
 let giBatch = true;
 let giFrame = 0;
+// Glass debug views (gpu.js glassNode): null, 'thickness', 'through' or 'path'.
+let glassView = null;
+// Internal reflections a ray through glass may take before it counts as trapped.
+let glassBounces = GLASS_MAX_BOUNCES;
+// Panes a view ray refracts through (2: one more glass seen through the first).
+let glassLayers = GLASS_LAYERS;
+// Dispersion: off (0) by default - three traces instead of one. Debug.
+let glassDispersion = 0;
+// Glare off glass: 0 off, 1 its front surface (glass joins the mirror light's
+// rectangles), 2 its back face too (gpu.js glassBackGlare). Only while the
+// mirror light itself is on. Front-surface glare by default.
+let glassGlare = 1;
 let mirrorsOn = true;
 let mirrorOnly = false;   // the view: mirror light alone
 let mirrorRects = null;
@@ -2430,9 +2481,13 @@ const mirrorPack = new Float32Array(MAX_MIRRORS * 16);
 function updateMirrors() {
   if (!mirrorRects) {
     if (!terrainTextures.ready) return;
-    const reflective = new Set(MATERIALS.filter((m, l) => isReflective(terrainTextures.specRgba[l]))
+    // Glass only with its glare on (bxb.glassglare): otherwise its faces would
+    // take rectangles from the real mirrors' cap for a 4% reflection. Each
+    // rectangle carries its own texels' F0, so glass glares as glass does.
+    const reflective = new Set(MATERIALS.filter((m, l) => (!m.glass || glassGlare > 0) &&
+                                                   isReflective(terrainTextures.specRgba[l]))
                                         .map(m => m.id));
-    mirrorRects = buildMirrors(World, reflective);
+    mirrorRects = buildMirrors(World, reflective, isGlassMaterial);
   }
   // Culled to what each mirror can reflect THIS frame: the sun if it faces
   // it, and the lights that reach it - read back from the light list the
@@ -2466,9 +2521,24 @@ function updateMirrors() {
 let layerAlbedos = null;
 function resolveLayerAlbedos() {
   if (layerAlbedos || !terrainTextures.ready) return;
+  const spec = l => terrainTextures.specRgba[l];
   layerAlbedos = terrainTextures.rgba.map((rgba, l) =>
-    (rgba ? diffuseAlbedo(rgba, terrainTextures.specRgba[l]) : { r: 0.5, g: 0.5, b: 0.5 }));
+    (rgba ? diffuseAlbedo(rgba, spec(l)) : { r: 0.5, g: 0.5, b: 0.5 }));
+  // The specular share each material bounces (lpv.js specularAlbedo): all of
+  // it, and the part too rough for the mirror light, which carries the rest.
+  const grey = { r: 0.04, g: 0.04, b: 0.04 };
+  layerSpecAll = terrainTextures.rgba.map((rgba, l) => (rgba ? specularAlbedo(rgba, spec(l)) : grey));
+  layerSpecRough = terrainTextures.rgba.map((rgba, l) =>
+    (rgba ? specularAlbedo(rgba, spec(l), { mirrored: true }) : grey));
+  // Glass's tint through a block, for the light the LPV carries through it.
+  layerTints = MATERIALS.map((m, l) => (m.glass && terrainTextures.rgba[l]
+    ? averageAlbedo(terrainTextures.rgba[l]) : { r: 1, g: 1, b: 1 }));
 }
+let layerSpecAll = null, layerSpecRough = null, layerTints = null;
+// Mirror bounce: light the mirrors throw bounces from where it lands (the GI's
+// injection runs the mirror light at its probe hits). Only with the mirror
+// light on; without it, every surface bounces its whole specular share itself.
+let mirrorBounce = true;
 
 // The sprites the LPV sees this frame (lpv.js, "Sprites in the LPV"): every
 // card caster, as a lit box - its quad's width square and its height tall -
@@ -2512,7 +2582,11 @@ function updateGI() {
     if (terrainAlbedo) u.albedo.value.set(terrainAlbedo.r, terrainAlbedo.g, terrainAlbedo.b);
     if (layerAlbedos) {
       layerAlbedos.forEach((a, l) => u.layerAlbedo.array[l].set(a.r, a.g, a.b, 0));
+      layerSpecAll.forEach((a, l) => u.layerSpecAll.array[l].set(a.r, a.g, a.b, 0));
+      layerSpecRough.forEach((a, l) => u.layerSpecRough.array[l].set(a.r, a.g, a.b, 0));
+      layerTints.forEach((a, l) => u.layerTint.array[l].set(a.r, a.g, a.b, 0));
     }
+    u.mirrorGain.value = mirrorsOn && mirrorBounce ? 1 : 0;
     u.skyGain.value = SKY_GAIN;
     packGISprites(u);
     u.sunGain.value = sunOn ? 1 : 0;
@@ -2920,7 +2994,10 @@ function shadowNodeOptions() {
     mirrors: mirrorsOn ? mirrorBindings : null, mirrorOnly,
     viewCards: cardsReady && cardsOn ? viewCards : null,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
-    gi: giOn && ensureLPV() ? giBinding() : null, giOnly
+    gi: giOn && ensureLPV() ? giBinding() : null, giOnly,
+    glassView, glassBounces, glassLayers, glassDispersion,
+    // The world has glass: shadow rays tint through it (gpu.js createConeTraceSunTSL).
+    glass: !!glassInstancedMesh
   };
 }
 
@@ -2937,6 +3014,7 @@ function shadowSetKeyParts(opts) {
   const t = terrainTextures;
   parts.terrain = keyPart([t.albedo, t.normal, t.specular, t.blocks]);
   parts.mesh = keyPart(worldInstancedMesh);
+  parts.glass = keyPart(glassInstancedMesh);
   parts.texelCache = keyPart([texelCacheOn, texelCacheOn ? texelCache.rt : null]);
   parts.sprites = keyPart(spriteMeshes().map(m => {
     const base = m.userData.originalMaterial || m.material;
@@ -2966,12 +3044,17 @@ function obtainShadowSet() {
                 diffKeyParts(parts, newest.parts).join(', '));
   }
 
-  const { node, spriteLight, sun } = createShadowColorNode(opts);
+  const built = createShadowColorNode(opts);
+  const { node, spriteLight, sun } = built;
   // The node applies the albedo itself - specular adds after it, not under it.
   // With the texel cache, the terrain's own material looks its colour up and
   // a second, low-res material does the shading - see renderTexelCache.
   let lowMat = null, missMat = null;
   let terrainMat;
+  // Glass, when the world has any and the node could be built (it needs the
+  // reflection trace): its own materials, drawing only glass blocks.
+  const glassNode = glassInstancedMesh ? built.glassNode : null;
+  let glassMat = null, glassLow = null, glassMiss = null;
   if (texelCacheOn) {
     lowMat = new THREE.MeshBasicNodeMaterial();
     // outputNode, not colorNode: the stored colour must not carry the
@@ -2987,18 +3070,40 @@ function obtainShadowSet() {
     missMat.stencilFunc = THREE.EqualStencilFunc;
     missMat.stencilRef = 0;
     missMat.stencilZPass = THREE.KeepStencilOp;
+    if (glassNode) {
+      glassLow = new THREE.MeshBasicNodeMaterial();
+      glassLow.outputNode = createTexelCacheWriteNode(glassNode);
+      glassMat = createShadowMaterial(glassInstancedMesh, createTexelCacheLookupNode(texelCache));
+      glassMat.stencilWrite = true;
+      glassMat.stencilFunc = THREE.AlwaysStencilFunc;
+      glassMat.stencilRef = 1;
+      glassMat.stencilZPass = THREE.ReplaceStencilOp;
+      glassMiss = createShadowMaterial(glassInstancedMesh, createTexelMissNode(texelCache, glassNode));
+      glassMiss.stencilWrite = true;
+      glassMiss.stencilFunc = THREE.EqualStencilFunc;
+      glassMiss.stencilRef = 0;
+      glassMiss.stencilZPass = THREE.KeepStencilOp;
+    }
   } else {
     terrainMat = createShadowMaterial(worldInstancedMesh, node);
+    if (glassNode) glassMat = createShadowMaterial(glassInstancedMesh, glassNode);
   }
+  // Each draws only its own blocks - terrainKeepTSL in render.js.
+  for (const m of [terrainMat, lowMat, missMat]) if (m) m.positionNode = terrainKeepTSL(false);
+  for (const m of [glassMat, glassLow, glassMiss]) if (m) m.positionNode = terrainKeepTSL(true);
   const sprites = buildSpriteShadows(spriteLight);
   const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
   // Compiled against the float target it will draw into.
   if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt],
                          [terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
+  if (glassMat) pairs.push([glassInstancedMesh, glassMat]);
+  if (glassLow) pairs.push([glassInstancedMesh, glassLow, texelCache.rt],
+                           [terrainTwins.glassMiss, glassMiss]);
   const set = {
-    key, parts, sun, terrainMat, lowMat, missMat,
+    key, parts, sun, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
     made: sprites.made, variants: sprites.variants,
-    mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []), ...sprites.mats],
+    mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []),
+           ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
     compiled: false
   };
   set.ready = compileOffscreen(pairs).catch(err => {
@@ -3023,6 +3128,20 @@ function applyShadowSet(set) {
   terrainLowMat = set.lowMat;
   terrainLookupMat = set.terrainMat;
   if (terrainTwins.miss && set.missMat) terrainTwins.miss.material = set.missMat;
+  // Glass: its traced material, drawn after the terrain's lookup when cached.
+  // Without one (reflections off) it stays the plain, blended glass.
+  // Every field set either way, so a set without the cache (or without glass
+  // shading) never inherits the last one's layer or order.
+  const glass = glassInstancedMesh;
+  if (glass) {
+    if (set.glassLow) glass.layers.enable(TEXEL_LAYER);
+    else glass.layers.disable(TEXEL_LAYER);
+    glass.renderOrder = set.glassLow ? -2 : 0;
+    glass.material = set.glassMat || glass.userData.originalMaterial || glass.material;
+    if (terrainTwins.glassMiss && set.glassMiss) terrainTwins.glassMiss.material = set.glassMiss;
+  }
+  glassLowMat = set.glassLow || null;
+  glassLookupMat = set.glassLow ? set.glassMat : null;
   restoreSpriteMaterials();
   for (const m of spriteMeshes()) {
     const v = set.variants.get(m);
@@ -3052,6 +3171,8 @@ async function warmPlainMaterials() {
   const pairs = [];
   const base = worldInstancedMesh.userData.originalMaterial;
   if (base) pairs.push([worldInstancedMesh, base]);
+  const glassBase = glassInstancedMesh && glassInstancedMesh.userData.originalMaterial;
+  if (glassBase) pairs.push([glassInstancedMesh, glassBase]);
   for (const m of spriteMeshes()) {
     if (m.userData.originalMaterial) pairs.push([m, m.userData.originalMaterial]);
   }
@@ -3063,6 +3184,12 @@ function removeShadowSet() {
   const set = activeShadowSet;
   const mesh = worldInstancedMesh;
   if (mesh.userData.originalMaterial) mesh.material = mesh.userData.originalMaterial;
+  const glass = glassInstancedMesh;
+  if (glass && glass.userData.originalMaterial) {
+    glass.material = glass.userData.originalMaterial;
+    glass.renderOrder = 0;
+  }
+  glassLowMat = glassLookupMat = null;
   restoreSpriteMaterials();
   activeShadowSet = null;
   if (set && !shadowSets.has(set.key)) disposeShadowSet(set);
@@ -3562,6 +3689,62 @@ const bxbApi = installConsole(createConsole({
       return `cutout sprites ${cutoutsEnabled() ? 'opaque (binary alpha only)' : 'transparent, as before'}`;
     }
   },
+  glasslayers: {
+    help: 'panes a view ray refracts through: 1 sees straight through the second, 2 (default) bends through it too',
+    usage: 'bxb.glasslayers(2)',
+    run: (n = GLASS_LAYERS) => {
+      glassLayers = Math.max(1, Math.min(4, Math.round(n)));
+      if (shadowsOn) buildPerPixelShadows();
+      return `glass layers: ${glassLayers}`;
+    }
+  },
+  dispersion: {
+    help: 'glass dispersion (debug): red and blue refract at their own index - three traces instead of one',
+    usage: 'bxb.dispersion()  toggles  |  bxb.dispersion(0.02)  sets the spread',
+    run: (k = null) => {
+      glassDispersion = k === null ? (glassDispersion > 0 ? 0 : GLASS_DISPERSION) : Math.max(0, +k || 0);
+      if (shadowsOn) buildPerPixelShadows();
+      return glassDispersion > 0 ? `dispersion on, spread ${glassDispersion}` : 'dispersion off';
+    }
+  },
+  caustics: {
+    help: 'strength of the caustics under glass (from its normal map); 0 is off. No rebuild',
+    usage: 'bxb.caustics(1)  |  bxb.caustics(0)',
+    run: (k = null) => {
+      if (k !== null) glassCaustics.value = Math.max(0, +k || 0);
+      return `caustics ${glassCaustics.value > 0 ? 'strength ' + glassCaustics.value : 'off'}`;
+    }
+  },
+  glassglare: {
+    help: 'glare off glass: 0 off, 1 its front surface, 2 its back face too. Needs the mirror light on',
+    usage: 'bxb.glassglare(1)  |  bxb.glassglare(2)  |  bxb.glassglare(0)',
+    run: (level = null) => {
+      const next = level === null ? (glassGlare + 1) % 3 : Math.max(0, Math.min(2, Math.round(level)));
+      if ((next > 0) !== (glassGlare > 0)) mirrorRects = null;   // glass joins or leaves
+      glassGlare = next;
+      glassBackGlare.value = glassGlare >= 2 ? 1 : 0;
+      const what = ['off', 'front surface', 'front and back face'][glassGlare];
+      return `glass glare: ${what}${mirrorsOn || !glassGlare ? '' : ' - but the mirror light is off (bxb.mirrors())'}`;
+    }
+  },
+  glassview: {
+    help: "glass debug view: 'thickness' (path length inside the glass, white at two blocks), " +
+          "'through' (the transmitted light alone), 'path' (how each ray ended: red opaque inside, " +
+          "green out, blue out after an internal reflection, white trapped), or no argument for normal",
+    usage: "bxb.glassview('thickness' | 'through' | 'path')  |  bxb.glassview()",
+    run: (mode = null) => {
+      glassView = ['thickness', 'through', 'path'].includes(mode) ? mode : null;
+      if (shadowsOn) buildPerPixelShadows();
+      return `glass view: ${glassView || 'normal'}`;
+    }
+  },
+  mirrorbounce: {
+    help: 'light thrown by the mirrors bounces (GI) from where it lands - the mirror light run at each GI probe hit',
+    run: () => {
+      mirrorBounce = !mirrorBounce;
+      return `mirror bounce ${mirrorBounce ? 'on' : 'off'}${mirrorsOn ? '' : ' - but the mirror light is off'}`;
+    }
+  },
   gibatch: {
     help: "submit each GI volume's kernels as one compute pass (off: one submit per kernel)",
     run: () => {
@@ -3849,6 +4032,8 @@ const bxbApi = installConsole(createConsole({
     usage: "await bxb.wgsl()  |  await bxb.wgsl('text')",
     run: async (mode = null) => {
       const objects = [worldInstancedMesh, ...(terrainTwins.miss ? [terrainTwins.miss] : []),
+                       ...(glassInstancedMesh ? [glassInstancedMesh] : []),
+                       ...(terrainTwins.glassMiss ? [terrainTwins.glassMiss] : []),
                        ...spriteMeshes()];
       const seen = new Set();
       const rows = [];
@@ -4116,12 +4301,40 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
       get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) }
   ]},
+  { title: 'Glass', settings: [
+    { key: 'glassview', label: 'Glass view', type: 'select',
+      options: [{ value: 'normal', label: 'normal' }, { value: 'thickness', label: 'thickness' },
+                { value: 'through', label: 'transmitted only' },
+                { value: 'path', label: 'ray path (debug)' }],
+      help: 'path: red opaque inside, green out, blue out after internal reflection, white trapped',
+      get: () => glassView || 'normal',
+      set: v => bxbApi.glassview(v === 'normal' ? undefined : v) },
+    { key: 'glasslayers', label: 'Glass layers', type: 'range', min: 1, max: 4, step: 1,
+      help: 'panes a view ray refracts through; 2 bends through one more glass behind the first',
+      get: () => glassLayers, set: v => bxbApi.glasslayers(v) },
+    { key: 'caustics', label: 'Caustics', type: 'range', min: 0, max: 3, step: 0.1,
+      help: 'light focused by glass, from its normal map; flat glass casts none. 0 is off',
+      get: () => glassCaustics.value, set: v => bxbApi.caustics(v) },
+    { key: 'dispersion', label: 'Dispersion', type: 'toggle',
+      help: 'red and blue refract at their own index: three traces instead of one',
+      get: () => glassDispersion > 0, set: v => flip(glassDispersion > 0, v, () => bxbApi.dispersion()) },
+    { key: 'glassglare', label: 'Glare', type: 'range', min: 0, max: 2, step: 1,
+      help: '0 off, 1 front surface, 2 plus the back face (fainter, tinted, offset). Needs the mirror light',
+      get: () => glassGlare, set: v => bxbApi.glassglare(v) },
+    { key: 'glassbounces', label: 'Internal reflections', type: 'range', min: 0, max: 8, step: 1,
+      help: 'reflections inside glass before a ray gives up (then: ambient). Steep rays in a slab need several',
+      get: () => glassBounces,
+      set: v => { glassBounces = Math.round(v); if (shadowsOn) buildPerPixelShadows(); } }
+  ]},
   { title: 'Sky', settings: [
     { key: 'time', label: 'Time of day (h)', type: 'range', min: 0, max: 24, step: 0.25,
       help: 'palette on the clock; moves the sun along its arc',
       get: () => skyHour, set: v => bxbApi.time(v) }
   ]},
   { title: 'GI', settings: [
+    { key: 'mirrorbounce', label: 'Mirror bounce', type: 'toggle',
+      help: 'light the mirrors throw bounces from where it lands (needs the mirror light)',
+      get: () => mirrorBounce, set: v => flip(mirrorBounce, v, () => bxbApi.mirrorbounce()) },
     { key: 'gi', label: 'Bounce light (LPV)', type: 'toggle',
       get: () => giOn, set: v => flip(giOn, v, () => bxbApi.gi()) },
     { key: 'gistrength', label: 'Strength', type: 'range', min: 0, max: 4, step: 0.05,

@@ -2,13 +2,13 @@ import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec3, uniform, instanceIndex,
   storage, texture3D, textureStore, max, min, select, normalize, round, uniformArray,
-  length
+  length, pow, mix
 } from 'three/tsl';
-import { HIT_EPS, MIN_STEP, cascadeVoxelMetres } from './boxgrid.js';
+import { HIT_EPS, MIN_STEP, cascadeVoxelMetres, VOXEL_METRES } from './boxgrid.js';
 import {
   decodeFieldTSL, ringUV, createConeTraceSunTSL, createPointLightsTSL,
   createSunUniforms, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
-  sunColourUniform, skyShTSL
+  sunColourUniform, skyShTSL, glassRayTransmitTSL, createMirrorLightTSL
 } from './gpu.js';
 import { BLOCK_METRES } from './world.js';
 import { MATERIALS } from './materials.js';
@@ -60,7 +60,10 @@ function neighbour(c, dx, dy, dz) {
 // own block's albedo. Either may be null, and the old behaviour stands.
 export function createLPV({ cascades, lights, level = 0, biasUniform = null,
                             fadeStartUniform = null, edgeFadeUniform = null,
-                            sky = null, ambientUniform = null, blocks = null }) {
+                            sky = null, ambientUniform = null, blocks = null,
+                            glass = false, terrain = null, mirrors = null }) {
+  // terrain: the terrain textures, for the mirror light's texels (with mirrors,
+  // the mirror bindings) - see the injection below. Either null: no mirror bounce.
   const c0 = cascades[level];
   const cellMetres = LPV_CELL_VOXELS * cascadeVoxelMetres(level);
   const buf = (itemSize) => new THREE.StorageBufferAttribute(LPV_CELLS, itemSize);
@@ -70,6 +73,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // with it the browser's pipeline cache key, changed from run to run.
   const solid = storage(solidBuf, 'float', LPV_CELLS).setName(`bxbLpv${level}Solid`);
   const E = storage(eBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}E`);
+  // Per cell, what its light is multiplied by: glass tints it (lpv.js
+  // glassCellTransmit). Only in a world with glass.
+  const tBuf = glass ? buf(4) : null;
+  const T = glass ? storage(tBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}T`) : null;
   const A = storage(aBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}A`);
   const B = storage(bBuf, 'vec4', LPV_CELLS).setName(`bxbLpv${level}B`);
 
@@ -92,6 +99,19 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
     layerAlbedo: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
       .setName(`bxbLpv${level}Albedo`),
+    // ... the SPECULAR share it bounces (lpv.js specularAlbedo): all of it, and
+    // only its rough part - the smooth part the mirror light carries instead.
+    layerSpecAll: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
+      .setName(`bxbLpv${level}SpecAll`),
+    layerSpecRough: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
+      .setName(`bxbLpv${level}SpecRough`),
+    // ... and for glass, its tint through one block (1 for everything else).
+    layerTint: uniformArray(MATERIALS.map(() => new THREE.Vector4(1, 1, 1, 0)), 'vec4')
+      .setName(`bxbLpv${level}Tint`),
+    // 1: light thrown by the mirrors bounces from where it lands (and the
+    // smooth texels' own share is left to it). 0: no mirror light - every
+    // texel bounces its whole specular share where it is.
+    mirrorGain: uniform(float(0)),
     // Sprites (lpv.js MAX_GI_SPRITES), two vec4 each:
     //   0  centre xyz, half width        1  albedo rgb (linear), half height
     // and a fill each (opaque fraction x lpv.js SPRITE_GI_FILL) in spriteFill.
@@ -111,6 +131,16 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const fieldAt = p => {
     const vp = p.sub(c0.origin).div(c0.voxel);
     return decodeFieldTSL(texture3D(c0.tex, ringUV(vp, c0.ring)).r, c0.range);
+  };
+  const glassAt = p => {
+    const vp = p.sub(c0.origin).div(c0.voxel);
+    return decodeFieldTSL(texture3D(c0.tex, ringUV(vp, c0.ring)).g, c0.range);
+  };
+  // A block's material layer, from the block volume (0 when there is none).
+  const layerOf = bi => {
+    const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
+    const code = round(texture3D(blocks.tex, uvw).level(int(0)).r.mul(float(255)));
+    return int(max(code.sub(float(1)), float(0)));
   };
   // Centre of a cell, in world metres.
   const centreOf = c => u.origin.add(
@@ -134,10 +164,25 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     const base = u.origin.add(vec3(float(c.x), float(c.y), float(c.z))
                                 .mul(float(cellMetres))).toVar();
     const count = float(0).toVar();
+    const glassCount = float(0).toVar();
     const vox = cellMetres / LPV_CELL_VOXELS;
     for (const oz of [1, 3, 5]) for (const oy of [1, 3, 5]) for (const ox of [1, 3, 5]) {
       const p = base.add(vec3((ox + 0.5) * vox, (oy + 0.5) * vox, (oz + 0.5) * vox));
       count.addAssign(select(fieldAt(p).lessThan(float(0)), float(1), float(0)));
+      if (glass) glassCount.addAssign(select(glassAt(p).lessThan(float(0)), float(1), float(0)));
+    }
+    if (glass) {
+      // The cell's light, tinted by the glass in it: its block's tint through a
+      // block, to the power of the cell's share of a block, blended by how much
+      // of the cell is glass (lpv.js glassCellTransmit).
+      const frac = glassCount.div(float(27));
+      const centre = base.add(float(cellMetres * 0.5));
+      const tint = blocks ? u.layerTint.element(layerOf(round(centre.div(float(BLOCK_METRES))))).xyz
+                          : vec3(1, 1, 1);
+      const through = pow(max(tint, vec3(1e-3, 1e-3, 1e-3)),
+                          vec3(cellMetres / BLOCK_METRES, cellMetres / BLOCK_METRES,
+                               cellMetres / BLOCK_METRES));
+      T.element(c.i).assign(vec4(mix(vec3(1, 1, 1), through, frac), 0));
     }
     // Plus the sprites standing in it - partly, since a sprite is a flat card.
     const sprite = float(0).toVar();
@@ -157,10 +202,14 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // light list, the same functions the shading pass calls - times its albedo is
   // light this cell receives from that side. The terrain is boxes, so a probe
   // along an axis meets a face square on and the surface normal is -dir.
-  const coneTrace = createConeTraceSunTSL(cascades);
+  // glass: the terrain textures when the world has glass (false otherwise):
+  // the sun and the lights reach a probe through glass, tinted by the texel
+  // they entered through - so a floor behind a window is lit, and bounces,
+  // the window's colour.
+  const coneTrace = createConeTraceSunTSL(cascades, !!glass);
   const pointLights = createPointLightsTSL({ cascades, lights, biasUniform: bias,
                                              fadeStartUniform: fadeStart,
-                                             edgeFadeUniform: edgeFade, cards: null });
+                                             edgeFadeUniform: edgeFade, cards: null, glass });
   const maxProbe = float(cellMetres);
   const sunReach = float(12);
   // Sky visibility at a probe hit: one wide cone (45 degree half-angle) up
@@ -171,14 +220,34 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const SKY_CONE = float(1);
   // The albedo of the block a probe landed on: which block (the block volume),
   // then that material's diffuse albedo.
-  const blockAlbedo = (p, n) => {
+  const blockLayer = (p, n) =>
+    layerOf(round(p.sub(n.mul(c0.voxel.mul(float(0.5)))).div(float(BLOCK_METRES))));
+  const blockAlbedo = (p, n) => (blocks ? u.layerAlbedo.element(blockLayer(p, n)).xyz : u.albedo);
+  // What the surface bounces in all: its diffuse albedo, plus its specular
+  // share (lpv.js specularAlbedo) - the rough part only while the mirror light
+  // carries the smooth part, all of it otherwise.
+  const blockBounce = (p, n) => {
     if (!blocks) return u.albedo;
-    const bi = round(p.sub(n.mul(c0.voxel.mul(float(0.5)))).div(float(BLOCK_METRES)));
-    const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
-    const code = round(texture3D(blocks.tex, uvw).level(int(0)).r.mul(float(255)));
-    const layer = int(max(code.sub(float(1)), float(0)));
-    return u.layerAlbedo.element(layer).xyz;
+    const l = blockLayer(p, n).toVar();
+    const spec = mix(u.layerSpecAll.element(l).xyz, u.layerSpecRough.element(l).xyz, u.mirrorGain);
+    return u.layerAlbedo.element(l).xyz.add(spec);
   };
+
+  // The mirror light at a probe hit: light a mirror throws there bounces from
+  // there, times the surface's own diffuse albedo - where it lands, not at the
+  // mirror. The same function the shading pass calls (createMirrorLightTSL),
+  // lit by this volume's sun and its shadow; cards are left out, as the
+  // injection's lights leave them out.
+  const giSunShadow = (p, n) => {
+    const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
+    const traced = coneTrace(origin, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
+    return glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir).mul(traced.x) : traced.x;
+  };
+  const mirrorLight = terrain && mirrors
+    ? createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, sunShadow: giSunShadow,
+                             sunLight: () => u.sunGain, sunOn: true, bias,
+                             fadeStartUniform: fadeStart, edgeFadeUniform: edgeFade })
+    : null;
 
   const injectKernel = Fn(() => {
     const c = cellOf(instanceIndex);
@@ -210,11 +279,14 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
             const p = centre.add(dir.mul(t)).toVar();
             const n = dir.negate().toVar();
             const ndotl = max(n.dot(sun.dir), float(0)).toVar();
-            const sunLit = float(0).toVar();
+            const sunLit = vec3(0, 0, 0).toVar();
             If(ndotl.greaterThan(float(0)).and(u.sunGain.greaterThan(float(0))), () => {
               const origin = p.add(n.mul(bias.mul(c0.voxel))).toVar();
-              sunLit.assign(coneTrace(origin, sun.dir, sunReach, sun.coneRadius,
-                                      fadeStart, edgeFade).x.mul(ndotl).mul(u.sunGain));
+              const traced = coneTrace(origin, sun.dir, sunReach, sun.coneRadius,
+                                       fadeStart, edgeFade).toVar();
+              const through = glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir)
+                                    : vec3(1, 1, 1);
+              sunLit.assign(through.mul(traced.x.mul(ndotl).mul(u.sunGain)));
             });
             const lit = sunColourUniform.mul(sunLit).add(pointLights(p, n, NO_SKIP, n)).toVar();
             // Sky light the surface reflects: its sky irradiance, as the
@@ -229,7 +301,12 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
                 lit.addAssign(skyShTSL(sky, n, true).mul(ambient).mul(u.skyGain).mul(vis));
               });
             }
-            out.addAssign(lit.mul(blockAlbedo(p, n)));
+            out.addAssign(lit.mul(blockBounce(p, n)));
+            if (mirrorLight) {
+              If(u.mirrorGain.greaterThan(float(0)), () => {
+                out.addAssign(mirrorLight(p, n, n, n).mul(blockAlbedo(p, n)).mul(u.mirrorGain));
+              });
+            }
           });
         });
       });
@@ -269,7 +346,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
       const w = select(nb.inside, float(1).sub(solid.element(nb.index)), open);
       sum.addAssign(src.element(nb.index).xyz.mul(w));
     }
-    const next = E.element(c.i).xyz.add(sum.mul(u.spread.div(float(6)))).mul(open);
+    const next = E.element(c.i).xyz.add(sum.mul(u.spread.div(float(6)))).mul(open).toVar();
+    // Glass tints the light in its cells (lpv.js propagateStep's trans).
+    if (T) next.mulAssign(T.element(c.i).xyz);
     dst.element(c.i).assign(vec4(next, 0));
   })().compute(LPV_CELLS).setName(`LPV${level}.Propagate`);
   const aToB = propagate(A, B), bToA = propagate(B, A);
