@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ } from '../js/perf.js';
+import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ, WINDOW_MS, worstPerColumn } from "../js/perf.js";
 import { createConsole, installConsole } from '../js/console.js';
 
 file('perf.test.mjs - frame stats ring buffer and bxb console');
@@ -88,3 +88,48 @@ ok('60 fps with vsync jitter: every frame', repaints(60, 0.3), 60);
 ok('45 fps: every frame (the game rate)', repaints(45), 45);
 ok('20 fps: every frame', repaints(20), 20);
 truthy('0 Hz repaints every frame', nextRedraw(1000.1, 5000, 0).draw);
+
+section('fixed-length window');
+// One second of frames at a given fps, then the same window's contents.
+const windowed = fps => {
+  const w = createFrameStats(8192, WINDOW_MS);
+  for (let i = 1; i <= fps * 5; i++) w.push(1000 / fps, i * 1000 / fps);
+  return w;
+};
+ok('60 fps: 3 s holds 181 frames (both ends)', windowed(60).count, 181);
+ok('240 fps: 3 s holds 721 frames, not 180', windowed(240).count, 721);
+near('fps over the window', windowed(240).stats().fps, 240, 1e-3);
+const stall = createFrameStats(8192, WINDOW_MS);
+for (let i = 1; i <= 600; i++) stall.push(16.7, i * 16.7);
+ok('no new frames (a stall): the picture freezes, not empties', stall.count, 180);
+ok('newest is the last push', stall.newest, 600 * 16.7);
+const hitch = createFrameStats(8192, WINDOW_MS);
+hitch.push(16, 1000); hitch.push(4000, 5000); hitch.push(16, 5016);
+ok('a 4 s hitch pushes older frames out of the window', hitch.count, 2);
+ok('without a window it is a plain ring buffer', createFrameStats(3).capacity, 3);
+
+section('columns by time');
+const W = 240;
+// 3 s of 60 fps frames with one 50 ms spike in the middle.
+const cv = [], ct = [];
+for (let i = 1; i <= 180; i++) { cv.push(i === 90 ? 50 : 16.7); ct.push(i * 16.7); }
+const end = ct[ct.length - 1];
+const cols = worstPerColumn(cv, ct, end, WINDOW_MS, W);
+truthy('60 fps leaves no empty columns', [...cols].slice(1).every(i => i >= 0));
+truthy('the spike is drawn', [...cols].some(i => cv[i] === 50));
+truthy('a 50 ms spike is 4-5 columns of 12.5 ms wide', [4, 5].includes([...cols].filter(i => cv[i] === 50).length));
+ok('the newest frame lands in the last column', cols[W - 1], 179);
+const fast = [], ft = [];
+for (let i = 1; i <= 720; i++) { fast.push(i === 400 ? 30 : 4.17); ft.push(i * 4.17); }
+const fcols = worstPerColumn(fast, ft, ft[ft.length - 1], WINDOW_MS, W);
+truthy('240 fps: a spike among fast frames survives the column', [...fcols].some(i => fast[i] === 30));
+const long = worstPerColumn([4000], [5000], 5000, WINDOW_MS, W);
+truthy('a hitch longer than the window fills every column', [...long].every(i => i === 0));
+
+section('stats over the newest n');
+const gs = createFrameStats(8192);
+for (let i = 0; i < 1000; i++) gs.push(i < 900 ? 10 : 2);
+ok('n caps the count', gs.stats(100).count, 100);
+near('and the average covers only those', gs.stats(100).avg, 2);
+ok('fewer samples than n: all of them', createFrameStats(8192).stats(120).count, 0);
+ok('no n: everything held', gs.stats().count, 1000);

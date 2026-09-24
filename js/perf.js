@@ -5,36 +5,70 @@
 // canvas drawing on top of it. The graph is a 2D canvas overlay rather than
 // anything in the scene, so profiling never perturbs what it is measuring.
 
-const DEFAULT_CAPACITY = 180; // ~3 seconds at 60fps
+const DEFAULT_CAPACITY = 180;
+// The overlay's window is a fixed span of TIME, not a count of frames: at 240 fps
+// a 180-frame window was 0.75 s and scrolled four times faster than at 60. The
+// capacity only has to hold the busiest window - 3 s at over 2,700 fps.
+export const WINDOW_MS = 3000;
+const OVERLAY_CAPACITY = 8192;
 
-export function createFrameStats(capacity = DEFAULT_CAPACITY) {
+// Samples carry the time they were taken. With a window, only samples within
+// windowMs of the NEWEST one count - anchored to the data rather than the clock,
+// so a stall freezes the picture instead of emptying it. Without one (the
+// default), it is a plain ring buffer of the last `capacity` samples.
+export function createFrameStats(capacity = DEFAULT_CAPACITY, windowMs = Infinity) {
   const samples = new Float32Array(capacity);
+  const times = new Float64Array(capacity);
   let count = 0;
   let head = 0;
+  let clock = 0;   // stands in for a timestamp when none is given
+
+  // How many of the newest samples lie inside the window.
+  function inWindow() {
+    if (count === 0 || !Number.isFinite(windowMs)) return count;
+    const newest = times[(head - 1 + capacity) % capacity];
+    let n = 0;
+    while (n < count && newest - times[(head - 1 - n + capacity * 2) % capacity] <= windowMs) n++;
+    return n;
+  }
 
   return {
     capacity,
-    get count() { return count; },
+    windowMs,
+    get count() { return inWindow(); },
 
-    push(ms) {
+    push(ms, t = ++clock) {
       samples[head] = ms;
+      times[head] = t;
       head = (head + 1) % capacity;
       if (count < capacity) count++;
     },
 
     // Oldest first, so the graph can draw left-to-right without reordering.
-    toArray() {
-      const out = new Array(count);
-      const start = count < capacity ? 0 : head;
-      for (let i = 0; i < count; i++) out[i] = samples[(start + i) % capacity];
-      return out;
+    toArray() { return this.series().v; },
+
+    // Values and their times, oldest first, inside the window.
+    series() {
+      const n = inWindow();
+      const v = new Array(n), t = new Array(n);
+      const start = (head - n + capacity) % capacity;
+      for (let i = 0; i < n; i++) {
+        const j = (start + i) % capacity;
+        v[i] = samples[j]; t[i] = times[j];
+      }
+      return { v, t };
     },
+
+    // Time of the newest sample, or null when empty.
+    get newest() { return count ? times[(head - 1 + capacity) % capacity] : null; },
 
     reset() { count = 0; head = 0; },
 
-    stats() {
-      if (count === 0) return { last: 0, avg: 0, min: 0, max: 0, low1: 0, p95: 0, fps: 0, count: 0 };
-      const arr = this.toArray();
+    // last: only the newest `last` samples (bxb.gpu's "over N frames").
+    stats(last = Infinity) {
+      const all = this.toArray();
+      const arr = all.length > last ? all.slice(-last) : all;
+      if (arr.length === 0) return { last: 0, avg: 0, min: 0, max: 0, low1: 0, p95: 0, fps: 0, count: 0 };
       let sum = 0, min = Infinity, max = -Infinity;
       for (const v of arr) { sum += v; if (v < min) min = v; if (v > max) max = v; }
       const avg = sum / arr.length;
@@ -99,15 +133,38 @@ export function nextRedraw(now, due, hz) {
   if (next <= now) next = now + interval;
   return { draw: true, due: next };
 }
+// Per pixel column, the index of the worst frame whose span overlaps it, or -1
+// where none does. A frame spans (t - ms, t]: it fills every column its duration
+// touched, so a 60 fps run leaves no gaps between 12.5 ms columns and a hitch is
+// drawn as wide as it lasted. The worst, not the average, so a spike among
+// fast frames still shows.
+export function worstPerColumn(v, t, end, windowMs, columns) {
+  const out = new Int32Array(columns).fill(-1);
+  const start = end - windowMs, colMs = windowMs / columns;
+  for (let i = 0; i < v.length; i++) {
+    const c0 = Math.max(0, Math.floor((t[i] - v[i] - start) / colMs));
+    const c1 = Math.min(columns - 1, Math.floor((t[i] - start) / colMs));
+    for (let c = c0; c <= c1; c++) if (out[c] < 0 || v[i] > v[out[c]]) out[c] = i;
+  }
+  return out;
+}
+
 const BREAK_TOP = 30 + GRAPH_H + 10;
 const HEIGHT = BREAK_TOP + GRAPH_H + 44;
 
 export function createPerfOverlay(doc = document) {
-  const stats = createFrameStats();
-  const parts = Object.fromEntries(SECTIONS.map(([k]) => [k, createFrameStats()]));
-  const gpu = createFrameStats();
+  // All on one time axis. The sections are pushed with the frame, at the same
+  // time, so their series line up index for index with the frame's.
+  const series = () => createFrameStats(OVERLAY_CAPACITY, WINDOW_MS);
+  const stats = series();
+  const parts = Object.fromEntries(SECTIONS.map(([k]) => [k, series()]));
+  // The GPU series are counted, not windowed: bxb.gpu waits for N resolves, and
+  // resolves land less often than frames - on a slow device a 3 s window might
+  // never hold N. They are cut to the window only when drawn.
+  // Large enough for the whole window at any rate a resolve can land.
+  const gpu = createFrameStats(OVERLAY_CAPACITY);
   // GPU time of the compute passes (the LPV), resolved separately from render.
-  const gpuCompute = createFrameStats();
+  const gpuCompute = createFrameStats(OVERLAY_CAPACITY);
 
   const canvas = doc.createElement('canvas');
   canvas.width = WIDTH;
@@ -139,7 +196,9 @@ export function createPerfOverlay(doc = document) {
 
   function draw() {
     const s = stats.stats();
-    const arr = stats.toArray();
+    const { v: arr, t: times } = stats.series();
+    const end = stats.newest;
+    const cols = worstPerColumn(arr, times, end, WINDOW_MS, WIDTH);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     // Scaled by the 95th percentile rather than the absolute max: a single
@@ -160,14 +219,16 @@ export function createPerfOverlay(doc = document) {
     // One path and one fill per colour, not a fillRect per bar: in Firefox 2D
     // canvas is remoted to the same GPU-process thread as WebGPU, and there the
     // cost is per call. Same rectangles, same pixels.
-    const barW = WIDTH / stats.capacity;
+    // One column a pixel, WINDOW_MS across the width.
     const bars = new Map();
-    for (let i = 0; i < arr.length; i++) {
+    for (let c = 0; c < WIDTH; c++) {
+      const i = cols[c];
+      if (i < 0) continue;
       const h = Math.min(GRAPH_H, (arr[i] / scaleMax) * GRAPH_H);
       const colour = barColour(arr[i]);
       let path = bars.get(colour);
       if (!path) bars.set(colour, path = new Path2D());
-      path.rect(i * barW, top + GRAPH_H - h, Math.max(1, barW), h);
+      path.rect(c, top + GRAPH_H - h, 1, h);
     }
     for (const [colour, path] of bars) { ctx.fillStyle = colour; ctx.fill(path); }
 
@@ -176,39 +237,59 @@ export function createPerfOverlay(doc = document) {
     ctx.fillText(`${s.fps.toFixed(0)} fps   ${s.last.toFixed(1)}ms`, 6, 13);
     ctx.fillText(`1% low ${s.low1.toFixed(0)}   max ${s.max.toFixed(1)}ms`, 6, 25);
 
-    drawBreakdown(s);
+    // The resolution actually rendered: the canvas's backing size, which is CSS
+    // pixels times the renderer's pixel ratio - not the window's physical size.
+    // dpr is the display's, so a gap between the two is upscaling.
+    if (renderer && renderer.domElement) {
+      const c = renderer.domElement;
+      const dpr = (doc.defaultView && doc.defaultView.devicePixelRatio) || 1;
+      ctx.fillStyle = '#9ca3af';
+      ctx.textAlign = 'right';
+      ctx.fillText(`${c.width}×${c.height}`, WIDTH - 6, 13);
+      ctx.fillText(`dpr ${+dpr.toFixed(2)}`, WIDTH - 6, 25);
+      ctx.textAlign = 'left';
+    }
+
+    drawBreakdown(s, cols, end);
   }
 
   // Scaled to the frame's own time rather than to the 30 fps budget above:
   // at high refresh rates the whole frame is a few milliseconds, and on that
   // scale the stages would be slivers.
-  function drawBreakdown(s) {
+  // Each column stacks the sections of the frame the graph above shows there -
+  // the worst one - so the two graphs describe the same frame.
+  function drawBreakdown(s, frameCols, end) {
     const cols = SECTIONS.map(([k]) => parts[k].toArray());
-    const g = gpu.toArray();
+    const all = gpu.series();
+    const keep = end === null ? [] : all.t.map((t, i) => i).filter(i => all.t[i] >= end - WINDOW_MS);
+    const g = keep.map(i => all.v[i]), gt = keep.map(i => all.t[i]);
     const scale = Math.max(1, s.p95 || 0, ...g) * 1.1;
     const y0 = BREAK_TOP + GRAPH_H;
-    const barW = WIDTH / stats.capacity;
-    const n = cols[0].length;
     const paths = SECTIONS.map(() => new Path2D());
-    for (let i = 0; i < n; i++) {
+    for (let c = 0; c < WIDTH; c++) {
+      const i = frameCols[c];
+      if (i < 0) continue;
       let acc = 0;
       for (let k = 0; k < SECTIONS.length; k++) {
         const v = cols[k][i] || 0;
         const h = (v / scale) * GRAPH_H;
-        paths[k].rect(i * barW, y0 - acc - h, Math.max(1, barW), h);
+        paths[k].rect(c, y0 - acc - h, 1, h);
         acc += h;
       }
     }
     SECTIONS.forEach(([, colour], k) => { ctx.fillStyle = colour; ctx.fill(paths[k]); });
     // GPU time arrives a frame or two late and at its own cadence, so it is its
-    // own series, right-aligned with the newest frame.
-    if (g.length > 1) {
+    // own series, placed by when it landed on the same time axis.
+    if (g.length > 1 && end !== null) {
       ctx.strokeStyle = GPU_COLOUR;
       ctx.beginPath();
-      const off = stats.capacity - g.length;
+      const start = end - WINDOW_MS;
+      let first = true;
       g.forEach((v, i) => {
-        const x = (off + i + 0.5) * barW, y = y0 - Math.min(GRAPH_H, (v / scale) * GRAPH_H);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        const x = Math.min(WIDTH, ((gt[i] - start) / WINDOW_MS) * WIDTH);
+        if (x < 0) return;
+        const y = y0 - Math.min(GRAPH_H, (v / scale) * GRAPH_H);
+        if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
       });
       ctx.stroke();
     }
@@ -245,9 +326,9 @@ export function createPerfOverlay(doc = document) {
       // on (a console call, a chunk rebuild), so its dt is not a real frame time
       // and would sit in the buffer skewing the average for seconds.
       if (skipNext) { skipNext = false; return; }
-      stats.push(dt * 1000);
-      for (const [k] of SECTIONS) parts[k].push(sections ? sections[k] || 0 : 0);
       const now = performance.now();
+      stats.push(dt * 1000, now);
+      for (const [k] of SECTIONS) parts[k].push(sections ? sections[k] || 0 : 0, now);
       const r = nextRedraw(now, drawDue, drawHz);
       drawDue = r.due;
       if (!r.draw) return;
@@ -256,10 +337,11 @@ export function createPerfOverlay(doc = document) {
     get drawHz() { return drawHz; },
     set drawHz(hz) { drawHz = Math.max(0, Number(hz) || 0); drawDue = -Infinity; },
     // GPU time for a frame, in ms, whenever a timestamp resolve lands.
-    gpu(ms) { if (visible) gpu.push(ms); },
-    gpuCompute(ms) { if (visible) gpuCompute.push(ms); },
+    gpu(ms) { if (visible) gpu.push(ms, performance.now()); },
+    gpuCompute(ms) { if (visible) gpuCompute.push(ms, performance.now()); },
     // Averages for scripted profiling (bxb.gpu): render and compute, ms.
-    gpuStats: () => ({ render: gpu.stats(), compute: gpuCompute.stats() }),
+    // Over the newest n resolves - the buffer itself holds far more.
+    gpuStats: (n = DEFAULT_CAPACITY) => ({ render: gpu.stats(n), compute: gpuCompute.stats(n) }),
     resetGPU() { gpu.reset(); gpuCompute.reset(); },
     toggle() {
       visible = !visible;

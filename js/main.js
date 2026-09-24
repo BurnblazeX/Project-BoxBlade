@@ -12,6 +12,7 @@ import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
          crossedPlanesGeometry } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
+import { createFramePacer, describePacing } from './pacing.js';
 import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createVoxelAONode } from './gpu.js';
@@ -165,6 +166,9 @@ const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: tru
                                            device: await requestGPUDevice() });
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
+// Which refreshes render: every one, a cap, or uncapped - see pacing.js.
+// animate is hoisted; the loop itself starts at the bottom of the file.
+const pacer = createFramePacer(renderer, animate);
 
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambientLight);
@@ -3831,9 +3835,9 @@ const bxbApi = installConsole(createConsole({
         perf.resetGPU();
         await new Promise(r => setTimeout(r, 200));   // let in-flight resolves land
         perf.resetGPU();
-        while (perf.gpuStats().render.count < frames) await new Promise(r => setTimeout(r, 50));
+        while (perf.gpuStats(frames).render.count < frames) await new Promise(r => setTimeout(r, 50));
       }
-      const { render, compute } = perf.gpuStats();
+      const { render, compute } = perf.gpuStats(frames);
       const f = x => +x.toFixed(3);
       return { render: f(render.avg), renderP95: f(render.p95), compute: f(compute.avg),
                total: f(render.avg + compute.avg), frames: render.count };
@@ -3876,6 +3880,19 @@ const bxbApi = installConsole(createConsole({
     run: (hz = null) => {
       if (hz !== null) perf.drawHz = hz;
       return `frame graph repaints ${perf.drawHz > 0 ? perf.drawHz + ' times a second' : 'every frame'}`;
+    }
+  },
+  pacing: {
+    help: "frame pacing: 'vsync' (every refresh), a cap of 30/40/60, or 'uncapped' (benchmark only)",
+    usage: "bxb.pacing(30)  |  bxb.pacing('vsync')  |  bxb.pacing('uncapped', 3)",
+    run: (mode = null, depth = null) => {
+      if (mode !== null && !pacer.setMode(mode)) {
+        return `unknown pacing '${mode}' - use 'vsync', 30, 40, 60 or 'uncapped'`;
+      }
+      if (depth !== null) pacer.depth = depth;
+      return `frame pacing: ${describePacing(pacer.mode)}` +
+             (pacer.mode === 'uncapped'
+               ? `, ${pacer.depth ? pacer.depth + ' frames in flight' : 'unbounded queue'}` : '');
     }
   },
   grid: {
@@ -4015,6 +4032,18 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => (lightBindings ? lightBindings.cutoff.value : DEFAULT_LIGHT_CUTOFF),
       format: v => (v > 0 ? '1/' + Math.round(1 / v) : 'off'),
       set: v => bxbApi.lightcutoff(v) },
+    { key: 'pacing', label: 'Frame pacing', type: 'select',
+      options: [{ value: 'vsync', label: 'default (vsync)' }, { value: 30, label: 'cap 30' },
+                { value: 40, label: 'cap 40' }, { value: 60, label: 'cap 60' },
+                { value: 'uncapped', label: 'uncapped (benchmark)' }],
+      help: 'which refreshes render; vsync itself and buffering are the browser\'s. ' +
+            'Uncapped renders frames that are never shown - for measuring only',
+      get: () => pacer.mode, set: v => bxbApi.pacing(v) },
+    { key: 'inflight', label: 'Uncapped: frames in flight', type: 'range', min: 0, max: 8, step: 1,
+      format: v => (v ? String(v) : 'unbounded'),
+      help: 'frames the uncapped loop may queue on the GPU. Too few starves it (the ' +
+            'finished signal arrives late); unbounded lets a backlog build and stall',
+      get: () => pacer.depth, set: v => bxbApi.pacing(null, v) },
     { key: 'perf', label: 'Frame graph', type: 'toggle',
       get: () => perf.visible, set: v => flip(perf.visible, v, () => bxbApi.perf()) },
     { key: 'spikes', label: 'Log spikes > 8 ms', type: 'toggle',
@@ -4216,4 +4245,4 @@ function enableAlwaysOnAO() {
 }
 enableAlwaysOnAO();
 
-renderer.setAnimationLoop(animate);
+renderer.setAnimationLoop(pacer.onRefresh);
