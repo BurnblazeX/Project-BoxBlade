@@ -55,6 +55,19 @@ body.ui-hidden #dialogue-panel {
 #btn-debug:hover, #btn-effects:hover { background: rgba(40, 46, 60, 0.95); color: #9fb4ff; }
 #btn-effects:disabled { opacity: 0.6; cursor: wait; }
 
+/* Version, commit and bundle checksum (js/version.js). */
+#build-stamp {
+  position: fixed;
+  right: 6px;
+  bottom: 4px;
+  z-index: 49;
+  color: rgba(216, 220, 230, 0.7);
+  font: 11px monospace;
+  white-space: pre;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+}
+
 /* Alt+V debug settings panel (js/settings.js). */
 #settings-panel {
   position: fixed;

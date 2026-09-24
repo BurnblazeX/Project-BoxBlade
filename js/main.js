@@ -12,6 +12,7 @@ import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
          crossedPlanesGeometry } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
+import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createVoxelAONode } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
@@ -4169,6 +4170,20 @@ for (const ev of ['pointerdown', 'pointerup', 'click']) {
   debugBtn.addEventListener(ev, e => e.stopPropagation());
 }
 debugBtn.addEventListener('click', () => { settingsPanel.toggle(); debugBtn.blur(); });
+
+// Bottom right: version, commit and bundle checksum, so a tab can be matched
+// to a build at a glance - e.g. that GitHub Pages is serving the latest push.
+// Hover for the build time. The commit and time are stamped by vite.config.js.
+{
+  const stamp = document.createElement('div');
+  stamp.id = 'build-stamp';
+  stamp.textContent = buildLabel({
+    version: VERSION, commit: __BUILD_COMMIT__, dirty: __BUILD_DIRTY__,
+    bundle: bundleHash(import.meta.url)
+  });
+  stamp.title = `built ${__BUILD_TIME__}`;
+  document.body.appendChild(stamp);
+}
 
 // Beside it: the advanced effects, exactly as R. Labelled with what a click
 // will do, and followed by syncEffectsButton, since R and bxb.shadows() can
