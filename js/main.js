@@ -138,9 +138,18 @@ scene.background = new THREE.Color(0x222233);
 // core adapter anyway and logs a notice on every load. Same features as three
 // would ask for: everything the adapter has. Any failure falls back to letting
 // three do it.
+// High performance: on a dual-GPU laptop the default is the integrated GPU. A
+// friend's RTX 3050 laptop ran the game on its Iris Xe at ~55 fps. Chrome on
+// Windows may still pin its GPU process to one adapter, in which case only the
+// OS graphics setting for the browser moves it.
 async function requestGPUDevice() {
   try {
-    const adapter = navigator.gpu && await navigator.gpu.requestAdapter();
+    const adapter = navigator.gpu &&
+      await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (adapter?.info) {
+      const { vendor, architecture, description } = adapter.info;
+      console.info('[renderer] WebGPU adapter:', vendor, architecture, description || '');
+    }
     return adapter ? await adapter.requestDevice({ requiredFeatures: [...adapter.features] })
                    : undefined;
   } catch (err) {
