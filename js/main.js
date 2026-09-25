@@ -1205,6 +1205,8 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
 }
 
 window.addEventListener('pointerdown', (e) => {
+  // A move still waiting for the frame came before this: handle it first, in order.
+  flushPointerMove();
   if (e.target.tagName !== 'CANVAS') return; 
   if (e.button !== 0) return; 
 
@@ -1433,6 +1435,7 @@ document.getElementById('btn-fight').addEventListener('click', () => {
 });
 
 window.addEventListener('pointerup', (e) => {
+  flushPointerMove();
   if (e.button === 0) isPointerDown = false;
   if (e.target.tagName !== 'CANVAS') return; 
   if (!inputRules[currentMode].click) return;
@@ -1482,7 +1485,22 @@ window.addEventListener('pointerup', (e) => {
   }
 });
 
-window.addEventListener('pointermove', (e) => {
+// Pointer moves are handled once a frame, from the frame loop, with the latest
+// event. A mouse can report far faster than the frame rate (150-190 moves a
+// second in a Firefox profile, some faster still), and each move raycast the
+// terrain - and, with the button held, re-pathed to the tile under the cursor,
+// which moves as the camera follows Bob. That was a steady fps drop while
+// click-walking. Only the newest position matters: the path it sets is read
+// once a frame anyway.
+let pendingPointerMove = null;
+window.addEventListener('pointermove', (e) => { pendingPointerMove = e; });
+function flushPointerMove() {
+  const e = pendingPointerMove;
+  if (!e) return;
+  pendingPointerMove = null;
+  handlePointerMove(e);
+}
+function handlePointerMove(e) {
   if (e.target.tagName !== 'CANVAS') {
       document.body.style.cursor = 'default';
       return;
@@ -1565,7 +1583,7 @@ window.addEventListener('pointermove', (e) => {
     pathGroup.clear();
     lastHoveredKey = null;
   }
-});
+}
 
 // Whiteworld draws the terrain plain white. One uniform, read by both the plain
 // and the shadowed terrain materials (render.js), so toggling it is a write.
@@ -1827,6 +1845,9 @@ function animate(time) {
   if (currentMode === 'explore') {
     enemyAI.update(dt, currentHeading);
   }
+
+  // The newest pointer move since the last frame (see handlePointerMove).
+  flushPointerMove();
 
   // Handle Highlight Pulse Animation
   if (clickPulseTime > 0) {

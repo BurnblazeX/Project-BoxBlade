@@ -221,12 +221,71 @@ function isEnterable(x, y, z) {
   return !block.occupant;
 }
 
-export function findPath(start, end, allowDiagonals = false) {
-  const openSet = [start];
-  const cameFrom = new Map();
+// A* over standable tiles. Called on every click, every held-mouse retarget
+// and by the AI, so it has to be cheap: a long path or an unreachable target
+// (which searches everything reachable) cost 2.5-11 ms per call when the open
+// set was an array scanned in full every step and every lookup built an
+// "x,y,z" string - a dropped frame per click at 240 fps.
+//
+// Now: numeric keys, and a binary heap ordered by (f, the order the tile
+// entered the open set). That is exactly the old scan's choice - the first
+// tile in the open set with the lowest f, the open set kept in insertion
+// order - so the paths are identical, ties included (tools/world.test.mjs
+// checks it against the old search). A tile whose f improves while open
+// keeps its place: a new heap entry with its old order, and the stale entry
+// is skipped when it surfaces.
+const pathKey = (x, y, z) =>
+  ((Math.round(x) + 32768) * 65536 + (Math.round(z) + 32768)) * 1024 + (Math.round(y) + 512);
 
+export function findPath(start, end, allowDiagonals = false) {
+  const cameFrom = new Map();
   const gScore = new Map();
-  gScore.set(getVoxelKey(start.x, start.y, start.z), 0);
+  const fScore = new Map();
+  // Tiles in the open set -> the order they entered it; and each tile's node
+  // object as first opened (the old open set held that object, and the path
+  // is built from these).
+  const openOrder = new Map();
+  const nodeOf = new Map();
+  // Whether a tile can be entered does not change during a search, and each
+  // is asked up to nine times (as a neighbour and as diagonal corners) - each
+  // time three string-keyed World lookups. Asked once, then remembered.
+  const enterable = new Map();
+  const canEnter = (x, y, z) => {
+    const k = pathKey(x, y, z);
+    let v = enterable.get(k);
+    if (v === undefined) { v = isEnterable(x, y, z); enterable.set(k, v); }
+    return v;
+  };
+  const heap = [];
+  const before = (a, b) => a.f < b.f || (a.f === b.f && a.order < b.order);
+  const push = e => {
+    heap.push(e);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const up = (i - 1) >> 1;
+      if (!before(heap[i], heap[up])) break;
+      [heap[i], heap[up]] = [heap[up], heap[i]];
+      i = up;
+    }
+  };
+  const pop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && before(heap[l], heap[m])) m = l;
+        if (r < heap.length && before(heap[r], heap[m])) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m], heap[i]];
+        i = m;
+      }
+    }
+    return top;
+  };
 
   // Octile heuristic for diagonals, Manhattan for 4-way
   const getH = (a, b) => {
@@ -235,8 +294,13 @@ export function findPath(start, end, allowDiagonals = false) {
     return allowDiagonals ? (Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz)) : (dx + dz);
   };
 
-  const fScore = new Map();
-  fScore.set(getVoxelKey(start.x, start.y, start.z), getH(start, end));
+  let entered = 0;
+  const startKey = pathKey(start.x, start.y, start.z);
+  gScore.set(startKey, 0);
+  fScore.set(startKey, getH(start, end));
+  openOrder.set(startKey, entered);
+  nodeOf.set(startKey, start);
+  push({ f: fScore.get(startKey), order: entered++, key: startKey });
 
   const dirs = [
     {x: 0, z: -1, cost: 1},
@@ -254,59 +318,59 @@ export function findPath(start, end, allowDiagonals = false) {
     );
   }
 
-  while (openSet.length > 0) {
-    let current = openSet[0];
-    let lowestIndex = 0;
-    let currentKey = getVoxelKey(current.x, current.y, current.z);
-
-    for (let i = 1; i < openSet.length; i++) {
-      const nodeKey = getVoxelKey(openSet[i].x, openSet[i].y, openSet[i].z);
-      if ((fScore.get(nodeKey) ?? Infinity) < (fScore.get(currentKey) ?? Infinity)) {
-        current = openSet[i];
-        lowestIndex = i;
-        currentKey = nodeKey;
-      }
-    }
+  while (openOrder.size > 0) {
+    // The live entry: still open under the same entry, at its current f.
+    let e = pop();
+    while (openOrder.get(e.key) !== e.order || fScore.get(e.key) !== e.f) e = pop();
+    const currentKey = e.key;
+    const current = nodeOf.get(currentKey);
 
     if (current.x === end.x && current.y === end.y && current.z === end.z) {
       const path = [];
       let currNode = current;
-      let currKey = getVoxelKey(currNode.x, currNode.y, currNode.z);
+      let currKey = currentKey;
 
       while (cameFrom.has(currKey)) {
         path.unshift(currNode);
         currNode = cameFrom.get(currKey);
-        currKey = getVoxelKey(currNode.x, currNode.y, currNode.z);
+        currKey = pathKey(currNode.x, currNode.y, currNode.z);
       }
       return path;
     }
 
-    openSet.splice(lowestIndex, 1);
+    openOrder.delete(currentKey);
 
     for (const dir of dirs) {
       const neighbor = { x: current.x + dir.x, y: current.y, z: current.z + dir.z };
-      const neighborKey = getVoxelKey(neighbor.x, neighbor.y, neighbor.z);
 
-      if (currentArena && !currentArena.has(neighborKey)) continue;
-      if (!isEnterable(neighbor.x, neighbor.y, neighbor.z)) continue;
+      if (currentArena && !currentArena.has(getVoxelKey(neighbor.x, neighbor.y, neighbor.z))) continue;
+      if (!canEnter(neighbor.x, neighbor.y, neighbor.z)) continue;
 
       // Prevent clipping through solid OR occupied corners when moving diagonally.
       // Checked at the mover's own level, not a hardcoded y = 0.
       if (allowDiagonals && dir.cost > 1) {
-        if (!isEnterable(current.x + dir.x, current.y, current.z)) continue;
-        if (!isEnterable(current.x, current.y, current.z + dir.z)) continue;
+        if (!canEnter(current.x + dir.x, current.y, current.z)) continue;
+        if (!canEnter(current.x, current.y, current.z + dir.z)) continue;
       }
 
+      const neighborKey = pathKey(neighbor.x, neighbor.y, neighbor.z);
       const tentative_gScore = (gScore.get(currentKey) ?? Infinity) + dir.cost;
 
       if (tentative_gScore < (gScore.get(neighborKey) ?? Infinity)) {
         cameFrom.set(neighborKey, current);
         gScore.set(neighborKey, tentative_gScore);
-        fScore.set(neighborKey, tentative_gScore + getH(neighbor, end));
+        const f = tentative_gScore + getH(neighbor, end);
+        fScore.set(neighborKey, f);
 
-        if (!openSet.find(n => n.x === neighbor.x && n.y === neighbor.y && n.z === neighbor.z)) {
-          openSet.push(neighbor);
+        // Already open: it keeps its place in the order and its object (the
+        // old array kept its first copy). Otherwise it joins the end.
+        let order = openOrder.get(neighborKey);
+        if (order === undefined) {
+          order = entered++;
+          openOrder.set(neighborKey, order);
+          nodeOf.set(neighborKey, neighbor);
         }
+        push({ f, order, key: neighborKey });
       }
     }
   }

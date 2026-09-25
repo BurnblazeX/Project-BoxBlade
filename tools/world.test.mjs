@@ -1,6 +1,7 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
-         findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory,
+         findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory, currentArena,
+         getBlock,
          pathDistance, attackRange, getAbilityModifier,
          BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/world.js';
 
@@ -85,3 +86,103 @@ addToInventory(e, 'gold_coin', 3);
 addToInventory(e, 'rope', 1);
 ok('stacks the same item', e.inventory.find(i => i.itemId === 'gold_coin').quantity, 8);
 ok('keeps distinct items separate', e.inventory.length, 2);
+
+
+section('findPath: identical to the old array search, ties included');
+{
+  // The search as it was before the heap (2026-09-25): an open set scanned in
+  // full every step, first tile with the lowest f wins. The new one must give
+  // exactly these paths - the same tiles in the same order.
+  const isEnterable = (x, y, z) => isStandable(x, y, z) && !getBlock(x, y, z).occupant;
+  function oldFindPath(start, end, allowDiagonals = false) {
+    const openSet = [start];
+    const cameFrom = new Map();
+    const gScore = new Map();
+    gScore.set(getVoxelKey(start.x, start.y, start.z), 0);
+    const getH = (a, b) => {
+      const dx = Math.abs(a.x - b.x);
+      const dz = Math.abs(a.z - b.z);
+      return allowDiagonals ? (Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz)) : (dx + dz);
+    };
+    const fScore = new Map();
+    fScore.set(getVoxelKey(start.x, start.y, start.z), getH(start, end));
+    const dirs = [{x: 0, z: -1, cost: 1}, {x: 0, z: 1, cost: 1}, {x: -1, z: 0, cost: 1}, {x: 1, z: 0, cost: 1}];
+    if (allowDiagonals) {
+      dirs.push({x: -1, z: -1, cost: Math.SQRT2}, {x: 1, z: -1, cost: Math.SQRT2},
+                {x: -1, z: 1, cost: Math.SQRT2}, {x: 1, z: 1, cost: Math.SQRT2});
+    }
+    while (openSet.length > 0) {
+      let current = openSet[0];
+      let lowestIndex = 0;
+      let currentKey = getVoxelKey(current.x, current.y, current.z);
+      for (let i = 1; i < openSet.length; i++) {
+        const nodeKey = getVoxelKey(openSet[i].x, openSet[i].y, openSet[i].z);
+        if ((fScore.get(nodeKey) ?? Infinity) < (fScore.get(currentKey) ?? Infinity)) {
+          current = openSet[i]; lowestIndex = i; currentKey = nodeKey;
+        }
+      }
+      if (current.x === end.x && current.y === end.y && current.z === end.z) {
+        const path = [];
+        let currNode = current;
+        let currKey = getVoxelKey(currNode.x, currNode.y, currNode.z);
+        while (cameFrom.has(currKey)) {
+          path.unshift(currNode);
+          currNode = cameFrom.get(currKey);
+          currKey = getVoxelKey(currNode.x, currNode.y, currNode.z);
+        }
+        return path;
+      }
+      openSet.splice(lowestIndex, 1);
+      for (const dir of dirs) {
+        const neighbor = { x: current.x + dir.x, y: current.y, z: current.z + dir.z };
+        const neighborKey = getVoxelKey(neighbor.x, neighbor.y, neighbor.z);
+        if (currentArena && !currentArena.has(neighborKey)) continue;
+        if (!isEnterable(neighbor.x, neighbor.y, neighbor.z)) continue;
+        if (allowDiagonals && dir.cost > 1) {
+          if (!isEnterable(current.x + dir.x, current.y, current.z)) continue;
+          if (!isEnterable(current.x, current.y, current.z + dir.z)) continue;
+        }
+        const tentative = (gScore.get(currentKey) ?? Infinity) + dir.cost;
+        if (tentative < (gScore.get(neighborKey) ?? Infinity)) {
+          cameFrom.set(neighborKey, current);
+          gScore.set(neighborKey, tentative);
+          fScore.set(neighborKey, tentative + getH(neighbor, end));
+          if (!openSet.find(n => n.x === neighbor.x && n.y === neighbor.y && n.z === neighbor.z)) {
+            openSet.push(neighbor);
+          }
+        }
+      }
+    }
+    return [];
+  }
+
+  const tiles = [];
+  for (let x = 0; x < 36; x++) for (let z = 0; z < 36; z++) {
+    const y = getColumnTop(x, z);
+    if (y !== null) tiles.push({ x, y, z });
+  }
+  const same = (a, b) => a.length === b.length &&
+    a.every((n, i) => n.x === b[i].x && n.y === b[i].y && n.z === b[i].z);
+  // Deterministic sample: every 37th tile as a start, every 13th as an end -
+  // near, far, blocked, around the wall, onto the unreachable platform.
+  let pairs = 0, mismatches = 0, ties = 0;
+  const run = () => {
+    for (let i = 0; i < tiles.length; i += 37) for (let j = 0; j < tiles.length; j += 13) {
+      for (const diag of [false, true]) {
+        const a = oldFindPath(tiles[i], tiles[j], diag), b = findPath(tiles[i], tiles[j], diag);
+        pairs++;
+        if (!same(a, b)) mismatches++;
+        if (a.length > 1) ties++;
+      }
+    }
+  };
+  run();
+  ok(`${pairs} start/end pairs, 4-way and diagonal: the same paths`, mismatches, 0);
+  truthy('the sample includes real multi-step paths', ties > 50);
+  // In battle the arena bounds the search.
+  enterBattle({ x: 13, y: 0, z: 13 });
+  pairs = 0; mismatches = 0;
+  run();
+  exitBattle();
+  ok(`${pairs} pairs inside a battle arena: the same paths`, mismatches, 0);
+}
