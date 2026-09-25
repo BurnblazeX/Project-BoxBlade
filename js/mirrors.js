@@ -14,6 +14,7 @@
 // CPU and pure, so it is tested headlessly. gpu.js createMirrorLightTSL reads
 // the packed form.
 import { BLOCK_METRES, GROUND_Y } from './world.js';
+import { BLOCK_TEXELS } from './materials.js';
 
 export const MAX_MIRRORS = 32;
 
@@ -44,7 +45,13 @@ const PLANE_AXES = [[1, 2], [0, 2], [0, 1]];
 // something (a back face against the ground is no mirror). Faces are grouped
 // by plane AND thickness, so glass never merges with a coplanar marble face,
 // nor two slabs of different depth.
-export function buildMirrors(world, reflective, isGlass = () => false) {
+//
+// backFaces (default true): glass faces are grouped by the slab behind them,
+// which only the back-face glare (bxb.glassglare(2)) reads. Without it the
+// thickness means nothing, so coplanar faces merge whatever they are made of -
+// the same light, in fewer rectangles: a ray crosses a plane at one point,
+// which lies in one rectangle of a group or another, never two.
+export function buildMirrors(world, reflective, isGlass = () => false, { backFaces = true } = {}) {
   const groups = new Map();
   for (const [key, block] of world) {
     if (!reflective.has(block.materialId)) continue;
@@ -58,7 +65,7 @@ export function buildMirrors(world, reflective, isGlass = () => false) {
         // nothing is ever there to receive from it.
         if (axis === 1 && sign === -1 && c[1] <= GROUND_Y) continue;
         let thickness = 0;
-        if (glass) {
+        if (glass && backFaces) {
           // Walk back through the glass behind this face.
           const q = c.slice();
           let k = 0;
@@ -70,7 +77,8 @@ export function buildMirrors(world, reflective, isGlass = () => false) {
           thickness = world.has(q.join(',')) ? 0 : k * BLOCK_METRES;
         }
         const [ua, va] = PLANE_AXES[axis];
-        const g = `${axis},${sign},${c[axis]},${glass ? 'g' + thickness : 'o'}`;
+        const g = backFaces ? `${axis},${sign},${c[axis]},${glass ? 'g' + thickness : 'o'}`
+                            : `${axis},${sign},${c[axis]}`;
         if (!groups.has(g)) groups.set(g, { axis, sign, level: c[axis], thickness, cells: new Set() });
         groups.get(g).cells.add(`${c[ua]},${c[va]}`);
       }
@@ -153,7 +161,7 @@ export function mirrorReach(r, sun, lights) {
 
 // Nearest `capacity` to a point that reflect anything, packed four vec4 each:
 //   0  axis, sign, plane, mask          1  umin, vmin, umax, vmax
-//   2  sun box min xyz, glass thickness 3  sun box max xyz, 0
+//   2  sun box min xyz, glass thickness 3  sun box max xyz, cache base
 // A rectangle's footprint on the ground, { minX, maxX, minZ, maxZ }, metres.
 export function mirrorFootprint(r) {
   const [ua, va] = PLANE_AXES[r.axis];
@@ -165,12 +173,37 @@ export function mirrorFootprint(r) {
 }
 
 export const MIRROR_VEC4S = 4;
+
+// --- The mirror texel cache (gpu.js createMirrorLightTSL) ---
+//
+// What a mirror texel sends does not depend on who receives it - its own sun
+// shadow, its view of each light, its F0, smoothness and bumped normal - yet
+// every receiving texel recomputed them, two marches and three texture reads a
+// hit. A compute pass works them out once per mirror texel into a buffer, and
+// the receivers read their mirror texel's slot. Same function, same snapped
+// point: the same values.
+//
+// Each packed rectangle's texels are numbered row by row from its cache base
+// (its first texel's index, row 3's w); a texel's slot is index * stride:
+// two vec4 for the sun, three per light in the list.
+export const MIRROR_TEXEL = BLOCK_METRES / BLOCK_TEXELS;
+export const MIRROR_CACHE_VEC4S = 1 << 20;
+export const mirrorCacheStride = lightCount => 2 + 3 * lightCount;
+export function mirrorTexelDims(r) {
+  return [Math.round((r.max[0] - r.min[0]) / MIRROR_TEXEL),
+          Math.round((r.max[1] - r.min[1]) / MIRROR_TEXEL)];
+}
 // area: optional { minX, maxX, minZ, maxZ } - only rectangles overlapping it
 // are packed. main.js passes C1's footprint: past C1 the field is too coarse
 // for a mirror's two marches to mean much, and a mirror the player is nowhere
 // near should cost the frame nothing.
+// cache: optional { stride, capacity } - each rectangle gets its texel cache
+// base, and packing stops before the cache would overflow (nearest first, as
+// the rectangle cap). cache.texels is set to the texels packed: the compute
+// pass's count.
 export function packMirrors(rects, near, out, capacity = MAX_MIRRORS,
-                            sun = { dir: [0, 1, 0], on: false }, lights = [], area = null) {
+                            sun = { dir: [0, 1, 0], on: false }, lights = [], area = null,
+                            cache = null) {
   const centre = r => {
     const [ua, va] = PLANE_AXES[r.axis];
     const p = [0, 0, 0];
@@ -187,11 +220,18 @@ export function packMirrors(rects, near, out, capacity = MAX_MIRRORS,
   const live = rects.filter(inArea).map(r => ({ r, reach: mirrorReach(r, sun, lights) }))
     .filter(m => m.reach.mask !== 0)
     .sort((a, b) => d2(a.r) - d2(b.r)).slice(0, capacity);
-  live.forEach(({ r, reach }, i) => {
+  let texels = 0;
+  let n = 0;
+  for (const { r, reach } of live) {
+    const [nu, nv] = mirrorTexelDims(r);
+    if (cache && (texels + nu * nv) * cache.stride > cache.capacity) break;
     const bmin = reach.box ? reach.box[0] : [0, 0, 0], bmax = reach.box ? reach.box[1] : [0, 0, 0];
     out.set([r.axis, r.sign, r.plane, reach.mask, r.min[0], r.min[1], r.max[0], r.max[1],
-             bmin[0], bmin[1], bmin[2], r.thickness || 0, bmax[0], bmax[1], bmax[2], 0], i * 16);
-  });
-  return live.length;
+             bmin[0], bmin[1], bmin[2], r.thickness || 0, bmax[0], bmax[1], bmax[2], texels], n * 16);
+    texels += nu * nv;
+    n++;
+  }
+  if (cache) cache.texels = texels;
+  return n;
 }
 export const MIRROR_SUN_BIT = SUN_BIT;

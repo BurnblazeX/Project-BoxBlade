@@ -21,7 +21,7 @@ import { BLOCK_METRES } from './world.js';
 import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
 import { terrainSampleTSL, terrainWhite, terrainLayerTSL } from './render.js';
 import { METAL_F0, MATERIALS, BLOCK_TEXELS } from './materials.js';
-import { MIRROR_VEC4S, MIRROR_SUN_BIT } from './mirrors.js';
+import { MIRROR_VEC4S, MIRROR_SUN_BIT, MIRROR_CACHE_VEC4S } from './mirrors.js';
 import { VOXEL_AO_MIN } from './voxelao.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
@@ -1314,7 +1314,7 @@ export const spriteTexelLockTSL = Fn(([p, st, size]) => {
 // axes did, and a tree's four planes can share ONE mesh and one draw, each
 // plane still facing its own way (sprites.js crossedPlanesGeometry). Every
 // sprite geometry must carry a tangent (sprites.js addSpriteTangent).
-function spriteShadeNormalTSL(map, normalTex) {
+function spriteShadeNormalTSL(map, normalTex, front = frontFacing) {
   const tan = varying(attribute('tangent', 'vec4').xyz, 'vSpriteTangent')
     .setInterpolation(THREE.InterpolationSamplingType.FLAT);
   const nrm = varying(attribute('normal', 'vec3'), 'vSpriteNormal')
@@ -1322,7 +1322,7 @@ function spriteShadeNormalTSL(map, normalTex) {
   const right = normalize(modelWorldMatrix.mul(vec4(tan, 0)).xyz);
   const up = normalize(modelWorldMatrix.mul(vec4(0, 1, 0, 0)).xyz);
   const fwd = normalize(modelWorldMatrix.mul(vec4(nrm, 0)).xyz);
-  const face = select(frontFacing, fwd, fwd.negate());
+  const face = select(front, fwd, fwd.negate());
   if (!normalTex) return { n: face, ao: float(1) };
   // Live references to the map's own repeat and offset, so flipping the sprite
   // in updateSpriteFacing flips its normals in the same frame.
@@ -1333,7 +1333,11 @@ function spriteShadeNormalTSL(map, normalTex) {
            ao: t.w };
 }
 
-export function createSpriteShadowMaterial(base, spriteLight, normalTex = null) {
+// atlas: the sprite texel atlas ({ tex, size }), or null to shade every pixel.
+// With it, the light is read back from the texel's atlas slot, filled this
+// frame by the atlas pass (createSpriteAtlasMaterial) - the same value, shaded
+// once per texel instead of once per pixel.
+export function createSpriteShadowMaterial(base, spriteLight, normalTex = null, atlas = null) {
   const mat = new THREE.MeshBasicNodeMaterial({
     map: base.map, transparent: base.transparent,
     alphaTest: base.alphaTest, side: base.side,
@@ -1341,8 +1345,56 @@ export function createSpriteShadowMaterial(base, spriteLight, normalTex = null) 
     depthTest: base.depthTest, depthWrite: base.depthWrite
   });
   const base4 = materialColor.toVar();
+  if (atlas) {
+    const size = vec2(textureSize(texture(base.map), int(0)));
+    const plane = varying(attribute('spritePlane', 'float'), 'vSpritePlane')
+      .setInterpolation(THREE.InterpolationSamplingType.FLAT);
+    const t = clamp(floor(uv().mul(size)), vec2(0, 0), size.sub(float(1)));
+    const slot = spriteAtlasOriginTSL()
+      .add(vec2(plane.mul(size.x), select(frontFacing, float(0), size.y))).add(t);
+    mat.colorNode = base4.mul(vec4(textureLoad(atlas.tex, ivec2(slot)).rgb, 1));
+    return mat;
+  }
   const drawn = base4.a.greaterThanEqual(float(base.alphaTest || 0));
   mat.colorNode = base4.mul(vec4(spriteLight(base.map, drawn, normalTex), 1));
+  return mat;
+}
+
+// The sprite's atlas region, per object: the mesh and its atlas twin carry
+// the same Vector2 (main.js ensureSpriteAtlas). In the object's own uniform
+// group, which already carries its matrix, so it adds no buffer write.
+const spriteAtlasOriginTSL = () => uniform(new THREE.Vector2())
+  .onObjectUpdate(({ object }) => object.userData.spriteAtlasOrigin);
+
+// The atlas pass's material, drawn on each sprite mesh's twin
+// (sprites.js spriteAtlasGeometry): every plane and side laid flat on the
+// mesh's region, one fragment per texel, each running the sprite shading at
+// that texel's centre. The world position and frame still come from the real
+// vertices, so what it computes is what the sprite's own pixels did - only the
+// clip position is the atlas's.
+export function createSpriteAtlasMaterial(base, spriteLight, normalTex, atlas) {
+  const mat = new THREE.MeshBasicNodeMaterial({
+    map: base.map, side: THREE.DoubleSide, depthTest: false, depthWrite: false
+  });
+  // The art's size as a uniform rather than read off the texture: every
+  // sprite's atlas material then compiles to the same code, one pipeline for
+  // all of them (a texture query added a binding of its own for some sprites
+  // and not others, and a pipeline per sprite). main.js only builds the atlas
+  // once the art has loaded.
+  const img = base.map.image;
+  const size = uniform(new THREE.Vector2(img.width, img.height));
+  const side = attribute('spriteSide', 'float');
+  const px = spriteAtlasOriginTSL()
+    .add(vec2(attribute('spritePlane', 'float').mul(size.x), side.mul(size.y)))
+    .add(uv().mul(size));
+  // WebGPU clip space: y up, with row 0 of the target at the top.
+  mat.vertexNode = vec4(px.x.div(atlas.size.x).mul(2).sub(1),
+                        float(1).sub(px.y.div(atlas.size.y).mul(2)), 0, 1);
+  const front = varying(side, 'vSpriteSide')
+    .setInterpolation(THREE.InterpolationSamplingType.FLAT).lessThan(float(0.5));
+  const drawn = materialColor.a.greaterThanEqual(float(base.alphaTest || 0));
+  // outputNode, as the texel cache's: the stored light is raw, not tone mapped.
+  mat.outputNode = vec4(spriteLight(base.map, drawn, normalTex, front, size), 1);
   return mat;
 }
 
@@ -1766,11 +1818,16 @@ function isGlassCodeTSL(code) {
 // every other texel pays one plane test per rectangle. The sun only: a point
 // light's mirror image depends on which plane, so it needs its own pass.
 export function createMirrorBindings(capacity) {
+  // The mirror texel cache (mirrors.js): written by the cache pass, read by the
+  // shading. One buffer, a writable and a read-only view.
+  const cache = new THREE.StorageBufferAttribute(MIRROR_CACHE_VEC4S, 4);
   return {
     capacity,
     data: uniformArray(new Array(capacity * MIRROR_VEC4S).fill(0).map(() => new THREE.Vector4()), 'vec4')
       .setName('bxbMirrors'),
-    count: uniform(int(0))
+    count: uniform(int(0)),
+    cacheWrite: storage(cache, 'vec4', MIRROR_CACHE_VEC4S).setName('bxbMirrorCacheW'),
+    cacheRead: storage(cache, 'vec4', MIRROR_CACHE_VEC4S).toReadOnly().setName('bxbMirrorCache')
   };
 }
 export function writeMirrorBindings(b, packed, count) {
@@ -1864,7 +1921,13 @@ export function createCardHitTSL(b, colourTex) {
 // throw.
 export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, sunShadow,
                                       sunLight, sunOn, bias, fadeStartUniform = null,
-                                      edgeFadeUniform = null, cards = null, lightCards = null }) {
+                                      edgeFadeUniform = null, cards = null, lightCards = null,
+                                      cache = false, sunColoured = false }) {
+  // cache: read each mirror texel's own terms from the mirror texel cache
+  // (mirrors.js) rather than working them out per receiver; the returned
+  // function then carries .cacheKernel, the pass that fills it, which must run
+  // each frame before anything shaded with this. sunColoured: sunShadow
+  // returns a colour (a world with glass), so the cache keeps three channels.
   // Reflected light from the mirrors - see createMirrorBindings. Needs the
   // terrain arrays, for each mirror texel's own reflectivity.
   //
@@ -1920,7 +1983,10 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
     const F = d.f0.add(vec3(1, 1, 1).sub(d.f0).mul(pow(float(1).sub(lb), float(5)))).toVar();
     return { F, smooth, aligned, alb, f0: d.f0 };
   };
-  const mirrorTexel = (H, N, Lh, back, minWidth) => {
+  // In two parts: what the texel is (its Fresnel, smoothness, where it sends
+  // the light and how wide) - the same for every receiver, so the cache pass
+  // stores it - and the lobe toward one receiver, `back`.
+  const mirrorTexelTerms = (H, N, Lh, minWidth) => {
     const f = boxFaceTSL(H, N);
     const layer = blockLayerTSL(terrain, f.block);
     const s = texture(terrain.specular, f.st).depth(layer).level(int(0));
@@ -1933,10 +1999,22 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
     const lb = max(Lh.dot(Nb), float(0)).toVar();
     const Rb = Lh.negate().add(Nb.mul(lb.mul(float(2))));
     const width = max(d.alpha, max(minWidth, float(SPEC_MIN_ALPHA)));
-    const aligned = exp2(Rb.dot(back).sub(float(1)).div(width.mul(width)).mul(float(1.4427)));
     const F = d.f0.add(vec3(1, 1, 1).sub(d.f0).mul(pow(float(1).sub(lb), float(5))));
+    return { F, smooth, Rb, width };
+  };
+  const mirrorLobe = ({ F, smooth, Rb, width }, back) => {
+    const aligned = exp2(Rb.dot(back).sub(float(1)).div(width.mul(width)).mul(float(1.4427)));
     return F.mul(smooth.mul(aligned));
   };
+  const mirrorTexel = (H, N, Lh, back, minWidth) =>
+    mirrorLobe(mirrorTexelTerms(H, N, Lh, minWidth), back);
+
+  // The cache's layout (mirrors.js): per mirror texel, `stride` vec4 - the
+  // sun's lobe and its shadow at the texel, then per light its Fresnel and
+  // smoothness, its lobe direction and width, and the mirror->light leg's
+  // visibility and cards.
+  const cacheStride = () => int(2).add(lights ? lights.count.mul(int(3)) : int(0));
+  const sunVisOf = v => (sunColoured ? v.xyz : v.x);
 
   // skip: the receiving sprite's own card, so it does not block the light
   // reaching itself. Terrain passes NO_SKIP.
@@ -1963,6 +2041,15 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
       const pick = v => select(isX, v.x, select(isY, v.y, v.z));
       const pickU = v => select(isX, v.y, v.x);                   // mirrors.js PLANE_AXES
       const pickV = v => select(isX.or(isY), v.z, v.y);
+      // A snapped mirror texel's slot in the cache: its row and column on the
+      // rectangle, from the rectangle's cache base (E.w).
+      const texelSlot = H => {
+        const q = float(VOXEL_METRES);
+        const nu = round(B.z.sub(B.x).div(q));
+        const iu = floor(pickU(H).div(q)).sub(round(B.x.div(q)));
+        const iv = floor(pickV(H).div(q)).sub(round(B.y.div(q)));
+        return int(E.w.add(iv.mul(nu)).add(iu)).mul(cacheStride());
+      };
       // The receiver must be on the mirror's reflecting side.
       const side = pick(origin).sub(A.z).mul(A.y);
       If(side.greaterThan(float(0)), () => {
@@ -2025,7 +2112,9 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
               // The mirror texel: snapped, like every surface point, so one
               // mirror texel reflects one value.
               const Hl = texelLockTSL(origin.add(D.mul(t)), N).toVar();
-              const w = mirrorTexel(Hl, N, L, D.negate(), sun.coneRadius.mul(float(2))).toVar();
+              const slot = cache ? texelSlot(Hl).toVar() : null;
+              const w = (cache ? mirrors.cacheRead.element(slot).xyz
+                               : mirrorTexel(Hl, N, L, D.negate(), sun.coneRadius.mul(float(2)))).toVar();
               If(w.x.add(w.y).add(w.z).greaterThan(float(1e-3)), () => {
                 const toMirror = mirrorTrace(origin, D, t.sub(float(VOXEL_METRES * 2)),
                                              sun.coneRadius, mirrorFade, mirrorEdge).x.toVar();
@@ -2034,7 +2123,8 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
                 if (mirrorSunCards) {
                   toMirror.mulAssign(mirrorSunCards(origin, D, t, sun.coneRadius, skip));
                 }
-                const toSun = sunShadow(Hl, N, NO_SKIP);
+                const toSun = cache ? sunVisOf(mirrors.cacheRead.element(slot.add(int(1))))
+                                    : sunShadow(Hl, N, NO_SKIP);
                 const wb = backGlare(D, t, L, sun.coneRadius.mul(float(2)));
                 sum.addAssign(w.add(wb).mul(toMirror.mul(toSun).mul(facing))
                                .mul(sunLight()).mul(sunColourUniform));
@@ -2074,7 +2164,13 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
                   const legB = max(length(toLight), float(1e-4)).toVar();
                   const Lh = toLight.div(legB).toVar();
                   // The flame's angular size from the mirror is the lobe's floor.
-                  const w = mirrorTexel(Hl, N, Lh, D.negate(), LB.w.div(legB)).toVar();
+                  const at = cache ? texelSlot(Hl).add(int(2)).add(ml.mul(int(3))).toVar() : null;
+                  const c0 = cache ? mirrors.cacheRead.element(at).toVar() : null;
+                  const c1 = cache ? mirrors.cacheRead.element(at.add(int(1))).toVar() : null;
+                  const c2 = cache ? mirrors.cacheRead.element(at.add(int(2))).toVar() : null;
+                  const w = (cache
+                    ? mirrorLobe({ F: c0.xyz, smooth: c0.w, Rb: c1.xyz, width: c1.w }, D.negate())
+                    : mirrorTexel(Hl, N, Lh, D.negate(), LB.w.div(legB))).toVar();
                   If(w.x.add(w.y).add(w.z).greaterThan(float(1e-3)), () => {
                     // Both legs shadowed, as the light loop shadows - the same
                     // budget weight (LC.z) and sprite cards (LC.x, LC.y, LC.w).
@@ -2085,15 +2181,16 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
                       const v = mirrorTrace(origin, D, t.sub(float(VOXEL_METRES * 2)), slope,
                                             mirrorFade, mirrorEdge).x.toVar();
                       const lift2 = Hl.add(N.mul(bias.mul(float(VOXEL_METRES)))).toVar();
-                      v.mulAssign(mirrorTrace(lift2, Lh, legB, LB.w.div(legB),
-                                              mirrorFade, mirrorEdge).x);
+                      v.mulAssign(cache ? c2.x : mirrorTrace(lift2, Lh, legB, LB.w.div(legB),
+                                                            mirrorFade, mirrorEdge).x);
                       if (mirrorCards) {
                         // Both legs: receiver->mirror (leaving the receiver's
                         // own card out) and mirror->light.
                         const start = int(LC.x).toVar();
                         const end = start.add(int(LC.y)).toVar();
                         const cardVis = mirrorCards(origin, D, t, slope, skip, start, end)
-                          .mul(mirrorCards(lift2, Lh, legB, LB.w.div(legB), NO_SKIP, start, end));
+                          .mul(cache ? c2.y
+                                     : mirrorCards(lift2, Lh, legB, LB.w.div(legB), NO_SKIP, start, end));
                         v.mulAssign(mix(float(1), cardVis, LC.w));
                       }
                       visible.assign(mix(float(1), v, LC.z));
@@ -2113,8 +2210,102 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
     { name: 'p', type: 'vec3' }, { name: 'nS', type: 'vec3' }, { name: 'lift', type: 'vec3' },
     { name: 'skip', type: 'vec2' }]))
     : null;
-  return mirrorLightFn
-    ? (p, n, nS, lift, skip = NO_SKIP) => mirrorLightFn(p, nS, lift, skip) : null;
+  if (!mirrorLightFn) return null;
+  const light = (p, n, nS, lift, skip = NO_SKIP) => mirrorLightFn(p, nS, lift, skip);
+  if (cache) light.cacheKernel = createMirrorCacheKernel();
+  return light;
+
+  // The cache pass: one invocation per mirror texel of the packed rectangles
+  // (count set each frame to mirrors.js packMirrors' cache.texels). Each works
+  // out, at its texel's snapped centre - the very point a receiver's
+  // texelLockTSL lands on, built by the same arithmetic - everything the
+  // mirror loop above reads from the cache, with the same calls. Traces only
+  // where a receiver would trace: behind the same gates, the lobe taken at its
+  // largest (aligned <= 1), so no receiver ever reads a slot left unfilled.
+  function createMirrorCacheKernel() {
+    const out = mirrors.cacheWrite;
+    return Fn(() => {
+      const idx = float(instanceIndex).toVar();
+      // Which rectangle: bases rise in packing order, so the last one at or
+      // below this index.
+      const r = int(0).toVar();
+      Loop({ start: int(1), end: mirrors.count, type: 'int', condition: '<', name: 'mc' }, ({ mc }) => {
+        If(mirrors.data.element(mc.mul(int(MIRROR_VEC4S)).add(int(3))).w.lessThanEqual(idx), () => {
+          r.assign(mc);
+        });
+      });
+      const row = r.mul(int(MIRROR_VEC4S));
+      const A = mirrors.data.element(row).toVar();
+      const B = mirrors.data.element(row.add(int(1))).toVar();
+      const E = mirrors.data.element(row.add(int(3))).toVar();
+      const mask = A.w;
+      const bit = k => floor(mask.div(exp2(k))).mod(float(2)).greaterThan(float(0.5));
+      const axis = int(A.x);
+      const isX = axis.equal(int(0)), isY = axis.equal(int(1));
+      const N = select(isX, vec3(A.y, 0, 0), select(isY, vec3(0, A.y, 0), vec3(0, 0, A.y))).toVar();
+      // The texel's snapped centre, as texelLockTSL builds it: (k + 0.5) q
+      // along the face, round(plane / q) q across it.
+      const q = float(VOXEL_METRES);
+      const nu = round(B.z.sub(B.x).div(q)).toVar();
+      const local = idx.sub(E.w).toVar();
+      const iv = floor(local.div(nu)).toVar();
+      const iu = local.sub(iv.mul(nu));
+      const hu = round(B.x.div(q)).add(iu).add(float(0.5)).mul(q);
+      const hv = round(B.y.div(q)).add(iv).add(float(0.5)).mul(q);
+      const hp = round(A.z.div(q)).mul(q);
+      const Hl = vec3(select(isX, hp, hu),
+                      select(isX, hu, select(isY, hp, hv)),
+                      select(isX.or(isY), hv, hp)).toVar();
+      const slot = int(instanceIndex).mul(cacheStride()).toVar();
+
+      const wS = vec3(0, 0, 0).toVar();
+      const vS = vec3(0, 0, 0).toVar();
+      if (sunOn) {
+        const L = sun.dir;
+        const D = L.sub(N.mul(L.dot(N).mul(float(2)))).toVar();
+        If(bit(float(Math.log2(MIRROR_SUN_BIT))).and(L.dot(N).greaterThan(float(0))), () => {
+          wS.assign(mirrorTexel(Hl, N, L, D.negate(), sun.coneRadius.mul(float(2))));
+          If(wS.x.add(wS.y).add(wS.z).greaterThan(float(1e-3)), () => {
+            const v = sunShadow(Hl, N, NO_SKIP);
+            vS.assign(sunColoured ? v : vec3(v, v, v));
+          });
+        });
+      }
+      out.element(slot).assign(vec4(wS, 0));
+      out.element(slot.add(int(1))).assign(vec4(vS, 0));
+
+      if (lights) {
+        Loop({ start: int(0), end: lights.count, type: 'int', condition: '<', name: 'ml' }, ({ ml }) => {
+          const base = ml.mul(int(LIGHT_VEC4S));
+          const LA = lights.data.element(base).toVar();
+          const LB = lights.data.element(base.add(int(1))).toVar();
+          const LC = lights.data.element(base.add(int(2))).toVar();
+          If(bit(float(ml)), () => {
+            const toLight = LA.xyz.sub(Hl).toVar();
+            const legB = max(length(toLight), float(1e-4)).toVar();
+            const Lh = toLight.div(legB).toVar();
+            const terms = mirrorTexelTerms(Hl, N, Lh, LB.w.div(legB));
+            const F = terms.F.toVar(), smooth = terms.smooth.toVar();
+            const vis = float(1).toVar(), cardVis = float(1).toVar();
+            const Fs = F.mul(smooth);
+            If(Fs.x.add(Fs.y).add(Fs.z).greaterThan(float(1e-3)).and(LC.z.greaterThan(float(0))), () => {
+              const lift2 = Hl.add(N.mul(bias.mul(float(VOXEL_METRES)))).toVar();
+              vis.assign(mirrorTrace(lift2, Lh, legB, LB.w.div(legB), mirrorFade, mirrorEdge).x);
+              if (mirrorCards) {
+                const start = int(LC.x).toVar();
+                const end = start.add(int(LC.y)).toVar();
+                cardVis.assign(mirrorCards(lift2, Lh, legB, LB.w.div(legB), NO_SKIP, start, end));
+              }
+            });
+            const at = slot.add(int(2)).add(ml.mul(int(3)));
+            out.element(at).assign(vec4(F, smooth));
+            out.element(at.add(int(1))).assign(vec4(terms.Rb, terms.width));
+            out.element(at.add(int(2))).assign(vec4(vis, cardVis, 0, 0));
+          });
+        });
+      }
+    })().compute(1);
+  }
 }
 
 export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12,
@@ -2133,13 +2324,18 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   aoOnly = false, gi = null, giOnly = false,
-                                  glassView = null, glass = false,
+                                  glassView = null, glass = false, glassShadows = true,
                                   glassBounces = GLASS_MAX_BOUNCES,
-                                  glassLayers = GLASS_LAYERS, glassDispersion = 0 }) {
+                                  glassLayers = GLASS_LAYERS, glassDispersion = 0,
+                                  mirrorCache = true }) {
+  // mirrorCache: the mirror light reads the mirror texel cache (mirrors.js);
+  // the returned mirrorCache is the pass that fills it, run before rendering.
   // glass: the world has glass. Shadow rays then tint through it, and the sun's
   // visibility is a colour rather than a number (see createConeTraceSunTSL).
   // The markers below take the terrain textures, for the entry texel's tint.
-  const glassT = glass && terrain ? terrain : false;
+  // glassShadows false (profiling only): shadow rays pass glass as if it were
+  // air - the no-glass march, to measure what the tinting costs.
+  const glassT = glass && glassShadows && terrain ? terrain : false;
   const sunVisZero = () => (glassT ? vec3(0, 0, 0) : float(0)).toVar();
   const asColour = v => (glassT ? v : vec3(v, v, v));
   // Held as uniforms whose .value is live, so moving the sun is a uniform write
@@ -2247,7 +2443,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // nS: the shading normal (normal-mapped) for every N.L and the sky; n, the
   // geometric one, still decides which faces the sun can reach at all, as it
   // does for a surface seen directly. ao: the texture's own, on the sky.
-  const hitLight = (p, n, lift, skip, mode, nS = n, ao = null) => {
+  // lambert: a flag node that picks 'lambert' over `mode` at run time, so one
+  // call can light either a block or a sprite (shadeTraced).
+  const hitLight = (p, n, lift, skip, mode, nS = n, ao = null, lambert = null) => {
     const light = skyIrradiance(nS).toVar();
     if (ao) light.mulAssign(ao);
     if (sunOn) {
@@ -2255,7 +2453,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       If(n.dot(sun.dir).greaterThan(float(0)), () => {
         vis.assign(sunShadow(p, lift, skip));
       });
-      light.addAssign(sunColourUniform.mul(sunDirect(vis, nS, mode)));
+      const shade = lambert
+        ? select(lambert.greaterThan(float(0.5)), sunDirect(vis, nS, 'lambert'), sunDirect(vis, nS, mode))
+        : sunDirect(vis, nS, mode);
+      light.addAssign(sunColourUniform.mul(shade));
     }
     // Lifted along `lift` as the sun's ray is; N.L against the hit's normal.
     if (pointLight) light.addAssign(pointLight(p, lift, skip, nS));
@@ -2270,43 +2471,148 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // light list, thrown here by every polished rectangle that can reach.
   const mirrorLight = createMirrorLightTSL({
     cascades, terrain, mirrors, lights, sun, sunShadow, sunLight, sunOn, bias,
-    fadeStartUniform, edgeFadeUniform, cards, lightCards });
+    fadeStartUniform, edgeFadeUniform, cards, lightCards,
+    cache: mirrorCache && !!mirrors, sunColoured: !!glassT });
   const mirrorTrace = mirrorLight;
 
   // What a reflection ray sees: the nearer of the terrain it marched to and
   // any sprite card it crosses first. Terrain shows its block's texture; a
   // sprite its own pixels, lit as the sprites are (Lambert, facing back along
   // the ray, since the card was turned to be seen). Past the field, the sky.
-  // What a ray from origin along dir sees, given its trace (hit).
-  const shadeTraced = (origin, dir, hit) => {
+  //
+  // In three parts, so that everything a shader lights can go through ONE sun
+  // march and ONE light loop (lightBatch): the D3D12 shader compiler (DXC,
+  // behind both Firefox and Chrome) inlines every function at every call site,
+  // so each place that lit something was another full copy of the lighting to
+  // compile. The values are the same - the same functions, with what differed
+  // between the call sites chosen before them.
+  //
+  // traceRecord: what a ray from origin along dir met, given its trace (hit) -
+  // into the vars of `rec` (newHitRecord), so it can be filled inside a branch.
+  // direct: a flag node - the hit is a known surface at origin, normal hit.xyz
+  // (an opaque block met inside glass): no sprite in front, no arena test,
+  // as glass's own walk has already judged both.
+  const newHitRecord = () => ({
+    col: vec3(0, 0, 0).toVar(), P: vec3(0, 0, 0).toVar(), N: vec3(0, 1, 0).toVar(),
+    lift: vec3(0, 1, 0).toVar(), nS: vec3(0, 1, 0).toVar(), alb: vec3(0, 0, 0).toVar(),
+    ao: float(1).toVar(), skip: vec2(NO_SKIP).toVar(), lambert: float(0).toVar(),
+    met: float(0).toVar()
+  });
+  const traceRecord = (origin, dir, hit, direct = null, rec = newHitRecord()) => {
     // A miss sees the sky - the same SH the background draws.
-    const col = (sky ? skyShTSL(sky, dir) : vec3(0, 0, 0)).toVar();
+    rec.col.assign(sky ? skyShTSL(sky, dir) : vec3(0, 0, 0));
     const sp = spriteHit
       ? spriteHit(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, reflectMax))
       : null;
     // A hit on a block outside the battle arena is not on screen: a miss.
     const hitAt = origin.add(dir.mul(max(hit.w, float(0)))).toVar();
     const inArena = inHitBoundsTSL(hitAt.sub(hit.xyz.mul(float(VOXEL_METRES * 0.5))));
-    const terrainWins = sp ? hit.w.greaterThanEqual(float(0)).and(inArena).and(sp.t.lessThan(float(0)))
-                           : hit.w.greaterThanEqual(float(0)).and(inArena);
+    const traced = sp ? hit.w.greaterThanEqual(float(0)).and(inArena).and(sp.t.lessThan(float(0)))
+                      : hit.w.greaterThanEqual(float(0)).and(inArena);
+    const terrainWins = direct ? direct.greaterThan(float(0.5)).or(traced) : traced;
+    // A block or a sprite, never both (terrainWins needs no sprite in front).
     If(terrainWins, () => {
       const nh = hit.xyz.toVar();
-      const hp = hitAt;
-      const hpL = texelLockTSL(hp, nh).toVar();
+      const hpL = texelLockTSL(hitAt, nh).toVar();
       const hs = hitSurfaceTSL(terrain, hpL, nh, nearCascade);
-      col.assign(hs.albedo.mul(hitLight(hpL, nh, nh, NO_SKIP, shadeMode, hs.n, hs.ao)));
+      rec.P.assign(hpL); rec.N.assign(nh); rec.lift.assign(nh); rec.nS.assign(hs.n);
+      rec.ao.assign(hs.ao); rec.alb.assign(hs.albedo); rec.met.assign(float(1));
     });
     if (sp) {
-      If(sp.t.greaterThanEqual(float(0)), () => {
-        const hs = origin.add(dir.mul(sp.t)).toVar();
+      const spriteWins = direct ? sp.t.greaterThanEqual(float(0)).and(direct.lessThan(float(0.5)))
+                                : sp.t.greaterThanEqual(float(0));
+      If(spriteWins, () => {
         const back = vec3(dir.x.negate(), float(0), dir.z.negate());
         const ns = select(length(back).greaterThan(float(1e-4)), normalize(back),
                           vec3(0, 1, 0)).toVar();
         // Lifted straight up, as the sprites' own shading is - see spriteLight.
-        col.assign(sp.col.mul(hitLight(hs, ns, vec3(0, 1, 0), sp.skip, 'lambert')));
+        rec.P.assign(origin.add(dir.mul(sp.t))); rec.N.assign(ns); rec.lift.assign(vec3(0, 1, 0));
+        rec.nS.assign(ns); rec.alb.assign(sp.col); rec.skip.assign(sp.skip);
+        rec.lambert.assign(float(1)); rec.met.assign(float(1));
       });
     }
-    return col;
+    return rec;
+  };
+  // A record as a lighting request (lightBatch).
+  const hitRequest = rec => ({ active: rec.met, P: rec.P, N: rec.N, lift: rec.lift,
+                               skip: rec.skip, nS: rec.nS });
+  // The colour a record shows, from its request's answer (vis, diff): what
+  // hitLight computes, term for term and in its order.
+  const composeHit = (rec, vis, diff) => {
+    const out = rec.col.toVar();
+    If(rec.met.greaterThan(float(0.5)), () => {
+      const light = skyIrradiance(rec.nS).toVar();
+      light.mulAssign(rec.ao);
+      if (sunOn) {
+        light.addAssign(sunColourUniform.mul(select(rec.lambert.greaterThan(float(0.5)),
+          sunDirect(vis, rec.nS, 'lambert'), sunDirect(vis, rec.nS, shadeMode))));
+      }
+      if (pointLight) light.addAssign(diff);
+      if (gi) {
+        light.addAssign(lpvSampleTSL(gi, rec.P.add(rec.N.mul(float(LPV_CELL_METRES * 0.5))))
+                          .mul(gi.strength));
+      }
+      out.assign(rec.alb.mul(light));
+    });
+    return out;
+  };
+
+  // Light for several points through ONE sun march and ONE light loop, in a
+  // loop over the requests: { active (a flag node), P, N (the geometric
+  // normal: which faces the sun can reach), lift (the ray's lift), skip, nS
+  // (N.L), brdf: null or { v, alpha, f0 } for highlights }. Answers, per
+  // request, { vis: the sun's visibility (0 facing away), diff: the light
+  // list's diffuse, spec: its highlights }. An inactive request is skipped.
+  const lightBatch = reqs => {
+    const outs = reqs.map(() => ({ vis: sunVisZero(), diff: vec3(0, 0, 0).toVar(),
+                                   spec: vec3(0, 0, 0).toVar() }));
+    const anySpec = reqs.some(r => r.brdf);
+    // One request needs no loop: the body runs as it stands.
+    const over = reqs.length > 1
+      ? fn => Loop({ start: int(0), end: int(reqs.length), type: 'int', condition: '<', name: 'lr' },
+                   ({ lr }) => fn(lr))
+      : fn => fn(null);
+    over(lr => {
+      // Request lr's value of f (the last one where no other matches).
+      const pick = f => (lr ? reqs.slice(0, -1).reduceRight(
+        (acc, r, i) => select(lr.equal(int(i)), f(r), acc), f(reqs[reqs.length - 1])) : f(reqs[0]));
+      If(pick(r => float(r.active)).greaterThan(float(0.5)), () => {
+        const P = pick(r => r.P).toVar(), N = pick(r => r.N).toVar();
+        const lift = pick(r => r.lift).toVar(), skip = pick(r => r.skip).toVar();
+        const nS = pick(r => r.nS).toVar();
+        const vis = sunVisZero();
+        if (sunOn) {
+          If(N.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(P, lift, skip)); });
+        }
+        const diff = vec3(0, 0, 0).toVar(), spec = vec3(0, 0, 0).toVar();
+        if (pointLight) {
+          if (anySpec) {
+            // Requests without highlights take the first one's inputs; their
+            // spec is not read.
+            const b = r => r.brdf || reqs.find(q => q.brdf).brdf;
+            const brdf = specularTSL(nS, pick(r => b(r).v), pick(r => b(r).alpha), pick(r => b(r).f0));
+            const pl = pointLight.withSpecular(P, lift, skip, nS, brdf);
+            diff.assign(pl.diffuse); spec.assign(pl.spec);
+          } else {
+            diff.assign(pointLight.withSpecular(P, lift, skip, nS));
+          }
+        }
+        reqs.forEach((r, i) => {
+          const store = () => {
+            outs[i].vis.assign(vis); outs[i].diff.assign(diff);
+            if (r.brdf) outs[i].spec.assign(spec);
+          };
+          if (lr) If(lr.equal(int(i)), store); else store();
+        });
+      });
+    });
+    return outs;
+  };
+  // One ray's colour, lit on its own.
+  const shadeTraced = (origin, dir, hit, direct = null) => {
+    const rec = traceRecord(origin, dir, hit, direct);
+    const [o] = lightBatch([hitRequest(rec)]);
+    return composeHit(rec, o.vis, o.diff);
   };
   const reflectedTSL = (origin, dir) =>
     shadeTraced(origin, dir, reflectTrace(origin, dir, reflectMax).toVar());
@@ -2334,18 +2640,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // glassView: 'thickness' shows the path length inside the glass (white at
   // two blocks), 'through' the transmitted light alone, 'path' how each
   // texel's ray ended (see below).
-  // As layout functions, so the glass shader holds ONE copy of each however
-  // many of its paths use them: the reflection, the ray out of the glass, and
-  // an opaque surface met inside it.
-  const reflectedFn = reflectTrace ? Fn(([o, d]) => reflectedTSL(o, d))
-    .setLayout(layout('glassSeen', 'vec3', [{ name: 'o', type: 'vec3' }, { name: 'd', type: 'vec3' }]))
-    : null;
-  const opaqueHitFn = reflectTrace ? Fn(([hp, nh]) => {
-    const hpL = texelLockTSL(hp, nh).toVar();
-    const hs = hitSurfaceTSL(terrain, hpL, nh, nearCascade);
-    return hs.albedo.mul(hitLight(hpL, nh, nh, NO_SKIP, shadeMode, hs.n, hs.ao));
-  }).setLayout(layout('glassOpaqueHit', 'vec3', [{ name: 'hp', type: 'vec3' }, { name: 'nh', type: 'vec3' }]))
-    : null;
+  // Everything a glass texel lights goes through one lightBatch in glassNode.
   const skyAlong = d => (sky ? skyShTSL(sky, d) : vec3(0, 0, 0));
   // The ambient at q, facing dirq: sky irradiance plus the bounce. What glass
   // too rough to see through shows, and where a ray's budget ran out.
@@ -2355,25 +2650,18 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     return a;
   };
 
-  // A ray leaving glass: what it sees, or - when it meets more glass first -
-  // where. vec4(colour, -1), or vec4(0, 0, 0, t) with t the distance to that
-  // glass. Only built for a world with glass and more than one layer.
+  // A ray leaving glass: the trace that also stops at glass. Its hit, as
+  // reflectTrace answers; w <= -2 means more glass, -2 - w away. What it saw is
+  // shaded after the walk, with the walk's other endings (glassThroughRec).
+  // Only built for a world with glass and more than one layer.
   const glassSeekTrace = reflectTrace && glass && glassLayers > 1
     ? createReflectTraceTSL(cascades, true) : null;
-  const seenOrGlassFn = glassSeekTrace ? Fn(([o, dd]) => {
-    const hit = glassSeekTrace(o, dd, reflectMax).toVar();
-    const res = vec4(0, 0, 0, -1).toVar();
-    If(hit.w.lessThanEqual(float(-2)), () => { res.assign(vec4(0, 0, 0, float(-2).sub(hit.w))); })
-      .Else(() => { res.assign(vec4(shadeTraced(o, dd, hit), -1)); });
-    return res;
-  }).setLayout(layout('glassSeenOrGlass', 'vec4', [{ name: 'o', type: 'vec3' }, { name: 'dd', type: 'vec3' }]))
-    : null;
+  const seenOrGlassFn = glassSeekTrace;
 
   // --- What shows through glass, at one index of refraction ---
   //
-  // A shader function of its own, so dispersion can call it three times - once
-  // per colour, at slightly different indices - with the shader still holding
-  // one copy. In the debug views it answers the view's colour instead.
+  // Dispersion calls it three times - once per colour, at slightly different
+  // indices. In the debug views it answers the view's colour instead.
   // smoothW, not smooth: `smooth` is a reserved word in WGSL (and the
   // compile fails on it) - tools/wgslnames.test.mjs checks every name.
   //
@@ -2381,7 +2669,13 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // and, while glassLayers allows, if what it meets next is more glass, it
   // refracts into that pane and walks on: glass seen through glass. Each pane
   // absorbs by its own length and the tint of the texel the ray entered it by.
-  const glassThroughFn = reflectTrace ? Fn(([p, n, nS, v, ior, f0, alpha, tint0, smoothW]) => {
+  // Returns what the walk ended on rather than its colour - { rec, need,
+  // pre, sO, sD, exitW, smoothW, absorb } - so glassNode lights it in one
+  // batch with the surface's own reflection and highlights, and
+  // glassThroughColour finishes it. In the debug views, { debug: colour }.
+  // Inline, not a shader function: its answer is many values. Dispersion
+  // calls it three times, so that (debug) build holds three walks.
+  const glassThroughRec = reflectTrace ? (p, n, nS, v, ior, f0, alpha, tint0, smoothW) => {
     const lift = bias.mul(float(VOXEL_METRES));
     const f0v = vec3(f0, f0, f0);
     // In: bent toward the normal. Entering a denser medium cannot reflect
@@ -2399,7 +2693,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const outO = vec3(0, 0, 0).toVar(), outD = dIn.toVar();
     const exitW = float(1).toVar();
     const bounces = int(0).toVar();          // internal reflections taken
-    const seenC = vec3(0, 0, 0).toVar();
+    const seenHit = vec4(0, 0, 0, -1).toVar();   // kind 5: the seek's hit
     const layers = int(0).toVar();           // panes entered
 
     // --- The walk through the glass, block by block ---
@@ -2489,11 +2783,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       } else {
         // Out of this pane. With layers left, look for more glass on the way.
         If(gl.lessThan(int(glassLayers - 1)), () => {
-          const r = seenOrGlassFn(outO, outD).toVar();
-          If(r.w.greaterThanEqual(float(0)), () => {
+          const hit = seenOrGlassFn(outO, outD, reflectMax).toVar();
+          If(hit.w.lessThanEqual(float(-2)), () => {
             // Into the next pane: its face from the block grid, its tint from
             // the texel the ray enters by, less the Fresnel it reflects away.
-            const entry = outO.add(outD.mul(r.w)).toVar();
+            const entry = outO.add(outD.mul(float(-2).sub(hit.w))).toVar();
             const nf = blockFaceTSL(entry, outD, false).toVar();
             const pL = texelLockTSL(entry, nf).toVar();
             const f = boxFaceTSL(pL, nf);
@@ -2506,7 +2800,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
             cell.assign(floor(pL.sub(nf.mul(float(VOXEL_METRES * 0.5))).div(float(BLOCK_METRES))
                               .add(float(0.5))));
           }).Else(() => {
-            seenC.assign(r.xyz);
+            seenHit.assign(hit);
             kind.assign(int(5));
             Break();
           });
@@ -2529,42 +2823,54 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // grey too rough to trace.
     if (glassView === 'path') {
       const out2 = kind.equal(int(2)).or(kind.equal(int(5)));
-      return select(kind.equal(int(1)), vec3(1, 0.2, 0.2),
+      return { debug: select(kind.equal(int(1)), vec3(1, 0.2, 0.2),
              select(out2,
                     select(layers.greaterThan(int(1)), vec3(0.2, 1, 1),
                            select(bounces.greaterThan(int(0)), vec3(0.2, 0.4, 1), vec3(0.2, 1, 0.2))),
-                    select(kind.equal(int(4)), vec3(0.5, 0.5, 0.5), vec3(1, 1, 1))));
+                    select(kind.equal(int(4)), vec3(0.5, 0.5, 0.5), vec3(1, 1, 1)))) };
     }
     if (glassView === 'thickness') {
       const k = lenAll.div(float(BLOCK_METRES * 2));
-      return vec3(k, k, k);
+      return { debug: vec3(k, k, k) };
     }
-    const seen = vec3(0, 0, 0).toVar();
-    If(kind.equal(int(1)), () => {
-      seen.assign(mix(ambientAt(hitP, hitN), opaqueHitFn(hitP, hitN), smoothW).mul(exitW));
+    // Whatever the walk ended on - an opaque block inside the glass (1), the
+    // world beyond a face (2, traced now), or what the seek already met (5) -
+    // is recorded here and lit with the rest of the texel's lighting in one
+    // batch (glassNode). The other endings need no lighting: `pre`.
+    const pre = vec3(0, 0, 0).toVar();
+    const isOpaque = kind.equal(int(1));
+    const need = isOpaque.or(kind.equal(int(2))).or(kind.equal(int(5)));
+    const rec = newHitRecord();
+    const sO = select(isOpaque, hitP, outO).toVar();
+    const sD = select(isOpaque, hitN, outD).toVar();
+    If(need, () => {
+      const sHit = seenHit.toVar();
+      If(isOpaque, () => { sHit.assign(vec4(hitN, 0)); })
+        .ElseIf(kind.equal(int(2)), () => { sHit.assign(reflectTrace(outO, outD, reflectMax)); });
+      traceRecord(sO, sD, sHit, select(isOpaque, float(1), float(0)), rec);
     })
-      .ElseIf(kind.equal(int(2)), () => {
-        // Rougher glass shows less of what is beyond and more of the ambient.
-        seen.assign(mix(ambientAt(outO, outD), reflectedFn(outO, outD), smoothW).mul(exitW));
-      })
-      .ElseIf(kind.equal(int(5)), () => {
-        seen.assign(mix(ambientAt(outO, outD), seenC, smoothW).mul(exitW));
-      })
-      .ElseIf(kind.equal(int(4)), () => { seen.assign(ambientAt(outO, outD)); })
+      .ElseIf(kind.equal(int(4)), () => { pre.assign(ambientAt(outO, outD)); })
       .Else(() => {
         // Trapped: the budget of internal reflections is spent. Not the sky's
         // radiance - that is a bright light the ray never reached - but the
         // ambient around it: sky irradiance along the last direction, plus the
         // bounce where it stopped.
-        seen.assign(skyIrradiance(outD));
-        if (gi) seen.addAssign(lpvSampleTSL(gi, outO).mul(gi.strength));
+        pre.assign(skyIrradiance(outD));
+        if (gi) pre.addAssign(lpvSampleTSL(gi, outO).mul(gi.strength));
       });
-    return seen.mul(absorb);
-  }).setLayout(layout('glassThrough', 'vec3', [
-    { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' }, { name: 'nS', type: 'vec3' },
-    { name: 'v', type: 'vec3' }, { name: 'ior', type: 'float' }, { name: 'f0', type: 'float' },
-    { name: 'alpha', type: 'float' }, { name: 'tint0', type: 'vec3' }, { name: 'smoothW', type: 'float' }]))
-    : null;
+    return { rec, need, pre, sO, sD, exitW, smoothW, absorb };
+  } : null;
+  // The colour through the glass, once its record is lit (lightBatch's answer).
+  // Rougher glass shows less of what is beyond and more of the ambient.
+  const glassThroughColour = (t, lit) => {
+    if (t.debug) return t.debug;
+    const seen = t.pre.toVar();
+    If(t.need, () => {
+      seen.assign(mix(ambientAt(t.sO, t.sD), composeHit(t.rec, lit.vis, lit.diff), t.smoothW)
+                    .mul(t.exitW));
+    });
+    return seen.mul(t.absorb);
+  };
 
   const glassNode = reflectTrace ? Fn(() => {
     const n = axisNormalTSL(normalWorld).toVar();
@@ -2591,9 +2897,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // Reflected: off the bumped normal, kept on the outside of the face.
     const r0 = reflect(v.negate(), nS).toVar();
     const rdir = select(r0.dot(n).greaterThan(float(0.02)), r0, reflect(v.negate(), n)).toVar();
-    const reflected = ambientAt(p.add(n.mul(lift)), nS).toVar();
+    const reflOrigin = p.add(n.mul(lift)).toVar();
+    const reflRec = newHitRecord();
     If(smooth.greaterThan(float(0)), () => {
-      reflected.assign(mix(reflected, reflectedFn(p.add(n.mul(lift)), rdir), smooth));
+      traceRecord(reflOrigin, rdir, reflectTrace(reflOrigin, rdir, reflectMax).toVar(), null, reflRec);
     });
 
     // --- Transmitted ---
@@ -2603,26 +2910,39 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // LabPBR glass texel's F0 of 0.04 is n = 1.5.
     const sf = sqrt(clamp(d.f0.x, float(0), float(0.5)));
     const ior = float(1).add(sf).div(float(1).sub(sf)).toVar();
-    const through = (x => glassThroughFn(p, n, nS, v, x, d.f0.x, d.alpha, tint, smooth));
     // Dispersion (off unless glassDispersion): red and blue take their own
     // index - three traces instead of one - so edges split into colour.
+    const iors = glassDispersion > 0
+      ? [ior.mul(float(1 - glassDispersion)), ior, ior.mul(float(1 + glassDispersion))] : [ior];
+    const throughs = iors.map(x => glassThroughRec(p, n, nS, v, x, d.f0.x, d.alpha, tint, smooth));
+    const traced = throughs.filter(t => !t.debug);
+    // Everything this texel lights - its own highlights, what its reflection
+    // meets, what shows through it - in ONE batch: one sun march, one light
+    // loop (lightBatch).
+    const lit = lightBatch([
+      { active: float(1), P: p, N: n, lift: n, skip: NO_SKIP, nS,
+        brdf: { v, alpha: d.alpha, f0: d.f0 } },
+      hitRequest(reflRec),
+      ...traced.map(t => hitRequest(t.rec))]);
+    const colours = throughs.map(t => glassThroughColour(t, t.debug ? null : lit[2 + traced.indexOf(t)]));
     const seenThrough = (glassDispersion > 0
-      ? vec3(through(ior.mul(float(1 - glassDispersion))).x,
-             through(ior).y,
-             through(ior.mul(float(1 + glassDispersion))).z)
-      : through(ior)).toVar();
+      ? vec3(colours[0].x, colours[1].y, colours[2].z) : colours[0]).toVar();
     if (glassView) return seenThrough;
+    const reflected = ambientAt(reflOrigin, nS).toVar();
+    If(smooth.greaterThan(float(0)), () => {
+      reflected.assign(mix(reflected, composeHit(reflRec, lit[1].vis, lit[1].diff), smooth));
+    });
     // Highlights: the sun, and every light, from the same visibility the
     // surfaces use.
     const brdf = specularTSL(nS, v, d.alpha, d.f0);
     const direct = vec3(0, 0, 0).toVar();
     if (sunOn) {
       If(n.dot(sun.dir).greaterThan(float(0)), () => {
-        direct.addAssign(brdf(sun.dir).mul(sunShadow(p, n, NO_SKIP))
+        direct.addAssign(brdf(sun.dir).mul(lit[0].vis)
                            .mul(sunLight()).mul(sunColourUniform));
       });
     }
-    if (pointLight) direct.addAssign(pointLight.withSpecular(p, n, NO_SKIP, nS, brdf).spec);
+    if (pointLight) direct.addAssign(lit[0].spec);
     return F.mul(reflected)
       .add(vec3(1, 1, 1).sub(F).mul(seenThrough))
       .add(min(direct, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX)));
@@ -2773,13 +3093,17 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   //
   // `drawn` gates the marches: a fragment alphaTest is about to discard still
   // ran both of them, and the trees' crossed planes are mostly transparent.
-  const spriteLight = (map, drawn, normalTex = null) => Fn(() => {
+  // front: which side is being shaded - the rasterised side (frontFacing) by
+  // default; the sprite atlas pass says which explicitly. size: the art's size
+  // in texels, when the caller has it as a uniform (the atlas pass) - else read
+  // off the texture.
+  const spriteLight = (map, drawn, normalTex = null, front = frontFacing, size = null) => Fn(() => {
     const n = vec3(0, 1, 0);
     // Before the branch - the snap takes screen derivatives.
     const p = spriteTexelLockTSL(positionWorld, uv(),
-                                 vec2(textureSize(texture(map), int(0)))).toVar();
+                                 size || vec2(textureSize(texture(map), int(0)))).toVar();
     const skip = modelWorldMatrix.mul(vec4(0, 0, 0, 1)).xz.toVar();
-    const shade = spriteShadeNormalTSL(map, normalTex);
+    const shade = spriteShadeNormalTSL(map, normalTex, front);
     const nS = shade.n.toVar();
     const texAO = shade.ao.toVar();
     const out = vec3(0, 0, 0).toVar();
@@ -2817,6 +3141,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // surface, not the glass's own appearance. glassView is glass's own views.
   const terrainView = aoOnly || giOnly || shadowOnly || mirrorOnly || specularOnly;
   return { node, glassNode: terrainView ? node : glassNode, spriteLight, sun, cascades, lights,
+           mirrorCache: (mirrorLight && mirrorLight.cacheKernel) || null,
            maxDistUniform: maxDist, ambientUniform: ambient };
 }
 

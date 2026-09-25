@@ -22,11 +22,15 @@ export const CHARACTER_RENDER_ORDER = 10;
 // Sprite shading takes each quad's frame from its vertices: normal for the way
 // it faces, tangent for its art's +x (gpu.js spriteShadeNormalTSL). A plain
 // PlaneGeometry has the normal but no tangent, so add one: +x, the art's right.
+// Also which plane of the mesh each vertex is on (spritePlane, 0 for a single
+// quad) - the sprite texel atlas keeps each plane's texels apart.
 export function addSpriteTangent(geo) {
   const n = geo.attributes.position.count;
   const t = new Float32Array(n * 4);
   for (let i = 0; i < n; i++) { t[i * 4] = 1; t[i * 4 + 3] = 1; }
   geo.setAttribute('tangent', new THREE.BufferAttribute(t, 4));
+  geo.setAttribute('spritePlane', new THREE.BufferAttribute(new Float32Array(n), 1));
+  geo.userData.spritePlanes = 1;
   return geo;
 }
 
@@ -37,13 +41,14 @@ export function addSpriteTangent(geo) {
 // the mesh's origin is where each plane's was, so the card skip (the model
 // matrix's position) is unchanged.
 export function crossedPlanesGeometry(width, height, angles) {
-  const parts = angles.map(a => {
+  const parts = angles.map((a, k) => {
     const g = addSpriteTangent(new THREE.PlaneGeometry(width, height));
     g.translate(0, height / 2, 0);
     g.rotateY(a);
+    g.attributes.spritePlane.array.fill(k);
     return g;
   });
-  const names = ['position', 'normal', 'uv', 'tangent'];
+  const names = ['position', 'normal', 'uv', 'tangent', 'spritePlane'];
   const merged = new THREE.BufferGeometry();
   for (const name of names) {
     const size = parts[0].attributes[name].itemSize;
@@ -62,8 +67,70 @@ export function crossedPlanesGeometry(width, height, angles) {
   merged.setIndex(index);
   merged.computeBoundingBox();
   merged.computeBoundingSphere();
+  merged.userData.spritePlanes = angles.length;
   for (const g of parts) g.dispose();
   return merged;
+}
+
+// --- Sprite texel atlas ---
+//
+// A sprite's shading is locked to its art's texels (gpu.js spriteTexelLockTSL),
+// and at play zoom a texel covers some 80 pixels - each of which ran the full
+// shading, torch and mirror light and all, to the same answer. So each texel
+// is shaded ONCE, into a float atlas, and the sprite's own draw reads it back.
+//
+// Each sprite mesh gets a region: its art's width x height, once per plane
+// across and once per side down (front row block, then back - a back face
+// faces the other way, so it is lit differently). The atlas pass draws each
+// mesh's twin: this geometry, every vertex twice - once per side, spriteSide 0
+// then 1 - and the vertex shader lays each plane and side out flat on its
+// region, one fragment per texel.
+const atlasGeometries = new WeakMap();
+export function spriteAtlasGeometry(geo) {
+  let out = atlasGeometries.get(geo);
+  if (out) return out;
+  out = new THREE.BufferGeometry();
+  const n = geo.attributes.position.count;
+  for (const name of ['position', 'normal', 'uv', 'tangent', 'spritePlane']) {
+    const a = geo.attributes[name];
+    const arr = new Float32Array(a.array.length * 2);
+    arr.set(a.array, 0);
+    arr.set(a.array, a.array.length);
+    out.setAttribute(name, new THREE.BufferAttribute(arr, a.itemSize));
+  }
+  const side = new Float32Array(n * 2);
+  side.fill(1, n);
+  out.setAttribute('spriteSide', new THREE.BufferAttribute(side, 1));
+  const idx = geo.index.array;
+  const index = new Array(idx.length * 2);
+  for (let i = 0; i < idx.length; i++) { index[i] = idx[i]; index[i + idx.length] = idx[i] + n; }
+  out.setIndex(index);
+  // Culled with the sprite it shades: the same bounds.
+  if (!geo.boundingSphere) geo.computeBoundingSphere();
+  out.boundingSphere = geo.boundingSphere.clone();
+  atlasGeometries.set(geo, out);
+  return out;
+}
+
+// The region a sprite needs: art width per plane across, art height per side down.
+export const spriteAtlasRegion = (texW, texH, planes) => [texW * planes, texH * 2];
+
+// Shelf packing: sizes [[w, h], ...] into rows of the given width, tallest
+// first so the shelves stay full. Returns each one's [x, y] (in input order)
+// and the height used. Whole pixels, so a region's texels land on pixel centres.
+export function packSpriteAtlas(sizes, width) {
+  const order = sizes.map((s, i) => i).sort((a, b) => sizes[b][1] - sizes[a][1]);
+  const at = new Array(sizes.length);
+  let x = 0, y = 0, shelf = 0;
+  for (const i of order) {
+    const [w, h] = sizes[i];
+    if (w > width) throw new Error(`sprite region ${w} wider than the atlas (${width})`);
+    if (x + w > width) { y += shelf; x = 0; shelf = 0; }
+    at[i] = [x, y];
+    x += w;
+    shelf = Math.max(shelf, h);
+  }
+  return { at, height: y + shelf };
 }
 
 // Four corners plus the top-edge midpoint. The top edge is what leans, so it is

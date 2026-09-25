@@ -134,3 +134,50 @@ section('sprite geometry - merged crossed planes');
   ok('bottom edge on the origin', g.boundingBox.min.y, 0);
   near('top at the plane height', g.boundingBox.max.y, H, 1e-6);
 }
+
+section('sprite texel atlas - planes, sides and packing');
+{
+  const { addSpriteTangent, crossedPlanesGeometry, spriteAtlasGeometry, spriteAtlasRegion,
+          packSpriteAtlas } = await import('../js/sprites.js');
+  const plane = addSpriteTangent(new THREE.PlaneGeometry(1, 2));
+  ok('a plain quad is one plane', plane.userData.spritePlanes, 1);
+  truthy('its vertices are all on plane 0', [...plane.attributes.spritePlane.array].every(v => v === 0));
+
+  const angles = [0, Math.PI / 2, Math.PI / 4, 3 * Math.PI / 4];
+  const g = crossedPlanesGeometry(1, 2, angles);
+  ok('the crossed planes are four planes', g.userData.spritePlanes, 4);
+  truthy('each quad carries its own plane index', angles.every((a, k) =>
+    [0, 1, 2, 3].every(i => g.attributes.spritePlane.getX(k * 4 + i) === k)));
+
+  // The atlas twin: every vertex twice, front then back, the rest unchanged.
+  const t = spriteAtlasGeometry(g);
+  ok('twice the vertices', t.attributes.position.count, 32);
+  ok('twice the triangles', t.index.count, 48);
+  truthy('first copy is side 0, second side 1', [...t.attributes.spriteSide.array]
+    .every((s, i) => s === (i < 16 ? 0 : 1)));
+  truthy('both copies keep position, uv and plane', ['position', 'uv', 'spritePlane'].every(n =>
+    [...Array(16).keys()].every(i => t.attributes[n].getX(i) === g.attributes[n].getX(i) &&
+                                     t.attributes[n].getX(i + 16) === g.attributes[n].getX(i))));
+  truthy('the back copy indexes its own vertices', [...Array(24).keys()].every(i =>
+    t.index.getX(i + 24) === g.index.getX(i) + 16));
+  ok('one twin geometry per source geometry', spriteAtlasGeometry(g), t);
+  ok('its bounds are the sprite\'s', t.boundingSphere.radius, g.boundingSphere.radius);
+
+  ok('a tree region: four planes across, two sides down', spriteAtlasRegion(24, 36, 4).join(), '96,72');
+
+  const sizes = [[96, 72], [12, 48], [96, 72], [96, 72], [12, 48]];
+  const { at, height } = packSpriteAtlas(sizes, 200);
+  const overlap = (i, j) => at[i][0] < at[j][0] + sizes[j][0] && at[j][0] < at[i][0] + sizes[i][0] &&
+                            at[i][1] < at[j][1] + sizes[j][1] && at[j][1] < at[i][1] + sizes[i][1];
+  let clean = true;
+  for (let i = 0; i < sizes.length; i++) {
+    if (at[i][0] + sizes[i][0] > 200 || at[i][1] + sizes[i][1] > height) clean = false;
+    for (let j = i + 1; j < sizes.length; j++) if (overlap(i, j)) clean = false;
+  }
+  truthy('regions inside the atlas and never overlapping', clean);
+  truthy('whole pixels', at.every(([x, y]) => Number.isInteger(x) && Number.isInteger(y)));
+  ok('two tree shelves then the characters', height, 72 + 72);
+  let threw = false;
+  try { packSpriteAtlas([[300, 10]], 200); } catch { threw = true; }
+  truthy('a region wider than the atlas is an error, not an overlap', threw);
+}

@@ -92,3 +92,57 @@ section('glass rectangles: thickness for the back-face glare');
   // Glass never merges into a coplanar non-glass rectangle.
   truthy('every glass face is its own rectangle group', glassRects.length > 0);
 }
+
+section('front-only glare: coplanar faces merge whatever is behind them');
+{
+  const { buildMirrors: build } = await import('../js/mirrors.js');
+  const { isGlassMaterial } = await import('../js/materials.js');
+  const W = new Map();
+  const put = (x, y, z, materialId) => W.set(`${x},${y},${z}`, { materialId });
+  // A pane two blocks wide along x, facing +z: the left block has glass behind
+  // it (a 2-deep slab), the right one is a single layer, so the back-face
+  // glare sees two slabs of different depth.
+  put(0, 1, 0, 'glass'); put(0, 1, -1, 'glass');
+  put(1, 1, 0, 'glass');
+  const plane = r => r.axis === 2 && r.sign === 1 && Math.abs(r.plane - 0.5 * BLOCK_METRES) < 1e-9;
+  const split = build(W, new Set(['glass']), isGlassMaterial).filter(plane);
+  const merged = build(W, new Set(['glass']), isGlassMaterial, { backFaces: false }).filter(plane);
+  ok('with the back-face glare: split by slab depth', split.length, 2);
+  ok('front only: one rectangle', merged.length, 1);
+  near('covering both faces', merged[0].max[0] - merged[0].min[0], 2 * BLOCK_METRES, 1e-9);
+  ok('and carrying no slab', merged[0].thickness, 0);
+  const area = rs => rs.reduce((a, r) => a + (r.max[0] - r.min[0]) * (r.max[1] - r.min[1]), 0);
+  near('the same faces either way', area(merged), area(split), 1e-9);
+}
+
+section('the mirror texel cache: bases and budget');
+{
+  const { mirrorTexelDims, mirrorCacheStride, MIRROR_TEXEL } = await import('../js/mirrors.js');
+  near('a texel is an eighth of a metre', MIRROR_TEXEL, 0.125, 1e-12);
+  ok('a block face is 12 x 12 texels', mirrorTexelDims({ min: [0, 0], max: [BLOCK_METRES, BLOCK_METRES] }).join(), '12,12');
+  ok('stride: the sun, then three per light', mirrorCacheStride(0), 2);
+  ok('one light', mirrorCacheStride(1), 5);
+
+  const lit = { dir: [0, 1, 0], on: true };
+  const o = new Float32Array(MAX_MIRRORS * 16);
+  const cache = { stride: 5, capacity: 1 << 20 };
+  const n = packMirrors(rects, { x: 5 * BLOCK_METRES, y: 0, z: 14 * BLOCK_METRES }, o, MAX_MIRRORS, lit, [],
+                        null, cache);
+  ok('the cache changes nothing about what is packed', n, all);
+  // Bases: each rectangle starts where the previous ones' texels end.
+  let expect = 0, bases = true;
+  for (let i = 0; i < n; i++) {
+    if (o[i * 16 + 15] !== expect) bases = false;
+    const r = { min: [o[i * 16 + 4], o[i * 16 + 5]], max: [o[i * 16 + 6], o[i * 16 + 7]] };
+    const [nu, nv] = mirrorTexelDims(r);
+    expect += nu * nv;
+  }
+  truthy('each base is the texels before it', bases);
+  ok('texels counts them all', cache.texels, expect);
+  // A budget that fits only the first rectangle packs only that one.
+  const first = mirrorTexelDims({ min: [o[4], o[5]], max: [o[6], o[7]] });
+  const small = { stride: 5, capacity: first[0] * first[1] * 5 };
+  ok('a full cache stops packing, nearest kept', packMirrors(rects, { x: 5 * BLOCK_METRES, y: 0, z: 14 * BLOCK_METRES },
+     o, MAX_MIRRORS, lit, [], null, small), 1);
+  ok('and counts only what it packed', small.texels, first[0] * first[1]);
+}

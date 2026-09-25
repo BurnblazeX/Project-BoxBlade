@@ -5,13 +5,15 @@ import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
          glassInstancedMesh, terrainKeepTSL,
          terrainTextures, terrainWhite, terrainSampleTSL } from './render.js';
+import { texelPixels, texelCacheSpacingFor } from './texelcache.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres,
          VOXEL_METRES, applyHandoff } from './boxgrid.js';
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
-         crossedPlanesGeometry } from './sprites.js';
+         crossedPlanesGeometry, spriteAtlasGeometry, spriteAtlasRegion,
+         packSpriteAtlas } from './sprites.js';
 import { createPerfOverlay } from './perf.js';
 import { createFramePacer, describePacing } from './pacing.js';
 import { VERSION, bundleHash, buildLabel } from './version.js';
@@ -21,7 +23,8 @@ import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings, setHitBounds,
          GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
          glassBackGlare } from './gpu.js';
-import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS } from './mirrors.js';
+import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride,
+         MIRROR_CACHE_VEC4S } from './mirrors.js';
 import { MATERIALS, isGlassMaterial } from './materials.js';
 import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
          DEFAULT_SKY_HOUR } from './sky.js';
@@ -31,6 +34,7 @@ import { createCardBindings, createCardAtlasTexture, createCardColourTexture, wr
 import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
          runGPUMarch, createShadowColorNode, createShadowMaterial,
          restoreOriginalMaterial, followShadowGrid, commitShadowGrid, createSpriteShadowMaterial,
+         createSpriteAtlasMaterial,
          createNormalTexture,
          createBayerTexture, writeSunUniforms,
          SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
@@ -803,6 +807,8 @@ function setTreeMerge(on) {
     tree.remove(...out);
     tree.add(...into);
   }
+  // The meshes now drawn need their atlas twins and regions.
+  if (activeShadowSet && activeShadowSet.atlasMats) ensureSpriteAtlas(activeShadowSet.atlasMats);
 }
 
 function createTrees(treePositions) {
@@ -2069,10 +2075,12 @@ function animate(time) {
   if (shadowsOn) updateLights();
   // After the light list: the mirrors are culled against where the lights are now.
   updateMirrors();
+  runMirrorCache();
   if (shadowsOn) updateGI();
 
   const tRender = performance.now();
   renderTexelCache();
+  renderSpriteAtlas();
   renderer.render(scene, camera);
   const tEnd = performance.now();
   logSpike(tGrid, tCards, tRender, tEnd, moved);
@@ -2349,6 +2357,10 @@ function giBinding() {
 // The low-res pass draws only layer TEXEL_LAYER, which only the terrain is on.
 const TEXEL_LAYER = 1;
 let texelCacheOn = true;
+// The sample spacing in pixels: 0 follows the texel's size on screen
+// (render.js texelCacheSpacingFor), a number fixes it. texelCacheScale is the
+// spacing in use.
+let texelCacheSpacing = 0;
 let texelCacheScale = 4;
 const texelCache = {
   rt: null,
@@ -2402,6 +2414,8 @@ function ensureTerrainTwins() {
 const _drawSize = new THREE.Vector2();
 function sizeTexelCache() {
   renderer.getDrawingBufferSize(_drawSize);
+  texelCacheScale = texelCacheSpacing ||
+    texelCacheSpacingFor(texelPixels(_drawSize.y, camera.fov, currentDistance), texelCacheScale);
   const w = Math.max(1, Math.ceil(_drawSize.x / texelCacheScale));
   const h = Math.max(1, Math.ceil(_drawSize.y / texelCacheScale));
   if (!texelCache.rt) {
@@ -2429,7 +2443,9 @@ function renderTexelCache() {
   if (terrainTwins.prepass) {
     terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible;
   }
-  if (terrainTwins.glassMiss) terrainTwins.glassMiss.visible = !!glassActive && mesh.visible;
+  if (terrainTwins.glassMiss) {
+    terrainTwins.glassMiss.visible = !!glassActive && mesh.visible && glass.visible;
+  }
   if (!active) return;
   sizeTexelCache();
   const mask = camera.layers.mask;
@@ -2442,6 +2458,75 @@ function renderTexelCache() {
   camera.layers.mask = mask;
   mesh.material = terrainLookupMat;
   if (glassActive) glass.material = glassLookupMat;
+}
+
+// --- Sprite texel atlas (sprites.js) ---
+//
+// The sprites' light, shaded once per art texel into a float target by one
+// pass of twins, then read back by the sprites' own draws - the texel cache's
+// idea for sprites, with a fixed slot per texel instead of a screen lookup.
+// Each sprite mesh has a twin: its child (so the same world matrix), on
+// SPRITE_ATLAS_LAYER only, drawing sprites.js spriteAtlasGeometry. Culled with
+// its sprite; a slot off screen goes stale, and nothing reads it.
+// bxb.spriteatlas() turns it off, back to shading every pixel, for A/B.
+const SPRITE_ATLAS_LAYER = 2;
+const SPRITE_ATLAS_WIDTH = 512;
+let spriteAtlasOn = true;
+const spriteAtlas = {
+  rt: null,
+  tex: null,
+  size: uniform(new THREE.Vector2(1, 1))
+};
+// Every sprite's art must be loaded to size its region.
+const spriteArtReady = () => spriteMeshes().every(m => {
+  const map = (m.userData.originalMaterial || m.material).map;
+  return map && map.image && map.image.width > 0;
+});
+// Twins for the meshes drawn now, and their regions. Run on each build and
+// whenever the drawn meshes change (bxb.treemerge). mats: base material ->
+// atlas material, for the twins; null leaves their materials as they are.
+function ensureSpriteAtlas(mats = null) {
+  const meshes = spriteMeshes();
+  const sizes = meshes.map(m => {
+    const img = (m.userData.originalMaterial || m.material).map.image;
+    return spriteAtlasRegion(img.width, img.height, m.geometry.userData.spritePlanes || 1);
+  });
+  const { at, height } = packSpriteAtlas(sizes, SPRITE_ATLAS_WIDTH);
+  meshes.forEach((m, i) => {
+    let twin = m.userData.spriteAtlasTwin;
+    if (!twin) {
+      twin = new THREE.Mesh(spriteAtlasGeometry(m.geometry), new THREE.MeshBasicNodeMaterial());
+      twin.layers.set(SPRITE_ATLAS_LAYER);
+      twin.raycast = () => {};
+      twin.userData.spriteAtlasOrigin = m.userData.spriteAtlasOrigin = new THREE.Vector2();
+      m.userData.spriteAtlasTwin = twin;
+      m.add(twin);
+    }
+    twin.userData.spriteAtlasOrigin.set(at[i][0], at[i][1]);
+    const lit = mats && mats.get(m.userData.originalMaterial || m.material);
+    if (lit) twin.material = lit;
+  });
+  const h = Math.max(1, height);
+  if (!spriteAtlas.rt) {
+    spriteAtlas.rt = new THREE.RenderTarget(SPRITE_ATLAS_WIDTH, h,
+                                            { type: THREE.FloatType, depthBuffer: false });
+    spriteAtlas.tex = spriteAtlas.rt.texture;
+    spriteAtlas.tex.minFilter = spriteAtlas.tex.magFilter = THREE.NearestFilter;
+    spriteAtlas.tex.generateMipmaps = false;
+  } else if (spriteAtlas.rt.height !== h) {
+    spriteAtlas.rt.setSize(SPRITE_ATLAS_WIDTH, h);
+  }
+  spriteAtlas.size.value.set(SPRITE_ATLAS_WIDTH, h);
+}
+// The atlas pass, before the main render. Only while the showing set reads it.
+function renderSpriteAtlas() {
+  if (!shadowsOn || !activeShadowSet || !activeShadowSet.atlasMats) return;
+  const mask = camera.layers.mask;
+  camera.layers.set(SPRITE_ATLAS_LAYER);
+  renderer.setRenderTarget(spriteAtlas.rt);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  camera.layers.mask = mask;
 }
 
 // --- Mirrors (mirrors.js): reflected sunlight ---
@@ -2473,9 +2558,16 @@ let glassDispersion = 0;
 // rectangles), 2 its back face too (gpu.js glassBackGlare). Only while the
 // mirror light itself is on. Front-surface glare by default.
 let glassGlare = 1;
+// Shadow rays tint through glass. Off only inside bxb.gpuprofile, to price it.
+let glassShadows = true;
 let mirrorsOn = true;
 let mirrorOnly = false;   // the view: mirror light alone
 let mirrorRects = null;
+// The mirror texel cache (mirrors.js): each mirror texel's own terms, worked
+// out once a frame by a compute pass instead of by every receiver. Off
+// (bxb.mirrorcache()) goes back to per receiver, for A/B.
+let mirrorCacheOn = true;
+let mirrorCacheTexels = 0;
 const mirrorBindings = createMirrorBindings(MAX_MIRRORS);
 const mirrorPack = new Float32Array(MAX_MIRRORS * 16);
 function updateMirrors() {
@@ -2487,7 +2579,8 @@ function updateMirrors() {
     const reflective = new Set(MATERIALS.filter((m, l) => (!m.glass || glassGlare > 0) &&
                                                    isReflective(terrainTextures.specRgba[l]))
                                         .map(m => m.id));
-    mirrorRects = buildMirrors(World, reflective, isGlassMaterial);
+    // Glass faces split by the slab behind them only for the back-face glare.
+    mirrorRects = buildMirrors(World, reflective, isGlassMaterial, { backFaces: glassGlare >= 2 });
   }
   // Culled to what each mirror can reflect THIS frame: the sun if it faces
   // it, and the lights that reach it - read back from the light list the
@@ -2511,9 +2604,19 @@ function updateMirrors() {
     area = { minX: g1.origin.x, maxX: g1.origin.x + side,
              minZ: g1.origin.z, maxZ: g1.origin.z + side };
   }
+  const cache = { stride: mirrorCacheStride(lights.length), capacity: MIRROR_CACHE_VEC4S, texels: 0 };
   const n = area ? packMirrors(mirrorRects, playerSprite.position, mirrorPack, MAX_MIRRORS,
-                               { dir: [d.x, d.y, d.z], on: sunLive }, lights, area) : 0;
+                               { dir: [d.x, d.y, d.z], on: sunLive }, lights, area, cache) : 0;
   writeMirrorBindings(mirrorBindings, mirrorPack, n);
+  mirrorCacheTexels = n ? cache.texels : 0;
+}
+// The cache pass, after the mirrors and lights are packed and before anything
+// that reads it is drawn. Only for a set built to read it.
+function runMirrorCache() {
+  const k = shadowsOn && activeShadowSet && activeShadowSet.mirrorCache;
+  if (!k || !mirrorCacheTexels) return;
+  k.count = mirrorCacheTexels;
+  renderer.compute(k);
 }
 
 // Each material's diffuse albedo, once its textures are in (lpv.js
@@ -2878,15 +2981,23 @@ const clippingSprites = () => [playerSprite, enemySprite];
 // the rebuild that follows.
 const spriteNormalFor = m =>
   (m === playerSprite ? bobCard : m === enemySprite ? evilCard : treeCard).normalTex;
-function buildSpriteShadows(spriteLight) {
+// atlas: shade into the sprite texel atlas and read it back (ensureSpriteAtlas
+// has made the twins); false shades every pixel.
+function buildSpriteShadows(spriteLight, atlas = false) {
   const made = new Map();
   const pairs = [];
   const variants = new Map();
+  const atlasMats = atlas ? new Map() : null;
+  const reads = atlas ? spriteAtlas : null;
   for (const m of spriteMeshes()) {
     const base = m.userData.originalMaterial || m.material;
     m.userData.originalMaterial = base;
+    if (atlas && !atlasMats.has(base)) {
+      atlasMats.set(base, createSpriteAtlasMaterial(base, spriteLight, spriteNormalFor(m), spriteAtlas));
+    }
+    if (atlas) pairs.push([m.userData.spriteAtlasTwin, atlasMats.get(base), spriteAtlas.rt]);
     if (!made.has(base)) {
-      const mat = createSpriteShadowMaterial(base, spriteLight, spriteNormalFor(m));
+      const mat = createSpriteShadowMaterial(base, spriteLight, spriteNormalFor(m), reads);
       mat.depthTest = mat.depthWrite = true;
       // Opaque when its texture's alpha is binary (js/cutout.js). Set from the
       // texture, not copied from base: a character parked mid-clip has a
@@ -2899,7 +3010,7 @@ function buildSpriteShadows(spriteLight) {
   const mats = [...made.values()];
   for (const m of clippingSprites()) {
     const top = createSpriteShadowMaterial(m.userData.originalMaterial, spriteLight,
-                                           spriteNormalFor(m));
+                                           spriteNormalFor(m), reads);
     top.depthTest = top.depthWrite = false;
     // Always transparent: drawn last, over everything, is the transparent pass.
     top.transparent = true;
@@ -2907,7 +3018,8 @@ function buildSpriteShadows(spriteLight) {
     pairs.push([m, top]);
     mats.push(top);
   }
-  return { pairs, mats, variants, made };
+  if (atlasMats) mats.push(...atlasMats.values());
+  return { pairs, mats, variants, made, atlasMats };
 }
 
 // Compile the new materials before anything visible uses them, so the swap
@@ -2944,14 +3056,19 @@ async function compileOffscreen(pairs) {
     seen.add(mat);
     const old = mesh.material, culled = mesh.frustumCulled;
     const oldTarget = renderer.getRenderTarget();
+    const mask = camera.layers.mask;
     mesh.material = mat;
     mesh.frustumCulled = false;
+    // compileAsync skips what the camera's layers leave out - a sprite atlas
+    // twin is on its own layer only.
+    camera.layers.mask |= mesh.layers.mask;
     let pending;
     // A pipeline is per target format: compile against the one it draws into.
     if (target) renderer.setRenderTarget(target);
     try { pending = renderer.compileAsync(mesh, camera, scene); }
     finally {
       mesh.material = old; mesh.frustumCulled = culled;
+      camera.layers.mask = mask;
       if (target) renderer.setRenderTarget(oldTarget);
     }
     await pending;
@@ -2995,7 +3112,8 @@ function shadowNodeOptions() {
     viewCards: cardsReady && cardsOn ? viewCards : null,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
     gi: giOn && ensureLPV() ? giBinding() : null, giOnly,
-    glassView, glassBounces, glassLayers, glassDispersion,
+    glassView, glassBounces, glassLayers, glassDispersion, glassShadows,
+    mirrorCache: mirrorCacheOn,
     // The world has glass: shadow rays tint through it (gpu.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
@@ -3016,6 +3134,7 @@ function shadowSetKeyParts(opts) {
   parts.mesh = keyPart(worldInstancedMesh);
   parts.glass = keyPart(glassInstancedMesh);
   parts.texelCache = keyPart([texelCacheOn, texelCacheOn ? texelCache.rt : null]);
+  parts.spriteAtlas = keyPart(spriteAtlasOn && spriteArtReady());
   parts.sprites = keyPart(spriteMeshes().map(m => {
     const base = m.userData.originalMaterial || m.material;
     return [base, spriteNormalFor(m), wantsTransparent(base)];
@@ -3091,7 +3210,9 @@ function obtainShadowSet() {
   // Each draws only its own blocks - terrainKeepTSL in render.js.
   for (const m of [terrainMat, lowMat, missMat]) if (m) m.positionNode = terrainKeepTSL(false);
   for (const m of [glassMat, glassLow, glassMiss]) if (m) m.positionNode = terrainKeepTSL(true);
-  const sprites = buildSpriteShadows(spriteLight);
+  const atlas = spriteAtlasOn && spriteArtReady();
+  if (atlas) ensureSpriteAtlas();
+  const sprites = buildSpriteShadows(spriteLight, atlas);
   const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
   // Compiled against the float target it will draw into.
   if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt],
@@ -3101,7 +3222,8 @@ function obtainShadowSet() {
                            [terrainTwins.glassMiss, glassMiss]);
   const set = {
     key, parts, sun, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
-    made: sprites.made, variants: sprites.variants,
+    made: sprites.made, variants: sprites.variants, atlasMats: sprites.atlasMats,
+    mirrorCache: built.mirrorCache,
     mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []),
            ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
     compiled: false
@@ -3143,6 +3265,7 @@ function applyShadowSet(set) {
   glassLowMat = set.glassLow || null;
   glassLookupMat = set.glassLow ? set.glassMat : null;
   restoreSpriteMaterials();
+  if (set.atlasMats) ensureSpriteAtlas(set.atlasMats);
   for (const m of spriteMeshes()) {
     const v = set.variants.get(m);
     if (v) {
@@ -3656,14 +3779,25 @@ const bxbApi = installConsole(createConsole({
   },
   texelcache: {
     help: 'texel-rate shading: shade the terrain in a low-res pass and reuse each texel\'s colour. ' +
-          'A number sets the sample spacing in pixels',
-    usage: "bxb.texelcache()  toggles  |  bxb.texelcache(4)  |  bxb.texelcache('misses')",
+          "A number fixes the sample spacing in pixels; 'auto' (default) follows the texel's size on screen",
+    usage: "bxb.texelcache()  toggles  |  bxb.texelcache(4)  |  bxb.texelcache('auto')  |  bxb.texelcache('misses')",
     run: (scale = null) => {
       if (scale === 'misses') texelCache.showMisses = !texelCache.showMisses;
-      else if (scale !== null) texelCacheScale = Math.max(1, Math.min(8, Math.round(Number(scale))));
+      else if (scale === 'auto' || scale === 0) texelCacheSpacing = 0;
+      else if (scale !== null) texelCacheSpacing = Math.max(1, Math.min(8, Math.round(Number(scale))));
       else texelCacheOn = !texelCacheOn;
+      if (texelCacheOn) sizeTexelCache();
       if (shadowsOn) buildPerPixelShadows();
-      return `texel cache ${texelCacheOn ? `on, 1/${texelCacheScale} per axis` : 'off'}`;
+      return `texel cache ${texelCacheOn ? `on, 1/${texelCacheScale} per axis` +
+             (texelCacheSpacing ? '' : ' (auto)') : 'off'}`;
+    }
+  },
+  spriteatlas: {
+    help: "sprite texel atlas: shade each sprite art texel once and read it back. Off shades every pixel, as before",
+    run: () => {
+      spriteAtlasOn = !spriteAtlasOn;
+      if (shadowsOn) buildPerPixelShadows();
+      return `sprite atlas ${spriteAtlasOn ? 'on: one shading per art texel' : 'off: every pixel shades'}`;
     }
   },
   shadowcache: {
@@ -3721,6 +3855,7 @@ const bxbApi = installConsole(createConsole({
     run: (level = null) => {
       const next = level === null ? (glassGlare + 1) % 3 : Math.max(0, Math.min(2, Math.round(level)));
       if ((next > 0) !== (glassGlare > 0)) mirrorRects = null;   // glass joins or leaves
+      if ((next >= 2) !== (glassGlare >= 2)) mirrorRects = null;  // faces split by slab, or merge
       glassGlare = next;
       glassBackGlare.value = glassGlare >= 2 ? 1 : 0;
       const what = ['off', 'front surface', 'front and back face'][glassGlare];
@@ -3743,6 +3878,15 @@ const bxbApi = installConsole(createConsole({
     run: () => {
       mirrorBounce = !mirrorBounce;
       return `mirror bounce ${mirrorBounce ? 'on' : 'off'}${mirrorsOn ? '' : ' - but the mirror light is off'}`;
+    }
+  },
+  mirrorcache: {
+    help: "the mirror texel cache: each mirror texel's own sun shadow, light visibility and surface " +
+          'worked out once a frame, not per receiver. Off computes them per receiver, as before',
+    run: () => {
+      mirrorCacheOn = !mirrorCacheOn;
+      if (shadowsOn) buildPerPixelShadows();
+      return `mirror texel cache ${mirrorCacheOn ? 'on' : 'off'}`;
     }
   },
   gibatch: {
@@ -4004,9 +4148,10 @@ const bxbApi = installConsole(createConsole({
     }
   },
   internals: {
-    help: 'live references for profiling from the console: card bindings, trees, scene',
+    help: 'live references for profiling from the console: card bindings, trees, scene. ' +
+          'enemyAI.isPaused = true holds Evil Bob still, for image A/Bs',
     run: () => ({ scene, renderer, sunCards, lightCards, viewCards, treeMeshes,
-                  playerSprite, enemySprite, perf })
+                  playerSprite, enemySprite, perf, enemyAI })
   },
   gpu: {
     help: 'average GPU ms over the last frames (render, compute), for profiling. ' +
@@ -4026,24 +4171,101 @@ const bxbApi = installConsole(createConsole({
                total: f(render.avg + compute.avg), frames: render.count };
     }
   },
+  gpuprofile: {
+    help: 'what each feature costs the GPU in this view: turns each off in turn, measures, ' +
+          'turns it back on. Stand still. The rebuilding cases compile first - several ' +
+          'seconds each in Firefox',
+    usage: 'await bxb.gpuprofile()  |  await bxb.gpuprofile(120)  frames per measurement',
+    run: async (frames = 90) => {
+      if (!shadowsOn) return 'run bxb.shadows() first';
+      const measure = async rebuilt => {
+        if (rebuilt) await shadowBuildDone;
+        return bxbApi.gpu(true, frames);
+      };
+      const glass = glassInstancedMesh;
+      const glare = glassGlare, caustic = glassCaustics.value, layers = glassLayers;
+      const rebuild = () => buildPerPixelShadows();
+      let shown = [];
+      // [name, applies, off, back on, rebuilds]. A case already off is skipped.
+      const cases = [
+        ['glass surfaces (holes left)', !!glass,
+         () => { glass.visible = false; }, () => { glass.visible = true; }, false],
+        ['caustics', !!glass && caustic > 0,
+         () => bxbApi.caustics(0), () => bxbApi.caustics(caustic), false],
+        ['glare off glass', !!glass && glare > 0 && mirrorsOn,
+         () => bxbApi.glassglare(0), () => bxbApi.glassglare(glare), false],
+        ['torch', torchOn, () => toggleTorch(), () => toggleTorch(), false],
+        ['sprites (not drawn)', true,
+         () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
+         () => shown.forEach(m => { m.visible = true; }), false],
+        ['shadow rays tinting through glass', !!glass,
+         () => { glassShadows = false; rebuild(); }, () => { glassShadows = true; rebuild(); }, true],
+        ['second glass layer', !!glass && layers > 1,
+         () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
+        ['mirror light', mirrorsOn, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
+        ['reflections (and glass shading)', reflectionsOn,
+         () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
+      ];
+      const f = x => +x.toFixed(3);
+      const rows = [];
+      const before = await measure(false);
+      rows.push({ case: 'baseline', render: before.render, compute: before.compute });
+      for (const [name, applies, off, on, rebuilds] of cases) {
+        if (!applies) continue;
+        off();
+        const m = await measure(rebuilds);
+        on();
+        if (rebuilds) await shadowBuildDone;
+        rows.push({ case: `${name} off`, render: m.render, compute: m.compute });
+        console.log(`[gpuprofile] ${name} off: render ${m.render} ms`);
+      }
+      const after = await measure(false);
+      rows.push({ case: 'baseline again', render: after.render, compute: after.compute });
+      // Savings against the mean of the two baselines; their difference is the drift.
+      const base = (before.render + after.render) / 2;
+      for (const r of rows) r.saved = f(base - r.render);
+      console.table(rows);
+      return rows;
+    }
+  },
   wgsl: {
-    help: "hash of each drawn material's WGSL, to compare across runs; flags names that change per run. " +
-          "bxb.wgsl('text') also returns the source",
+    help: "hash of each material's WGSL - drawn, and the texel cache's low-res and the sprite atlas " +
+          "passes - to compare across runs and to spot two materials with the same code (one compile). " +
+          "Flags names that change per run. bxb.wgsl('text') also returns the source",
     usage: "await bxb.wgsl()  |  await bxb.wgsl('text')",
     run: async (mode = null) => {
-      const objects = [worldInstancedMesh, ...(terrainTwins.miss ? [terrainTwins.miss] : []),
-                       ...(glassInstancedMesh ? [glassInstancedMesh] : []),
-                       ...(terrainTwins.glassMiss ? [terrainTwins.glassMiss] : []),
-                       ...spriteMeshes()];
+      // [label, object]. The low-res materials are only on their meshes inside
+      // the low-res pass, so they are read off a stand-in sharing the mesh's
+      // instances; the atlas twins wear theirs, on their own layer.
+      const stand = (src, mat) => {
+        const m = new THREE.InstancedMesh(src.geometry, mat, src.count);
+        m.instanceMatrix = src.instanceMatrix;
+        m.instanceColor = src.instanceColor;
+        return m;
+      };
+      const set = activeShadowSet;
+      const objects = [['terrain', worldInstancedMesh],
+                       ['terrain miss', terrainTwins.miss],
+                       ['terrain low-res', set && set.lowMat && stand(worldInstancedMesh, set.lowMat)],
+                       ['glass', glassInstancedMesh],
+                       ['glass miss', terrainTwins.glassMiss],
+                       ['glass low-res', set && set.glassLow && glassInstancedMesh &&
+                                         stand(glassInstancedMesh, set.glassLow)],
+                       ...spriteMeshes().map(m => ['sprite', m]),
+                       ...spriteMeshes().map(m => ['sprite atlas', m.userData.spriteAtlasTwin])];
       const seen = new Set();
       const rows = [];
-      for (const o of objects) {
+      const mask = camera.layers.mask;
+      for (const [label, o] of objects) {
         if (!o || seen.has(o.material)) continue;
         seen.add(o.material);
-        const { vertexShader: vs, fragmentShader: fs } =
-          await renderer.debug.getShaderAsync(scene, camera, o);
+        camera.layers.mask |= o.layers.mask;
+        let code;
+        try { code = await renderer.debug.getShaderAsync(scene, camera, o); }
+        finally { camera.layers.mask = mask; }
+        const { vertexShader: vs, fragmentShader: fs } = code;
         const unstable = unstableNames(vs + fs);
-        rows.push({ object: o.name || o.type, material: o.material.type,
+        rows.push({ object: label, material: o.material.type,
                     vs: hashText(vs), fs: hashText(fs), fsKB: +(fs.length / 1024).toFixed(1),
                     unstable: unstable.join(' ') || '-',
                     ...(mode === 'text' ? { vsText: vs, fsText: fs } : {}) });
@@ -4188,9 +4410,9 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'texelcache', label: 'Texel-rate shading', type: 'toggle',
       help: 'terrain shaded once per texel in a low-res pass, reused at full res',
       get: () => texelCacheOn, set: v => flip(texelCacheOn, v, () => bxbApi.texelcache()) },
-    { key: 'texelscale', label: 'Texel cache spacing (px)', type: 'range', min: 2, max: 8, step: 1,
-      help: 'low-res sample spacing; texels smaller than this shade themselves',
-      get: () => texelCacheScale, set: v => bxbApi.texelcache(v) },
+    { key: 'texelscale', label: 'Texel cache spacing (px, 0 auto)', type: 'range', min: 0, max: 8, step: 1,
+      help: 'low-res sample spacing; texels smaller than this shade themselves. 0 follows the texel size on screen',
+      get: () => texelCacheSpacing, set: v => bxbApi.texelcache(v) },
     { key: 'shadowcache', label: 'Keep shadow materials', type: 'toggle',
       help: 'compiled shadow sets are kept, so toggling back is a swap',
       get: () => shadowCacheOn, set: v => flip(shadowCacheOn, v, () => bxbApi.shadowcache()) },
