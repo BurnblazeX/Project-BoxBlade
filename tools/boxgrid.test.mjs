@@ -304,3 +304,70 @@ ok('and 4 at C1', cascadeRangeVoxels(1), 4);
   inRange('C1 holds about an eighth the occupied voxels over the same blocks',
           g1.occupiedCount / g0.occupiedCount, 0.1, 0.16);
 }
+
+section('half blocks bake over their own span');
+{
+  createTestArea(12, 12);
+  const put = (x, y, z, shape) => World.set(getVoxelKey(x, y, z), { ...solid(), shape });
+  put(3, 1, 3, 'halfBottom');
+  put(5, 1, 3, 'halfTop');
+  put(7, 1, 3, 'halfBottom');
+  put(7, 2, 3, undefined);          // a full block over a half-bottom's gap
+  const h = createBoxGrid(0, 0);
+  // Block y 1 is vy 48..59; x 3 is vx 36..47, x 5 60..71, x 7 84..95; z 3 is 36..47.
+  truthy('a half-bottom fills its lower six voxels', isOccupied(h, 40, 48, 40) && isOccupied(h, 40, 53, 40));
+  falsy('and not its upper six', isOccupied(h, 40, 54, 40) || isOccupied(h, 40, 59, 40));
+  truthy('a half-top fills its upper six', isOccupied(h, 64, 54, 40) && isOccupied(h, 64, 59, 40));
+  falsy('and not its lower six', isOccupied(h, 64, 48, 40) || isOccupied(h, 64, 53, 40));
+  truthy('a full block over a half-bottom fills all of itself (unsupported underside kept)',
+         isOccupied(h, 88, 60, 40) && isOccupied(h, 88, 71, 40));
+  falsy('the gap between them is air', isOccupied(h, 88, 55, 40));
+}
+
+section('slopes bake as staircases under their plane');
+{
+  createTestArea(12, 12);
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'slope', facing: 'E' });
+  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'halfSlopeHigh', facing: 'W' });
+  const h = createBoxGrid(0, 0);
+  // x 3 is vx 36..47, y 1 is vy 48..59, z 3 is 36..47. Facing E: column k
+  // (vx 36 + k) is solid up to the plane at its downhill edge, k voxels.
+  falsy('the first column is empty (the plane starts at the floor)', isOccupied(h, 36, 48, 40));
+  truthy('the second is one voxel', isOccupied(h, 37, 48, 40) && !isOccupied(h, 37, 49, 40));
+  truthy('the sixth is five', isOccupied(h, 41, 52, 40) && !isOccupied(h, 41, 53, 40));
+  truthy('the last is eleven', isOccupied(h, 47, 58, 40) && !isOccupied(h, 47, 59, 40));
+  // A high half slope facing W: its x = 5 cell (vx 60..71) rises toward -x,
+  // from half a block (vy 54) at the east edge to a whole one at the west.
+  truthy('its base half is solid across', isOccupied(h, 71, 53, 40) && isOccupied(h, 60, 53, 40));
+  falsy('nothing above its base at the east edge', isOccupied(h, 71, 54, 40));
+  truthy('at the west edge, 5.5 voxels over the base', isOccupied(h, 60, 58, 40));
+}
+
+section('placed models bake as their cubes');
+{
+  const { addWorldModel, clearWorldModels, isStandable: standable } = await import('../js/world.js');
+  const { parseBBModel } = await import('../js/bbmodel.js');
+  createTestArea(12, 12);
+  // A fixed test model (not the authored chair, which changes): a 4 x 1 x 4
+  // seat 3 up, a 1 x 3 x 1 leg under one corner, a 1 x 9 x 1 post.
+  const face = { uv: [0, 0, 1, 1], texture: 0 };
+  const faces = Object.fromEntries(['north', 'south', 'east', 'west', 'up', 'down'].map(f => [f, face]));
+  const chair = parseBBModel({ name: 'testChair', textures: [], elements: [
+    { name: 'seat', from: [-2, 3, -2], to: [2, 4, 2], faces },
+    { name: 'leg', from: [1, 0, -2], to: [2, 3, -1], faces },
+    { name: 'post', from: [-2, 0, -2], to: [-1, 9, -1], faces },
+    { name: 'bounds', type: 'bounding_box', from: [-2, 0, -2], to: [2, 4, 2] }] });
+  addWorldModel(chair, 5, 0, 5, 0);
+  const h = createBoxGrid(0, 0);
+  // Cell (5, 0, 5): its top face is vy 48 (ground y 0 is vy 36..47), its
+  // centre vx 66, vz 66. The seat is x -2..2, y 3..4 over it: vy 51.
+  truthy('the seat is solid', isOccupied(h, 66, 51, 66));
+  falsy('under the seat, between the legs, is air', isOccupied(h, 66, 49, 66));
+  truthy('a leg is solid (x 1..2, z -2..-1)', isOccupied(h, 67, 48, 64));
+  truthy('the backrest post reaches 9 up', isOccupied(h, 64, 56, 64));
+  falsy('and no higher', isOccupied(h, 64, 57, 64));
+  truthy('with bounds, the tile is taken', !!World.get('5,0,5').occupant);
+  clearWorldModels();
+  falsy('cleared, it is free again', !!World.get('5,0,5').occupant);
+  truthy('and standable', standable(5, 0, 5));
+}

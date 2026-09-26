@@ -13,7 +13,7 @@
 //
 // CPU and pure, so it is tested headlessly. gpu.js createMirrorLightTSL reads
 // the packed form.
-import { BLOCK_METRES, GROUND_Y } from './world.js';
+import { BLOCK_METRES, GROUND_Y, blockSpan, isCompound } from './world.js';
 import { BLOCK_TEXELS } from './materials.js';
 
 export const MAX_MIRRORS = 32;
@@ -55,15 +55,40 @@ export function buildMirrors(world, reflective, isGlass = () => false, { backFac
   const groups = new Map();
   for (const [key, block] of world) {
     if (!reflective.has(block.materialId)) continue;
+    // A slope's staircase would be dozens of one-texel rectangles, and stairs
+    // are faces at two depths: they reflect through the view ray, but throw
+    // no mirror light.
+    if (isCompound(block)) continue;
     const c = key.split(',').map(Number);
     const glass = isGlass(block.materialId);
+    // A half block (world.js BLOCK_SHAPES) fills [lo, hi] of its cell's height.
+    const [lo, hi] = blockSpan(block);
     for (let axis = 0; axis < 3; axis++) {
       for (const sign of [1, -1]) {
         const nb = c.slice(); nb[axis] += sign;
-        if (world.has(nb.join(','))) continue;          // not exposed
+        const nbBlock = world.get(nb.join(','));
+        const [nlo, nhi] = nbBlock ? blockSpan(nbBlock) : [0, 0];
+        // The part of the face left exposed, as a span of the cell's height:
+        // [a, b], or null when covered. A top or bottom face is covered only
+        // when it lies on the cell boundary against a neighbour that fills
+        // up (down) to it; a side face loses what its neighbour's span covers,
+        // which with halves leaves the whole face, one half, or nothing.
+        let span;
+        // Beside a slope or stairs: only a top face under it is covered (each
+        // fills its cell's floor); anything else is left whole - conservative,
+        // and the legs are traced through the field anyway.
+        if (nbBlock && isCompound(nbBlock)) span = axis === 1 && sign > 0 ? null : [lo, hi];
+        else if (axis === 1) {
+          const onEdge = sign > 0 ? hi === 1 : lo === 0;
+          const covered = onEdge && nbBlock && (sign > 0 ? nlo === 0 : nhi === 1);
+          span = covered ? null : [lo, hi];
+        } else if (!nbBlock || nhi <= lo || nlo >= hi) span = [lo, hi];
+        else if (nlo <= lo && nhi >= hi) span = null;
+        else span = nlo > lo ? [lo, nlo] : [nhi, hi];
+        if (!span) continue;                            // not exposed
         // The underside of the ground layer faces the void under the world -
         // nothing is ever there to receive from it.
-        if (axis === 1 && sign === -1 && c[1] <= GROUND_Y) continue;
+        if (axis === 1 && sign === -1 && c[1] <= GROUND_Y && lo === 0) continue;
         let thickness = 0;
         if (glass && backFaces) {
           // Walk back through the glass behind this face.
@@ -77,9 +102,14 @@ export function buildMirrors(world, reflective, isGlass = () => false, { backFac
           thickness = world.has(q.join(',')) ? 0 : k * BLOCK_METRES;
         }
         const [ua, va] = PLANE_AXES[axis];
-        const g = backFaces ? `${axis},${sign},${c[axis]},${glass ? 'g' + thickness : 'o'}`
-                            : `${axis},${sign},${c[axis]}`;
-        if (!groups.has(g)) groups.set(g, { axis, sign, level: c[axis], thickness, cells: new Set() });
+        // The face's plane, in blocks: a half block's top or bottom sits
+        // mid-cell. A side face less than the whole height is grouped by its
+        // span and its row, so it merges only along the row.
+        const level = axis === 1 ? c[1] - 0.5 + (sign > 0 ? hi : lo) : c[axis] + 0.5 * sign;
+        const part = axis !== 1 && (span[0] > 0 || span[1] < 1) ? span : null;
+        const g = `${axis},${sign},${level}` + (part ? `,${c[1]},${part}` : '') +
+                  (backFaces ? `,${glass ? 'g' + thickness : 'o'}` : '');
+        if (!groups.has(g)) groups.set(g, { axis, sign, level, thickness, part, row: c[1], cells: new Set() });
         groups.get(g).cells.add(`${c[ua]},${c[va]}`);
       }
     }
@@ -101,12 +131,19 @@ export function buildMirrors(world, reflective, isGlass = () => false, { backFac
       while (rowFull(v1 + 1)) v1++;
       for (let v = v0; v <= v1; v++) for (let u = u0; u <= u1; u++) left.delete(`${u},${v}`);
       // Blocks are centred on their grid coordinate, so a block spans
-      // (i - 0.5 .. i + 0.5) * BLOCK_METRES.
+      // (i - 0.5 .. i + 0.5) * BLOCK_METRES; a part of a side face spans only
+      // its share of the row's height.
+      const min = [(u0 - 0.5) * BLOCK_METRES, (v0 - 0.5) * BLOCK_METRES];
+      const max = [(u1 + 0.5) * BLOCK_METRES, (v1 + 0.5) * BLOCK_METRES];
+      if (g.part) {
+        const k = PLANE_AXES[g.axis].indexOf(1);
+        min[k] = (g.row - 0.5 + g.part[0]) * BLOCK_METRES;
+        max[k] = (g.row - 0.5 + g.part[1]) * BLOCK_METRES;
+      }
       rects.push({
         axis: g.axis, sign: g.sign,
-        plane: (g.level + 0.5 * g.sign) * BLOCK_METRES,
-        min: [(u0 - 0.5) * BLOCK_METRES, (v0 - 0.5) * BLOCK_METRES],
-        max: [(u1 + 0.5) * BLOCK_METRES, (v1 + 0.5) * BLOCK_METRES],
+        plane: g.level * BLOCK_METRES,
+        min, max,
         thickness: g.thickness
       });
     }

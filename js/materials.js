@@ -33,6 +33,41 @@ export const MATERIALS = [
   { id: 'frostedGlass', texture: 'terrain_frostedGlass', glass: true }
 ];
 
+// --- Discovered materials ---
+//
+// Every other terrain_<id>.png in assets/textures is a material too, found at
+// load: add a texture and it is in the game and the editor's palette, mapped
+// like the rest - no code. Its companions (_n, _s, _slope, _halfSlope, and
+// their _n / _s) are found by name as for the materials above. Properties a
+// texture cannot say go in terrain_<id>.json beside it, e.g. { "glass": true }.
+// Appended after the built-in list, alphabetically: a layer is an index into
+// the texture arrays, but levels store materials by id, so the order is free
+// to grow.
+//
+// Only under Vite (the game and the worker): import.meta.glob is replaced at
+// build time, and in node - the tests - the call throws and the built-in list
+// is all there is.
+export const MATERIAL_TEXTURE_PREFIX = 'terrain_';
+const COMPANION = /_(n|s|e)$|_(slope|halfSlope)(_(n|s|e))?$/;
+export function materialIdsFromFiles(paths) {
+  const ids = [];
+  for (const p of paths) {
+    const m = p.split('/').pop().match(/^terrain_(.+)\.png$/);
+    if (m && !COMPANION.test(m[1])) ids.push(m[1]);
+  }
+  return ids.sort();
+}
+let textureFiles = {}, propertyFiles = {};
+try {
+  textureFiles = import.meta.glob('../assets/textures/terrain_*.png', { eager: true, query: '?url', import: 'default' });
+  propertyFiles = import.meta.glob('../assets/textures/terrain_*.json', { eager: true, import: 'default' });
+} catch { /* not under Vite */ }
+for (const id of materialIdsFromFiles(Object.keys(textureFiles))) {
+  if (MATERIALS.some(m => m.id === id)) continue;
+  const props = Object.entries(propertyFiles).find(([p]) => p.endsWith(`/terrain_${id}.json`));
+  MATERIALS.push({ ...(props ? props[1] : {}), id, texture: MATERIAL_TEXTURE_PREFIX + id });
+}
+
 const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
 
 // What the two faces of a glass slab let through, of light meeting the first at
@@ -52,8 +87,12 @@ export function isGlassMaterial(id) {
   return i != null && i >= 0 && MATERIALS[i].glass === true;
 }
 
+// A block's layer. No id: layer 0. An id with no material (a level naming a
+// texture since removed): the missingTexture material when there is one, so
+// it shows as missing instead of passing for grass.
+export const MISSING_MATERIAL = 'missingTexture';
 export function materialLayer(id) {
-  return id == null ? 0 : (layerById.get(id) ?? 0);
+  return id == null ? 0 : (layerById.get(id) ?? layerById.get(MISSING_MATERIAL) ?? 0);
 }
 
 // --- LabPBR specular ---

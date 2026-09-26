@@ -88,17 +88,19 @@ function fill(mesh, grid, clip = null) {
   _generation = (_generation + 1) & 0xff;
   if (_generation === 0) { _seen.fill(0); _generation = 1; } // wrapped, retire old stamps
 
-  // Rock first, then glass: each from its own block list and its own channel.
+  // Rock first, then glass: each from its own range list and its own channel.
   for (const glass of [false, true]) {
   const b = glass ? (grid.glassBlocks || []) : grid.filledBlocks;
   const occ = glass ? isGlassVoxel : isOccupied;
-  // Visit only the voxel ranges that blocks actually filled. Scanning all
-  // 144^3 cells meant ~18M neighbour lookups per rebuild; this is ~12x fewer.
-  for (let k = 0; k < b.length; k += 3) {
+  // Visit only the voxel ranges the bake wrote - blocks, the boxes of a
+  // shape, a model's cubes: x0, y0, z0, x1, y1, z1 each. Scanning all 144^3
+  // cells meant ~18M neighbour lookups per rebuild; this is ~12x fewer.
+  for (let k = 0; k < b.length; k += 6) {
     const vx0 = b[k], vy0 = b[k + 1], vz0 = b[k + 2];
-    for (let dz = 0; dz < per; dz++) {
-      for (let dy = 0; dy < per && vy0 + dy < GRID_DIM; dy++) {
-        for (let dx = 0; dx < per; dx++) {
+    const sx = b[k + 3] - vx0, sy = b[k + 4] - vy0, sz = b[k + 5] - vz0;
+    for (let dz = 0; dz < sz; dz++) {
+      for (let dy = 0; dy < sy && vy0 + dy < GRID_DIM; dy++) {
+        for (let dx = 0; dx < sx; dx++) {
           const vx = vx0 + dx, vy = vy0 + dy, vz = vz0 + dz;
           // Blocks outside the footprint are baked now, for their band alone -
           // see populateDistanceField - so their voxel ranges can start outside

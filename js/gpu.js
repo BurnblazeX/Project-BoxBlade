@@ -19,7 +19,9 @@ import { CARD_RANGE, CARD_PAD, CARD_FADE_START,
          CARD_SUN_REACH } from './cards.js';
 import { BLOCK_METRES } from './world.js';
 import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
-import { terrainSampleTSL, terrainWhite, terrainLayerTSL } from './render.js';
+import { terrainSampleTSL, terrainWhite, terrainLayerTSL, axisNormalTSL, blockFaceTSL as boxFaceTSL,
+         texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL, terrainTexelTSL } from './render.js';
+export { axisNormalTSL, texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL };
 import { METAL_F0, MATERIALS, BLOCK_TEXELS } from './materials.js';
 import { MIRROR_VEC4S, MIRROR_SUN_BIT, MIRROR_CACHE_VEC4S } from './mirrors.js';
 import { VOXEL_AO_MIN } from './voxelao.js';
@@ -967,33 +969,16 @@ export function createCardsTSL(b, { ranged = false } = {}) {
       .setLayout(layout('cards', 'float', inputs));
 }
 
-// The face normal, exactly on its axis. normalWorld is interpolated and
-// renormalised, so it is off-axis by a rounding error that varies by pixel;
-// the terrain is boxes, so its dominant axis IS the face.
-export const axisNormalTSL = Fn(([v]) => {
-  const a = abs(v).toVar();
-  const nx = a.x.greaterThanEqual(a.y).and(a.x.greaterThanEqual(a.z));
-  const ny = a.y.greaterThan(a.x).and(a.y.greaterThanEqual(a.z));
-  return select(nx, vec3(sign(v.x), 0, 0),
-                select(ny, vec3(0, sign(v.y), 0), vec3(0, 0, sign(v.z))));
-});
-
-// ONE TEXEL, ONE ANSWER - bit for bit. n must be axis-exact (axisNormalTSL):
-// across the face each coordinate snaps to its texel centre, and ALONG the
-// normal it snaps to the face plane itself, which is a voxel boundary (every
-// face of the terrain's boxes is). It used to keep the interpolated value
-// there, and that drifts by a rounding error from pixel to pixel - harmless to
-// a soft shadow, but a reflection ray started a hair differently marches a
-// long way and can land on a different voxel, so one texel reflected bands.
-// Every input is now computed from the same integers, so every fragment of a
-// texel gets the identical float.
-export const texelLockTSL = Fn(([p, n]) => {
-  const q = float(VOXEL_METRES);
-  const a = abs(n);
-  const snapped = p.div(q).floor().add(float(0.5)).mul(q);
-  const plane = round(p.div(q)).mul(q);
-  return snapped.mul(vec3(1, 1, 1).sub(a)).add(plane.mul(a));
-});
+// A model's lightSource cube is drawn unlit - its own texel, the _e texture's
+// where it has one (render.js modelInstanceData). Lit, every face of it faces
+// away from the light at its centre and would draw dark. Wraps the terrain's
+// shading, so the low-res, lookup and miss passes all see it.
+export function terrainEmissiveTSL(shade, terrain) {
+  return Fn(() => {
+    const surf = terrainSurfaceTSL();
+    return select(surf.emissive, terrainTexelTSL(terrain.albedo, surf.st, surf).rgb, shade);
+  })();
+}
 
 // --- The sky, as L2 SH (sky.js) ---
 //
@@ -1218,9 +1203,11 @@ export function createVoxelAONode(terrain, cards = null) {
   const vol = terrain.blocks;
   const spriteAO = createSpriteAOTSL(cards);
   return Fn(() => {
-    const n = axisNormalTSL(normalWorld).toVar();
-    const p = texelLockTSL(positionWorld, n).toVar();
-    const block = boxFaceTSL(p, n).block.toVar();
+    // A slope's plane is taken as a top face of its own block (approximate).
+    const surf = terrainSurfaceTSL();
+    const n = select(surf.on, vec3(0, 1, 0), surf.n).toVar();
+    const p = surf.p;
+    const block = surf.block;
     // The face's two tangent axes, and where the texel sits along each, 0..1.
     const t1 = select(abs(n.x).greaterThan(float(0.5)), vec3(0, 1, 0), vec3(1, 0, 0)).toVar();
     const t2 = select(abs(n.z).greaterThan(float(0.5)), vec3(0, 1, 0), vec3(0, 0, 1)).toVar();
@@ -1243,8 +1230,7 @@ export function createVoxelAONode(terrain, cards = null) {
     const c00 = corner(e.l, e.d, occ(-1, -1)), c10 = corner(e.r, e.d, occ(1, -1));
     const c01 = corner(e.l, e.u, occ(-1, 1)), c11 = corner(e.r, e.u, occ(1, 1));
     const v = mix(mix(c00, c10, a), mix(c01, c11, a), b);
-    const st = boxFaceTSL(p, n).st;
-    const texAO = texture(terrain.normal, st).depth(terrainLayerTSL()).b;
+    const texAO = terrainTexelTSL(terrain.normal, surf.st, surf).b;
     const ao = float(VOXEL_AO_MIN).add(float(1 - VOXEL_AO_MIN).mul(v)).mul(texAO);
     return spriteAO ? ao.mul(spriteAO(p, vec2(1e9, 1e9))) : ao;
   })();
@@ -1714,22 +1700,6 @@ export function createGlassMarchTSL(cascades) {
   }).setLayout(layout('glassMarch', 'vec4', [
     { name: 'origin0', type: 'vec3' }, { name: 'dir0', type: 'vec3' },
     { name: 'maxDist', type: 'float' }])));
-}
-
-// Which block a surface point belongs to, and its uv on that face - the uv
-// BoxGeometry itself gives that face (the table in boxBumpedNormalTSL), so a
-// texture read here matches the mesh's own. p on the face, n axis-exact.
-// { block: the block's grid coordinate, st: the face uv }.
-function boxFaceTSL(p, n) {
-  const block = round(p.sub(n.mul(float(VOXEL_METRES * 0.5))).div(float(BLOCK_METRES))).toVar();
-  const l = p.div(float(BLOCK_METRES)).sub(block).toVar();
-  const h = float(0.5);
-  const uvX = vec2(select(n.x.greaterThan(float(0)), l.z.negate(), l.z).add(h), l.y.add(h));
-  const uvY = vec2(l.x.add(h), select(n.y.greaterThan(float(0)), l.z.negate(), l.z).add(h));
-  const uvZ = vec2(select(n.z.greaterThan(float(0)), l.x, l.x.negate()).add(h), l.y.add(h));
-  const st = select(abs(n.x).greaterThan(float(0.5)), uvX,
-                    select(abs(n.y).greaterThan(float(0.5)), uvY, uvZ));
-  return { block, st };
 }
 
 // A reflection hit's albedo: which block it is (render.js's block-material
@@ -2959,23 +2929,25 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // it to lift the ray origin off the face along the surface rather than along
     // the ray - see SURFACE_BIAS_VOXELS for why that distinction matters at low
     // sun angles.
-    const n = axisNormalTSL(normalWorld).toVar();
+    // (A slope's plane gives its own exact normal - terrainSurfaceTSL.)
+    const face = terrainSurfaceTSL(!!terrain);
+    const n = face.n;
     // Locked once, used by every light. Two lights that disagreed about where a
     // surface IS would put their shadows on different texel grids, and the
     // mismatch would read as the torch's shadow crawling against the sun's.
-    const p = texelLockTSL(positionWorld, n).toVar();
+    const p = face.p;
     // Every texture read at THIS texel's centre, from the locked position -
     // not at the fragment's own uv, which at a texel's edge can read the
     // neighbour's normal or specular while p is still this texel's.
-    const st = terrain ? boxFaceTSL(p, n).st.toVar() : null;
-    const sample = tex => terrainSampleTSL(tex, st);
+    const st = terrain ? face.st : null;
+    const sample = tex => terrainTexelTSL(tex, st, face);
     // Shading normal: the face normal bent by the block texture's normal map.
     // The geometric n still lifts rays and decides which faces the sun can
     // reach at all; only N.L sees the bumps.
     // terrain: { normal, specular, albedo, blocks }, from render.js.
     const lab = terrain ? labNormalTSL(sample(terrain.normal)).toVar() : null;
     // The face's exact frame, not a derivative one - see boxBumpedNormalTSL.
-    const nS = lab ? boxBumpedNormalTSL(n, lab.xyz).toVar() : n;
+    const nS = lab ? surfaceBumpTSL(face, lab.xyz).toVar() : n;
     const texAO = lab ? lab.w : float(1);
     // The raw LabPBR specular texel: R smoothness, G F0 / metal, B porosity or
     // SSS - how an authored _s is checked in place.
@@ -2983,7 +2955,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // The views below show a light term; they keep the albedo multiply they
     // always had.
     // albedo: a function of the face uv (main.js), so it is read here too.
-    const base = albedo && st ? albedo(st).toVar() : vec3(1, 1, 1);
+    const base = albedo && st ? albedo(st, face).toVar() : vec3(1, 1, 1);
     const view = x => base.mul(x);
     // Traced AO times the texture's own. The hemisphere is the geometric face,
     // not the bumped normal - the rays test real geometry.
@@ -3419,10 +3391,21 @@ export const texelIdTSL = (p, n) => {
 };
 // This terrain fragment's texel id - the same lock the shading takes.
 export const terrainTexelIdTSL = () => {
-  const n = axisNormalTSL(normalWorld).toVar();
-  const p = texelLockTSL(positionWorld, n);
-  return texelIdTSL(p, n);
+  const surf = terrainSurfaceTSL();
+  return select(surf.on, slopeTexelIdTSL(surf), texelIdTSL(surf.p, surf.n));
 };
+// A slope texel's id: its rows are finer than the voxels, so two can share a
+// voxel - it is named by its block and indices instead, face 6. Only the
+// 3 x 3 window has to tell texels apart, so each block coordinate keeps its
+// low bits: x (2) with the row (5), z (3) with the column (4), y (7).
+function slopeTexelIdTSL(surf) {
+  const wrap = (v, m) => v.sub(floor(v.div(float(m))).mul(float(m)));
+  const b = surf.block;
+  const fx = wrap(b.x, 4).mul(float(32)).add(surf.slopeTexel.y);
+  const fz = wrap(b.z, 8).mul(float(16)).add(surf.slopeTexel.x);
+  return fx.add(wrap(b.y, 128).mul(float(128))).add(fz.mul(float(16384)))
+    .add(float(6 * 2097152)).add(float(TEXEL_ID_OFFSET));
+}
 
 // The low-res pass's output: the full shading and the texel it belongs to.
 export function createTexelCacheWriteNode(shade) {

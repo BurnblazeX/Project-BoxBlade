@@ -1,4 +1,5 @@
-import { World, getVoxelKey, CHUNK_SIZE, Y_MIN, CHUNK_HEIGHT, BLOCK_METRES } from './world.js';
+import { World, getVoxelKey, CHUNK_SIZE, Y_MIN, CHUNK_HEIGHT, BLOCK_METRES, blockSpan, blockBoxes,
+         ModelBoxes } from './world.js';
 import { isGlassMaterial } from './materials.js';
 
 // --- boxGrid: the fine occupancy / light field ---
@@ -827,7 +828,7 @@ export function populateDistanceField(grid, dirty = null) {
       minBoxVoxels(grid, vx0 + per / 2, vy0 + per / 2, vz0 + per / 2,
                    per / 2, per / 2, per / 2, rects, range, GLASS_CHANNEL);
       if (inFootprint) glassFilled += per * per * per;
-      glassBlocks.push(vx0, vy0, vz0);
+      glassBlocks.push(vx0, vy0, vz0, vx0 + per, vy0 + per, vz0 + per);
       continue;
     }
 
@@ -840,14 +841,35 @@ export function populateDistanceField(grid, dirty = null) {
     // special case any more, just a box of a different height.
     // Glass below counts as support, and must: the underside shows through
     // glass, so a block standing on it keeps its full height in the field.
+    // A half block (world.js BLOCK_SHAPES) is a box over its own span, half a
+    // block being six voxels at C0; only a full block over nothing at all is
+    // trimmed. Anything below counts - over a half-bottom's gap the underside
+    // can be seen, and rays come up to it.
+    const [lo, hi] = blockSpan(block);
     const supported = World.has(getVoxelKey(bx, by - 1, bz));
-    const dyStart = supported ? 0 : per / 2;
-    const height = per - dyStart;
-    // Floored: C2 has 3 voxels per block, so half a block is 1.5 voxels, and a
-    // fractional start here had the overlay indexing the grid at non-integer
-    // coordinates - read as empty, which dropped most of C2's surface. The
-    // field is unaffected; the box itself is placed continuously below.
-    blocks.push(vx0, vy0 + Math.floor(dyStart), vz0);
+    const dyStart = lo > 0 ? lo * per : hi === 1 && !supported ? per / 2 : 0;
+    const height = hi * per - dyStart;
+    // The voxel range written, for the overlay (debug.js): x0, y0, z0, x1, y1,
+    // z1. Floored and ceiled: C2 has 3 voxels per block, so half a block is 1.5
+    // voxels, and a fractional start had the overlay indexing the grid at
+    // non-integer coordinates - read as empty, which dropped most of C2's
+    // surface. The field is unaffected; the box itself is placed continuously.
+    blocks.push(vx0, vy0 + Math.floor(dyStart), vz0, vx0 + per, vy0 + Math.ceil(hi * per), vz0 + per);
+
+    // A slope is a staircase of boxes (world.js BLOCK_SHAPES), each baked on
+    // its own - the min of their distances is the staircase's. A step is a
+    // twelfth of a block: half a voxel at C1, a quarter at C2, placed
+    // continuously like any box.
+    const boxes = blockBoxes(block);
+    if (boxes.length > 1) {
+      for (const [x0, x1, y0, y1, z0, z1] of boxes) {
+        minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per,
+                     vz0 + (z0 + z1) / 2 * per, (x1 - x0) / 2 * per, (y1 - y0) / 2 * per,
+                     (z1 - z0) / 2 * per, rects, range);
+        if (inFootprint) filled += (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
+      }
+      continue;
+    }
 
     // The box in voxel units, as a centre and a half-extent.
     const cx = vx0 + per / 2;
@@ -856,6 +878,20 @@ export function populateDistanceField(grid, dirty = null) {
 
     minBoxVoxels(grid, cx, cy, cz, per / 2, height / 2, per / 2, rects, range);
     if (inFootprint) filled += per * height * per;
+  }
+
+  // Placed models (world.js ModelBoxes): each cube a box, in world texels. A
+  // texel is a C0 voxel, so at C0 these land exactly on the grid; coarser
+  // levels place them continuously, like a half block's.
+  const texel = BLOCK_METRES / TEXELS_PER_BLOCK;
+  for (const [x0, y0, z0, x1, y1, z1] of ModelBoxes) {
+    const v = (t, o) => (t * texel - o) / grid.voxelSize;
+    const lo = [v(x0, grid.origin.x), v(y0, grid.origin.y), v(z0, grid.origin.z)];
+    const hi = [v(x1, grid.origin.x), v(y1, grid.origin.y), v(z1, grid.origin.z)];
+    if (hi.some(h => h + band <= 0) || lo.some(l => l - band >= GRID_DIM)) continue;
+    minBoxVoxels(grid, (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2,
+                 (hi[0] - lo[0]) / 2, (hi[1] - lo[1]) / 2, (hi[2] - lo[2]) / 2, rects, range);
+    blocks.push(...lo.map(Math.floor), ...hi.map(Math.ceil));
   }
 
   grid.occupiedCount = filled;

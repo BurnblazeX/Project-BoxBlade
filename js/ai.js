@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { World, getVoxelKey, pathDistance, findPath, isStandable } from './world.js';
+import { World, getVoxelKey, pathDistance, findPath, isStandable, stepLevel, followGround } from './world.js';
 import { VOXEL_SIZE } from './render.js';
 
 function updateSpriteFacing(sprite, isFacingRight) {
@@ -47,7 +47,7 @@ export function createWanderAI(entity, sprite, tetherRadius) {
         const targetNode = path[0];
         const targetWorldPos = new THREE.Vector3(
           targetNode.x * VOXEL_SIZE,
-          VOXEL_SIZE / 2,
+          sprite.position.y,          // across the ground; followGround sets the height
           targetNode.z * VOXEL_SIZE
         );
         const step = 5 * dt; // Enemy speed
@@ -78,9 +78,12 @@ export function createWanderAI(entity, sprite, tetherRadius) {
             // FIX: Strict check
             if (oldVoxel && oldVoxel.occupant === entity.id) oldVoxel.occupant = null;
             
-            const newVoxel = World.get(getVoxelKey(newGridX, entity.gridPos.y, newGridZ));
+            const p = entity.gridPos;
+            const newGridY = stepLevel(p.x, p.y, p.z, newGridX, newGridZ) ?? p.y;
+            const newVoxel = World.get(getVoxelKey(newGridX, newGridY, newGridZ));
             if (newVoxel) newVoxel.occupant = entity.id;
             entity.gridPos.x = newGridX;
+            entity.gridPos.y = newGridY;
             entity.gridPos.z = newGridZ;
           }
         }

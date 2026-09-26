@@ -1,10 +1,13 @@
 import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3, positionWorldDirection } from 'three/tsl';
-import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid, worldMirrorEntries } from './world.js';
+import { MODELS } from './models.js';
+import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid, worldMirrorEntries, surfaceHeight, stepLevel, followGround, ModelBoxes, addWorldModel,
+         WorldModels, mountWorldModel, loadLevel } from './world.js';
+import { createEditor } from './editor.js';
 import { createObject, rollLootTable } from './objects.js';
-import { initWorldRender, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
-         glassInstancedMesh, terrainKeepTSL,
-         terrainTextures, terrainWhite, terrainSampleTSL } from './render.js';
+import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
+         glassInstancedMesh, terrainKeepTSL, terrainShapeTSL,
+         terrainTextures, terrainWhite, terrainSampleTSL, terrainTexelTSL } from './render.js';
 import { texelPixels, texelCacheSpacingFor } from './texelcache.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
@@ -18,7 +21,7 @@ import { createPerfOverlay } from './perf.js';
 import { createFramePacer, describePacing } from './pacing.js';
 import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
-         createVoxelAONode } from './gpu.js';
+         createVoxelAONode, terrainEmissiveTSL } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings, setHitBounds,
          GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
@@ -189,8 +192,72 @@ dirLight.position.set(...sunForHour(DEFAULT_SKY_HOUR));
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
+// The saved level (levels/default.json - the editor writes it) if there is
+// one; otherwise the test area built in code, with its test props.
+async function fetchLevel(name) {
+  try {
+    const res = await fetch(`${import.meta.env.BASE_URL}levels/${name}.json`, { cache: 'no-store' });
+    return res.ok ? await res.json() : null;
+  } catch { return null; }
+}
+const savedLevel = await fetchLevel('default');
+if (savedLevel) {
+  const missing = loadLevel(savedLevel, MODELS);
+  if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
+} else {
 createTestArea(36, 36);
+// Test props: the chair from assets/objects (models.js), standing on the
+// ground near the start, in three facings.
+const testChair = MODELS.get('decor_chair');
+if (testChair) {
+  addWorldModel(testChair, 6, 0, 8, 0);
+  addWorldModel(testChair, 6, 0, 10, 1);
+  addWorldModel(testChair, 4, 0, 9, 2);
+}
+// The wall torch, hung on walls: on the west face of the grass wall at x = 20
+// (the wall east of its cell), and on the marble wall behind the reflection
+// bed (south of its cell, z = 17) - both walls are two blocks tall, where the iron floor and marble mirror it.
+const testTorch = MODELS.get('decor_wallTorch');
+if (testTorch) {
+  // One block up (cell y 2): at eye level, not at the foot of the wall.
+  mountWorldModel(testTorch, 19, 2, 11, 'E');
+  mountWorldModel(testTorch, 5, 2, 16, 'S');
+}
+// Every other model in assets/objects, in a row along z = 6 from x = 4, so a
+// new one shows up by being dropped in the folder (until the editor places them).
+{
+  let x = 4;
+  for (const [name, model] of MODELS) {
+    if (name === 'decor_chair' || name === 'decor_wallTorch' || x > 10) continue;
+    addWorldModel(model, x, 0, 6, 0);
+    x += 2;
+  }
+}
+}
 initWorldRender(scene);
+
+// The lights of placed models (world.js WorldModels): one per lightSource
+// cube, at its centre, as big as the cube - its penumbra is the cube's. Its
+// level from the cube's name (lightSource_12), else MODEL_LIGHT_LEVEL. The
+// colour is the cube's own pixels (render.js lightColourOf), read when its
+// texture has decoded; warm white until then.
+const MODEL_LIGHT_LEVEL = 10;
+const MODEL_LIGHT_FALLBACK = 0xffe2b0;
+const modelLights = [];
+function syncModelLights() {
+  modelLights.length = 0;
+  for (const m of WorldModels) {
+    for (const l of m.lights) {
+      modelLights.push({
+        name: m.name, level: l.level ?? MODEL_LIGHT_LEVEL, sourceRadius: l.radius,
+        position: new THREE.Vector3(...l.position),
+        get colour() { return m.model.lightColour ?? MODEL_LIGHT_FALLBACK; }
+      });
+    }
+  }
+}
+syncModelLights();
+
 
 // --- PLAYER ENTITY & SPRITE SETUP ---
 const player = createEntity({
@@ -252,10 +319,10 @@ const playerTex = loadSpriteTexture(bobTextureUrl);
 const playerSprite = createCharacterMesh(playerTex);
 
 // An entity's gridPos.y is the block it stands ON, so its sprite sits on that
-// block's top face: centre of block y, plus half a block up.
+// block's top face - half a block lower on a half-bottom (world.js).
 const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
   gridPos.x * VOXEL_SIZE,
-  (gridPos.y * VOXEL_SIZE) + (VOXEL_SIZE / 2),
+  surfaceHeight(gridPos.x, gridPos.y, gridPos.z),
   gridPos.z * VOXEL_SIZE
 );
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
@@ -965,7 +1032,7 @@ function updatePathDots(path, reach = Infinity) {
     const node = path[i];
     const dot = new THREE.Mesh(dotGeo, i < reach ? dotMat : dotMatOut);
     // Position slightly above the surface
-    dot.position.set(node.x * VOXEL_SIZE, (node.y * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.1, node.z * VOXEL_SIZE);
+    dot.position.set(node.x * VOXEL_SIZE, surfaceHeight(node.x, node.y, node.z) + 0.1, node.z * VOXEL_SIZE);
     pathGroup.add(dot);
   }
 }
@@ -1075,6 +1142,39 @@ let currentReachable = null;
 let currentArenaMap = null;
 let isPointerDown = false;
 let currentMoveTargetKey = null;
+
+// --- THE EDITOR (js/editor.js): Tab ---
+// An edit changes World / WorldModels; this rebuilds what is made from them.
+// The terrain mesh is refilled in place (render.js), the block-material
+// volume with it; the mirrors rebuild on their next update; the field is
+// re-baked in full, and the worker handed the new world; the model lights are
+// re-read. Returns a message for the editor when something needs a reload.
+function applyWorldEdit() {
+  const r = rebuildWorldInstances();
+  if (!r.ok) return { message: `${r.count} pieces is past the terrain mesh's room - save and reload` };
+  for (const t of Object.values(terrainTwins)) if (t) t.count = worldInstancedMesh.count;
+  mirrorRects = null;
+  syncModelLights();
+  if (shadowsOn) {
+    // No prior footprint: a full bake, not a scroll (boxgrid.js createBoxGridAt).
+    for (const g of shadowGrids) if (g) g.filledBlocks = null;
+    ensureShadowGrids();
+  }
+  if (r.glassNeeded) return { message: 'glass in a world built without it: save and reload to see it traced' };
+  return null;
+}
+const editor = createEditor({
+  scene, camera, dom: renderer.domElement,
+  onEdit: applyWorldEdit,
+  onToggle: on => {
+    if (on && currentMode !== 'explore') { console.log('the editor opens in explore mode only'); return false; }
+    // Nothing carries over: no walk in progress, no key held down.
+    currentPath = [];
+    currentMoveTargetKey = null;
+    for (const k of Object.keys(keyState)) keyState[k] = false;
+    return true;
+  }
+});
 let enemyPath = []; // Tracks AI movement animation
 
 // Handles resetting resources and triggering AI
@@ -1187,7 +1287,7 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
       currentPath = path; // Instant override of the path!
       currentMoveTargetKey = targetKey;
       
-      highlightMesh.position.set(gx * VOXEL_SIZE, (gy * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+      highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
       highlightMesh.visible = true;
       
       if (isDownEvent) {
@@ -1472,7 +1572,7 @@ window.addEventListener('pointerup', (e) => {
       currentPath = path;
       currentMoveTargetKey = targetKey;
       clickPulseTime = 1.0; 
-      highlightMesh.position.set(gx * VOXEL_SIZE, (gy * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+      highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
       highlightMesh.visible = true;
       highlightMesh.material.color.setHex(0xffff00); 
       
@@ -1557,7 +1657,7 @@ function handlePointerMove(e) {
 
       const inArena = currentMode === 'explore' || !currentArenaMap || currentArenaMap.has(targetKey);
       if (voxel && isStandable(gx, gy, gz) && inArena) {
-        highlightMesh.position.set(gx * VOXEL_SIZE, (gy * VOXEL_SIZE) + (VOXEL_SIZE / 2) + 0.02, gz * VOXEL_SIZE);
+        highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
         highlightMesh.visible = true;
 
         if (currentMode === 'battle') {
@@ -1842,7 +1942,7 @@ function animate(time) {
   timer.update(time);
   const dt = Math.min(timer.getDelta(), 0.1);
 
-  if (currentMode === 'explore') {
+  if (currentMode === 'explore' && !editor.active) {
     enemyAI.update(dt, currentHeading);
   }
 
@@ -1875,6 +1975,8 @@ function animate(time) {
   if (currentPath.length > 0) {
     const targetNode = currentPath[0];
     const targetWorldPos = getSpriteWorldPos(targetNode);
+    // Across the ground only: followGround sets the height under the sprite.
+    targetWorldPos.y = playerSprite.position.y;
     const step = 8 * dt;
     
     if (playerSprite.position.distanceTo(targetWorldPos) <= step) {
@@ -1913,10 +2015,14 @@ function animate(time) {
           // FIX: Only clear if we own it
           if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
           
-          const newVoxel = World.get(getVoxelKey(newGridX, player.gridPos.y, newGridZ));
+          // The column's level: half a block up or down is a step (world.js).
+          const newGridY = stepLevel(player.gridPos.x, player.gridPos.y, player.gridPos.z,
+                                     newGridX, newGridZ) ?? player.gridPos.y;
+          const newVoxel = World.get(getVoxelKey(newGridX, newGridY, newGridZ));
           if (newVoxel) newVoxel.occupant = player.id;
           
           player.gridPos.x = newGridX;
+          player.gridPos.y = newGridY;
           player.gridPos.z = newGridZ;
         }
       }
@@ -1926,6 +2032,7 @@ function animate(time) {
   if (enemyPath.length > 0) {
     const targetNode = enemyPath[0];
     const targetWorldPos = getSpriteWorldPos(targetNode);
+    targetWorldPos.y = enemySprite.position.y;   // across the ground only
     const step = 5 * dt; 
     
     if (enemySprite.position.distanceTo(targetWorldPos) <= step) {
@@ -1984,9 +2091,14 @@ function animate(time) {
       const nextGX = Math.round(newX / VOXEL_SIZE);
       const nextGZ = Math.round(newZ / VOXEL_SIZE);
       
+      // The level a column is entered at: the same, or a half-block step
+      // (world.js stepLevel). A full block's rise needs Jump.
+      const levelAt = (gx, gz) => (gx === player.gridPos.x && gz === player.gridPos.z)
+        ? player.gridPos.y
+        : stepLevel(player.gridPos.x, player.gridPos.y, player.gridPos.z, gx, gz);
       const canWalk = (gx, gz) => {
-         const y = player.gridPos.y; // free movement is same-level until Jump exists
-         if (!isStandable(gx, y, gz)) return false;
+         const y = levelAt(gx, gz);
+         if (y === null) return false;
          const v = World.get(getVoxelKey(gx, y, gz));
          return !v.occupant || v.occupant === player.id;
       };
@@ -2007,14 +2119,21 @@ function animate(time) {
         // FIX: Strict ownership check
         if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
         
-        const newVoxel = World.get(getVoxelKey(newGridX, player.gridPos.y, newGridZ));
+        const newGridY = levelAt(newGridX, newGridZ) ?? player.gridPos.y;
+        const newVoxel = World.get(getVoxelKey(newGridX, newGridY, newGridZ));
         if (newVoxel) newVoxel.occupant = player.id;
         
         player.gridPos.x = newGridX;
+        player.gridPos.y = newGridY;
         player.gridPos.z = newGridZ;
       }
     }
   }
+  // Characters move across the ground; their height is the ground under
+  // them, followed exactly up a slope and eased over a half-block ledge
+  // (world.js followGround).
+  followGround(playerSprite, player.gridPos, dt);
+  followGround(enemySprite, enemy.gridPos, dt);
 
   // Auto-close the panel if the player walks out of look-range of whichever
   // target is open; otherwise keep its action buttons' enabled state live.
@@ -2057,6 +2176,7 @@ function animate(time) {
   camera.position.z = pivot.position.z + xzLen * Math.cos(currentHeading);
   
   camera.lookAt(pivot.position);
+  editor.update(dt);
 
   // Clamped billboard: characters turn to face the camera's heading, plus lean
   // back toward its pitch up to MAX_CHARACTER_TILT - enough to avoid looking
@@ -2144,6 +2264,11 @@ let spikeLog = false;
 
 // --- DEBUG CONSOLE (bxb) ---
 let shadowsOn = false;
+// What the field is centred on: the player, or while editing, the ground the
+// editor camera looks at - so the shadows are fine where the edits are.
+function fieldFocus() {
+  return editor && editor.active ? editor.focusGridPos() : player.gridPos;
+}
 // One entry per cascade. C0 is the fine 18 m field the texel lock is aligned to;
 // C1 is half resolution over 36 m and exists so a long shadow's ray still finds
 // its caster after C0 has run out. See boxgrid.js for the level table.
@@ -2157,7 +2282,7 @@ let shadowOrigins = [];     // block origin each level is currently built at
 // Called on turn-on and whenever a level's origin moves.
 function ensureShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const o = gridOriginFor(currentMode, player.gridPos, dirLight.position, sunGridBias, l);
+    const o = gridOriginFor(currentMode, fieldFocus(), dirLight.position, sunGridBias, l);
     shadowGrids[l] = createBoxGridAt(o.x, o.z, shadowGrids[l] || null, l);
     if (!shadowTexes[l]) shadowTexes[l] = createDistanceTexture(shadowGrids[l]);
     updateDistanceTexture(shadowTexes[l]);
@@ -2205,7 +2330,7 @@ function resetFieldWorker() {
   // Every reset, not once. World is static today, but a mirror baking from
   // stale blocks would hand back strips of terrain that is not there, so any
   // future terrain edit only has to trigger a reset to reach it.
-  fieldWorker.postMessage({ type: 'world', blocks: worldMirrorEntries(World) });
+  fieldWorker.postMessage({ type: 'world', blocks: worldMirrorEntries(World), models: ModelBoxes });
   fieldGen++;
   fieldInFlight.length = 0;
   for (let l = 0; l < CASCADE_COUNT; l++) {
@@ -2221,7 +2346,7 @@ function followShadowGrids() {
   let moved = fieldApplied;
   fieldApplied = false;
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const want = gridOriginFor(currentMode, player.gridPos, dirLight.position, sunGridBias, l);
+    const want = gridOriginFor(currentMode, fieldFocus(), dirLight.position, sunGridBias, l);
     const at = shadowOrigins[l];
     if (at && want.x === at.x && want.z === at.z) continue;
     if (fieldWorker) {
@@ -2270,11 +2395,11 @@ let sunFadeStart = null, sunEdgeFade = null;
 // Set for exactly one pass to overwrite every cached texel. A stored shadow is
 // only good while the sun and the world it was measured against hold, so moving
 // either invalidates all of them at once.
-// How N.L is applied. 'ground' normalises against what a horizontal surface
+// How N.L is applied; 'lambert' (raw N.L) by default. 'ground' normalises against what a horizontal surface
 // receives, so the sun's ANGLE sets shadow direction and length rather than the
 // whole scene's brightness - see sunShadeTSL. A kernel branch, so changing it
 // rebuilds; ambient beside it is a plain uniform.
-let shadeMode = 'ground';
+let shadeMode = 'lambert';
 // How far the explore footprint leans toward the sun, in blocks. A plain number
 // rather than a uniform: it changes WHERE the grid is baked, so it takes effect
 // on the next re-origin, not on the next shade.
@@ -2424,6 +2549,8 @@ function terrainTwin(material, renderOrder) {
 function ensureTerrainTwins() {
   if (terrainTwins.prepass) return terrainTwins;
   const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
+  // The same vertex code as the shaded draws: a slope's plane, not its box.
+  depthOnly.positionNode = terrainShapeTSL();
   // The prepass keeps every block, glass included: glass is the front surface
   // wherever it is, so the terrain behind it fails the depth test and is never
   // shaded.
@@ -2787,7 +2914,7 @@ function ensureLightBindings() {
 // of the shared card buffer. Once per frame, after the torch has moved.
 function updateLights() {
   if (!lightBindings) return;
-  const live = liveLights([syncTorchLight(), ...placedLights], MAX_LIGHTS);
+  const live = liveLights([syncTorchLight(), ...placedLights, ...modelLights], MAX_LIGHTS);
   const withCards = frameCasters && lightCards && cardsReady && cardsOn;
   // The shadow budget: which lights get a march, ranked by what they give the
   // player's surroundings. Each light's weight eases toward in or out, so a
@@ -2877,7 +3004,7 @@ function describeLight(l, i) {
 }
 
 function listLights() {
-  const all = [syncTorchLight(), ...placedLights];
+  const all = [syncTorchLight(), ...placedLights, ...modelLights];
   const live = new Set(liveLights(all, MAX_LIGHTS));
   const rows = all.map((l, i) => describeLight(l, i) + (live.has(l) ? '' : '  (not shaded)'));
   return `${live.size}/${MAX_LIGHTS} lights shaded, ${lastShadowedCount} with ` +
@@ -3126,7 +3253,9 @@ function shadowNodeOptions() {
     cards: cardsReady && cardsOn ? sunCards : null,
     lightCards: cardsReady && cardsOn ? lightCards : null,
     terrain: terrainTextures, specularOnly,
-    albedo: st => mix(terrainSampleTSL(terrainTextures.albedo, st).rgb, vec3(1, 1, 1), whiteUniform),
+    // At the surface's texel - on a slope's plane, its own texture (render.js).
+    albedo: (st, surf = null) => mix(terrainTexelTSL(terrainTextures.albedo, st, surf).rgb,
+                                     vec3(1, 1, 1), whiteUniform),
     specular: specularOn, reflections: reflectionsOn,
     sky: skyBindings,
     mirrors: mirrorsOn ? mirrorBindings : null, mirrorOnly,
@@ -3185,7 +3314,9 @@ function obtainShadowSet() {
   }
 
   const built = createShadowColorNode(opts);
-  const { node, spriteLight, sun } = built;
+  const { spriteLight, sun } = built;
+  // A model's lightSource cube draws unlit, in every terrain pass.
+  const node = terrainEmissiveTSL(built.node, terrainTextures);
   // The node applies the albedo itself - specular adds after it, not under it.
   // With the texel cache, the terrain's own material looks its colour up and
   // a second, low-res material does the shading - see renderTexelCache.
@@ -4106,7 +4237,7 @@ const bxbApi = installConsole(createConsole({
   shade: {
     help: 'how N.L is applied, and the ambient floor - both paths share one formula',
     usage: "bxb.shade('ground'|'lambert'|'flat', ambient?)",
-    run: async (mode = 'ground', ambient = DEFAULT_AMBIENT) => {
+    run: async (mode = 'lambert', ambient = DEFAULT_AMBIENT) => {
       const modes = ['ground', 'lambert', 'flat'];
       if (!modes.includes(mode)) return `mode must be one of ${modes.join(', ')}`;
       shadeMode = mode;

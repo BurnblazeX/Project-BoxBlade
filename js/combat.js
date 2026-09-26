@@ -1,5 +1,5 @@
 import { rollD20, rollDice } from './dice.js';
-import { getAbilityModifier, attackRange, getVoxelKey, World, currentArena, findPath } from './world.js';
+import { getAbilityModifier, attackRange, getVoxelKey, World, currentArena, findPath, stepLevel } from './world.js';
 
 export function isInMeleeRange(attacker, defender) {
   return attackRange(attacker.gridPos, defender.gridPos) <= 1;
@@ -57,7 +57,11 @@ export function takeEnemyTurn(enemy, player) {
     let shortest = Infinity;
 
     for (const dir of dirs) {
-      const target = { x: player.gridPos.x + dir.x, y: player.gridPos.y, z: player.gridPos.z + dir.z };
+      // The square beside the player at the level a step from it lands on.
+      const p = player.gridPos;
+      const ty = stepLevel(p.x, p.y, p.z, p.x + dir.x, p.z + dir.z);
+      if (ty === null) continue;
+      const target = { x: p.x + dir.x, y: ty, z: p.z + dir.z };
       const tKey = getVoxelKey(target.x, target.y, target.z);
       const v = World.get(tKey);
       

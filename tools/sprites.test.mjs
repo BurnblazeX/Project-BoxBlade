@@ -37,11 +37,11 @@ ok('corners sit at half a block from centre', Math.abs(samples[0].x), BLOCK_METR
 ok('top samples at two blocks up', samples[2].y, BLOCK_METRES * 2);
 
 section('open ground - depth testing must be preserved');
-// The test world is bare ground away from the wall (x=20), pillar (26,20) and
-// platform (28-31, 28-31).
+// The test world is bare ground away from the wall (x=20), pillar (26,20),
+// platform (28-31, 28-31) and the stairs up the wall (18-19, 12).
 falsy('standing in the open never clips', clipsAtAnyHeading({ x: 5, y: 0, z: 5 }));
 falsy('nor does another open tile', clipsAtAnyHeading({ x: 10, y: 0, z: 25 }));
-falsy('nor one a single tile from the wall line', clipsAtAnyHeading({ x: 18, y: 0, z: 11 }));
+falsy('nor one a single tile from the wall line', clipsAtAnyHeading({ x: 18, y: 0, z: 9 }));
 
 section('beside tall geometry - the case that was getting sliced');
 // Wall occupies x=20, z=8..14, y=1..2. Standing directly alongside it, the

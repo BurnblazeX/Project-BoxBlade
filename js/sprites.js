@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { isSolid, BLOCK_METRES } from './world.js';
+import { isSolidAt, BLOCK_METRES } from './world.js';
 import { wantsTransparent } from './cutout.js';
 
 // --- Character quad vs. world geometry ---
@@ -150,16 +150,15 @@ const _point = new THREE.Vector3();
 
 // Takes a world matrix rather than a mesh so it can be exercised without a
 // renderer or a scene graph.
+// Blocks: more than a slope rises over half a character's width (0.25).
+export const SLOPE_FOOT_CLEARANCE = 0.3;
 export function isQuadClipping(matrixWorld, samples) {
   for (const local of samples) {
     _point.copy(local).applyMatrix4(matrixWorld);
-    // Blocks are centred on b * BLOCK_METRES, so rounding maps a world point to
-    // the cell that contains it.
-    if (isSolid(
-      Math.round(_point.x / BLOCK_METRES),
-      Math.round(_point.y / BLOCK_METRES),
-      Math.round(_point.z / BLOCK_METRES)
-    )) return true;
+    // Shape-aware: a half block's empty half is air (world.js isSolidAt). On a
+    // slope the feet stand on the plane at the sprite's centre, so a corner
+    // uphill is under it: SLOPE_FOOT_CLEARANCE lets a character stand there.
+    if (isSolidAt(_point.x, _point.y, _point.z, SLOPE_FOOT_CLEARANCE)) return true;
   }
   return false;
 }

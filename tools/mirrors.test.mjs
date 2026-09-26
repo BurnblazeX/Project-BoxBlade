@@ -146,3 +146,41 @@ section('the mirror texel cache: bases and budget');
      o, MAX_MIRRORS, lit, [], null, small), 1);
   ok('and counts only what it packed', small.texels, first[0] * first[1]);
 }
+
+section('half blocks: their own faces');
+{
+  const { buildMirrors } = await import('../js/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const m = (shape) => ({ materialId: 'marble', ...(shape ? { shape } : {}) });
+  // A full marble block at (0,1,0) with a half-bottom beside it at (1,1,0),
+  // both on marble ground.
+  const W = new Map([['0,0,0', m()], ['1,0,0', m()], ['0,1,0', m()], ['1,1,0', m('halfBottom')]]);
+  const r = buildMirrors(W, new Set(['marble']));
+  const find = (axis, sign, plane) => r.filter(q => q.axis === axis && q.sign === sign &&
+                                                   Math.abs(q.plane - plane * B) < 1e-9);
+  const top = find(1, 1, 1);
+  ok('the half-bottom\'s top is a rectangle at mid-cell', top.length, 1);
+  ok('one block across', top[0] && (top[0].max[0] - top[0].min[0]) / B, 1);
+  // The full block's +x face: its lower half is against the half-bottom.
+  const side = find(0, 1, 0.5);
+  ok('the full block\'s +x face is one rectangle', side.length, 1);
+  ok('covering only its upper half (y 1 .. 1.5 blocks)',
+     side[0] && `${side[0].min[0] / B},${side[0].max[0] / B}`, '1,1.5');
+  // The half-bottom's own +x face: half a block tall.
+  const own = find(0, 1, 1.5).filter(q => q.min[0] >= 0.5 * B);
+  ok('the half-bottom\'s side is half a block tall', own[0] && (own[0].max[0] - own[0].min[0]) / B, 0.5);
+  // A half-top's underside is a face even over a full block.
+  const W2 = new Map([['0,0,0', m()], ['0,1,0', m('halfTop')]]);
+  const under = buildMirrors(W2, new Set(['marble'])).filter(q => q.axis === 1 && q.sign === -1);
+  ok('a half-top\'s underside faces the gap', under.length && under[0].plane / B, 1);
+}
+
+section('slopes throw no mirror light');
+{
+  const { buildMirrors } = await import('../js/mirrors.js');
+  const W = new Map([['0,0,0', { materialId: 'marble' }],
+                     ['0,1,0', { materialId: 'marble', shape: 'slope', facing: 'E' }]]);
+  const r = buildMirrors(W, new Set(['marble']));
+  truthy('no rectangle above the ground block', r.every(q => !(q.axis === 1 && q.plane > 0.75 + 1e-9)));
+  falsy('the ground block top is covered by the slope', r.some(q => q.axis === 1 && q.sign === 1));
+}
