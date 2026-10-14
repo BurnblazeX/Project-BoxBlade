@@ -269,7 +269,7 @@ export function cutAmount(amount, cutoff = DEFAULT_LIGHT_CUTOFF) {
 // contribution each would make at the focus point, as lightContribution
 // computes it. A light that does not reach the focus scores its level alone,
 // below every light that does, so a bright far lamp still outranks a dim one.
-export const DEFAULT_SHADOW_BUDGET = 12;
+export const DEFAULT_SHADOW_BUDGET = 16;
 
 // The card budget: of the lights that march, how many also test sprite cards.
 // A narrower cut than the shadow budget, and a safe one: a light over it still
@@ -281,7 +281,7 @@ export const DEFAULT_SHADOW_BUDGET = 12;
 // profile). Ranked as the shadow budget is: the player's torch first.
 export const DEFAULT_HIT_SHADOW_BUDGET = 1;
 export const DEFAULT_MIRROR_LIGHT_BUDGET = 1;
-export const DEFAULT_CARD_BUDGET = 6;
+export const DEFAULT_CARD_BUDGET = 16;
 
 // Seconds for a light's shadow to fade in or out when it enters or leaves the
 // budget, so walking past a lamp does not pop its shadows on and off.
