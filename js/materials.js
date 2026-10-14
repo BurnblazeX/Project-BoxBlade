@@ -48,7 +48,7 @@ export const MATERIALS = [
 // build time, and in node - the tests - the call throws and the built-in list
 // is all there is.
 export const MATERIAL_TEXTURE_PREFIX = 'terrain_';
-const COMPANION = /_(n|s|e)$|_(slope|halfSlope)(_(n|s|e))?$/;
+const COMPANION = /_(n|s|e)$|_(slope|halfSlope|top|bottom)(_(n|s|e))?$/;
 export function materialIdsFromFiles(paths) {
   const ids = [];
   for (const p of paths) {
@@ -69,6 +69,39 @@ for (const id of materialIdsFromFiles(Object.keys(textureFiles))) {
 }
 
 const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
+
+// --- A material's other faces: top, bottom, slope planes ---
+//
+// A material's own texture (layer = its index) is its SIDE. Optional
+// companions, each with its own _n / _s, add layers after the materials':
+//   <texture>_top.png, <texture>_bottom.png  the +y / -y faces, as a pillar's
+//     ends (a missing _bottom takes the _top, as a log's two ends match);
+//   <texture>_slope.png (12 x 17), <texture>_halfSlope.png (12 x 13)  a
+//     slope's plane, split over two 12 x 12 layers: rows 0-11, then the rest.
+// So every face of everything - blocks, slopes, model tiles - is one read of
+// the same three arrays (render.js terrainTexelTSL).
+// has(name): whether assets/textures holds name.png.
+// Returns { faces: per material { top, bottom, slope: [slope, halfSlope] }
+// (a slope entry -1 when the plane takes the side texture, stretched), end:
+// the first layer after them (where models.js starts) }.
+export const SLOPE_SUFFIXES = ['_slope', '_halfSlope'];
+export function allocateMaterialLayers(materials, has) {
+  let next = materials.length;
+  const any = name => has(name) || has(name + '_n') || has(name + '_s');
+  const faces = materials.map((m, i) => {
+    const top = any(m.texture + '_top') ? next++ : i;
+    const bottom = any(m.texture + '_bottom') ? next++ : top;
+    const slope = SLOPE_SUFFIXES.map(s => {
+      if (!any(m.texture + s)) return -1;
+      next += 2;
+      return next - 2;
+    });
+    return { top, bottom, slope };
+  });
+  return { faces, end: next };
+}
+const hasTexture = name => Object.keys(textureFiles).some(k => k.endsWith('/' + name + '.png'));
+export const MATERIAL_LAYERS = allocateMaterialLayers(MATERIALS, hasTexture);
 
 // What the two faces of a glass slab let through, of light meeting the first at
 // |cos| cosI: each reflects F (Schlick, from its F0), so (1 - F)^2. The CPU

@@ -11,7 +11,9 @@ import {
   sunColourUniform, skyShTSL, glassRayTransmitTSL, createMirrorLightTSL
 } from './gpu.js';
 import { BLOCK_METRES } from './world.js';
-import { MATERIALS } from './materials.js';
+import { GI_LAYERS } from './models.js';
+// One entry per material, then per model (models.js giIndex).
+const GI_TABLE = Array.from({ length: GI_LAYERS });
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, FACE_DIRS, SOLID_THRESHOLD,
   DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES
@@ -128,16 +130,16 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     slices: uniform(int(DEFAULT_LPV_SLICES)),
     shift: uniform(new THREE.Vector3()),
     // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
-    layerAlbedo: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
+    layerAlbedo: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
       .setName(`bxbLpvAlbedo`),
     // ... the SPECULAR share it bounces (lpv.js specularAlbedo): all of it, and
     // only its rough part - the smooth part the mirror light carries instead.
-    layerSpecAll: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
+    layerSpecAll: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
       .setName(`bxbLpvSpecAll`),
-    layerSpecRough: uniformArray(MATERIALS.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
+    layerSpecRough: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
       .setName(`bxbLpvSpecRough`),
     // ... and for glass, its tint through one block (1 for everything else).
-    layerTint: uniformArray(MATERIALS.map(() => new THREE.Vector4(1, 1, 1, 0)), 'vec4')
+    layerTint: uniformArray(GI_TABLE.map(() => new THREE.Vector4(1, 1, 1, 0)), 'vec4')
       .setName(`bxbLpvTint`),
     // 1: light thrown by the mirrors bounces from where it lands (and the
     // smooth texels' own share is left to it). 0: no mirror light - every
@@ -167,10 +169,13 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     const vp = p.sub(c0.origin).div(c0.voxel);
     return decodeFieldTSL(ownField(ringUV(vp, c0.ring)).g, c0.range);
   };
-  // A block's material layer, from the block volume (0 when there is none).
+  // A block's entry in the per-layer tables, from the block volume: its
+  // material's (R, layer + 1), or in a model's cell the model's (A, giIndex
+  // + 1; render.js buildBlockVolume). 0 when there is neither.
   const layerOf = bi => {
     const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
-    const code = round(texture3D(blocks.tex, uvw).level(int(0)).r.mul(float(255)));
+    const v = texture3D(blocks.tex, uvw).level(int(0));
+    const code = round(max(v.r, v.a).mul(float(255)));
     return int(max(code.sub(float(1)), float(0)));
   };
   // Centre of a cell, in world metres.

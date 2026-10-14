@@ -270,3 +270,70 @@ export function lightColourOf(model, rgba, width) {
   const c = v => Math.min(255, Math.round(v / count * k));
   return (c(r) << 16) | (c(g) << 8) | c(b);
 }
+
+// A placed cube's per-instance model attributes (render.js modelTexelTSL).
+export function modelInstanceData(cube, model) {
+  let mask = 0;
+  const uv = [];
+  cube.faces.forEach((f, d) => {
+    if (!f) { uv.push(0, 0); return; }
+    if (f.u.d < 0) mask |= 1 << (2 * d);
+    if (f.v.d < 0) mask |= 1 << (2 * d + 1);
+    if ((d === 2 || d === 3) && faceSwapped(d, f)) mask |= 1 << (10 + d);
+    uv.push(f.u.o, f.v.o);
+  });
+  // A lightSource cube: w = 2 (drawn unlit), and its texels from the _e
+  // tiles when the model has them.
+  if (cube.light) return { info: [mask, model.emissiveLayer ?? model.modelLayer, model.tilesX, 2], uv };
+  return { info: [mask, model.modelLayer, model.tilesX, 1], uv };
+}
+
+
+// --- The rays' view of placed models ---
+//
+// A ray that hits a model cube (reflections, the view through glass) knows
+// only its cell and its face. Per model cell a header (first record, count),
+// then per cube that reaches into the cell a record of MODEL_HIT_RECORD vec4:
+// its world texel box min, max, then modelInstanceData's info and uv.
+export const MODEL_HIT_VEC4S = 32768;
+export const MODEL_HIT_RECORD = 6;
+// The block a world texel (on any axis) lies in: blocks are centred on
+// whole multiples of a block (12 texels), so texel t is in round((t + 0.5) / 12).
+const cellOfTexel = t => Math.floor((t + 6) / 12);
+
+// The model hit table (render.js buildBlockVolume, read by gpu.js
+// hitSurfaceTSL), as a flat Float32Array of vec4, and per cell key ("x,y,z")
+// its header index and model's GI entry. models: placed models ({ cubes,
+// model }); isBlock(key): a cell a block fills, which a ray never reads as a
+// model's.
+export function buildModelHits(models, isBlock = () => false, capacity = MODEL_HIT_VEC4S) {
+  const byCell = new Map();
+  for (const m of models) {
+    for (const cube of m.cubes) {
+      const lo = cube.min.map(cellOfTexel), hi = cube.max.map(t => cellOfTexel(t - 1));
+      for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++)
+        for (let z = lo[2]; z <= hi[2]; z++) {
+          const key = `${x},${y},${z}`;
+          if (isBlock(key)) continue;
+          if (!byCell.has(key)) byCell.set(key, { cell: [x, y, z], model: m.model, cubes: [] });
+          byCell.get(key).cubes.push({ cube, model: m.model });
+        }
+    }
+  }
+  const cells = [...byCell.values()];
+  const data = new Float32Array(capacity * 4);
+  let next = cells.length, overflow = false;
+  const index = new Map();
+  cells.forEach((c, h) => {
+    const need = c.cubes.length * MODEL_HIT_RECORD;
+    if (next + need > capacity) { overflow = true; return; }
+    data.set([next, c.cubes.length, 0, 0], h * 4);
+    for (const { cube, model } of c.cubes) {
+      const d = modelInstanceData(cube, model);
+      data.set([...cube.min, 0, ...cube.max, 0, ...d.info, ...d.uv], next * 4);
+      next += MODEL_HIT_RECORD;
+    }
+    index.set(c.cell.join(','), { header: h, giIndex: c.model.giIndex ?? 0 });
+  });
+  return { data, index, used: next, overflow };
+}

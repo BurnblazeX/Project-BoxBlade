@@ -400,3 +400,20 @@ section('stairs');
   truthy('solid under the upper tread', isSolidAt(18 * B + 0.3, 2.1, 12 * B));
   falsy('air over the lower tread', isSolidAt(18 * B - 0.3, 2.1, 12 * B));
 }
+
+section('buried faces are not drawn');
+{
+  const { exposedFaceMask, occludesFaces, ALL_FACES } = await import('../js/world.js');
+  const solid = new Set(['1,0,0', '0,-1,0']);
+  const at = (x, y, z) => solid.has(`${x},${y},${z}`);
+  const full = [0, 1, 0, 1, 0, 1];
+  ok('+x and -y buried, the rest drawn', exposedFaceMask(0, 0, 0, full, false, at), ALL_FACES & ~1 & ~8);
+  ok('a half block\'s top is inside its cell: drawn', exposedFaceMask(0, 0, 0, [0, 1, 0, 0.5, 0, 1], false,
+     () => true), 4);
+  ok('a slope\'s top (its plane) is never buried', exposedFaceMask(0, 0, 0, full, true, () => true) & 4, 4);
+  ok('nothing around: all drawn', exposedFaceMask(0, 0, 0, full, false, () => false), ALL_FACES);
+  falsy('glass buries nothing', occludesFaces({ materialId: 'glass' }));
+  falsy('a half block buries nothing', occludesFaces({ materialId: 'grass', shape: 'halfBottom' }));
+  truthy('a full block does', occludesFaces({ materialId: 'grass' }));
+}
+

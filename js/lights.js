@@ -28,14 +28,15 @@ export function clampLevel(level) {
   return Math.max(0, Math.min(MAX_LIGHT_LEVEL, Math.round(level || 0)));
 }
 
-// The level IS the radius in blocks. Stated as its own function because the
-// shader mirrors this line and nothing else about the convention.
-export function lightRadiusBlocks(level) {
+// The level IS the radius in metres (2026-10-14; it was blocks). Stated as
+// its own function because the shader mirrors this line (gpu.js: radius =
+// level) and nothing else about the convention.
+export function lightRadiusMetres(level) {
   return clampLevel(level);
 }
 
-export function lightRadiusMetres(level) {
-  return lightRadiusBlocks(level) * BLOCK_METRES;
+export function lightRadiusBlocks(level) {
+  return lightRadiusMetres(level) / BLOCK_METRES;
 }
 
 // Peak brightness at the source, 0..1. Linear in the level, so the levels are
@@ -195,21 +196,25 @@ export function parseColour(c) {
 
 // The lights that will actually be shaded: lit ones only, at most `capacity`,
 // in the order given. Level 0 is off, and off costs nothing - it never reaches
-// the array, so the kernel's loop does not even visit it.
-export function liveLights(lights, capacity = MAX_LIGHTS) {
-  const out = [];
-  for (const l of lights) {
-    if (!l || clampLevel(l.level) <= 0) continue;
-    out.push(l);
-    if (out.length >= capacity) break;
-  }
-  return out;
+// the array, so the kernel's loop does not even visit it. Past the capacity,
+// with a focus (the player), the ones that give it most win (shadowScore, as
+// the shadow budget ranks) - every wall torch in a map is a light, and list
+// order would drop whichever came last. The winners keep their order.
+export function liveLights(lights, capacity = MAX_LIGHTS, focus = null) {
+  const lit = lights.filter(l => l && clampLevel(l.level) > 0);
+  if (lit.length <= capacity) return lit;
+  if (!focus) return lit.slice(0, capacity);
+  const keep = new Set(lit.map(l => ({ l, s: shadowScore(l, focus) }))
+                          .sort((a, b) => b.s - a.s).slice(0, capacity).map(r => r.l));
+  return lit.filter(l => keep.has(l));
 }
 
 // One light into its three vec4. cardStart/cardCount are the slice of the
-// shared card buffer that was turned to face THIS light.
+// shared card buffer that was turned to face THIS light. hitShadow: whether
+// it marches at SECONDARY hits too (what reflections and the view through
+// glass land on) - carried in the source radius's sign, negative for no.
 export function packLight(out, index, light, cardStart = 0, cardCount = 0,
-                          shadowWeight = 1, cardWeight = 1) {
+                          shadowWeight = 1, cardWeight = 1, hitShadow = true) {
   const o = index * LIGHT_FLOATS;
   const { r, g, b } = colourToRGB(parseColour(light.colour));
   out[o + 0] = light.position.x;
@@ -217,7 +222,8 @@ export function packLight(out, index, light, cardStart = 0, cardCount = 0,
   out[o + 2] = light.position.z;
   out[o + 3] = clampLevel(light.level);
   out[o + 4] = r; out[o + 5] = g; out[o + 6] = b;
-  out[o + 7] = light.sourceRadius ?? LIGHT_SOURCE_RADIUS;
+  const radius = Math.max(1e-3, light.sourceRadius ?? LIGHT_SOURCE_RADIUS);
+  out[o + 7] = hitShadow ? radius : -radius;
   out[o + 8] = cardStart;
   out[o + 9] = cardCount;
   out[o + 10] = Math.max(0, Math.min(1, shadowWeight));
@@ -260,6 +266,12 @@ export const DEFAULT_SHADOW_BUDGET = 12;
 // A narrower cut than the shadow budget, and a safe one: a light over it still
 // marches the field, so walls still block it - only sprites stop casting its
 // shadow. Picked by the same score, so it is the most important few.
+// Of the shadowed lights, how many march at secondary hits (reflections, the
+// view through glass) and throw mirror light: each is a full extra march per
+// hit per light, and these were most of what three lights cost (2026-10-14
+// profile). Ranked as the shadow budget is: the player's torch first.
+export const DEFAULT_HIT_SHADOW_BUDGET = 1;
+export const DEFAULT_MIRROR_LIGHT_BUDGET = 1;
 export const DEFAULT_CARD_BUDGET = 6;
 
 // Seconds for a light's shadow to fade in or out when it enters or leaves the

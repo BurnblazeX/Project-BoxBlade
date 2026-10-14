@@ -93,6 +93,32 @@ export const BLOCK_SHAPES = {
   stairs:        { boxes: [[0, 1, 0, 0.5, 0, 1], [0.5, 1, 0.5, 1, 0, 1]],
                    stand: 0.75, low: 0.5, high: 1, treads: true }
 };
+// --- Buried faces ---
+//
+// Which of a drawn box's faces can be seen at all: a face on its cell's
+// boundary with a full opaque block beyond it is buried in solid, so the
+// terrain draws it as nothing (render.js terrainShapeTSL). Raster only - the
+// field, the block volume, mirrors and picking all read the world, not these
+// triangles, so shadows, GI and reflections are untouched. A slope's top is
+// its plane, which drops away from the cell's top, so it is never buried.
+// Bits d: +x, -x, +y, -y, +z, -z (BoxGeometry's face order); set = drawn.
+export const FACE_STEPS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+export const ALL_FACES = 63;
+export function occludesFaces(block) {
+  return !!block && !isGlassMaterial(block.materialId) && blockShape(block) === 'full';
+}
+// box: [x0, x1, y0, y1, z0, z1] in cell fractions; occluderAt(x, y, z): a
+// cell that buries a face against it.
+export function exposedFaceMask(x, y, z, box, slope, occluderAt) {
+  const onEdge = [box[1] === 1, box[0] === 0, box[3] === 1, box[2] === 0, box[5] === 1, box[4] === 0];
+  let mask = 0;
+  FACE_STEPS.forEach(([dx, dy, dz], d) => {
+    const buried = onEdge[d] && !(slope && d === 2) && occluderAt(x + dx, y + dy, z + dz);
+    if (!buried) mask |= 1 << d;
+  });
+  return mask;
+}
+
 // Uphill, as (x, z).
 export const FACINGS = { N: [0, -1], E: [1, 0], S: [0, 1], W: [-1, 0] };
 
@@ -649,6 +675,9 @@ const pathKey = (x, y, z) =>
   ((Math.round(x) + 32768) * 65536 + (Math.round(z) + 32768)) * 1024 + (Math.round(y) + 512);
 
 export function findPath(start, end, allowDiagonals = false) {
+  // A target nothing can stand on (a wall, a covered top, an occupied tile)
+  // is never reached - without this the search exhausts the map first.
+  if (!isEnterable(end.x, end.y, end.z)) return [];
   const cameFrom = new Map();
   const gScore = new Map();
   const fScore = new Map();

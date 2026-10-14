@@ -25,10 +25,9 @@ section('a level is a radius in blocks');
 // Stated as an identity rather than a formula, because that is what makes a
 // marched light and a future propagated one land on the same geometry: level 15
 // reaches 15 blocks, not "about 15 blocks after attenuation".
-ok('level 15 reaches 15 blocks', lightRadiusBlocks(15), 15);
-ok('level 8 reaches 8 blocks', lightRadiusBlocks(8), 8);
-near('15 blocks is 22.5 m', lightRadiusMetres(15), 22.5, 1e-12);
-near('and one block is one block', lightRadiusMetres(1), BLOCK_METRES, 1e-12);
+ok('level 15 reaches 15 m', lightRadiusMetres(15), 15);
+ok('level 8 reaches 8 m', lightRadiusMetres(8), 8);
+near('15 m is 10 blocks', lightRadiusBlocks(15), 15 / BLOCK_METRES, 1e-12);
 
 section('out-of-range levels are clamped, not wrapped');
 // A level arriving as 16 must not read as 0. Wrapping a brightness is the kind
@@ -151,6 +150,17 @@ ok('capped at the budget', liveLights(Array.from({ length: 20 }, () => L(3))).le
   const live = liveLights([L(0), a, b]);
   truthy('order is kept - the caller decides priority', live[0] === a && live[1] === b);
 }
+{
+  // Past the cap, with a focus, the lights that reach it win - not the first
+  // in the list. 18 far lamps, then two near ones.
+  const far = Array.from({ length: 18 }, () => L(3, 100));
+  const nearA = L(6, 1), nearB = L(6, 2);
+  const live = liveLights([...far, nearA, nearB], 16, at(0));
+  ok('still capped', live.length, 16);
+  truthy('the near lights are kept', live.includes(nearA) && live.includes(nearB));
+  truthy('in list order', live.indexOf(nearA) === 14 && live.indexOf(nearB) === 15);
+  ok('without a focus, list order', liveLights([...far, nearA], 16).includes(nearA), false);
+}
 
 {
   const out = new Float32Array(LIGHT_FLOATS * 2);
@@ -203,4 +213,16 @@ section('the shadow budget');
   ok('never overshoots', easeShadowWeight(0.9, true, 10), 1);
   ok('never undershoots', easeShadowWeight(0.1, false, 10), 0);
   ok('zero fade snaps', easeShadowWeight(0, true, 0.001, 0), 1);
+}
+{
+  // The hit-shadow flag rides in the source radius's sign; the radius itself
+  // is unchanged (the shader takes abs).
+  const out = new Float32Array(LIGHT_FLOATS);
+  const lamp = { position: { x: 0, y: 0, z: 0 }, level: 8, colour: 0xffffff, sourceRadius: 0.5 };
+  packLight(out, 0, lamp, 0, 0, 1, 1, true);
+  ok('shadowed at hits: radius positive', out[7], 0.5);
+  packLight(out, 0, lamp, 0, 0, 1, 1, false);
+  ok('not: the same radius, negative', out[7], -0.5);
+  packLight(out, 0, { ...lamp, sourceRadius: 0 }, 0, 0, 1, 1, false);
+  truthy('a zero radius still carries the sign', out[7] < 0);
 }

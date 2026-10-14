@@ -21,7 +21,8 @@ import { createPerfOverlay } from './perf.js';
 import { createFramePacer, describePacing } from './pacing.js';
 import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
-         createVoxelAONode, terrainEmissiveTSL } from './gpu.js';
+         createVoxelAONode, terrainEmissiveTSL, createHitCache,
+         createSplitShading, createTexelGBufferNode } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings, setHitBounds,
          GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
@@ -49,7 +50,7 @@ import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
          pointPenumbraMetres, MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY,
          liveLights, packLight, parseColour, DEFAULT_SHADOW_BUDGET,
          DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight,
-         DEFAULT_CARD_BUDGET, LIGHT_VEC4S } from './lights.js';
+         DEFAULT_CARD_BUDGET, LIGHT_VEC4S, DEFAULT_HIT_SHADOW_BUDGET, DEFAULT_MIRROR_LIGHT_BUDGET } from './lights.js';
 import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
 import { maskFromRGBA, createSilhouetteSet, facingToward,
          AXIS_X, AXIS_Z } from './silhouette.js';
@@ -1256,6 +1257,8 @@ function refreshReachableTiles() {
   updateVoxelTints(null, null, false);
 }
 
+// The last click-to-move search that found nothing, as "start>target".
+let lastFailedPath = null;
 function processClickToMove(clientX, clientY, isDownEvent = false) {
   if (!inputRules[currentMode].click) return;
   // Strict lock for Battle mode turns: No interruptions allowed
@@ -1277,9 +1280,15 @@ function processClickToMove(clientX, clientY, isDownEvent = false) {
   // Prevent spamming pathfinder calculations if we are holding the mouse and hovering the same tile
   if (!isDownEvent && targetKey === currentMoveTargetKey && currentPath.length > 0) return;
 
+  // A target that just failed from this tile is not searched again while
+  // the mouse is held or hovers on it (an unreachable one searches all).
+  const failKey = `${getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z)}>${targetKey}`;
+  if (failKey === lastFailedPath) return;
+
   if (World.has(targetKey)) {
     const allowDiagonals = currentMode === 'explore'; 
     const path = findPath(player.gridPos, { x: gx, y: gy, z: gz }, allowDiagonals);
+    lastFailedPath = path.length ? null : failKey;
     
     if (currentMode === 'battle' && path.length > player.speed) return;
 
@@ -2577,6 +2586,19 @@ function sizeTexelCache() {
   texelCache.scale.value.set(w / _drawSize.x, h / _drawSize.y);
   texelCache.size.value.set(w, h);
 }
+// Split shading's kernels over this frame's low-res samples, in one submit.
+function runSplitShading() {
+  const ks = activeShadowSet && activeShadowSet.splitKernels;
+  if (!ks || !splitShading) return;
+  const s = splitShading, rt = texelCache.rt;
+  const n = Math.min(rt.width * rt.height, s.capacity);
+  s.width.value = rt.width;
+  s.count.value = n;
+  s.viewPos.value.copy(camera.position);
+  for (const k of ks) k.count = n;
+  renderer.compute(ks);
+}
+
 // The low-res pass, before the main render. Only while the terrain wears the
 // material this cache was built for - mid-rebuild it may not.
 function renderTexelCache() {
@@ -2604,6 +2626,7 @@ function renderTexelCache() {
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
   camera.layers.mask = mask;
+  runSplitShading();
   mesh.material = terrainLookupMat;
   if (glassActive) glass.material = glassLookupMat;
 }
@@ -2740,7 +2763,8 @@ function updateMirrors() {
   const lb = ensureLightBindings();
   for (let i = 0; i < lb.count.value; i++) {
     const A = lb.data.array[i * LIGHT_VEC4S];
-    lights.push({ x: A.x, y: A.y, z: A.z, radius: A.w * VOXEL_SIZE });
+    // Past the mirror-light budget a light reaches no mirror (radius 0).
+    lights.push({ x: A.x, y: A.y, z: A.z, radius: lightMirrorRows[i] === false ? 0 : A.w });
   }
   // Only mirrors inside C1's footprint. The cascades follow the player, so a
   // player (or free cam's subject) far from every mirror packs none, and the
@@ -2762,9 +2786,18 @@ function updateMirrors() {
 // that reads it is drawn. Only for a set built to read it.
 function runMirrorCache() {
   const k = shadowsOn && activeShadowSet && activeShadowSet.mirrorCache;
-  if (!k || !mirrorCacheTexels) return;
-  k.count = mirrorCacheTexels;
-  renderer.compute(k);
+  // The hit cache's halves swap, and the one written this frame is cleared -
+  // in the same submit as the mirror cache.
+  const list = [];
+  if (shadowsOn && hitCache && hitCacheOn) {
+    hitCache.writeHalf.value = 1 - hitCache.writeHalf.value;
+    list.push(hitCache.clear);
+  }
+  if (k && mirrorCacheTexels) {
+    k.count = mirrorCacheTexels;
+    list.push(k);
+  }
+  if (list.length) renderer.compute(list.length === 1 ? list[0] : list);
 }
 
 // Each material's diffuse albedo, once its textures are in (lpv.js
@@ -2784,6 +2817,13 @@ function resolveLayerAlbedos() {
   // Glass's tint through a block, for the light the LPV carries through it.
   layerTints = MATERIALS.map((m, l) => (m.glass && terrainTextures.rgba[l]
     ? averageAlbedo(terrainTextures.rgba[l]) : { r: 1, g: 1, b: 1 }));
+  // Then each model's entry (models.js giIndex): its texture's diffuse
+  // albedo, a dielectric's specular share, no tint.
+  for (const m of MODELS.values()) {
+    layerAlbedos[m.giIndex] = m.albedoPixels ? diffuseAlbedo(m.albedoPixels) : { r: 0.5, g: 0.5, b: 0.5 };
+    layerSpecAll[m.giIndex] = layerSpecRough[m.giIndex] = grey;
+    layerTints[m.giIndex] = { r: 1, g: 1, b: 1 };
+  }
 }
 let layerSpecAll = null, layerSpecRough = null, layerTints = null;
 // Mirror bounce: light the mirrors throw bounces from where it lands (the GI's
@@ -2899,8 +2939,64 @@ let lastShadowedCount = 0;
 let shadowBudget = DEFAULT_SHADOW_BUDGET;
 // Of those, how many test sprite cards too. The rest still march the field.
 let cardBudget = DEFAULT_CARD_BUDGET;
+// Of those, how many march at secondary hits, and how many throw mirror light
+// (lights.js DEFAULT_HIT_SHADOW_BUDGET). Uniform data, no rebuild.
+let hitShadowBudget = DEFAULT_HIT_SHADOW_BUDGET;
+let mirrorLightBudget = DEFAULT_MIRROR_LIGHT_BUDGET;
+// Per light-list row: whether it throws mirror light (updateMirrors).
+let lightMirrorRows = [];
+// Profiling only (bxb.gpuprofile): the model lookup in reflection hits.
+let modelHitsOn = true;
+// The hit lighting cache (gpu.js createHitCache): reflections reuse what the
+// terrain lit on screen last frame. A rebuild to switch (bxb.hitcache()).
+// Off by default: on the glass bed it saved ~0 (the low-res pass loses early
+// depth tests to the writes) and the one-frame lag shimmered in motion.
+let hitCacheOn = false;
+// Split shading (gpu.js createSplitShading): the low-res pass writes samples,
+// compute kernels light them a feature at a time. A rebuild to switch
+// (bxb.splitshading()); off by itself if the GPU rejects it.
+let splitOn = true;
+let splitShading = null;
+let splitFailed = false;
+function ensureSplitShading() {
+  if (splitShading) return splitShading;
+  // Room for every sample at the finest spacing (2) on this screen.
+  const dpr = window.devicePixelRatio || 1;
+  const cap = Math.ceil(screen.width * dpr / 2) * Math.ceil(screen.height * dpr / 2);
+  splitShading = createSplitShading(Math.min(cap, 1 << 22));
+  return splitShading;
+}
+// A validation error soon after split shading goes on: fall back to the
+// one-shader path for the session rather than draw nothing.
+let splitSince = 0;
+function watchSplitErrors() {
+  const device = renderer.backend && renderer.backend.device;
+  if (!device || watchSplitErrors.done) return;
+  watchSplitErrors.done = true;
+  device.addEventListener('uncapturederror', e => {
+    if (!splitOn || splitFailed || performance.now() - splitSince > 20000) return;
+    splitFailed = true;
+    splitOn = false;
+    console.warn('[split] the GPU rejected split shading - back to one shader. First error:',
+                 e.error && e.error.message);
+    buildPerPixelShadows();
+  });
+}
+let hitCache = null;
+function ensureHitCache() {
+  if (!hitCache) hitCache = createHitCache();
+  return hitCache;
+}
 let lastCardLights = 0;
 let lastLightTime = 0;
+
+// Every light there is: the torch, placed lamps, then the placed models' -
+// those off inside bxb.gpuprofile, to price them.
+let modelLightsOn = true;
+function allLights() {
+  return modelLightsOn ? [syncTorchLight(), ...placedLights, ...modelLights]
+                       : [syncTorchLight(), ...placedLights];
+}
 
 function ensureLightBindings() {
   if (lightBindings) return lightBindings;
@@ -2914,7 +3010,7 @@ function ensureLightBindings() {
 // of the shared card buffer. Once per frame, after the torch has moved.
 function updateLights() {
   if (!lightBindings) return;
-  const live = liveLights([syncTorchLight(), ...placedLights, ...modelLights], MAX_LIGHTS);
+  const live = liveLights(allLights(), MAX_LIGHTS, playerSprite.position);
   const withCards = frameCasters && lightCards && cardsReady && cardsOn;
   // The shadow budget: which lights get a march, ranked by what they give the
   // player's surroundings. Each light's weight eases toward in or out, so a
@@ -2927,6 +3023,9 @@ function updateLights() {
   // set whenever it is the smaller of the two.
   const carded = pickShadowed(live, playerSprite.position,
                               Math.min(cardBudget, shadowBudget));
+  const hitShadowed = pickShadowed(live, playerSprite.position, Math.min(hitShadowBudget, shadowBudget));
+  const mirrored = pickShadowed(live, playerSprite.position, mirrorLightBudget);
+  lightMirrorRows = live.map(l => mirrored.has(l));
   let used = 0, marching = 0, cardLights = 0;
   for (let i = 0; i < live.length; i++) {
     const l = live[i];
@@ -2949,7 +3048,7 @@ function updateLights() {
         used += count;
       }
     }
-    packLight(lightPack, i, l, start, count, l.shadowWeight, l.cardWeight);
+    packLight(lightPack, i, l, start, count, l.shadowWeight, l.cardWeight, hitShadowed.has(l));
   }
   if (withCards) writeCardBindings(lightCards, cardPack, used);
   writeLightBindings(lightBindings, lightPack, live.length);
@@ -3004,8 +3103,8 @@ function describeLight(l, i) {
 }
 
 function listLights() {
-  const all = [syncTorchLight(), ...placedLights, ...modelLights];
-  const live = new Set(liveLights(all, MAX_LIGHTS));
+  const all = allLights();
+  const live = new Set(liveLights(all, MAX_LIGHTS, playerSprite.position));
   const rows = all.map((l, i) => describeLight(l, i) + (live.has(l) ? '' : '  (not shaded)'));
   return `${live.size}/${MAX_LIGHTS} lights shaded, ${lastShadowedCount} with ` +
          `shadows (budget ${shadowBudget}), ${lastCardLights} with sprite shadows ` +
@@ -3263,7 +3362,9 @@ function shadowNodeOptions() {
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
     gi: giOn && ensureLPV() ? giBinding() : null, giOnly,
     glassView, glassBounces, glassLayers, glassDispersion, glassShadows,
-    mirrorCache: mirrorCacheOn,
+    mirrorCache: mirrorCacheOn, modelHits: modelHitsOn,
+    hitCache: hitCacheOn ? ensureHitCache() : null,
+    split: splitOn && texelCacheOn ? ensureSplitShading() : null,
     // The world has glass: shadow rays tint through it (gpu.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
@@ -3313,6 +3414,12 @@ function obtainShadowSet() {
                 diffKeyParts(parts, newest.parts).join(', '));
   }
 
+  if (opts.split) {
+    sizeTexelCache();
+    opts.split.rt = texelCache.tex;
+    splitSince = performance.now();
+    watchSplitErrors();
+  }
   const built = createShadowColorNode(opts);
   const { spriteLight, sun } = built;
   // A model's lightSource cube draws unlit, in every terrain pass.
@@ -3330,8 +3437,11 @@ function obtainShadowSet() {
     lowMat = new THREE.MeshBasicNodeMaterial();
     // outputNode, not colorNode: the stored colour must not carry the
     // per-instance tint, which the lookup material applies once itself.
-    lowMat.outputNode = createTexelCacheWriteNode(node);
-    terrainMat = createShadowMaterial(worldInstancedMesh, createTexelCacheLookupNode(texelCache));
+    // The low-res pass alone also fills the hit lighting cache (gpu.js makeNode).
+    const split = built.splitKernels ? opts.split : null;
+    lowMat.outputNode = split ? createTexelGBufferNode()
+      : createTexelCacheWriteNode(terrainEmissiveTSL(built.nodeCaching, terrainTextures));
+    terrainMat = createShadowMaterial(worldInstancedMesh, createTexelCacheLookupNode(texelCache, split));
     terrainMat.stencilWrite = true;
     terrainMat.stencilFunc = THREE.AlwaysStencilFunc;
     terrainMat.stencilRef = 1;
@@ -3343,8 +3453,9 @@ function obtainShadowSet() {
     missMat.stencilZPass = THREE.KeepStencilOp;
     if (glassNode) {
       glassLow = new THREE.MeshBasicNodeMaterial();
-      glassLow.outputNode = createTexelCacheWriteNode(glassNode);
-      glassMat = createShadowMaterial(glassInstancedMesh, createTexelCacheLookupNode(texelCache));
+      glassLow.outputNode = built.splitGlass ? createTexelGBufferNode(true)
+        : createTexelCacheWriteNode(glassNode, !!split);
+      glassMat = createShadowMaterial(glassInstancedMesh, createTexelCacheLookupNode(texelCache, split));
       glassMat.stencilWrite = true;
       glassMat.stencilFunc = THREE.AlwaysStencilFunc;
       glassMat.stencilRef = 1;
@@ -3376,6 +3487,7 @@ function obtainShadowSet() {
     key, parts, sun, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
     made: sprites.made, variants: sprites.variants, atlasMats: sprites.atlasMats,
     mirrorCache: built.mirrorCache,
+    splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
     mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []),
            ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
     compiled: false
@@ -3574,7 +3686,7 @@ function toggleTorch(level = null, flame = null, forward = null) {
                ` (bxb.torchside() flips which), ` +
                `${TORCH_HEIGHT.toFixed(2)} m up`;
   return `torch on - ${held}, level ${torchLevel}/${MAX_LIGHT_LEVEL}, reaching ` +
-         `${torchLevel} blocks (${lightRadiusMetres(torchLevel).toFixed(1)} m), ` +
+         `${lightRadiusMetres(torchLevel).toFixed(1)} m, ` +
          `#${TORCH_COLOUR.toString(16).toUpperCase()}, ` +
          `${(torchSourceRadius * 2).toFixed(2)} m flame. Soft by CONE TRACE, the ` +
          `same marcher the sun uses - the only difference is that its cone opens ` +
@@ -4206,6 +4318,43 @@ const bxbApi = installConsole(createConsole({
              `field, so walls still block them; only sprites stop casting.`;
     }
   },
+  splitshading: {
+    help: 'light the low-res samples in compute, a feature per kernel (rebuilds)',
+    usage: 'bxb.splitshading()',
+    run: () => {
+      splitOn = !splitOn;
+      splitFailed = false;
+      buildPerPixelShadows();
+      return `split shading ${splitOn ? 'on' : 'off - one shader shades each low-res sample'}`;
+    }
+  },
+  hitcache: {
+    help: 'reflections reuse the light the terrain worked out on screen last frame (rebuilds)',
+    usage: 'bxb.hitcache()',
+    run: () => {
+      hitCacheOn = !hitCacheOn;
+      buildPerPixelShadows();
+      return `hit lighting cache ${hitCacheOn ? 'on' : 'off - every reflection hit is lit by its own light batch'}`;
+    }
+  },
+  hitshadowbudget: {
+    help: 'of the shadowed lights, how many also march at reflection / through-glass hits',
+    usage: 'bxb.hitshadowbudget(1)  |  bxb.hitshadowbudget(16) every shadowed light',
+    run: (n = DEFAULT_HIT_SHADOW_BUDGET) => {
+      hitShadowBudget = Math.max(0, Math.min(MAX_LIGHTS, Math.round(n)));
+      return `hit-shadow budget ${hitShadowBudget} - in reflections and through glass, ` +
+             `the ${hitShadowBudget} most important lights march; the rest light what they show unshadowed.`;
+    }
+  },
+  mirrorlightbudget: {
+    help: 'how many point lights throw mirror light (reflected light off mirrors)',
+    usage: 'bxb.mirrorlightbudget(1)  |  bxb.mirrorlightbudget(16) every light',
+    run: (n = DEFAULT_MIRROR_LIGHT_BUDGET) => {
+      mirrorLightBudget = Math.max(0, Math.min(MAX_LIGHTS, Math.round(n)));
+      return `mirror-light budget ${mirrorLightBudget} - the ${mirrorLightBudget} most important ` +
+             `lights glare off mirrors; the sun always does.`;
+    }
+  },
   lightcutoff: {
     help: 'the faint outer band of each light that is not marched (0 = none)',
     usage: 'bxb.lightcutoff(1/100)  |  bxb.lightcutoff(0)',
@@ -4347,6 +4496,8 @@ const bxbApi = installConsole(createConsole({
         ['glare off glass', !!glass && glare > 0 && mirrorsOn,
          () => bxbApi.glassglare(0), () => bxbApi.glassglare(glare), false],
         ['torch', torchOn, () => toggleTorch(), () => toggleTorch(), false],
+        [`model lights (${modelLights.length})`, modelLights.length > 0,
+         () => { modelLightsOn = false; }, () => { modelLightsOn = true; }, false],
         ['sprites (not drawn)', true,
          () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
          () => shown.forEach(m => { m.visible = true; }), false],
@@ -4355,6 +4506,12 @@ const bxbApi = installConsole(createConsole({
         ['second glass layer', !!glass && layers > 1,
          () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
         ['mirror light', mirrorsOn, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
+        ['split shading', splitOn,
+         () => { splitOn = false; rebuild(); }, () => { splitOn = true; rebuild(); }, true],
+        ['hit lighting cache', hitCacheOn,
+         () => { hitCacheOn = false; rebuild(); }, () => { hitCacheOn = true; rebuild(); }, true],
+        ['model lookup in reflection hits', !!terrainTextures.modelHits,
+         () => { modelHitsOn = false; rebuild(); }, () => { modelHitsOn = true; rebuild(); }, true],
         ['reflections (and glass shading)', reflectionsOn,
          () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
       ];
@@ -4369,13 +4526,14 @@ const bxbApi = installConsole(createConsole({
         on();
         if (rebuilds) await shadowBuildDone;
         rows.push({ case: `${name} off`, render: m.render, compute: m.compute });
-        console.log(`[gpuprofile] ${name} off: render ${m.render} ms`);
+        console.log(`[gpuprofile] ${name} off: render ${m.render} + compute ${m.compute} ms`);
       }
       const after = await measure(false);
       rows.push({ case: 'baseline again', render: after.render, compute: after.compute });
-      // Savings against the mean of the two baselines; their difference is the drift.
-      const base = (before.render + after.render) / 2;
-      for (const r of rows) r.saved = f(base - r.render);
+      // Savings, render + compute (split shading moves work between them),
+      // against the mean of the two baselines; their difference is the drift.
+      const base = (before.render + before.compute + after.render + after.compute) / 2;
+      for (const r of rows) r.saved = f(base - r.render - r.compute);
       console.table(rows);
       return rows;
     }
@@ -4586,6 +4744,12 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'cardbudget', label: 'Sprite-shadow lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
       help: 'of the shadowed lights, how many also cast sprite (card) shadows - walls still block the rest',
       get: () => cardBudget, set: v => bxbApi.cardbudget(v) },
+    { key: 'hitbudget', label: 'Lights shadowed in reflections', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
+      help: 'of the shadowed lights, how many march at reflection and through-glass hits - the rest light those unshadowed',
+      get: () => hitShadowBudget, set: v => bxbApi.hitshadowbudget(v) },
+    { key: 'mirrorbudget', label: 'Mirror-light lights', type: 'range', min: 0, max: MAX_LIGHTS, step: 1,
+      help: 'how many point lights glare off mirrors (the sun always does)',
+      get: () => mirrorLightBudget, set: v => bxbApi.mirrorlightbudget(v) },
     { key: 'cutoff', label: 'Light cutoff', type: 'range', min: 0, max: 0.1, step: 0.005,
       help: 'faint outer band of each light that is not marched',
       get: () => (lightBindings ? lightBindings.cutoff.value : DEFAULT_LIGHT_CUTOFF),

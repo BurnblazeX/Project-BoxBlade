@@ -1,7 +1,7 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
 import { readFileSync } from 'node:fs';
 import { MATERIALS, materialLayer, decodeSpecular, METAL_F0, DEFAULT_SPECULAR,
-         BLOCK_TEXELS } from '../js/materials.js';
+         BLOCK_TEXELS, allocateMaterialLayers, materialIdsFromFiles } from '../js/materials.js';
 
 file('materials.test.mjs - block materials and LabPBR specular');
 
@@ -72,3 +72,19 @@ section('materials are found by their texture files');
   ok('one material per albedo, companions left out', materialIdsFromFiles(files).join(','),
      'cobble,grass,oakPlanks,sandstone');
 }
+
+section('faces and slope planes get layers after the materials');
+{
+  const mats = [{ texture: 't_a' }, { texture: 't_pillar' }, { texture: 't_log' }, { texture: 't_ramp' }];
+  const files = new Set(['t_pillar_top', 't_pillar_bottom', 't_log_top', 't_ramp_halfSlope_n']);
+  const { faces, end } = allocateMaterialLayers(mats, n => files.has(n));
+  ok('a plain material: every face its own layer', JSON.stringify(faces[0]),
+     JSON.stringify({ top: 0, bottom: 0, slope: [-1, -1] }));
+  ok('top and bottom, after the materials', `${faces[1].top},${faces[1].bottom}`, '4,5');
+  ok('a missing bottom takes the top', `${faces[2].top},${faces[2].bottom}`, '6,6');
+  ok('any one map authors a plane, two layers', faces[3].slope.join(','), '-1,7');
+  ok('the end', end, 9);
+  ok('face companions are not materials',
+     materialIdsFromFiles(['x/terrain_log.png', 'x/terrain_log_top.png', 'x/terrain_log_bottom_n.png']).join(','), 'log');
+}
+

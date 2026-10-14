@@ -1,13 +1,15 @@
 import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, int, mix, vec3, vec4, uniform, select, positionLocal,
          Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize,
-         cameraViewMatrix, clamp, exp2 } from 'three/tsl';
+         cameraViewMatrix, clamp, exp2, storage } from 'three/tsl';
 import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey,
-         WorldModels, Y_MIN, CHUNK_HEIGHT } from './world.js';
+         WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, occludesFaces, ALL_FACES } from './world.js';
 import { MODELS, TERRAIN_LAYERS } from './models.js';
-import { faceSwapped, lightColourOf } from './bbmodel.js';
+import { lightColourOf, modelInstanceData, buildModelHits, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from './bbmodel.js';
+export { MODEL_HIT_RECORD };
 import { VOXEL_METRES } from './boxgrid.js';
-import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial } from './materials.js';
+import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
+         MATERIAL_LAYERS, SLOPE_SUFFIXES } from './materials.js';
 import { terrainNormals } from './normals.js';
 
 // Every block texture, by URL, so Vite bundles them - albedo, _n and _s alike.
@@ -54,26 +56,15 @@ export const terrainTextures = {
   rgba: [],
   // The same for each layer's _s, or undefined where it has none.
   specRgba: [],
-  // Which material each BLOCK is, as a 3D texture over the world's block
-  // bounds: layer + 1, 0 for air. What a reflection ray reads to find the
-  // texture of the block it hit. { tex, origin, size } - origin and size in
-  // blocks, as vec3 uniforms. Built with the terrain mesh.
+  // What each BLOCK is, as a 3D texture over a fixed box of blocks: what a
+  // ray that hit something reads to find its texture (buildBlockVolume).
+  // { tex, origin, size } - origin and size in blocks, as vec3 uniforms.
   blocks: null,
-  // The slopes' planes (terrainSurfaceTSL): three more arrays, 12 x 17, two
-  // layers per material - 2 * layer its slope, 2 * layer + 1 its half slope
-  // (the lowest 13 rows). Authored as <texture>_slope.png (12 x 17) and
-  // <texture>_halfSlope.png (12 x 13), with _n and _s beside them like a
-  // block's; a material without them gets its block texture stretched.
-  slopeAlbedo: null, slopeNormal: null, slopeSpecular: null,
+  // Placed models' cubes, by cell, for the rays (buildBlockVolume): a
+  // read-only storage buffer of vec4. { attr, node }.
+  modelHits: null,
   ready: false
 };
-
-// The slope array that goes with a block array (terrainTexelTSL).
-function slopeTextureFor(tex) {
-  const t = terrainTextures;
-  return tex === t.albedo ? t.slopeAlbedo : tex === t.normal ? t.slopeNormal
-       : tex === t.specular ? t.slopeSpecular : null;
-}
 
 // 1 draws the terrain plain white (whiteworld) - a uniform, so both the plain
 // and the shadowed materials follow it with no rebuild.
@@ -87,8 +78,10 @@ export const terrainLayerTSL = () => int(attribute('blockLayer', 'float').add(0.
 // branch still costs registers: doc §0), and glass never runs the terrain's.
 // Applied after instancing (NodeMaterial.setupPosition), so positionLocal is
 // already the placed block.
+// blockGlass also carries the instance's drawn faces: glass + 2 * mask
+// (world.js exposedFaceMask), read by terrainShapeTSL.
 export const terrainKeepTSL = glass => {
-  const isGlass = attribute('blockGlass', 'float').greaterThan(0.5);
+  const isGlass = attribute('blockGlass', 'float').mod(float(2)).greaterThan(0.5);
   return select(glass ? isGlass : isGlass.not(), terrainShapeTSL(), vec3(0, 0, 0));
 };
 
@@ -129,12 +122,22 @@ export function slopeTSL() {
 // dropped by its rise (grad blocks). The geometry's own position picks the
 // vertices - top, and on the downhill side of the box's centre. After
 // instancing, like terrainKeepTSL, so the drop is in world metres.
+//
+// A buried face (world.js exposedFaceMask, bits in blockGlass / 2) collapses
+// to a point - zero area, no fragments - in every pass that draws the terrain.
 export const terrainShapeTSL = () => {
   const s = slopeTSL();
   const raw = attribute('position', 'vec3');
   const low = s.on.and(raw.y.greaterThan(float(0)))
     .and(raw.x.mul(s.f.x).add(raw.z.mul(s.f.y)).lessThan(float(0)));
-  return positionLocal.sub(vec3(0, select(low, s.grad.mul(float(BLOCK_METRES)), float(0)), 0));
+  const shaped = positionLocal.sub(vec3(0, select(low, s.grad.mul(float(BLOCK_METRES)), float(0)), 0));
+  const mask = floor(attribute('blockGlass', 'float').mul(float(0.5)));
+  const nr = attribute('normal', 'vec3');
+  const d = select(abs(nr.x).greaterThan(float(0.5)), select(nr.x.greaterThan(float(0)), float(0), float(1)),
+            select(abs(nr.y).greaterThan(float(0.5)), select(nr.y.greaterThan(float(0)), float(2), float(3)),
+                   select(nr.z.greaterThan(float(0)), float(4), float(5))));
+  const shown = floor(mask.div(exp2(d))).mod(float(2)).greaterThan(float(0.5));
+  return select(shown, shaped, vec3(0, 0, 0));
 };
 
 // The instances a block draws: its boxes (one, unless it is a slope), or for
@@ -214,6 +217,12 @@ export function terrainSurfaceTSL(slopes = true) {
   const Ba = select(abs(nA.y).greaterThan(float(0.5)), vec3(0, 0, nA.y.negate()), vec3(0, 1, 0));
   if (!slopes) return { on: null, n: nA, p: pA, block: fA.block, st: fA.st, T: Ta, B: Ba };
   const model = modelTexelTSL(nA, pA);
+  // A block's face layer: its top and bottom from the instance (fillInstances:
+  // modelInfo y, z - the side's own layer where it has none), else its side.
+  const info = model.info;
+  // Int-typed selects only (see gpu.js faceLayerTSL).
+  const faceLayer = select(nA.y.greaterThan(float(0.5)), int(info.y.add(float(0.5))),
+                           select(nA.y.lessThan(float(-0.5)), int(info.z.add(float(0.5))), terrainLayerTSL()));
   const sl = slopeTSL();
   const on = sl.on.and(nA.y.greaterThan(float(0.5))).toVar();
   const Bm = float(BLOCK_METRES), q = float(VOXEL_METRES);
@@ -237,19 +246,25 @@ export function terrainSurfaceTSL(slopes = true) {
   const y = by.sub(float(0.5)).add(sl.base).mul(Bm).add(sl.grad.mul(a).mul(Bm));
   const pS = vec3(xz.x, y, xz.y);
   const blockS = vec3(bxz.x, by, bxz.y);
-  // Its uv in the slope texture: 12 across, rows along (the half slope's 13
-  // are the lowest of the array's 17).
-  const stS = vec2(col.add(float(0.5)).div(float(12)), row.add(float(0.5)).div(float(SLOPE_ROWS)));
+  // Its texel in the plane's texture: authored (modelInfo.x = its first layer
+  // + 1), rows 0-11 in that layer and the rest in the next; else the side's
+  // own texture stretched nearest along the climb (row * 12 / rows).
+  const authored = info.x.greaterThan(float(0.5));
+  const upper = row.greaterThanEqual(float(12));
+  const slopeLayer = select(authored, int(info.x.sub(float(0.5))).add(select(upper, int(1), int(0))),
+                            terrainLayerTSL());
+  const rowIn = select(authored, row.sub(select(upper, float(12), float(0))),
+                       floor(row.mul(float(12)).div(rows)));
+  const stS = vec2(col.add(float(0.5)).div(float(12)), rowIn.add(float(0.5)).div(float(12)));
   // Frame: T across, B up the plane.
   const Ts = vec3(r.x, float(0), r.y);
   const Bs = normalize(vec3(sl.f.x, sl.grad, sl.f.y));
   return {
     on,
-    // Which slope texture: 0 slope, 1 half slope (either kind).
-    slopeLayer: terrainLayerTSL().mul(int(2)).add(select(sl.grad.lessThan(float(0.75)), int(1), int(0))),
     slopeTexel: vec3(col, row, float(0)),
-    // A model's face reads its own tile of the terrain arrays (models.js).
-    layer: select(model.on, model.layer, terrainLayerTSL()).toVar(),
+    // The one layer every map is read at (terrainTexelTSL): the plane's, a
+    // model face's tile (models.js), or the block face's.
+    layer: select(on, slopeLayer, select(model.on, model.layer, faceLayer)).toVar(),
     // A model's lightSource cube: unlit, its own texel (terrainEmissiveTSL).
     emissive: model.emissive,
     n: select(on, sl.n, nA).toVar(),
@@ -286,6 +301,13 @@ export function modelTexelTSL(nA, pA) {
   const uv0 = round(attribute('modelUV0', 'vec4')).toVar();
   const uv1 = round(attribute('modelUV1', 'vec4')).toVar();
   const uv2 = round(attribute('modelUV2', 'vec4')).toVar();
+  return { ...modelTexelCoreTSL(nA, pA, info, uv0, uv1, uv2), info };
+}
+
+// The texel arithmetic itself, from a cube's info and uv vectors - the
+// instance's attributes above, or a ray hit's record (gpu.js hitSurfaceTSL).
+// pA: a point on the face (any point within the texel), nA axis-exact.
+export function modelTexelCoreTSL(nA, pA, info, uv0, uv1, uv2) {
   const q = float(VOXEL_METRES);
   const t = floor(pA.sub(nA.mul(q.mul(float(0.5)))).div(q)).toVar();
   const ax = abs(nA.x).greaterThan(float(0.5)), ay = abs(nA.y).greaterThan(float(0.5));
@@ -312,37 +334,17 @@ export function modelTexelTSL(nA, pA) {
   return { on: info.w.greaterThan(float(0.5)), emissive: info.w.greaterThan(float(1.5)), layer, st };
 }
 
-// A placed cube's per-instance model attributes (see modelTexelTSL).
-export function modelInstanceData(cube, model) {
-  let mask = 0;
-  const uv = [];
-  cube.faces.forEach((f, d) => {
-    if (!f) { uv.push(0, 0); return; }
-    if (f.u.d < 0) mask |= 1 << (2 * d);
-    if (f.v.d < 0) mask |= 1 << (2 * d + 1);
-    if ((d === 2 || d === 3) && faceSwapped(d, f)) mask |= 1 << (10 + d);
-    uv.push(f.u.o, f.v.o);
-  });
-  // A lightSource cube: w = 2 (drawn unlit), and its texels from the _e
-  // tiles when the model has them.
-  if (cube.light) return { info: [mask, model.emissiveLayer ?? model.modelLayer, model.tilesX, 2], uv };
-  return { info: [mask, model.modelLayer, model.tilesX, 1], uv };
-}
-
 // The shading normal from a surface's frame and a LabPBR tangent-space
 // normal - boxBumpedNormalTSL's arithmetic, with the frame handed in.
 export const surfaceBumpTSL = (surf, t) =>
   normalize(surf.T.mul(t.x).add(surf.B.mul(t.y)).add(surf.n.mul(t.z)));
 
-// A terrain texture read at a surface's texel: the block's own layer, or on
-// a slope's plane the matching slope texture. tex: one of terrainTextures'
-// albedo, normal or specular. Without a surface (or one built without
-// slopes), the block read alone.
+// A terrain texture read at a surface's texel: ONE read, at the layer and uv
+// the surface chose - a block face's (side, top or bottom), a slope plane's,
+// a model tile's. tex: one of terrainTextures' albedo, normal or specular.
+// Without a surface (or one built without slopes), the block's own layer.
 export function terrainTexelTSL(tex, st, surf = null) {
-  const block = surf && surf.layer ? texture(tex, st).depth(surf.layer) : terrainSampleTSL(tex, st);
-  const slopeTex = slopeTextureFor(tex);
-  if (!surf || !surf.on || !slopeTex) return block;
-  return select(surf.on, texture(slopeTex, st).depth(surf.slopeLayer), block);
+  return surf && surf.layer ? texture(tex, st).depth(int(surf.layer)) : terrainSampleTSL(tex, st);
 }
 
 // Which block a surface point belongs to, and its uv on that face - the uv
@@ -430,56 +432,104 @@ function writeLayer(tex, layer, topDown, rows = BLOCK_TEXELS) {
   tex.needsUpdate = true;
 }
 
-// A block layer (bottom-up, 12 x 12) stretched nearest onto `rows` rows of a
-// slope layer - a material's fallback slope texture: the foot at row 0.
-function stretchLayer(src, srcLayer, dst, dstLayer, rows) {
-  const row = BLOCK_TEXELS * 4;
-  const from = srcLayer * BLOCK_TEXELS * row, to = dstLayer * dst.image.height * row;
+// Top-down image pixels (12 wide, `rows` tall) flipped to bottom-up.
+function bottomUp(topDown, rows) {
+  const row = BLOCK_TEXELS * 4, out = new Uint8ClampedArray(rows * row);
+  for (let y = 0; y < rows; y++) out.set(topDown.subarray(y * row, (y + 1) * row), (rows - 1 - y) * row);
+  return out;
+}
+
+// A block layer (bottom-up, 12 x 12) stretched nearest onto `rows` rows,
+// bottom-up - a missing slope map's fallback: the foot at row 0.
+function stretched(src, srcLayer, rows) {
+  const row = BLOCK_TEXELS * 4, from = srcLayer * BLOCK_TEXELS * row;
+  const out = new Uint8ClampedArray(rows * row);
   for (let y = 0; y < rows; y++) {
     const sy = Math.floor(y * BLOCK_TEXELS / rows);
-    dst.image.data.set(src.image.data.subarray(from + sy * row, from + (sy + 1) * row), to + y * row);
+    out.set(src.image.data.subarray(from + sy * row, from + (sy + 1) * row), y * row);
   }
-  dst.needsUpdate = true;
+  return out;
 }
 
-// One material's two slope textures, once its block textures are in: each
-// map authored, or - for a normal map, generated from an authored albedo -
-// else the block's own stretched.
+// Bottom-up rows of a slope texture into its two layers: rows 0-11 at
+// `first`, the rest from row 0 of first + 1 (terrainSurfaceTSL reads it so).
+function writeSplit(tex, first, data, rows) {
+  const row = BLOCK_TEXELS * 4, layerBytes = BLOCK_TEXELS * row;
+  for (let y = 0; y < rows; y++) {
+    const to = (first + Math.floor(y / BLOCK_TEXELS)) * layerBytes + (y % BLOCK_TEXELS) * row;
+    tex.image.data.set(data.subarray(y * row, (y + 1) * row), to);
+  }
+  tex.needsUpdate = true;
+}
+
+// One material's slope planes that are authored (materials.js
+// MATERIAL_LAYERS), once its block textures are in: each map authored, or -
+// for a normal map, generated from an authored albedo - else the side's own
+// stretched. A plane with none of the three is not allocated; the shader
+// stretches the side itself.
 async function loadSlopeLayers(m, layer) {
   const t = terrainTextures;
-  for (const [kind, suffix, rows] of [[0, '_slope', SLOPE_ROWS], [1, '_halfSlope', HALF_SLOPE_ROWS]]) {
-    const dst = layer * 2 + kind;
-    const name = m.texture + suffix;
+  const rowsOf = [SLOPE_ROWS, HALF_SLOPE_ROWS];
+  const firsts = MATERIAL_LAYERS.faces[layer].slope;
+  for (let kind = 0; kind < 2; kind++) {
+    const first = firsts[kind], rows = rowsOf[kind];
+    if (first < 0) continue;
+    const name = m.texture + SLOPE_SUFFIXES[kind];
+    const read = async suffix => {
+      const url = textureUrl(name + suffix);
+      return url ? bottomUp(imagePixels(await loadImage(url), name + suffix, rows), rows) : null;
+    };
     const aUrl = textureUrl(name);
-    const albedo = aUrl ? imagePixels(await loadImage(aUrl), name, rows) : null;
-    if (albedo) writeLayer(t.slopeAlbedo, dst, albedo, rows);
-    else stretchLayer(t.albedo, layer, t.slopeAlbedo, dst, rows);
-    const nUrl = textureUrl(name + '_n');
-    if (nUrl) writeLayer(t.slopeNormal, dst, imagePixels(await loadImage(nUrl), name + '_n', rows), rows);
-    else if (albedo) {
-      t.slopeNormal.image.data.set(terrainNormals(albedo, BLOCK_TEXELS, rows),
-                                   dst * SLOPE_ROWS * BLOCK_TEXELS * 4);
-      t.slopeNormal.needsUpdate = true;
-    } else stretchLayer(t.normal, layer, t.slopeNormal, dst, rows);
-    const sUrl = textureUrl(name + '_s');
-    if (sUrl) writeLayer(t.slopeSpecular, dst, imagePixels(await loadImage(sUrl), name + '_s', rows), rows);
-    else stretchLayer(t.specular, layer, t.slopeSpecular, dst, rows);
+    const albedoTD = aUrl ? imagePixels(await loadImage(aUrl), name, rows) : null;
+    writeSplit(t.albedo, first, albedoTD ? bottomUp(albedoTD, rows) : stretched(t.albedo, layer, rows), rows);
+    const normal = await read('_n');
+    writeSplit(t.normal, first, normal || (albedoTD ? terrainNormals(albedoTD, BLOCK_TEXELS, rows)
+                                                    : stretched(t.normal, layer, rows)), rows);
+    writeSplit(t.specular, first, (await read('_s')) || stretched(t.specular, layer, rows), rows);
   }
 }
 
-// One byte per block (material layer + 1, 0 air), over a FIXED volume: an
-// edit (the editor) rewrites it in place, where a volume sized to the world's
-// bounds changed size - and every material built on the old texture had to be
-// rebuilt. 256 x 12 x 256 blocks around the origin, 768 KB; a block outside
-// it reads as air to the rays that ask (reflection and glass hits, the GI).
+// A material's top and bottom faces, when it has them (materials.js
+// MATERIAL_LAYERS): albedo, then _n (else generated from it) and _s (else
+// the side's), as a block's.
+async function loadFaceLayers(m, layer) {
+  const t = terrainTextures, n = BLOCK_TEXELS;
+  const f = MATERIAL_LAYERS.faces[layer];
+  for (const [suffix, dst] of [['_top', f.top], ['_bottom', f.bottom]]) {
+    if (dst === layer || (suffix === '_bottom' && dst === f.top)) continue;
+    const name = m.texture + suffix;
+    const aUrl = textureUrl(name), nUrl = textureUrl(name + '_n'), sUrl = textureUrl(name + '_s');
+    const rgba = aUrl ? imagePixels(await loadImage(aUrl), name) : null;
+    if (rgba) writeLayer(t.albedo, dst, rgba);
+    else writeSplit(t.albedo, dst, stretched(t.albedo, layer, n), n);
+    if (nUrl) writeLayer(t.normal, dst, imagePixels(await loadImage(nUrl), name + '_n'));
+    else writeSplit(t.normal, dst, rgba ? terrainNormals(rgba, n, n) : stretched(t.normal, layer, n), n);
+    if (sUrl) writeLayer(t.specular, dst, imagePixels(await loadImage(sUrl), name + '_s'));
+    else writeSplit(t.specular, dst, stretched(t.specular, layer, n), n);
+  }
+}
+
+// What each block is, for the rays, over a FIXED volume: an edit (the
+// editor) rewrites it in place, where a volume sized to the world's bounds
+// changed size - and every material built on the old texture had to be
+// rebuilt. 256 x 12 x 256 blocks around the origin, RGBA8, 3 MB; a block
+// outside it reads as air to the rays that ask (reflection and glass hits,
+// the GI). Per block:
+//   a block       R layer + 1 (its side), G its top layer, B its bottom, A 0;
+//   a model cell  R 0 (air to the walk through glass, which ignores models),
+//                 G + 256 B its cell in modelHits, A the model's GI entry + 1
+//                 (models.js giIndex);
+//   air           all 0.
+// modelHits: the model cubes by cell (bbmodel.js buildModelHits) - what
+// gpu.js hitSurfaceTSL needs to find a hit's texel as the cube's own draw does.
 export const BLOCK_VOLUME_ORIGIN = [-96, Y_MIN, -96];
 export const BLOCK_VOLUME_SIZE = [256, CHUNK_HEIGHT, 256];
 function buildBlockVolume() {
   const lo = BLOCK_VOLUME_ORIGIN, size = BLOCK_VOLUME_SIZE;
   let v = terrainTextures.blocks;
   if (!v) {
-    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2]), size[0], size[1], size[2]);
-    tex.format = THREE.RedFormat;
+    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 4), size[0], size[1], size[2]);
+    tex.format = THREE.RGBAFormat;
     tex.type = THREE.UnsignedByteType;
     tex.minFilter = tex.magFilter = THREE.NearestFilter;
     tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
@@ -490,15 +540,37 @@ function buildBlockVolume() {
       origin: uniform(new THREE.Vector3(...lo)),
       size: uniform(new THREE.Vector3(...size))
     };
+    const attr = new THREE.StorageBufferAttribute(new Float32Array(MODEL_HIT_VEC4S * 4), 4);
+    terrainTextures.modelHits = {
+      attr, node: storage(attr, 'vec4', MODEL_HIT_VEC4S).toReadOnly().setName('bxbModelHits')
+    };
   }
   const data = v.tex.image.data;
   data.fill(0);
-  for (const [key, block] of World.entries()) {
-    const c = key.split(',').map(Number);
+  const at = c => {
     const r = c.map((x, a) => x - lo[a]);
-    if (r.some((x, a) => x < 0 || x >= size[a])) continue;
-    data[(r[2] * size[1] + r[1]) * size[0] + r[0]] = materialLayer(block.materialId) + 1;
+    return r.some((x, a) => x < 0 || x >= size[a]) ? -1 : ((r[2] * size[1] + r[1]) * size[0] + r[0]) * 4;
+  };
+  for (const [key, block] of World.entries()) {
+    const o = at(key.split(',').map(Number));
+    if (o < 0) continue;
+    const layer = materialLayer(block.materialId), f = MATERIAL_LAYERS.faces[layer];
+    data[o] = layer + 1;
+    data[o + 1] = f ? f.top : layer;
+    data[o + 2] = f ? f.bottom : layer;
   }
+  const hits = buildModelHits(WorldModels, key => World.has(key));
+  if (hits.overflow) console.warn(`[terrain] model hit table full (${MODEL_HIT_VEC4S} vec4): some model cubes reflect as air`);
+  for (const [key, { header, giIndex }] of hits.index) {
+    const o = at(key.split(',').map(Number));
+    if (o < 0 || header > 65535) continue;
+    data[o + 1] = header & 255;
+    data[o + 2] = header >> 8;
+    data[o + 3] = giIndex + 1;
+  }
+  const mh = terrainTextures.modelHits;
+  mh.attr.array.set(hits.data);
+  mh.attr.needsUpdate = true;
   v.tex.needsUpdate = true;
 }
 
@@ -507,10 +579,6 @@ function initTerrainTextures() {
   terrainTextures.albedo = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
   terrainTextures.normal = makeArray([128, 128, 255, 255], THREE.NoColorSpace);
   terrainTextures.specular = makeArray(DEFAULT_SPECULAR, THREE.NoColorSpace);
-  const slopeLayers = MATERIALS.length * 2;
-  terrainTextures.slopeAlbedo = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace, SLOPE_ROWS, slopeLayers);
-  terrainTextures.slopeNormal = makeArray([128, 128, 255, 255], THREE.NoColorSpace, SLOPE_ROWS, slopeLayers);
-  terrainTextures.slopeSpecular = makeArray(DEFAULT_SPECULAR, THREE.NoColorSpace, SLOPE_ROWS, slopeLayers);
   const loads = MATERIALS.map(async (m, layer) => {
     const albedoUrl = textureUrl(m.texture);
     if (!albedoUrl) { console.warn(`[terrain] no texture ${m.texture}.png`); return; }
@@ -533,6 +601,7 @@ function initTerrainTextures() {
       terrainTextures.specRgba[layer] = spec;
       writeLayer(terrainTextures.specular, layer, spec);
     }
+    await loadFaceLayers(m, layer);
     await loadSlopeLayers(m, layer);
   });
   for (const model of MODELS.values()) loads.push(loadModelTiles(model));
@@ -573,6 +642,8 @@ async function loadModelTiles(model) {
       writeLayer(tex, first + ty * model.tilesX + tx, tile);
     }
   }
+  // What a probe landing on the model bounces (main.js resolveLayerAlbedos).
+  if (pixels.albedo) model.albedoPixels = pixels.albedo.all;
   const src = pixels.emissive || pixels.albedo;
   if (src) model.lightColour = lightColourOf(model, src.all, src.w);
 }
@@ -707,6 +778,8 @@ function fillInstances() {
   const matrix = new THREE.Matrix4();
   const white = new THREE.Color(0xffffff);
   const zero4 = [0, 0, 0, 0];
+  const buries = (x, y, z) => occludesFaces(World.get(getVoxelKey(x, y, z)));
+  const slopeKind = { slope: 0, halfSlope: 1, halfSlopeHigh: 1 };
   let i = 0, glassCount = 0;
   // Every SOLID block renders, not just standable ones: walls, pillars and the
   // underground layers are all real geometry that the lighting work needs to
@@ -719,16 +792,22 @@ function fillInstances() {
     const layer = materialLayer(block.materialId);
     const glass = isGlassMaterial(block.materialId);
     const slope = slopeCode(block);
+    const [bx, by, bz] = key.split(',').map(Number);
     for (const box of drawnBoxes(block)) {
-      instanceSource[i] = { box };
+      instanceSource[i] = { box, glass, slope: !!slope, cell: [bx, by, bz] };
       mesh.setMatrixAt(i, instanceMatrix(matrix, i, key));
       ids.push(i);
       instanceKeyByIndex[i] = key;
       mesh.setColorAt(i, white);
       t.layers.setX(i, layer);
-      t.glassFlags.setX(i, glass ? 1 : 0);
+      t.glassFlags.setX(i, (glass ? 1 : 0) + 2 * exposedFaceMask(bx, by, bz, box, !!slope, buries));
       t.slopes.setX(i, slope);
-      for (const a of t.modelAttrs) a.setXYZW(i, ...zero4);
+      // A block's modelInfo (w 0): its slope plane's first layer + 1 (0: the
+      // side stretched), its top and bottom layers (terrainSurfaceTSL).
+      const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1] };
+      const sk = slope ? slopeKind[blockShape(block)] : null;
+      t.modelAttrs[0].setXYZW(i, sk == null ? 0 : f.slope[sk] + 1, f.top, f.bottom, 0);
+      for (let k = 1; k < 4; k++) t.modelAttrs[k].setXYZW(i, ...zero4);
       i++;
     }
     voxelIndexMap.set(key, ids);
@@ -747,7 +826,7 @@ function fillInstances() {
       instanceKeyByIndex[i] = key;
       mesh.setColorAt(i, white);
       t.layers.setX(i, 0);
-      t.glassFlags.setX(i, 0);
+      t.glassFlags.setX(i, 2 * ALL_FACES);
       t.slopes.setX(i, 0);
       const d = modelInstanceData(cube, m.model);
       t.modelAttrs[0].setXYZW(i, ...d.info);
@@ -803,6 +882,18 @@ export function updateVoxelVisibility(arenaMap, isBattle) {
     for (const idx of ids) worldInstancedMesh.setMatrixAt(idx, instanceMatrix(_matrix, idx, key, visible));
   }
   worldInstancedMesh.instanceMatrix.needsUpdate = true;
+  // A hidden neighbour buries nothing: the arena's edge shows its sides.
+  const shown = key => !(isBattle && (!arenaMap || !arenaMap.has(key)));
+  const buries = (x, y, z) => {
+    const key = getVoxelKey(x, y, z);
+    return shown(key) && occludesFaces(World.get(key));
+  };
+  instanceSource.forEach((src, i) => {
+    if (!src.box) return;
+    const [x, y, z] = src.cell;
+    terrain.glassFlags.setX(i, (src.glass ? 1 : 0) + 2 * exposedFaceMask(x, y, z, src.box, src.slope, buries));
+  });
+  terrain.instanceData.needsUpdate = true;
 }
 
 export function updateVoxelTints(arenaMap, reachableMap, isBattle) {

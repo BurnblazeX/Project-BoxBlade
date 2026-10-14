@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { parseBBModel, placeModel, facePixel, faceSwapped, transformCube, quarterTurn,
-         FACE_DIRS } from '../js/bbmodel.js';
+         FACE_DIRS, buildModelHits, modelInstanceData, MODEL_HIT_RECORD } from '../js/bbmodel.js';
 
 file('bbmodel.test.mjs - Blockbench import and placement');
 
@@ -202,3 +202,31 @@ section('wall models hang with their north against the wall');
   falsy('a torch has no bounds, so the tile under it stays free', !!W.get(key(4, 0, 4)).occupant);
   clearWorldModels();
 }
+
+section('the rays find model cubes by cell');
+{
+  // A cube from x texel 0 to 12 straddles blocks 0 and 1 (block b spans
+  // texels 12b - 6 .. 12b + 6); one from -6 to 6 is block 0 alone.
+  const face = { u: { o: 0, d: 1 }, v: { o: 0, d: 1 } };
+  const cube = (min, max) => ({ min, max, faces: [face, face, face, face, face, face] });
+  const model = { modelLayer: 40, tilesX: 2, giIndex: 7 };
+  const a = cube([-6, -6, -6], [6, 0, 6]), b = cube([0, -6, -6], [12, -3, 6]);
+  const hits = buildModelHits([{ cubes: [a, b], model }], key => key === '5,5,5');
+  ok('two cells', hits.index.size, 2);
+  const c0 = hits.index.get('0,0,0'), c1 = hits.index.get('1,0,0');
+  truthy('both found', c0 && c1);
+  ok('its GI entry', c0.giIndex, 7);
+  const head = h => [...hits.data.subarray(h * 4, h * 4 + 4)];
+  ok('cell 0 holds both cubes', head(c0.header)[1], 2);
+  ok('cell 1 holds the straddler', head(c1.header)[1], 1);
+  const rec = head(c1.header)[0] * 4;
+  ok('its record: the box', [...hits.data.subarray(rec, rec + 8)].join(','), '0,-6,-6,0,12,-3,6,0');
+  ok('then its instance data', [...hits.data.subarray(rec + 8, rec + 12)].join(','),
+     modelInstanceData(b, model).info.join(','));
+  ok('records follow the headers', head(c0.header)[0], 2);
+  ok('used', hits.used, 2 + 3 * MODEL_HIT_RECORD);
+  ok("a block's cell is never a model's",
+     buildModelHits([{ cubes: [cube([54, 54, 54], [60, 60, 60])], model }], k => k === '5,5,5').index.size, 0);
+  truthy('overflow is reported', buildModelHits([{ cubes: [a], model }], undefined, 4).overflow);
+}
+
