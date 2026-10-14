@@ -106,7 +106,11 @@ export function slopeCode(block) {
 // fraction of the block), n (the plane's exact normal - the same arithmetic
 // in every fragment, so one answer per texel).
 export function slopeTSL() {
-  const code = attribute('blockSlope', 'float');
+  return slopeFromCodeTSL(attribute('blockSlope', 'float'));
+}
+// The same from a code node (a split-shading kernel reads it from the block
+// volume's A channel). kind: 1 slope, 2 half slope, 3 high half slope.
+export function slopeFromCodeTSL(code) {
   const kind = floor(code.mul(float(0.25)).add(float(0.01)));
   const facing = code.sub(kind.mul(float(4)));
   const f = select(facing.lessThan(float(0.5)), vec2(0, -1),
@@ -115,7 +119,7 @@ export function slopeTSL() {
   const grad = select(kind.lessThan(float(1.5)), float(1), float(0.5));
   const base = select(kind.greaterThan(float(2.5)), float(0.5), float(0));
   const n = normalize(vec3(f.x.mul(grad).negate(), float(1), f.y.mul(grad).negate()));
-  return { on: code.greaterThan(float(0.5)), f, grad, base, n };
+  return { on: code.greaterThan(float(0.5)), f, grad, base, n, kind };
 }
 
 // Every terrain material's vertex position: a slope's downhill top edge
@@ -181,6 +185,51 @@ export const texelLockTSL = Fn(([p, n]) => {
   return snapped.mul(vec3(1, 1, 1).sub(a)).add(plane.mul(a));
 });
 
+// A slope plane's texel at a point on it - its locked position, block, uv
+// in the plane's texture and frame. posW: the point (the fragment's, or the
+// locked centre itself); pA: its lock on the world texel grid (only its
+// across-the-climb position is read); side: the material's own layer (int);
+// first1: the authored plane's first layer + 1, 0 for the side stretched.
+// Shared by the terrain surface and split shading's kernels.
+export function slopePlaneTSL(sl, posW, pA, side, first1) {
+  const Bm = float(BLOCK_METRES), q = float(VOXEL_METRES);
+  const r = vec2(sl.f.y.negate(), sl.f.x);                 // across, left to right looking up
+  const bxz = round(pA.xz.div(Bm)).toVar();
+  const hc = bxz.mul(Bm).dot(sl.f).toVar();                // the cell's centre, along the climb
+  const wc = bxz.mul(Bm).dot(r).toVar();                   // and across
+  // The plane at the cell's centre, from this fragment - only rounded.
+  const yMid = posW.y.add(sl.grad.mul(hc.sub(posW.xz.dot(sl.f))));
+  const by = round(yMid.div(Bm).add(float(0.5)).sub(sl.base).sub(sl.grad.mul(float(0.5)))).toVar();
+  // The texel: its row along the climb, its column across.
+  const rows = select(sl.grad.lessThan(float(0.75)), float(HALF_SLOPE_ROWS), float(SLOPE_ROWS)).toVar();
+  const along = posW.xz.dot(sl.f).sub(hc).div(Bm).add(float(0.5));
+  const row = clamp(floor(along.mul(rows)), float(0), rows.sub(float(1))).toVar();
+  const col = clamp(floor(pA.xz.dot(r).sub(wc).div(q).add(float(6))), float(0), float(11)).toVar();
+  // Its centre, from the indices: along the climb and across, then the plane.
+  const a = row.add(float(0.5)).div(rows);
+  const hS = hc.add(a.sub(float(0.5)).mul(Bm));
+  const wS = wc.add(col.add(float(0.5)).sub(float(6)).mul(q));
+  const xz = sl.f.mul(hS).add(r.mul(wS));
+  const y = by.sub(float(0.5)).add(sl.base).mul(Bm).add(sl.grad.mul(a).mul(Bm));
+  const pS = vec3(xz.x, y, xz.y);
+  const blockS = vec3(bxz.x, by, bxz.y);
+  // Its texel in the plane's texture: authored (modelInfo.x = its first layer
+  // + 1), rows 0-11 in that layer and the rest in the next; else the side's
+  // own texture stretched nearest along the climb (row * 12 / rows).
+  const authored = first1.greaterThan(float(0.5));
+  const upper = row.greaterThanEqual(float(12));
+  const slopeLayer = select(authored, int(first1.sub(float(0.5))).add(select(upper, int(1), int(0))),
+                            side);
+  const rowIn = select(authored, row.sub(select(upper, float(12), float(0))),
+                       floor(row.mul(float(12)).div(rows)));
+  const stS = vec2(col.add(float(0.5)).div(float(12)), rowIn.add(float(0.5)).div(float(12)));
+  // Frame: T across, B up the plane.
+  const Ts = vec3(r.x, float(0), r.y);
+  const Bs = normalize(vec3(sl.f.x, sl.grad, sl.f.y));
+  return { n: sl.n, p: vec3(xz.x, y, xz.y), block: vec3(bxz.x, by, bxz.y), st: stS,
+           layer: slopeLayer, slopeTexel: vec3(col, row, float(0)), T: Ts, B: Bs };
+}
+
 // THE TERRAIN FRAGMENT'S SURFACE: normal, locked position, block, face uv,
 // the tangent frame for its normal map, and on a slope its own texel - every
 // input to its shading.
@@ -225,54 +274,21 @@ export function terrainSurfaceTSL(slopes = true) {
                            select(nA.y.lessThan(float(-0.5)), int(info.z.add(float(0.5))), terrainLayerTSL()));
   const sl = slopeTSL();
   const on = sl.on.and(nA.y.greaterThan(float(0.5))).toVar();
-  const Bm = float(BLOCK_METRES), q = float(VOXEL_METRES);
-  const r = vec2(sl.f.y.negate(), sl.f.x);                 // across, left to right looking up
-  const bxz = round(pA.xz.div(Bm)).toVar();
-  const hc = bxz.mul(Bm).dot(sl.f).toVar();                // the cell's centre, along the climb
-  const wc = bxz.mul(Bm).dot(r).toVar();                   // and across
-  // The plane at the cell's centre, from this fragment - only rounded.
-  const yMid = positionWorld.y.add(sl.grad.mul(hc.sub(positionWorld.xz.dot(sl.f))));
-  const by = round(yMid.div(Bm).add(float(0.5)).sub(sl.base).sub(sl.grad.mul(float(0.5)))).toVar();
-  // The texel: its row along the climb, its column across.
-  const rows = select(sl.grad.lessThan(float(0.75)), float(HALF_SLOPE_ROWS), float(SLOPE_ROWS)).toVar();
-  const along = positionWorld.xz.dot(sl.f).sub(hc).div(Bm).add(float(0.5));
-  const row = clamp(floor(along.mul(rows)), float(0), rows.sub(float(1))).toVar();
-  const col = clamp(floor(pA.xz.dot(r).sub(wc).div(q).add(float(6))), float(0), float(11)).toVar();
-  // Its centre, from the indices: along the climb and across, then the plane.
-  const a = row.add(float(0.5)).div(rows);
-  const hS = hc.add(a.sub(float(0.5)).mul(Bm));
-  const wS = wc.add(col.add(float(0.5)).sub(float(6)).mul(q));
-  const xz = sl.f.mul(hS).add(r.mul(wS));
-  const y = by.sub(float(0.5)).add(sl.base).mul(Bm).add(sl.grad.mul(a).mul(Bm));
-  const pS = vec3(xz.x, y, xz.y);
-  const blockS = vec3(bxz.x, by, bxz.y);
-  // Its texel in the plane's texture: authored (modelInfo.x = its first layer
-  // + 1), rows 0-11 in that layer and the rest in the next; else the side's
-  // own texture stretched nearest along the climb (row * 12 / rows).
-  const authored = info.x.greaterThan(float(0.5));
-  const upper = row.greaterThanEqual(float(12));
-  const slopeLayer = select(authored, int(info.x.sub(float(0.5))).add(select(upper, int(1), int(0))),
-                            terrainLayerTSL());
-  const rowIn = select(authored, row.sub(select(upper, float(12), float(0))),
-                       floor(row.mul(float(12)).div(rows)));
-  const stS = vec2(col.add(float(0.5)).div(float(12)), rowIn.add(float(0.5)).div(float(12)));
-  // Frame: T across, B up the plane.
-  const Ts = vec3(r.x, float(0), r.y);
-  const Bs = normalize(vec3(sl.f.x, sl.grad, sl.f.y));
+  const sp = slopePlaneTSL(sl, positionWorld, pA, terrainLayerTSL(), info.x);
   return {
     on,
-    slopeTexel: vec3(col, row, float(0)),
+    slopeTexel: sp.slopeTexel,
     // The one layer every map is read at (terrainTexelTSL): the plane's, a
     // model face's tile (models.js), or the block face's.
-    layer: select(on, slopeLayer, select(model.on, model.layer, faceLayer)).toVar(),
+    layer: select(on, sp.layer, select(model.on, model.layer, faceLayer)).toVar(),
     // A model's lightSource cube: unlit, its own texel (terrainEmissiveTSL).
     emissive: model.emissive,
     n: select(on, sl.n, nA).toVar(),
-    p: select(on, pS, pA).toVar(),
-    block: select(on, blockS, fA.block).toVar(),
-    st: select(on, stS, select(model.on, model.st, fA.st)).toVar(),
-    T: select(on, Ts, Ta).toVar(),
-    B: select(on, Bs, Ba).toVar()
+    p: select(on, sp.p, pA).toVar(),
+    block: select(on, sp.block, fA.block).toVar(),
+    st: select(on, sp.st, select(model.on, model.st, fA.st)).toVar(),
+    T: select(on, sp.T, Ta).toVar(),
+    B: select(on, sp.B, Ba).toVar()
   };
 }
 
@@ -515,7 +531,8 @@ async function loadFaceLayers(m, layer) {
 // rebuilt. 256 x 12 x 256 blocks around the origin, RGBA8, 3 MB; a block
 // outside it reads as air to the rays that ask (reflection and glass hits,
 // the GI). Per block:
-//   a block       R layer + 1 (its side), G its top layer, B its bottom, A 0;
+//   a block       R layer + 1 (its side), G its top layer, B its bottom, A its
+//                 slope code (render.js slopeCode; 0 not a slope);
 //   a model cell  R 0 (air to the walk through glass, which ignores models),
 //                 G + 256 B its cell in modelHits, A the model's GI entry + 1
 //                 (models.js giIndex);
@@ -558,6 +575,7 @@ function buildBlockVolume() {
     data[o] = layer + 1;
     data[o + 1] = f ? f.top : layer;
     data[o + 2] = f ? f.bottom : layer;
+    data[o + 3] = slopeCode(block);   // a slope's kind and facing (split shading)
   }
   const hits = buildModelHits(WorldModels, key => World.has(key));
   if (hits.overflow) console.warn(`[terrain] model hit table full (${MODEL_HIT_VEC4S} vec4): some model cubes reflect as air`);

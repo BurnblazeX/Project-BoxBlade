@@ -175,7 +175,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const layerOf = bi => {
     const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
     const v = texture3D(blocks.tex, uvw).level(int(0));
-    const code = round(max(v.r, v.a).mul(float(255)));
+    const code = round(select(v.r.greaterThan(float(0.5 / 255)), v.r, v.a).mul(float(255)));
     return int(max(code.sub(float(1)), float(0)));
   };
   // Centre of a cell, in world metres.

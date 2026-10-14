@@ -15,6 +15,7 @@
 // the packed form.
 import { BLOCK_METRES, GROUND_Y, blockSpan, isCompound } from './world.js';
 import { BLOCK_TEXELS } from './materials.js';
+import { lightContribution, shadowScore } from './lights.js';
 
 export const MAX_MIRRORS = 32;
 
@@ -157,6 +158,33 @@ export const MIRROR_REACH = 24;
 // The light list's own rows carry a light's level; this many metres per level
 // is its radius (lights.js: the level IS the radius in blocks).
 const SUN_BIT = 1 << 16;
+
+// The mirror-light budget's pick: the lights that light the mirrors most -
+// each scored by its contribution at the nearest point of the best-lit
+// rectangle it faces - not the ones that light the player. Ranked at the
+// player, a lamp beside a mirror lost its slot to whichever lamp the player
+// walked nearer, and its glare blinked in and out with distance. The
+// player's score only breaks ties. rects: buildMirrors'; lights: the
+// liveLights records.
+export function pickMirrored(lights, rects, focus, budget) {
+  const n = Math.max(0, Math.floor(budget));
+  if (n >= lights.length) return new Set(lights);
+  if (n === 0) return new Set();
+  const score = l => {
+    const P = [l.position.x, l.position.y, l.position.z];
+    let best = 0;
+    for (const r of rects) {
+      if ((P[r.axis] - r.plane) * r.sign <= 0) continue;          // behind it
+      const [ua, va] = PLANE_AXES[r.axis];
+      const du = P[ua] - Math.min(Math.max(P[ua], r.min[0]), r.max[0]);
+      const dv = P[va] - Math.min(Math.max(P[va], r.min[1]), r.max[1]);
+      best = Math.max(best, lightContribution(Math.hypot(P[r.axis] - r.plane, du, dv), l.level));
+    }
+    return best + 1e-6 * shadowScore(l, focus);
+  };
+  const ranked = lights.map(l => ({ l, s: score(l) })).sort((a, b) => b.s - a.s);
+  return new Set(ranked.slice(0, n).map(r => r.l));
+}
 
 // What can a mirror actually reflect this frame? Returned per rectangle:
 //   mask  bit i: light i reaches it from its reflecting side; SUN_BIT: it

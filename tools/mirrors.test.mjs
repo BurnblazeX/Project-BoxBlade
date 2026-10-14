@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
 import { World, createTestArea, BLOCK_METRES } from '../js/world.js';
-import { buildMirrors, packMirrors, isReflective, mirrorReach, MAX_MIRRORS, MIRROR_SUN_BIT } from '../js/mirrors.js';
+import { buildMirrors, packMirrors, isReflective, mirrorReach, MAX_MIRRORS, MIRROR_SUN_BIT, pickMirrored } from '../js/mirrors.js';
 
 file('mirrors.test.mjs - reflective surfaces as rectangles');
 
@@ -183,4 +183,18 @@ section('slopes throw no mirror light');
   const r = buildMirrors(W, new Set(['marble']));
   truthy('no rectangle above the ground block', r.every(q => !(q.axis === 1 && q.plane > 0.75 + 1e-9)));
   falsy('the ground block top is covered by the slope', r.some(q => q.axis === 1 && q.sign === 1));
+}
+
+section('the mirror-light budget ranks by the mirrors, not the player');
+{
+  const B = BLOCK_METRES;
+  const at = (x, y, z, level = 6) => ({ position: { x: x * B, y: y * B, z: z * B }, level });
+  const byMirror = at(8.2, 1, 15);           // beside the iron wall at x = 9
+  const byPlayer = at(5, 1, 6);              // over the marble slab, far from the iron
+  const player = { x: 5 * B, y: 1 * B, z: 7 * B };
+  const iron = buildMirrors(World, new Set(['ironPlate']));
+  const pick = pickMirrored([byPlayer, byMirror], iron, player, 1);
+  truthy('the lamp beside the mirror wins, though the player stands by the other', pick.has(byMirror) && pick.size === 1);
+  ok('budget 0 picks none', pickMirrored([byMirror], iron, player, 0).size, 0);
+  ok('a budget past the count picks all', pickMirrored([byPlayer, byMirror], iron, player, 4).size, 2);
 }

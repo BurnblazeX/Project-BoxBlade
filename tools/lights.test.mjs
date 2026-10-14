@@ -131,7 +131,7 @@ section('the light list');
 // Sixteen is the §7.1 budget, and the card buffer the point lights share has to
 // hold at least the sun's per-light cap for one of them.
 ok('sixteen lights', MAX_LIGHTS, 16);
-ok('three vec4 per light', LIGHT_FLOATS, 12);
+ok('four vec4 per light', LIGHT_FLOATS, 16);
 truthy('the shared card buffer holds a full light', POINT_CARD_CAPACITY >= 64);
 
 ok('hex string with #', parseColour('#ff8800'), 0xff8800);
@@ -225,4 +225,12 @@ section('the shadow budget');
   ok('not: the same radius, negative', out[7], -0.5);
   packLight(out, 0, { ...lamp, sourceRadius: 0 }, 0, 0, 1, 1, false);
   truthy('a zero radius still carries the sign', out[7] < 0);
+  // Row 3: the hit-shadow and mirror weights, faded across their budgets.
+  packLight(out, 0, lamp, 0, 0, 1, 1, 0.25, 0.75);
+  ok('a fading hit shadow: weight carried', out[12], 0.25);
+  ok('and still marching (sign)', out[7], 0.5);
+  ok('the mirror weight', out[13], 0.75);
+  packLight(out, 0, lamp);
+  ok('defaults: full hit shadow', out[12], 1);
+  ok('defaults: full mirror light', out[13], 1);
 }

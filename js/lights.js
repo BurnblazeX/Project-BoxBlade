@@ -167,7 +167,7 @@ export function colourToRGB(hex) {
 // the caller supplies decides which sixteen are live.
 export const MAX_LIGHTS = 16;
 
-// Three vec4 per light:
+// Four vec4 per light:
 //   0  position xyz, level
 //   1  colour rgb,   source radius (metres)
 //   2  card start,   card count, shadow weight, card weight
@@ -175,7 +175,11 @@ export const MAX_LIGHTS = 16;
 //        applied (0 = unshadowed, no march), and how much of the SPRITE part
 //        of that shadow is (0 = terrain only, no card test) - see the budgets
 //        below
-export const LIGHT_VEC4S = 3;
+//   3  hit-shadow weight, mirror weight, 0, 0
+//      - how much of its shadow applies at secondary hits, and how much of
+//        its mirror light is thrown: faded in and out of those budgets as
+//        the shadow weight is, so a light crossing them does not pop
+export const LIGHT_VEC4S = 4;
 export const LIGHT_FLOATS = LIGHT_VEC4S * 4;
 
 // Point lights share one card buffer, each taking a slice. The per-light cap is
@@ -209,12 +213,14 @@ export function liveLights(lights, capacity = MAX_LIGHTS, focus = null) {
   return lit.filter(l => keep.has(l));
 }
 
-// One light into its three vec4. cardStart/cardCount are the slice of the
-// shared card buffer that was turned to face THIS light. hitShadow: whether
+// One light into its four vec4. cardStart/cardCount are the slice of the
+// shared card buffer that was turned to face THIS light. hitShadow: how much
 // it marches at SECONDARY hits too (what reflections and the view through
-// glass land on) - carried in the source radius's sign, negative for no.
+// glass land on), 0..1 (true / false = 1 / 0) - whether at all also in the
+// source radius's sign, negative for no. mirror: its mirror light, 0..1.
 export function packLight(out, index, light, cardStart = 0, cardCount = 0,
-                          shadowWeight = 1, cardWeight = 1, hitShadow = true) {
+                          shadowWeight = 1, cardWeight = 1, hitShadow = true, mirror = 1) {
+  const hit = Math.max(0, Math.min(1, Number(hitShadow)));
   const o = index * LIGHT_FLOATS;
   const { r, g, b } = colourToRGB(parseColour(light.colour));
   out[o + 0] = light.position.x;
@@ -223,11 +229,14 @@ export function packLight(out, index, light, cardStart = 0, cardCount = 0,
   out[o + 3] = clampLevel(light.level);
   out[o + 4] = r; out[o + 5] = g; out[o + 6] = b;
   const radius = Math.max(1e-3, light.sourceRadius ?? LIGHT_SOURCE_RADIUS);
-  out[o + 7] = hitShadow ? radius : -radius;
+  out[o + 7] = hit > 0 ? radius : -radius;
   out[o + 8] = cardStart;
   out[o + 9] = cardCount;
   out[o + 10] = Math.max(0, Math.min(1, shadowWeight));
   out[o + 11] = Math.max(0, Math.min(1, cardWeight));
+  out[o + 12] = hit;
+  out[o + 13] = Math.max(0, Math.min(1, mirror));
+  out[o + 14] = 0; out[o + 15] = 0;
   return out;
 }
 

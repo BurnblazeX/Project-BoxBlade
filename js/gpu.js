@@ -8,7 +8,7 @@ import {
   uniformArray, int, dot, select, dFdx, dFdy, textureSize, mix,
   modelWorldMatrix, materialColor, inverseSqrt, frontFacing, sign, sqrt, fract, exp2,
   cameraPosition, pow, round, reflect, refract, textureLoad, screenCoordinate, Discard, all, uint, ivec3, bitXor, shiftRight, bitAnd, bitOr, shiftLeft,
-  atomicMax, atomicLoad, atomicStore
+  atomicMax, atomicLoad, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4
 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE, FIELD_CHANNELS,
          gridIndex, ringSegments, ringSegmentsZ, CASCADE_COUNT,
@@ -22,9 +22,9 @@ import { BLOCK_METRES } from './world.js';
 import { LPV_DIM, LPV_CELL_METRES } from './lpv.js';
 import { terrainSampleTSL, terrainWhite, terrainLayerTSL, axisNormalTSL, blockFaceTSL as boxFaceTSL,
          texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL, terrainTexelTSL,
-         modelTexelCoreTSL, MODEL_HIT_RECORD } from './render.js';
+         modelTexelCoreTSL, MODEL_HIT_RECORD, slopeFromCodeTSL, slopePlaneTSL } from './render.js';
 export { axisNormalTSL, texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL };
-import { METAL_F0, MATERIALS, BLOCK_TEXELS } from './materials.js';
+import { METAL_F0, MATERIALS, BLOCK_TEXELS, MATERIAL_LAYERS } from './materials.js';
 import { MIRROR_VEC4S, MIRROR_SUN_BIT, MIRROR_CACHE_VEC4S } from './mirrors.js';
 import { VOXEL_AO_MIN } from './voxelao.js';
 
@@ -1723,6 +1723,7 @@ function hitSurfaceTSL(terrain, hp, nh, near = null) {
   const code = blockVolumeTSL(terrain, f.block).toVar();
   const layer = faceLayerTSL(code, nh).toVar();
   const st = f.st.toVar();
+  const emissive = float(0).toVar();     // a model's lightSource cube
   // A placed model's cell (A > 0): find the cube whose face holds the hit's
   // texel, and take that texel as the cube's own draw does (render.js
   // modelTexelCoreTSL) - so models reflect as themselves, not as layer 0.
@@ -1730,7 +1731,7 @@ function hitSurfaceTSL(terrain, hp, nh, near = null) {
   // texel), putting the texel just outside every box: then the NEAREST cube,
   // at its nearest texel - never the layer-0 fallback (green).
   if (terrain.modelHits) {
-    If(code.w.greaterThan(float(0.5)), () => {
+    If(code.w.greaterThan(float(0.5)).and(code.x.lessThan(float(0.5))), () => {
       const buf = terrain.modelHits.node;
       const hdr = buf.element(int(code.y.add(code.z.mul(float(256))))).toVar();
       const q = float(VOXEL_METRES);
@@ -1753,6 +1754,7 @@ function hitSurfaceTSL(terrain, hp, nh, near = null) {
                                     buf.element(best.add(int(4))), buf.element(best.add(int(5))));
         layer.assign(m.layer);
         st.assign(m.st);
+        emissive.assign(select(m.emissive, float(1), float(0)));
       });
     });
   }
@@ -1771,7 +1773,36 @@ function hitSurfaceTSL(terrain, hp, nh, near = null) {
        .and(vp.z.greaterThanEqual(float(0))).and(vp.x.lessThan(dim))
        .and(vp.y.lessThan(dim)).and(vp.z.lessThan(dim)), read);
   } else read();
-  return { albedo: mix(a, vec3(1, 1, 1), terrainWhite), n, ao, layer, st };
+  return { albedo: mix(a, vec3(1, 1, 1), terrainWhite), n, ao, layer, st, emissive };
+}
+
+// A reflection hit's face and locked texel, checked against the block volume.
+// The face: the trace's (the field gradient snapped to an axis) when the cell
+// behind it is solid, else the exact block-grid face (blockFaceTSL) when that
+// one's is. The texel: locked as usual, then kept inside that solid cell (or,
+// if the march stopped a hair short past an edge, the cell one texel further
+// along the ray). Near a corner or an edge the gradient can lean into the
+// other face, and the lock can land a texel over the edge - either names the
+// air beside the hit, read as layer 0: green speckles in reflections (seen on
+// Chrome's Dawn).
+function hitTexelTSL(terrain, p, g, dir) {
+  const q = float(VOXEL_METRES), Bm = float(BLOCK_METRES);
+  const cellAt = x => round(x.div(Bm));
+  const solidAt = k => {
+    const c = blockVolumeTSL(terrain, k);
+    return c.x.greaterThan(float(0.5)).or(c.w.greaterThan(float(0.5)));
+  };
+  const behind = n => cellAt(p.sub(n.mul(q.mul(float(0.5)))));
+  const b = blockFaceTSL(p, dir, false).toVar();
+  const n = select(solidAt(behind(g)).or(solidAt(behind(b)).not()), g, b).toVar();
+  const kB = behind(n).toVar();
+  const kA = cellAt(p.add(dir.mul(q))).toVar();
+  const k = select(solidAt(kB).or(solidAt(kA).not()), kB, kA).toVar();
+  // The lock, its point behind the face clamped into k's texel centres.
+  const half = Bm.sub(q).mul(float(0.5));
+  const lo = k.mul(Bm).sub(half), hi = k.mul(Bm).add(half);
+  const inner = clamp(texelLockTSL(p, n).sub(n.mul(q.mul(float(0.5)))), lo, hi);
+  return { n, p: inner.add(n.mul(q.mul(float(0.5)))) };
 }
 
 // A block's entry in render.js's block volume, as bytes (RGBA x 255):
@@ -2164,6 +2195,7 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
             const LA = lights.data.element(base).toVar();
             const LB = lightRowBTSL(lights.data.element(base.add(int(1)))).toVar();
             const LC = lights.data.element(base.add(int(2))).toVar();
+            const mirrorW = lights.data.element(base.add(int(3))).y.toVar();   // faded in / out of the budget
             const P = LA.xyz, level = LA.w;
             // In the mask: on the reflecting side and within reach of it.
             If(bit(float(ml)), () => {
@@ -2219,7 +2251,7 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
                       visible.assign(mix(float(1), v, LC.z));
                     });
                     const wb = backGlare(D, t, Lh, LB.w.div(legB));
-                    sum.addAssign(w.add(wb).mul(LB.xyz).mul(falloff.mul(facing).mul(visible)));
+                    sum.addAssign(w.add(wb).mul(LB.xyz).mul(falloff.mul(facing).mul(visible).mul(mirrorW)));
                   });
                 });
               });
@@ -2351,7 +2383,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   glassBounces = GLASS_MAX_BOUNCES,
                                   glassLayers = GLASS_LAYERS, glassDispersion = 0,
                                   mirrorCache = true, modelHits = true, hitCache = null,
-                                  split = null }) {
+                                  split = null, splitLegacy = false }) {
   // mirrorCache: the mirror light reads the mirror texel cache (mirrors.js);
   // the returned mirrorCache is the pass that fills it, run before rendering.
   // glass: the world has glass. Shadow rays then tint through it, and the sun's
@@ -2542,8 +2574,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const terrainWins = direct ? direct.greaterThan(float(0.5)).or(traced) : traced;
     // A block or a sprite, never both (terrainWins needs no sprite in front).
     If(terrainWins, () => {
-      const nh = hit.xyz.toVar();
-      const hpL = texelLockTSL(hitAt, nh).toVar();
+      const ht = hitTexelTSL(terrain, hitAt, hit.xyz, dir);
+      const nh = ht.n, hpL = ht.p.toVar();
       const shade = () => {
         // modelHits false (profiling only): models reflect as layer 0, to
         // price the lookup's weight in the shader.
@@ -3104,7 +3136,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
           const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
           // Through the blur band the reach shrinks to a quarter: a rough
           // reflection of something far is a smear of the ambient anyway.
-          const reach = reflectMax.mul(float(1).sub(float(0.75).mul(float(1).sub(w))));
+          const reach = reflectMax.mul(float(1).sub(roughReach.mul(float(1).sub(w))));
           env.assign(mix(env, reflectedTSL(origin, dir, reach), w));
         });
       }
@@ -3167,11 +3199,58 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
              select(f.lessThan(float(2.5)), vec3(0, 1, 0), select(f.lessThan(float(3.5)), vec3(0, -1, 0),
              select(f.lessThan(float(4.5)), vec3(0, 0, 1), vec3(0, 0, -1))))));
     };
-    const surfaceAt = (p, n) => {
-      const hs = hitSurfaceTSL(terrain, p, n, null);
-      const S = { base: hs.albedo.toVar(), nS: hs.n.toVar(), texAO: hs.ao.toVar(), kd: vec3(1, 1, 1) };
+    // A sample's geometry: its locked position and normal - a box face's
+    // from its id, a slope plane's (face 6) from its block's code.
+    const geoAt = s => {
+      if (splitLegacy) {
+        // A08//00a: box faces only (slopes and glowing cubes are misses).
+        return { p: s.xyz.toVar(), n: faceNormal(abs(s.w)).toVar(), slope: null, legacy: true };
+      }
+      const p = s.xyz.toVar();
+      const slope = floor(abs(s.w).sub(float(TEXEL_ID_OFFSET)).div(float(2097152))).greaterThan(float(5.5)).toVar();
+      const vol = blockVolumeTSL(terrain, round(p.div(float(BLOCK_METRES)))).toVar();
+      const sl = slopeFromCodeTSL(vol.w);
+      const n = select(slope, sl.n, faceNormal(abs(s.w))).toVar();
+      return { p, n, slope, sl, vol };
+    };
+    // The surface there - a box face as a reflection hit rebuilds one, a
+    // slope plane as the terrain draws it (slopePlaneTSL).
+    const surfaceAt = geo => {
+      const { p, n } = geo;
+      if (geo.legacy) {
+        const hs = hitSurfaceTSL(terrain, p, n, null);
+        const S = { base: hs.albedo.toVar(), nS: hs.n.toVar(), texAO: hs.ao.toVar(),
+                    emissive: float(0), kd: vec3(1, 1, 1) };
+        if (spec) {
+          S.d = decodeSpecularTSL(texture(terrain.specular, hs.st).depth(int(hs.layer)).level(int(0)), S.base);
+          S.v = normalize(split.viewPos.sub(p)).toVar();
+          S.brdf = specularTSL(S.nS, S.v, S.d.alpha, S.d.f0);
+          S.F = fresnelRoughTSL(S.d.f0, max(S.nS.dot(S.v), float(1e-4)), S.d.alpha).toVar();
+          S.kd = vec3(1, 1, 1).sub(S.F).mul(float(1).sub(S.d.metal)).toVar();
+        }
+        return S;
+      }
+      const S = { base: vec3(0, 0, 0).toVar(), nS: n.toVar(), texAO: float(1).toVar(),
+                  emissive: float(0).toVar(), kd: vec3(1, 1, 1) };
+      const layer = int(0).toVar(), st = vec2(0, 0).toVar();
+      If(geo.slope, () => {
+        const side = int(max(geo.vol.x.sub(float(1)), float(0))).toVar();
+        const row = slopeLayerTable.element(side);
+        const first1 = select(geo.sl.kind.lessThan(float(1.5)), row.x, row.y);
+        const sp = slopePlaneTSL(geo.sl, p, p, side, first1);
+        layer.assign(sp.layer); st.assign(sp.st);
+        S.base.assign(mix(texture(terrain.albedo, sp.st).depth(int(sp.layer)).level(int(0)).rgb,
+                          vec3(1, 1, 1), terrainWhite));
+        const lab = labNormalTSL(texture(terrain.normal, sp.st).depth(int(sp.layer)).level(int(0))).toVar();
+        S.nS.assign(surfaceBumpTSL(sp, lab.xyz));
+        S.texAO.assign(lab.w);
+      }).Else(() => {
+        const hs = hitSurfaceTSL(terrain, p, n, null);
+        layer.assign(hs.layer); st.assign(hs.st);
+        S.base.assign(hs.albedo); S.nS.assign(hs.n); S.texAO.assign(hs.ao); S.emissive.assign(hs.emissive);
+      });
       if (spec) {
-        S.d = decodeSpecularTSL(texture(terrain.specular, hs.st).depth(int(hs.layer)).level(int(0)), S.base);
+        S.d = decodeSpecularTSL(texture(terrain.specular, st).depth(int(layer)).level(int(0)), S.base);
         S.v = normalize(split.viewPos.sub(p)).toVar();
         S.brdf = specularTSL(S.nS, S.v, S.d.alpha, S.d.f0);
         S.F = fresnelRoughTSL(S.d.f0, max(S.nS.dot(S.v), float(1e-4)), S.d.alpha).toVar();
@@ -3179,14 +3258,32 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       }
       return S;
     };
-    // body(idx, s, p, n): a terrain sample only; glass and empty ones are
-    // the base kernel's alone.
+    // body(idx, s, geo): a terrain sample only; glass and empty ones are the
+    // base kernel's alone. Threads: this frame's low-res samples, then the
+    // misses; idx is where each one's buffers are (misses from lowCap on).
     const kernel = (name, body, base = null) => Fn(() => {
       cacheMode = 'none';
-      const idx = int(instanceIndex).toVar();
-      If(idx.lessThan(split.count), () => {
-        const s = textureLoad(split.rt, ivec2(idx.mod(split.width), idx.div(split.width))).toVar();
-        const terrainSample = () => body(idx, s, s.xyz.toVar(), faceNormal(abs(s.w)).toVar());
+      if (splitLegacy) {
+        // A08//00a exactly: low-res samples only, no miss list.
+        const idx = int(instanceIndex).toVar();
+        If(idx.lessThan(split.count), () => {
+          const s = textureLoad(split.rt, ivec2(idx.mod(split.width), idx.div(split.width))).toVar();
+          const terrainSample = () => body(idx, s, geoAt(s));
+          if (base) base(idx, s, terrainSample);
+          else If(s.w.greaterThan(float(1.5)), terrainSample);
+        });
+        return;
+      }
+      const t = int(instanceIndex).toVar();
+      const misses = min(int(split.missCount.ro.element(int(0))), int(split.missCap));
+      const low = t.lessThan(split.count);
+      const slot = t.sub(split.count).toVar();
+      If(low.or(slot.lessThan(misses)), () => {
+        const idx = select(low, t, int(split.lowCap).add(slot)).toVar();
+        const s = select(low,
+          textureLoad(split.rt, ivec2(t.mod(split.width), t.div(split.width))),
+          split.missSamples.ro.element(max(slot, int(0)))).toVar();
+        const terrainSample = () => body(idx, s, geoAt(s));
         if (base) base(idx, s, terrainSample);
         else If(s.w.greaterThan(float(1.5)), terrainSample);
       });
@@ -3195,13 +3292,39 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const r = split.result.rw.element(idx).toVar();
       split.result.rw.element(idx).assign(vec4(r.xyz.add(c), r.w));
     };
+    // The packed ambient / highlights (createSplitShading: light).
+    const readLight = idx => {
+      if (!split.half) {
+        return { env: split.env.rw.element(idx).xyz.toVar(), spec: split.spec.rw.element(idx).xyz.toVar() };
+      }
+      const w = split.light.rw.element(idx).toVar();
+      const a = unpackHalf2x16(w.x), b = unpackHalf2x16(w.y), c = unpackHalf2x16(w.z);
+      return { env: vec3(a.x, a.y, b.x), spec: vec3(b.y, c.x, c.y) };
+    };
+    const writeLight = (idx, env, spec) => {
+      if (!split.half) {
+        split.env.rw.element(idx).assign(vec4(env, float(0)));
+        split.spec.rw.element(idx).assign(vec4(spec, float(0)));
+        return;
+      }
+      split.light.rw.element(idx).assign(uvec4(packHalf2x16(vec2(env.x, env.y)),
+        packHalf2x16(vec2(env.z, spec.x)), packHalf2x16(vec2(spec.y, spec.z)), uint(0)));
+    };
     const addSpec = (idx, c) => {
-      const r = split.spec.rw.element(idx).toVar();
-      split.spec.rw.element(idx).assign(vec4(r.xyz.add(c), float(0)));
+      const l = readLight(idx);
+      writeLight(idx, l.env, l.spec.add(c));
     };
     splitKernels = [];
-    splitKernels.push(kernel('splitBase', (idx, s, p, n) => {
-      const S = surfaceAt(p, n);
+    // Glowing cubes are a kernel case unless legacy (then they are misses).
+    const unlessGlowing = (S, fn) => (splitLegacy ? fn() : If(S.emissive.lessThan(float(0.5)), fn));
+    splitKernels.push(kernel('splitBase', (idx, s, geo) => {
+      const { p, n } = geo;
+      const S = surfaceAt(geo);
+      If(S.emissive.greaterThan(float(0.5)), () => {
+        // A glowing model cube: its own texel, unlit (terrainEmissiveTSL).
+        split.result.rw.element(idx).assign(vec4(S.base, s.w));
+        writeLight(idx, vec3(0, 0, 0), vec3(0, 0, 0));
+      }).Else(() => {
       const occ = occlusion(p, n, n, NO_SKIP, S.texAO);
       const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao);
       const env = (occ.gi ? amb.add(occ.gi) : amb).toVar();
@@ -3214,8 +3337,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         if (spec) sunSpec.assign(S.brdf(sun.dir).mul(vis).mul(sunLight()).mul(sunColourUniform));
       }
       split.result.rw.element(idx).assign(vec4(S.base.mul(light).mul(S.kd), s.w));
-      split.env.rw.element(idx).assign(vec4(env, float(0)));
-      split.spec.rw.element(idx).assign(vec4(sunSpec, float(0)));
+      writeLight(idx, env, sunSpec);
+      });
     }, (idx, s, terrainSample) => {
       // Glass (negative id): its own kernels below, or - without them - its
       // own low-res shading, passed through.
@@ -3226,25 +3349,34 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       });
     }));
     if (pointLight) {
-      splitKernels.push(kernel('splitPoints', (idx, s, p, n) => {
-        const S = surfaceAt(p, n);
+      splitKernels.push(kernel('splitPoints', (idx, s, geo) => {
+        const { p, n } = geo;
+        const S = surfaceAt(geo);
+        unlessGlowing(S, () => {
         if (spec) {
           const pl = pointLight.withSpecular(p, n, NO_SKIP, S.nS, S.brdf);
           addResult(idx, S.base.mul(pl.diffuse).mul(S.kd));
           addSpec(idx, pl.spec);
         } else addResult(idx, S.base.mul(pointLight(p, n, NO_SKIP, S.nS)));
+        });
       }));
     }
     if (mirrorTrace) {
-      splitKernels.push(kernel('splitMirror', (idx, s, p, n) => {
-        const S = surfaceAt(p, n);
-        addResult(idx, S.base.mul(mirrorLight(p, n, S.nS, n)).mul(S.kd));
+      splitKernels.push(kernel('splitMirror', (idx, s, geo) => {
+        const { p, n } = geo;
+        const S = surfaceAt(geo);
+        unlessGlowing(S, () => {
+          addResult(idx, S.base.mul(mirrorLight(p, n, S.nS, n)).mul(S.kd));
+        });
       }));
     }
     if (spec) {
-      splitKernels.push(kernel('splitFinal', (idx, s, p, n) => {
-        const S = surfaceAt(p, n);
-        const env = split.env.rw.element(idx).xyz.toVar();
+      splitKernels.push(kernel('splitFinal', (idx, s, geo) => {
+        const { p, n } = geo;
+        const S = surfaceAt(geo);
+        unlessGlowing(S, () => {
+        const stored = readLight(idx);
+        const env = stored.env.toVar();
         if (reflectTrace) {
           const w = float(1).sub(smoothstep(float(REFLECT_ROUGH_START),
                                             float(REFLECT_ROUGH_END), S.d.alpha)).toVar();
@@ -3256,12 +3388,41 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
             const rj = normalize(r0.add(jit)).toVar();
             const dir = select(rj.dot(n).greaterThan(float(0.02)), rj, r0).toVar();
             const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
-            const reach = reflectMax.mul(float(1).sub(float(0.75).mul(float(1).sub(w))));
-            env.assign(mix(env, reflectedTSL(origin, dir, reach), w));
+            const reach = reflectMax.mul(float(1).sub(roughReach.mul(float(1).sub(w))));
+            if (splitLegacy) {
+              env.assign(mix(env, reflectedTSL(origin, dir, reach), w));
+              return;
+            }
+            // shadeTraced, spelled out so bxb.splitdebug can show its parts.
+            const hit = reflectTrace(origin, dir, reach).toVar();
+            const rec = traceRecord(origin, dir, hit);
+            const [o] = lightBatch([hitRequest(rec)]);
+            const refl = composeHit(rec, o.vis, o.diff).toVar();
+            // 1 the hit's own colour, unlit; 2 its distance (white = 16 m, red = a miss).
+            If(splitDebug.equal(int(1)), () => { refl.assign(select(rec.met.greaterThan(float(0.5)), rec.alb, rec.col)); });
+            If(splitDebug.equal(int(2)), () => {
+              refl.assign(select(hit.w.lessThan(float(0)), vec3(1, 0, 0), vec3(hit.w.div(float(16)))));
+            });
+            // 4 the hit's normal; 5 its block's code (magenta: air - layer 0).
+            If(splitDebug.greaterThanEqual(int(4)), () => {
+              const ht = hitTexelTSL(terrain, origin.add(dir.mul(max(hit.w, float(0)))), hit.xyz, dir);
+              const nh = ht.n, hpL = ht.p.toVar();
+              const code = blockVolumeTSL(terrain, boxFaceTSL(hpL, nh).block).toVar();
+              refl.assign(select(splitDebug.equal(int(4)), nh.mul(float(0.5)).add(float(0.5)),
+                select(hit.w.lessThan(float(0)), vec3(0, 0, 0),
+                select(code.x.lessThan(float(0.5)), vec3(1, 0, 1), vec3(code.x.div(float(16)))))));
+              // Raw, not through the Fresnel blend.
+              const r = split.result.rw.element(idx).toVar();
+              split.result.rw.element(idx).assign(vec4(refl, r.w));
+            });
+            env.assign(mix(env, refl, select(splitDebug.equal(int(3)), float(0), w)));
           });
         }
-        const sp = split.spec.rw.element(idx).xyz;
-        addResult(idx, min(sp, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX)).add(S.F.mul(env).mul(S.texAO)));
+        const sp = stored.spec;
+        If(splitDebug.lessThan(int(4)), () => {
+          addResult(idx, min(sp, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX)).add(S.F.mul(env).mul(S.texAO)));
+        });
+        });
       }));
     }
     if (splitGlass) {
@@ -3281,7 +3442,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const glassKernel = (name, body) => kernel(name, body, (idx, s, run) => {
         If(s.w.lessThan(float(-1.5)), run);
       });
-      splitKernels.push(glassKernel('splitGlassSurface', (idx, s, p, n) => {
+      splitKernels.push(glassKernel('splitGlassSurface', (idx, s, geo) => {
+        const { p, n } = geo;
         const G = glassAt(p, n);
         const [o] = lightBatch([{ active: float(1), P: p, N: n, lift: n, skip: NO_SKIP, nS: G.nS,
                                   brdf: { v: G.v, alpha: G.d.alpha, f0: G.d.f0 } }]);
@@ -3293,9 +3455,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
           });
         }
         if (pointLight) direct.addAssign(o.spec);
-        split.spec.rw.element(idx).assign(vec4(direct, float(0)));
+        writeLight(idx, readLight(idx).env, direct);
       }));
-      splitKernels.push(glassKernel('splitGlassReflect', (idx, s, p, n) => {
+      splitKernels.push(glassKernel('splitGlassReflect', (idx, s, geo) => {
+        const { p, n } = geo;
         const G = glassAt(p, n);
         const r0 = reflect(G.v.negate(), G.nS).toVar();
         const rdir = select(r0.dot(n).greaterThan(float(0.02)), r0, reflect(G.v.negate(), n)).toVar();
@@ -3309,9 +3472,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         If(G.smooth.greaterThan(float(0)), () => {
           reflected.assign(mix(reflected, composeHit(reflRec, o.vis, o.diff), G.smooth));
         });
-        split.env.rw.element(idx).assign(vec4(reflected, float(0)));
+        writeLight(idx, reflected, readLight(idx).spec);
       }));
-      splitKernels.push(glassKernel('splitGlassThrough', (idx, s, p, n) => {
+      splitKernels.push(glassKernel('splitGlassThrough', (idx, s, geo) => {
+        const { p, n } = geo;
         const G = glassAt(p, n);
         const sf = sqrt(clamp(G.d.f0.x, float(0), float(0.5)));
         const ior = float(1).add(sf).div(float(1).sub(sf)).toVar();
@@ -3324,11 +3488,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         const seen = glassDispersion > 0 ? vec3(colours[0].x, colours[1].y, colours[2].z) : colours[0];
         split.result.rw.element(idx).assign(vec4(seen, s.w.negate()));
       }));
-      splitKernels.push(glassKernel('splitGlassCompose', (idx, s, p, n) => {
+      splitKernels.push(glassKernel('splitGlassCompose', (idx, s, geo) => {
+        const { p, n } = geo;
         const G = glassAt(p, n);
         const r = split.result.rw.element(idx).toVar();
-        const refl = split.env.rw.element(idx).xyz;
-        const direct = split.spec.rw.element(idx).xyz;
+        const stored = readLight(idx);
+        const refl = stored.env, direct = stored.spec;
         split.result.rw.element(idx).assign(vec4(
           G.F.mul(refl).add(vec3(1, 1, 1).sub(G.F).mul(r.xyz))
             .add(min(direct, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX))), r.w));
@@ -3431,6 +3596,13 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
 //   1  that check's top 8 bits, then its colour as 8:8:8, each sqrt(c / 4).
 // A hit takes the slot only if both match its own check - a collision is a
 // miss (shaded), not a wrong colour.
+// How far through the rough band a reflection's reach shrinks: 0.75 = to a
+// quarter; 0 = full reach everywhere (bxb.roughreach()). A uniform: no rebuild.
+export const roughReach = uniform(float(0.75));
+// Split shading's reflection debug (bxb.splitdebug): 0 off, 1 hit colour
+// unlit, 2 hit distance, 3 no reflection. A uniform: no rebuild.
+export const splitDebug = uniform(int(0));
+
 export const HIT_CACHE_SLOTS = 1 << 18;
 // Past this along a reflection or through-glass ray, a hit is lit by point
 // lights without their shadow march (the sun keeps its own).
@@ -3578,6 +3750,7 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
       const Braw = lights.data.element(base.add(int(1))).toVar();
       const B = lightRowBTSL(Braw).toVar();
       const C = lights.data.element(base.add(int(2))).toVar();
+      const Dw = lights.data.element(base.add(int(3))).toVar();
       const level = A.w;
 
       const toLight = A.xyz.sub(p).toVar();
@@ -3623,7 +3796,9 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
         // C.z is the shadow weight: 0 for a light outside the shadow budget,
         // which lights the surface unshadowed and marches nothing; between 0
         // and 1 while it fades in or out of the budget.
-        const weight = C.z;
+        // At a secondary hit, times the hit-shadow weight (D.x) - faded in
+        // and out of that budget.
+        const weight = second ? C.z.mul(select(second.lessThan(float(0.5)), float(1), Dw.x)) : C.z;
         // A colour in a world with glass: the light tinted by what it crossed.
         const visible = (glass ? vec3(1, 1, 1) : float(1)).toVar();
         const marches = second
@@ -3808,32 +3983,137 @@ export function createTexelCacheWriteNode(shade, negate = false) {
 // lookup reads their result. A slope's plane or a glowing model cube writes
 // no sample (id 0): its pixels fall to the miss pass, which keeps the full
 // shader. capacity: samples (vec4 each) per buffer.
-export function createSplitShading(capacity) {
-  const buffer = name => {
-    const attr = new THREE.StorageBufferAttribute(capacity, 4);
-    return { attr, rw: storage(attr, 'vec4', capacity).setName(name),
-             ro: storage(attr, 'vec4', capacity).toReadOnly().setName(name + 'Read') };
+//
+// The misses too (2026-10-14): a full-res pass of the same G-buffer materials
+// (idRT) gives every pixel its texel; a resolve kernel finds each pixel's
+// low-res sample, or appends the pixel to a miss list, and records which
+// sample colours it (pixelSample). The kernels light low-res samples and
+// misses as one index range - lowCap samples, then missCap misses - and the
+// terrain's own draw reads its pixel's sample (createSplitReadNode). No
+// prepass, no stencil, no miss pass: the full shaders are never compiled.
+export function createSplitShading(lowCap, missCap, fullCap, half = true) {
+  const capacity = lowCap + missCap;
+  const buffer = (name, n = capacity, type = 'vec4', item = 4) => {
+    const attr = new THREE.StorageBufferAttribute(type === 'vec4' ? n
+      : type === 'uvec4' ? new Uint32Array(n * 4) : new Int32Array(n), item);
+    return { attr, rw: storage(attr, type, n).setName(name),
+             ro: storage(attr, type, n).toReadOnly().setName(name + 'Read') };
   };
+  const countAttr = new THREE.StorageBufferAttribute(new Uint32Array(1), 1);
   return {
-    capacity,
+    capacity, lowCap, missCap, fullCap,
     result: buffer('bxbSplitResult'),   // colour so far, texel id (0: none)
-    env: buffer('bxbSplitEnv'),         // the ambient the reflection blends with
-    spec: buffer('bxbSplitSpec'),       // highlights so far, clamped at the end
-    width: uniform(int(1)),
-    count: uniform(int(0)),
+    // Between kernels: the ambient a reflection blends with, and highlights
+    // so far (clamped at the end) - six half floats in one uvec4. fp16 is
+    // ~0.05%, a tenth of an 8-bit step before Fresnel scales it down; texel-
+    // locked, so flat per texel - nothing to band.
+    // half false: full precision, two vec4 buffers (bxb.splithalf()).
+    half,
+    light: half ? buffer('bxbSplitLight', capacity, 'uvec4') : null,
+    env: half ? null : buffer('bxbSplitEnv'),
+    spec: half ? null : buffer('bxbSplitSpec'),
+    missSamples: buffer('bxbSplitMisses', missCap),             // a miss's position, id
+    pixelSample: buffer('bxbSplitPixel', fullCap, 'int', 1),    // per pixel; -1 none
+    missCount: { attr: countAttr,
+                 rw: storage(countAttr, 'uint', 1).toAtomic().setName('bxbSplitMissCount'),
+                 ro: storage(countAttr, 'uint', 1).toReadOnly().setName('bxbSplitMissCountRead') },
+    width: uniform(int(1)),             // low-res
+    count: uniform(int(0)),             // low-res samples this frame
+    fullWidth: uniform(int(1)),
+    fullCount: uniform(int(0)),
     viewPos: uniform(new THREE.Vector3()),
-    rt: null                            // the low-res target's texture, set by main.js
+    rt: null,                           // the low-res target's texture, set by main.js
+    idRT: null                          // the full-res one's
   };
+}
+
+// Per material, its slope planes' first layers + 1 (0: the side stretched):
+// x slope, y half slope - render.js fillInstances' modelInfo.x, as a table.
+const slopeLayerTable = uniformArray(MATERIAL_LAYERS.faces.map(f =>
+  new THREE.Vector4(f.slope[0] + 1, f.slope[1] + 1, 0, 0)), 'vec4').setName('bxbSlopeLayers');
+
+// The resolve, before the kernels: [clear the miss count, per pixel find
+// its sample]. cache: texelCache (scale, size).
+export function createSplitResolve(split, cache) {
+  const clear = Fn(() => { atomicStore(split.missCount.rw.element(int(0)), uint(0)); })()
+    .compute(1).setName('splitMissClear');
+  const resolve = Fn(() => {
+    const idx = int(instanceIndex).toVar();
+    If(idx.lessThan(split.fullCount), () => {
+      const px = vec2(float(idx.mod(split.fullWidth)), float(idx.div(split.fullWidth))).toVar();
+      const s = textureLoad(split.idRT, ivec2(px)).toVar();
+      const out = int(-1).toVar();
+      If(abs(s.w).greaterThan(float(1.5)), () => {
+        // The lookup's own 3x3, on the low-res ids (glass ones negative too).
+        const lc = floor(px.add(float(0.5)).mul(cache.scale)).toVar();
+        const hi = cache.size.sub(float(1));
+        for (const [dx, dy] of TEXEL_CACHE_TAPS) {
+          If(out.lessThan(int(0)), () => {
+            const c = clamp(lc.add(vec2(dx, dy)), vec2(0, 0), hi);
+            const i = int(c.y).mul(split.width).add(int(c.x)).toVar();
+            If(i.lessThan(split.count), () => {
+              If(textureLoad(split.rt, ivec2(c)).w.equal(s.w), () => { out.assign(i); });
+            });
+          });
+        }
+        If(out.lessThan(int(0)), () => {
+          const slot = int(atomicAdd(split.missCount.rw.element(int(0)), uint(1))).toVar();
+          If(slot.lessThan(int(split.missCap)), () => {
+            split.missSamples.rw.element(slot).assign(s);
+            out.assign(int(split.lowCap).add(slot));
+          }).Else(() => {
+            // The list is full: the nearest low-res sample, not nothing.
+            const c = clamp(lc, vec2(0, 0), hi);
+            out.assign(int(c.y).mul(split.width).add(int(c.x)));
+          });
+        });
+      });
+      split.pixelSample.rw.element(idx).assign(out);
+    });
+  })().compute(split.fullCap).setName('splitResolve');
+  return [clear, resolve];
+}
+
+// The terrain's (and glass's) draw under split shading: its pixel's sample -
+// or, where this fragment is another texel than the pixel's centre (an MSAA
+// edge), its own in the 3x3 low-res window; failing both, the pixel's.
+export function createSplitReadNode(cache, split) {
+  return Fn(() => {
+    const id = terrainTexelIdTSL().toVar();
+    const px = floor(screenCoordinate.xy).toVar();
+    const si = split.pixelSample.ro.element(int(px.y).mul(split.fullWidth).add(int(px.x))).toVar();
+    const out = vec3(0, 0, 0).toVar();
+    const found = float(0).toVar();
+    If(si.greaterThanEqual(int(0)), () => {
+      const r = split.result.ro.element(si).toVar();
+      out.assign(r.xyz);
+      If(r.w.equal(id), () => { found.assign(float(1)); });
+    });
+    const lc = floor(screenCoordinate.xy.mul(cache.scale)).toVar();
+    const hi = cache.size.sub(float(1));
+    for (const [dx, dy] of TEXEL_CACHE_TAPS) {
+      If(found.equal(float(0)), () => {
+        const c = clamp(lc.add(vec2(dx, dy)), vec2(0, 0), hi);
+        const s = split.result.ro.element(int(c.y).mul(split.width).add(int(c.x))).toVar();
+        If(s.w.equal(id), () => { out.assign(s.xyz); found.assign(float(1)); });
+      });
+    }
+    return out;
+  })();
 }
 
 // The low-res pass's output under split shading: position and texel id -
 // negative for glass, which has kernels of its own.
-export function createTexelGBufferNode(glass = false) {
+export function createTexelGBufferNode(glass = false, legacy = false) {
   return Fn(() => {
     const surf = terrainSurfaceTSL();
-    const skip = surf.on.or(surf.emissive);
-    const id = texelIdTSL(surf.p, surf.n);
-    return select(skip, vec4(0, 0, 0, 0), vec4(surf.p, glass ? id.negate() : id));
+    if (legacy) {
+      // A08//00a: slopes and glowing cubes write nothing (they are misses).
+      const id = texelIdTSL(surf.p, surf.n);
+      return select(surf.on.or(surf.emissive), vec4(0, 0, 0, 0), vec4(surf.p, glass ? id.negate() : id));
+    }
+    const id = select(surf.on, slopeTexelIdTSL(surf), texelIdTSL(surf.p, surf.n));
+    return vec4(surf.p, glass ? id.negate() : id);
   })();
 }
 

@@ -22,13 +22,13 @@ import { createFramePacer, describePacing } from './pacing.js';
 import { VERSION, bundleHash, buildLabel } from './version.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createVoxelAONode, terrainEmissiveTSL, createHitCache,
-         createSplitShading, createTexelGBufferNode } from './gpu.js';
+         createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode, roughReach, splitDebug } from './gpu.js';
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings, setHitBounds,
          GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
          glassBackGlare } from './gpu.js';
 import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride,
-         MIRROR_CACHE_VEC4S } from './mirrors.js';
+         MIRROR_CACHE_VEC4S, pickMirrored } from './mirrors.js';
 import { MATERIALS, isGlassMaterial } from './materials.js';
 import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
          DEFAULT_SKY_HOUR } from './sky.js';
@@ -2585,18 +2585,36 @@ function sizeTexelCache() {
   }
   texelCache.scale.value.set(w / _drawSize.x, h / _drawSize.y);
   texelCache.size.value.set(w, h);
+  // The full-res G-buffer for split shading's resolve.
+  const fw = Math.max(1, _drawSize.x), fh = Math.max(1, _drawSize.y);
+  if (!texelCache.idRT) {
+    texelCache.idRT = new THREE.RenderTarget(fw, fh, { type: THREE.FloatType, depthBuffer: true });
+    texelCache.idRT.texture.minFilter = texelCache.idRT.texture.magFilter = THREE.NearestFilter;
+    texelCache.idRT.texture.generateMipmaps = false;
+  } else if (texelCache.idRT.width !== fw || texelCache.idRT.height !== fh) {
+    texelCache.idRT.setSize(fw, fh);
+  }
 }
 // Split shading's kernels over this frame's low-res samples, in one submit.
-function runSplitShading() {
+function runSplitShading(resolved) {
   const ks = activeShadowSet && activeShadowSet.splitKernels;
   if (!ks || !splitShading) return;
   const s = splitShading, rt = texelCache.rt;
-  const n = Math.min(rt.width * rt.height, s.capacity);
   s.width.value = rt.width;
-  s.count.value = n;
+  s.count.value = Math.min(rt.width * rt.height, s.lowCap);
   s.viewPos.value.copy(camera.position);
-  for (const k of ks) k.count = n;
-  renderer.compute(ks);
+  const list = [];
+  if (resolved) {
+    const full = texelCache.idRT;
+    s.fullWidth.value = full.width;
+    s.fullCount.value = Math.min(full.width * full.height, s.fullCap);
+    s.resolve[1].count = s.fullCount.value;
+    list.push(...s.resolve);
+  }
+  // This frame's low-res samples, then (resolved) up to missCap misses.
+  const n = s.count.value + (resolved ? s.missCap : 0);
+  for (const k of ks) { k.count = n; list.push(k); }
+  renderer.compute(list);
 }
 
 // The low-res pass, before the main render. Only while the terrain wears the
@@ -2610,11 +2628,12 @@ function renderTexelCache() {
   const glass = glassInstancedMesh;
   const glassActive = !!active && glass && glassLowMat && glass.material === glassLookupMat;
   // The twins follow the terrain's own visibility (the grid overlay hides it).
+  const resolved = !!(activeShadowSet && activeShadowSet.resolved);
   if (terrainTwins.prepass) {
-    terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible;
+    terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible && !resolved;
   }
   if (terrainTwins.glassMiss) {
-    terrainTwins.glassMiss.visible = !!glassActive && mesh.visible && glass.visible;
+    terrainTwins.glassMiss.visible = !!glassActive && mesh.visible && glass.visible && !resolved;
   }
   if (!active) return;
   sizeTexelCache();
@@ -2624,9 +2643,14 @@ function renderTexelCache() {
   camera.layers.set(TEXEL_LAYER);
   renderer.setRenderTarget(texelCache.rt);
   renderer.render(scene, camera);
+  // Resolved: the same G-buffer draws at full res, so every pixel knows its texel.
+  if (resolved) {
+    renderer.setRenderTarget(texelCache.idRT);
+    renderer.render(scene, camera);
+  }
   renderer.setRenderTarget(null);
   camera.layers.mask = mask;
-  runSplitShading();
+  runSplitShading(resolved);
   mesh.material = terrainLookupMat;
   if (glassActive) glass.material = glassLookupMat;
 }
@@ -2957,13 +2981,22 @@ let hitCacheOn = false;
 // (bxb.splitshading()); off by itself if the GPU rejects it.
 let splitOn = true;
 let splitShading = null;
+// The ambient / highlights between kernels at half precision (bxb.splithalf()).
+let splitHalf = true;
+// Misses resolved in the kernels (no miss pass) - bxb.splitresolve().
+let splitResolveOn = true;
+// Debug: the kernels' A08//00a surface path (bxb.splitlegacy()).
+let splitLegacy = false;
 let splitFailed = false;
 function ensureSplitShading() {
   if (splitShading) return splitShading;
-  // Room for every sample at the finest spacing (2) on this screen.
+  // Room for every sample at the finest spacing (2) on this screen, misses
+  // for 1 pixel in 16, and every pixel.
   const dpr = window.devicePixelRatio || 1;
-  const cap = Math.ceil(screen.width * dpr / 2) * Math.ceil(screen.height * dpr / 2);
-  splitShading = createSplitShading(Math.min(cap, 1 << 22));
+  const full = Math.min(Math.ceil(screen.width * dpr) * Math.ceil(screen.height * dpr), 1 << 24);
+  const low = Math.min(Math.ceil(screen.width * dpr / 2) * Math.ceil(screen.height * dpr / 2), 1 << 22);
+  splitShading = createSplitShading(low, Math.ceil(full / 16), full, splitHalf);
+  splitShading.resolve = createSplitResolve(splitShading, texelCache);
   return splitShading;
 }
 // A validation error soon after split shading goes on: fall back to the
@@ -3024,8 +3057,15 @@ function updateLights() {
   const carded = pickShadowed(live, playerSprite.position,
                               Math.min(cardBudget, shadowBudget));
   const hitShadowed = pickShadowed(live, playerSprite.position, Math.min(hitShadowBudget, shadowBudget));
-  const mirrored = pickShadowed(live, playerSprite.position, mirrorLightBudget);
-  lightMirrorRows = live.map(l => mirrored.has(l));
+  const mirrored = pickMirrored(live, mirrorRects || [], playerSprite.position, mirrorLightBudget);
+  // The hit-shadow and mirror budgets fade as the shadow budget does.
+  for (const l of live) {
+    l.hitWeight = l.hitWeight === undefined ? (hitShadowed.has(l) ? 1 : 0)
+                : easeShadowWeight(l.hitWeight, hitShadowed.has(l), dt);
+    l.mirrorWeight = l.mirrorWeight === undefined ? (mirrored.has(l) ? 1 : 0)
+                   : easeShadowWeight(l.mirrorWeight, mirrored.has(l), dt);
+  }
+  lightMirrorRows = live.map(l => l.mirrorWeight > 0);
   let used = 0, marching = 0, cardLights = 0;
   for (let i = 0; i < live.length; i++) {
     const l = live[i];
@@ -3048,7 +3088,7 @@ function updateLights() {
         used += count;
       }
     }
-    packLight(lightPack, i, l, start, count, l.shadowWeight, l.cardWeight, hitShadowed.has(l));
+    packLight(lightPack, i, l, start, count, l.shadowWeight, l.cardWeight, l.hitWeight, l.mirrorWeight);
   }
   if (withCards) writeCardBindings(lightCards, cardPack, used);
   writeLightBindings(lightBindings, lightPack, live.length);
@@ -3365,6 +3405,8 @@ function shadowNodeOptions() {
     mirrorCache: mirrorCacheOn, modelHits: modelHitsOn,
     hitCache: hitCacheOn ? ensureHitCache() : null,
     split: splitOn && texelCacheOn ? ensureSplitShading() : null,
+    splitResolve: splitResolveOn,
+    splitLegacy,
     // The world has glass: shadow rays tint through it (gpu.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
@@ -3417,6 +3459,7 @@ function obtainShadowSet() {
   if (opts.split) {
     sizeTexelCache();
     opts.split.rt = texelCache.tex;
+    opts.split.idRT = texelCache.idRT.texture;
     splitSince = performance.now();
     watchSplitErrors();
   }
@@ -3439,8 +3482,15 @@ function obtainShadowSet() {
     // per-instance tint, which the lookup material applies once itself.
     // The low-res pass alone also fills the hit lighting cache (gpu.js makeNode).
     const split = built.splitKernels ? opts.split : null;
-    lowMat.outputNode = split ? createTexelGBufferNode()
+    lowMat.outputNode = split ? createTexelGBufferNode(false, splitLegacy)
       : createTexelCacheWriteNode(terrainEmissiveTSL(built.nodeCaching, terrainTextures));
+    // Resolved: misses shaded by the kernels too, read per pixel - only when
+    // glass (if any) is split as well, as it shares the passes.
+    // Legacy sends slopes and glowing cubes to the miss pass, so not resolved.
+    const resolved = split && splitResolveOn && !splitLegacy && (built.splitGlass || !glassNode);
+    if (resolved) {
+      terrainMat = createShadowMaterial(worldInstancedMesh, createSplitReadNode(texelCache, split));
+    } else {
     terrainMat = createShadowMaterial(worldInstancedMesh, createTexelCacheLookupNode(texelCache, split));
     terrainMat.stencilWrite = true;
     terrainMat.stencilFunc = THREE.AlwaysStencilFunc;
@@ -3451,7 +3501,12 @@ function obtainShadowSet() {
     missMat.stencilFunc = THREE.EqualStencilFunc;
     missMat.stencilRef = 0;
     missMat.stencilZPass = THREE.KeepStencilOp;
-    if (glassNode) {
+    }
+    if (glassNode && resolved) {
+      glassLow = new THREE.MeshBasicNodeMaterial();
+      glassLow.outputNode = createTexelGBufferNode(true, splitLegacy);
+      glassMat = createShadowMaterial(glassInstancedMesh, createSplitReadNode(texelCache, split));
+    } else if (glassNode) {
       glassLow = new THREE.MeshBasicNodeMaterial();
       glassLow.outputNode = built.splitGlass ? createTexelGBufferNode(true)
         : createTexelCacheWriteNode(glassNode, !!split);
@@ -3478,17 +3533,18 @@ function obtainShadowSet() {
   const sprites = buildSpriteShadows(spriteLight, atlas);
   const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
   // Compiled against the float target it will draw into.
-  if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt],
-                         [terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
+  if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt]);
+  if (missMat) pairs.push([terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
   if (glassMat) pairs.push([glassInstancedMesh, glassMat]);
-  if (glassLow) pairs.push([glassInstancedMesh, glassLow, texelCache.rt],
-                           [terrainTwins.glassMiss, glassMiss]);
+  if (glassLow) pairs.push([glassInstancedMesh, glassLow, texelCache.rt]);
+  if (glassMiss) pairs.push([terrainTwins.glassMiss, glassMiss]);
   const set = {
     key, parts, sun, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
     made: sprites.made, variants: sprites.variants, atlasMats: sprites.atlasMats,
     mirrorCache: built.mirrorCache,
     splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
-    mats: [terrainMat, ...(lowMat ? [lowMat, missMat] : []),
+    resolved: !!(lowMat && built.splitKernels && !missMat),
+    mats: [terrainMat, ...[lowMat, missMat].filter(Boolean),
            ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
     compiled: false
   };
@@ -4316,6 +4372,64 @@ const bxbApi = installConsole(createConsole({
       return `card budget ${cardBudget} - the ${cardBudget} most important ` +
              `shadowed lights test sprite cards. The others still march the ` +
              `field, so walls still block them; only sprites stop casting.`;
+    }
+  },
+  splitdebug: {
+    help: 'split shading reflections: 0 normal, 1 hit colour unlit, 2 hit distance (white 16 m, red miss), 3 none, 4 hit face normal, 5 hit block (grey by layer, magenta air, black miss)',
+    usage: 'bxb.splitdebug(1)',
+    run: (n = 0) => {
+      splitDebug.value = Math.max(0, Math.min(5, Math.round(n)));
+      return `split reflection debug ${splitDebug.value}`;
+    }
+  },
+  roughreach: {
+    help: 'rough reflections: shrink their reach through the blur band (on) or keep full reach (off)',
+    usage: 'bxb.roughreach()',
+    run: () => {
+      roughReach.value = roughReach.value > 0 ? 0 : 0.75;
+      return `rough reflections ${roughReach.value > 0 ? 'reach less as they blur' : 'at full reach'}`;
+    }
+  },
+  splithalf: {
+    help: 'split shading: half or full precision for the ambient / highlights between kernels (rebuilds)',
+    usage: 'bxb.splithalf()',
+    run: () => {
+      splitHalf = !splitHalf;
+      splitShading = null;          // reallocated at the new precision
+      buildPerPixelShadows();
+      return `split shading buffers at ${splitHalf ? 'half' : 'full'} precision`;
+    }
+  },
+  splitresolve: {
+    help: 'split shading: misses shaded by the kernels (on) or by the old miss pass (off) (rebuilds)',
+    usage: 'bxb.splitresolve()',
+    run: () => {
+      splitResolveOn = !splitResolveOn;
+      buildPerPixelShadows();
+      return `misses ${splitResolveOn ? 'resolved in the kernels' : 'shaded by the miss pass'}`;
+    }
+  },
+  splitlegacy: {
+    help: "debug: split shading's kernels on A08//00a's surface path (rebuilds)",
+    usage: 'bxb.splitlegacy()',
+    run: () => {
+      splitLegacy = !splitLegacy;
+      buildPerPixelShadows();
+      return `split kernels on the ${splitLegacy ? 'A08//00a' : 'current'} surface path`;
+    }
+  },
+  splitstats: {
+    help: "split shading: last frame's misses against the list's room",
+    usage: 'await bxb.splitstats()',
+    run: async () => {
+      if (!splitShading) return 'split shading is off';
+      let misses;
+      try {
+        misses = new Uint32Array(await renderer.getArrayBufferAsync(splitShading.missCount.attr))[0];
+      } catch { return 'no misses resolved yet (resolve off, or the kernels have not run)'; }
+      const s = splitShading;
+      return `${misses} misses (room ${s.missCap}${misses > s.missCap ? ' - OVERFLOWING' : ''}), ` +
+             `${s.count.value} low-res samples, ${s.fullCount.value} pixels`;
     }
   },
   splitshading: {
