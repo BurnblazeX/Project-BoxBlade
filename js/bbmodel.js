@@ -20,6 +20,7 @@
 // nearest thing that works is done.
 //
 // Pure: no three, no DOM. Textures stay data URLs for the renderer to decode.
+import { rectCovered } from './rects.js';
 
 // Face directions, in this order everywhere: +x, -x, +y, -y, +z, -z.
 export const FACE_DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
@@ -288,6 +289,59 @@ export function modelInstanceData(cube, model) {
   return { info: [mask, model.modelLayer, model.tilesX, 1], uv };
 }
 
+
+// --- Buried faces of placed cubes (as world.js exposedFaceMask for blocks) ---
+//
+// Per cube, which faces can be seen at all, bits in FACE_DIRS order (set =
+// drawn). A face is buried when the solid boxes holding the texel layer just
+// past it cover all of it: the blocks' (boxesAt - world.js opaqueBoxes: a
+// carpet's underside on a floor or a slab, a wall model's back against its
+// wall) and other cubes', touching or overlapping (a chair's seat on its
+// legs). Models are drawn opaque, so a covered face is never seen. A
+// lightSource cube covers nothing (it is not solid). cubes: every placed
+// cube, world texels; returns a mask per cube, in that order.
+export function modelFaceMasks(cubes, boxesAt) {
+  // Solid cubes by the cells they reach into, so a face only meets its
+  // neighbours - a carpet of thousands of tiles is not checked pairwise.
+  const byCell = new Map();
+  cubes.forEach((c, i) => {
+    if (c.light) return;
+    const lo = c.min.map(cellOfTexel), hi = c.max.map(t => cellOfTexel(t - 1));
+    for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++)
+      for (let z = lo[2]; z <= hi[2]; z++) {
+        const k = `${x},${y},${z}`;
+        if (!byCell.has(k)) byCell.set(k, []);
+        byCell.get(k).push(i);
+      }
+  });
+  return cubes.map((c, i) => {
+    let mask = 0;
+    FACE_DIRS.forEach((dir, d) => {
+      const a = dir.findIndex(v => v !== 0), s = dir[a];
+      const [u, v] = [0, 1, 2].filter(k => k !== a);
+      // The texel layer just past the face, and every cell it crosses.
+      const layer = s > 0 ? c.max[a] : c.min[a] - 1;
+      const covers = [];
+      const cell = [0, 0, 0];
+      cell[a] = cellOfTexel(layer);
+      for (cell[u] = cellOfTexel(c.min[u]); cell[u] <= cellOfTexel(c.max[u] - 1); cell[u]++)
+        for (cell[v] = cellOfTexel(c.min[v]); cell[v] <= cellOfTexel(c.max[v] - 1); cell[v]++) {
+          // A block's boxes, in world texels (its cell's corner is 12 c - 6).
+          for (const b of boxesAt(...cell)) {
+            const lo = k => cell[k] * 12 - 6 + Math.round(b[2 * k] * 12);
+            const hi = k => cell[k] * 12 - 6 + Math.round(b[2 * k + 1] * 12);
+            if (lo(a) <= layer && hi(a) > layer) covers.push([lo(u), hi(u), lo(v), hi(v)]);
+          }
+          for (const j of byCell.get(cell.join(',')) || []) {
+            const o = cubes[j];
+            if (j !== i && o.min[a] <= layer && o.max[a] > layer) covers.push([o.min[u], o.max[u], o.min[v], o.max[v]]);
+          }
+        }
+      if (!rectCovered([c.min[u], c.max[u], c.min[v], c.max[v]], covers)) mask |= 1 << d;
+    });
+    return mask;
+  });
+}
 
 // --- The rays' view of placed models ---
 //

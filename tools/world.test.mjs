@@ -2,7 +2,7 @@ import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
 import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
          findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory, currentArena,
          getBlock, stepLevel, surfaceLevel, surfaceHeight, isSolidAt, blockShape, blockBoxes, edgeLevel,
-         slopeLevel, groundHeightAt, followGround, blockSpan,
+         slopeLevel, groundHeightAt, followGround, blockSpan, hasFacing, newBlock,
          pathDistance, attackRange, getAbilityModifier,
          BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/world.js';
 
@@ -103,10 +103,53 @@ falsy('air under it', isStandable(24, 1, 25));
   put('41,0,40', {});
   put('41,1,40', { shape: 'halfTop' });
   falsy('a full block under a half-top: not', isStandable(41, 0, 40));
-  // Glass is always whole.
+  // Glass takes the one-box shapes; a glass slope is whole.
   put('42,0,40', { shape: 'halfBottom', materialId: 'glass' });
-  ok('glass ignores a shape', blockShape(getBlock(42, 0, 40)), 'full');
+  ok('glass keeps a half', blockShape(getBlock(42, 0, 40)), 'halfBottom');
+  ok('but not a slope', blockShape({ materialId: 'glass', shape: 'slope', facing: 'E' }), 'full');
   for (const k of ['40,0,40', '40,1,40', '41,0,40', '41,1,40', '42,0,40']) World.delete(k);
+}
+
+section('vertical halves and panes: turned boxes, full-height tops');
+{
+  const vb = facing => blockBoxes({ materialId: 'grass', shape: 'halfVertical', facing })[0].join(',');
+  ok('a vertical half facing E is the east half', vb('E'), '0.5,1,0,1,0,1');
+  ok('facing W the west half', vb('W'), '0,0.5,0,1,0,1');
+  ok('facing S the south half (+z)', vb('S'), '0,1,0,1,0.5,1');
+  ok('facing N the north half', vb('N'), '0,1,0,1,0,0.5');
+  const pane = facing => blockBoxes({ materialId: 'grass', shape: 'middleVertical', facing })[0]
+    .map(v => Math.round(v * 12)).join(',');
+  ok('a pane facing E is four texels thick across x, in the middle', pane('E'), '4,8,0,12,0,12');
+  ok('facing N across z', pane('N'), '0,12,0,12,4,8');
+  truthy('both turn with Q/E', hasFacing('halfVertical') && hasFacing('middleVertical'));
+  falsy('half slabs do not', hasFacing('halfBottom'));
+  ok('they keep their facing when made', newBlock('grass', 'middleVertical', 'N').facing, 'N');
+  World.set('44,0,44', { ...newBlock('grass', 'halfVertical', 'E') });
+  truthy('a vertical half is standable', isStandable(44, 0, 44));
+  ok('at full height', surfaceLevel(44, 0, 44), 1);
+  truthy('solid in its east half', isSolidAt(44 * 1.5 + 0.3, 0, 44 * 1.5));
+  falsy('air in its west half', isSolidAt(44 * 1.5 - 0.3, 0, 44 * 1.5));
+  World.delete('44,0,44');
+}
+
+section('dual blocks: two materials, one full cell');
+{
+  const { isDual, blockParts, partAt, serializeLevel, loadLevel } = await import('../js/world.js');
+  const dual = newBlock('marble', 'halfBottom', null, 'glass');
+  truthy('a low half with a second material is dual', isDual(dual));
+  ok('its parts: marble low, glass high', blockParts(dual).map(p => `${p.materialId}:${p.boxes[0].join(',')}`).join(' '),
+     'marble:0,1,0,0.5,0,1 glass:0,1,0.5,1,0,1');
+  const v = newBlock('grass', 'halfVertical', 'N', 'marble');
+  ok('a vertical half\'s other half faces away', blockParts(v)[1].boxes[0].join(','), '0,1,0,1,0.5,1');
+  falsy('a pane has no other half', isDual(newBlock('grass', 'middleVertical', 'E', 'marble')));
+  World.set('46,0,46', dual);
+  ok('stood on at full height', surfaceLevel(46, 0, 46), 1);
+  truthy('solid in its glass half too', isSolidAt(46 * 1.5, 0.5, 46 * 1.5));
+  ok('the rays see marble below', partAt(46 * 1.5, -0.3, 46 * 1.5).materialId, 'marble');
+  ok('and glass above', partAt(46 * 1.5, 0.3, 46 * 1.5).materialId, 'glass');
+  const row = serializeLevel().blocks.find(b => b[0] === 46 && b[2] === 46);
+  ok('saved with its second material', JSON.stringify(row), '[46,0,46,"marble","halfBottom",null,"glass"]');
+  World.delete('46,0,46');
 }
 
 section('slopes: planes, baked as staircases under them');
@@ -403,17 +446,34 @@ section('stairs');
 
 section('buried faces are not drawn');
 {
-  const { exposedFaceMask, occludesFaces, ALL_FACES } = await import('../js/world.js');
-  const solid = new Set(['1,0,0', '0,-1,0']);
-  const at = (x, y, z) => solid.has(`${x},${y},${z}`);
+  const { exposedFaceMask, opaqueBoxes, ALL_FACES } = await import('../js/world.js');
   const full = [0, 1, 0, 1, 0, 1];
+  const cells = new Map([['1,0,0', [full]], ['0,-1,0', [full]]]);
+  const at = (x, y, z) => cells.get(`${x},${y},${z}`) || [];
   ok('+x and -y buried, the rest drawn', exposedFaceMask(0, 0, 0, full, false, at), ALL_FACES & ~1 & ~8);
   ok('a half block\'s top is inside its cell: drawn', exposedFaceMask(0, 0, 0, [0, 1, 0, 0.5, 0, 1], false,
-     () => true), 4);
-  ok('a slope\'s top (its plane) is never buried', exposedFaceMask(0, 0, 0, full, true, () => true) & 4, 4);
-  ok('nothing around: all drawn', exposedFaceMask(0, 0, 0, full, false, () => false), ALL_FACES);
-  falsy('glass buries nothing', occludesFaces({ materialId: 'glass' }));
-  falsy('a half block buries nothing', occludesFaces({ materialId: 'grass', shape: 'halfBottom' }));
-  truthy('a full block does', occludesFaces({ materialId: 'grass' }));
+     () => [full]) & 4, 4);
+  ok('a slope\'s top (its plane) is never buried', exposedFaceMask(0, 0, 0, full, true, () => [full]) & 4, 4);
+  ok('nothing around: all drawn', exposedFaceMask(0, 0, 0, full, false, () => []), ALL_FACES);
+  ok('glass hides nothing', opaqueBoxes({ materialId: 'glass' }).length, 0);
+  ok('a slope hides only with its floor', JSON.stringify(opaqueBoxes({ materialId: 'grass', shape: 'slope', facing: 'E' })), '[[0,1,0,0,0,1]]');
+  // Shapes against shapes.
+  const half = opaqueBoxes({ materialId: 'grass', shape: 'halfBottom' })[0];
+  const nb = new Map([['1,0,0', [half]], ['0,1,0', [half]]]);
+  const atH = (x, y, z) => nb.get(`${x},${y},${z}`) || [];
+  ok('two low halves side by side: the face between is buried', exposedFaceMask(0, 0, 0, half, false, atH) & 1, 0);
+  ok('a full block beside a low half: its side is drawn (half covered)', exposedFaceMask(0, 0, 0, full, false, atH) & 1, 1);
+  const paneE = opaqueBoxes({ materialId: 'grass', shape: 'middleVertical', facing: 'E' })[0];
+  const paneW = opaqueBoxes({ materialId: 'grass', shape: 'middleVertical', facing: 'W' })[0];
+  ok('a pane turned W lands on the same planes as E', paneW.join(), paneE.join());
+  ok('a row of panes hides the faces between', exposedFaceMask(0, 0, 0, paneE, false, (x, y, z) => (z === 1 ? [paneW] : [])) & 16, 0);
+  const stairs = opaqueBoxes({ materialId: 'grass', shape: 'stairs', facing: 'E' });
+  ok('stairs: the upper step\'s underside on the lower is buried', exposedFaceMask(0, 0, 0, stairs[1], false, () => stairs) & 8, 0);
+  ok('the lower step\'s top is drawn where the upper does not cover it', exposedFaceMask(0, 0, 0, stairs[0], false, () => stairs) & 4, 4);
+  const dual = { materialId: 'grass', shape: 'halfBottom', second: 'glass' };
+  ok('a dual with glass: only its opaque half hides', opaqueBoxes(dual).length, 1);
+  ok('its glass half\'s underside on the opaque half is buried',
+     exposedFaceMask(0, 0, 0, [0, 1, 0.5, 1, 0, 1], false, () => opaqueBoxes(dual)) & 8, 0);
+  ok('its opaque half\'s top under the glass is drawn', exposedFaceMask(0, 0, 0, half, false, () => opaqueBoxes(dual)) & 4, 4);
 }
 

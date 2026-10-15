@@ -5,12 +5,12 @@ import {
   positionWorld, normalWorld, floor, max, texture, uv, abs,
   attribute, varying, vec2, vec4, ivec2, textureStore, min,
   normalize, cross, clamp, cos, sin, smoothstep, length, log2,
-  uniformArray, int, dot, select, dFdx, dFdy, textureSize, mix,
+  uniformArray, int, dot, select, dFdx, dFdy, textureSize, mix, step,
   modelWorldMatrix, materialColor, inverseSqrt, frontFacing, sign, sqrt, fract, exp2,
   cameraPosition, pow, round, reflect, refract, textureLoad, screenCoordinate, Discard, all, uint, ivec3, bitXor, shiftRight, bitAnd, bitOr, shiftLeft,
   atomicMax, atomicLoad, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4
 } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE, FIELD_CHANNELS,
+import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE, createBoxGridAt, DISTANCE_RANGE, FIELD_CHANNELS,
          gridIndex, ringSegments, ringSegmentsZ, CASCADE_COUNT,
          HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from './boxgrid.js';
 import { BAYER4, SUN_ANGULAR_SIZE, coneOffsets, coneRadius,
@@ -492,9 +492,9 @@ export function glassRayTransmitTSL(terrain, traced, origin, dir) {
     // face is the nearest block plane, and the texel is locked onto it as the
     // glass's own shading locks its texels.
     const entry = origin.add(dir.mul(traced.w)).toVar();
-    const nf = blockFaceTSL(entry, dir, false).toVar();
+    const nf = blockFaceTSL(entry, dir, false, terrain).toVar();
     const f = boxFaceTSL(texelLockTSL(entry, nf), nf);
-    const layer = blockLayerTSL(terrain, f.block, nf).toVar();
+    const layer = blockLayerTSL(terrain, f.block, nf, entry).toVar();
     const st = f.st.toVar();
     const tint = texture(terrain.albedo, st).depth(int(layer)).level(int(0)).rgb;
     // The two surfaces' reflection at the angle this ray meets them.
@@ -1223,7 +1223,8 @@ export function createVoxelAONode(terrain, cards = null) {
       const inside = uvw.x.greaterThan(float(0)).and(uvw.y.greaterThan(float(0)))
         .and(uvw.z.greaterThan(float(0))).and(uvw.x.lessThan(float(1)))
         .and(uvw.y.lessThan(float(1))).and(uvw.z.lessThan(float(1)));
-      const filled = texture3D(vol.tex, uvw).level(int(0)).r.greaterThan(float(0.5 / 255));
+      // uvw is over the volume's blocks; the texture holds a dual's halves too.
+      const filled = texture3D(vol.tex, uvw.mul(vol.size).div(vol.dims)).level(int(0)).r.greaterThan(float(0.5 / 255));
       return select(inside.and(filled), float(1), float(0)).toVar();
     };
     const e = { l: occ(-1, 0), r: occ(1, 0), d: occ(0, -1), u: occ(0, 1) };
@@ -1641,15 +1642,23 @@ function axisFaceTSL(g) {
 // to the wrong axis, an exit bent against the wrong face and sent the ray to
 // the sky - the white rims along every glass edge. Mirrored on the CPU by
 // boxgrid.js blockFaceNormal.
-export function blockFaceTSL(p, dir, leaving) {
+// terrain: the block volume, so the planes of the shape in p's cell count too
+// (world.js codeBox) - a pane's or a half's faces sit mid-cell. Mirrors
+// boxgrid.js blockFaceNormal with a world.
+export function blockFaceTSL(p, dir, leaving, terrain = null) {
   const f = fract(p.div(float(BLOCK_METRES)).add(float(0.5))).toVar();
   const ad = abs(dir).toVar();
+  const edge = min(f, vec3(1, 1, 1).sub(f)).toVar();
+  if (terrain) {
+    const box = codeBoxTSL(blockVolumeTSL(terrain, round(p.div(float(BLOCK_METRES)))).w);
+    edge.assign(min(edge, min(abs(f.sub(box.lo)), abs(f.sub(box.hi)))));
+  }
   // Metres to the nearest boundary on each axis, less a millimetre's worth of
   // how squarely the ray crosses it (the tie-break), and ruled out where the ray
   // runs parallel to the planes.
-  const score = min(f, vec3(1, 1, 1).sub(f)).mul(float(BLOCK_METRES))
+  const score = edge.mul(float(BLOCK_METRES))
     .sub(ad.mul(float(1e-3)))
-    .add(select(ad.lessThan(vec3(1e-3, 1e-3, 1e-3)), vec3(1e3, 1e3, 1e3), vec3(0, 0, 0))).toVar();
+    .add(step(ad, vec3(1e-3, 1e-3, 1e-3)).mul(float(1e3))).toVar();   // per axis: not a select (one bool)
   const sx = score.x.lessThanEqual(score.y).and(score.x.lessThanEqual(score.z));
   const sy = score.y.lessThan(score.x).and(score.y.lessThanEqual(score.z));
   const s = leaving ? sign(dir) : sign(dir).negate();
@@ -1720,7 +1729,7 @@ export function createGlassMarchTSL(cascades) {
 // AO, skipping the reads.
 function hitSurfaceTSL(terrain, hp, nh, near = null) {
   const f = boxFaceTSL(hp, nh);
-  const code = blockVolumeTSL(terrain, f.block).toVar();
+  const code = volumeAtTSL(terrain, f.block, hp.sub(nh.mul(float(VOXEL_METRES * 0.5)))).toVar();
   const layer = faceLayerTSL(code, nh).toVar();
   const st = f.st.toVar();
   const emissive = float(0).toVar();     // a model's lightSource cube
@@ -1810,7 +1819,7 @@ function hitTexelTSL(terrain, p, g, dir) {
 // cell, R 0, G + 256 B its modelHits header, A its GI entry + 1.
 function blockVolumeTSL(terrain, block) {
   const vol = terrain.blocks;
-  const uvw = block.sub(vol.origin).add(float(0.5)).div(vol.size);
+  const uvw = block.sub(vol.origin).add(float(0.5)).div(vol.dims);
   return round(texture3D(vol.tex, uvw).level(int(0)).mul(float(255)));
 }
 
@@ -1826,21 +1835,91 @@ function faceLayerTSL(code, n) {
   return select(code.x.greaterThan(float(0.5)), face, int(0));
 }
 
-function blockLayerTSL(terrain, block, n) {
-  return faceLayerTSL(blockVolumeTSL(terrain, block), n);
+// p: a point on the face (n its outward normal) - a dual block's half is the
+// one behind it.
+function blockLayerTSL(terrain, block, n, p) {
+  return faceLayerTSL(volumeAtTSL(terrain, block, p.sub(n.mul(float(VOXEL_METRES * 0.5)))), n);
 }
 
-// A block's raw code (layer + 1, 0 air), with everything outside the volume
-// read as air - the volume clamps at its edge, which would repeat the border.
-function blockCodeTSL(terrain, block) {
-  const vol = terrain.blocks;
-  const rel = block.sub(vol.origin).toVar();
-  const inside = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))
-    .and(rel.z.greaterThanEqual(float(0))).and(rel.x.lessThan(vol.size.x))
-    .and(rel.y.lessThan(vol.size.y)).and(rel.z.lessThan(vol.size.z));
-  const uvw = rel.add(float(0.5)).div(vol.size);
-  const code = round(texture3D(vol.tex, uvw).level(int(0)).r.mul(float(255)));
-  return select(inside, code, float(0));
+// Whether cell fractions f lie in a codeBoxTSL box (half-open, as partAt).
+const inCodeBoxTSL = (f, box) => f.x.greaterThanEqual(box.lo.x).and(f.x.lessThan(box.hi.x))
+  .and(f.y.greaterThanEqual(box.lo.y)).and(f.y.lessThan(box.hi.y))
+  .and(f.z.greaterThanEqual(box.lo.z)).and(f.z.lessThan(box.hi.z));
+
+// A cell's entry as blockVolumeTSL reads it, for the part holding world point
+// q: a dual block (A >= 128; render.js buildBlockVolume) outside its own
+// half's box answers its other half's R, G, B from the volume's second half.
+export function volumeAtTSL(terrain, cell, q) {
+  const v = blockVolumeTSL(terrain, cell).toVar();
+  If(v.w.greaterThan(float(127.5)), () => {
+    const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5));
+    If(inCodeBoxTSL(f, codeBoxTSL(v.w)).not(), () => {
+      const v2 = blockVolumeTSL(terrain, cell.add(vec3(0, 0, terrain.blocks.size.z)));
+      v.assign(vec4(v2.xyz, v.w));
+    });
+  });
+  return v;
+}
+
+// The box the rays take for a shape code (the volume's A; world.js codeBox),
+// in cell fractions: a low or high half, a vertical half or a pane turned to
+// its facing (0 N, 1 E, 2 S, 3 W), else the whole cell.
+function codeBoxTSL(a) {
+  const c = a.mod(float(128)).toVar();
+  const f = c.mod(float(4));
+  const alongX = f.equal(float(1)).or(f.equal(float(3)));
+  const plus = f.equal(float(1)).or(f.equal(float(2)));            // E, S: the + side
+  const vert = c.greaterThanEqual(float(19.5)).and(c.lessThan(float(23.5)));
+  const pane = c.greaterThanEqual(float(23.5)).and(c.lessThan(float(27.5)));
+  // Along the shape's axis: [0.5, 1] or [0, 0.5] for a vertical half, the
+  // middle four texels for a pane, else [0, 1].
+  const a0 = select(vert, select(plus, float(0.5), float(0)), select(pane, float(4 / 12), float(0)));
+  const a1 = select(vert, select(plus, float(1), float(0.5)), select(pane, float(8 / 12), float(1)));
+  const y0 = select(c.equal(float(17)), float(0.5), float(0));
+  const y1 = select(c.equal(float(16)), float(0.5), float(1));
+  const lo = vec3(select(alongX, a0, float(0)), y0, select(alongX, float(0), a0));
+  const hi = vec3(select(alongX, a1, float(1)), y1, select(alongX, float(1), a1));
+  return { lo, hi };
+}
+
+// The other half's code for a dual block's (world.js complementShape): low
+// and high halves swap, a vertical half turns to face the other way.
+function complementCodeTSL(a) {
+  const c = a.mod(float(128));
+  const f = c.mod(float(4));
+  return select(c.equal(float(16)), float(17), select(c.equal(float(17)), float(16),
+                c.sub(f).add(f.add(float(2)).mod(float(4)))));
+}
+
+// What fills world point q for the walk through glass (world.js partAt, its
+// CPU mirror): code, the material's layer + 1 (0 air - and a model's cell,
+// which the walk ignores), and that part's box, lo and hi in metres. Outside
+// the volume or the battle arena, air.
+function partAtTSL(terrain, q) {
+  const Bm = float(BLOCK_METRES);
+  const cell = round(q.div(Bm)).toVar();
+  const v = blockVolumeTSL(terrain, cell).toVar();
+  const f = q.div(Bm).sub(cell).add(float(0.5)).toVar();
+  const own = codeBoxTSL(v.w);
+  const inOwn = inCodeBoxTSL(f, own).toVar();
+  // A dual block's other half fills the rest of the cell: its code from the
+  // volume's second half, its box the complement's.
+  const dual = v.w.greaterThan(float(127.5)).and(inOwn.not()).toVar();
+  const other = codeBoxTSL(complementCodeTSL(v.w));
+  If(dual, () => {
+    v.assign(vec4(blockVolumeTSL(terrain, cell.add(vec3(0, 0, terrain.blocks.size.z))).x, v.y, v.z, v.w));
+  });
+  const box = { lo: select(dual, other.lo, own.lo), hi: select(dual, other.hi, own.hi) };
+  const inBox = inOwn.or(dual);
+  // The volume clamps at its edge, which would repeat the border: outside
+  // it is air, as blockCodeTSL reads it.
+  const rel = cell.sub(terrain.blocks.origin);
+  const inVol = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))
+    .and(rel.z.greaterThanEqual(float(0))).and(rel.x.lessThan(terrain.blocks.size.x))
+    .and(rel.y.lessThan(terrain.blocks.size.y)).and(rel.z.lessThan(terrain.blocks.size.z));
+  const code = select(inBox.and(inVol).and(inHitBoundsTSL(cell.mul(Bm))), v.x, float(0));
+  const base = cell.sub(float(0.5));
+  return { code, lo: base.add(box.lo).mul(Bm), hi: base.add(box.hi).mul(Bm) };
 }
 
 // The codes of the glass materials (materials.js glass: true).
@@ -2022,7 +2101,7 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
   // F0 (for its index), albedo (its tint) and Fresnel separately.
   const mirrorTexelParts = (H, N, Lh, back, minWidth) => {
     const f = boxFaceTSL(H, N);
-    const layer = blockLayerTSL(terrain, f.block, N);
+    const layer = blockLayerTSL(terrain, f.block, N, H);
     const s = texture(terrain.specular, f.st).depth(int(layer)).level(int(0));
     const alb = texture(terrain.albedo, f.st).depth(int(layer)).level(int(0)).rgb.toVar();
     const d = decodeSpecularTSL(s, alb);
@@ -2042,7 +2121,7 @@ export function createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, 
   // stores it - and the lobe toward one receiver, `back`.
   const mirrorTexelTerms = (H, N, Lh, minWidth) => {
     const f = boxFaceTSL(H, N);
-    const layer = blockLayerTSL(terrain, f.block, N);
+    const layer = blockLayerTSL(terrain, f.block, N, H);
     const s = texture(terrain.specular, f.st).depth(int(layer)).level(int(0));
     const alb = texture(terrain.albedo, f.st).depth(int(layer)).level(int(0)).rgb;
     const d = decodeSpecularTSL(s, alb);
@@ -2789,8 +2868,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // not one - each is a step or two, and a block is 1.5 m.
     const pos = p.toVar();
     const dir = dIn.toVar();
-    const cell = floor(p.sub(n.mul(float(VOXEL_METRES * 0.5))).div(float(BLOCK_METRES))
-                 .add(float(0.5))).toVar();
+    // The glass box the ray is in (partAtTSL): a whole block's is its cell,
+    // a half's or a pane's its own. Faces are crossed a nudge deep to ask
+    // what is past them (boxgrid.js GLASS_WALK_NUDGE).
+    const nudge = float(GLASS_WALK_NUDGE);
+    const part0 = partAtTSL(terrain, p.sub(n.mul(nudge)));
+    const boxLo = part0.lo.toVar(), boxHi = part0.hi.toVar();
     // Only when the glass is smoothW enough to see through at all.
     If(smoothW.greaterThan(float(0)), () => {
     Loop({ start: int(0), end: int(glassLayers), type: 'int', condition: '<', name: 'gl' }, ({ gl }) => {
@@ -2799,25 +2882,28 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       kind.assign(int(0));
       Loop({ start: int(0), end: int(GLASS_WALK_STEPS), type: 'int', condition: '<', name: 'gw' }, () => {
         const st3 = sign(dir).toVar();
-        // Distance along the ray to the cell's next boundary on each axis.
-        const bound = cell.add(st3.mul(float(0.5))).mul(float(BLOCK_METRES));
-        const safe = select(abs(dir).lessThan(vec3(1e-6, 1e-6, 1e-6)), vec3(1e-6, 1e-6, 1e-6), dir);
-        const tm = select(abs(dir).lessThan(vec3(1e-6, 1e-6, 1e-6)), vec3(1e9, 1e9, 1e9),
-                          bound.sub(pos).div(safe)).toVar();
+        // Distance along the ray to the box's next face on each axis. Per
+        // component by mix / step: select's condition is ONE bool (three's
+        // ConditionalNode), so a bvec3 there picks a whole vector.
+        const bound = mix(boxLo, boxHi, step(vec3(0, 0, 0), dir));
+        const flat = step(abs(dir), vec3(1e-6, 1e-6, 1e-6)).toVar();   // 1 where the ray runs parallel
+        const safe = mix(dir, vec3(1e-6, 1e-6, 1e-6), flat);
+        const tm = mix(bound.sub(pos).div(safe), vec3(1e9, 1e9, 1e9), flat).toVar();
         const ax = tm.x.lessThanEqual(tm.y).and(tm.x.lessThanEqual(tm.z));
         const ay = tm.y.lessThan(tm.x).and(tm.y.lessThanEqual(tm.z));
         const e = select(ax, vec3(1, 0, 0), select(ay, vec3(0, 1, 0), vec3(0, 0, 1))).toVar();
         const tA = max(select(ax, tm.x, select(ay, tm.y, tm.z)), float(0)).toVar();
         const npos = pos.add(dir.mul(tA)).toVar();
         const nx = e.mul(st3).toVar();             // the face crossed, pointing along the ray
-        const next = cell.add(nx).toVar();
-        // Outside the battle arena a block is hidden, so it is air here too.
-        const code = select(inHitBoundsTSL(next.mul(float(BLOCK_METRES))),
-                            blockCodeTSL(terrain, next), float(0)).toVar();
+        // What is past it. Outside the battle arena a block is hidden, so it
+        // is air here too.
+        const next = partAtTSL(terrain, npos.add(nx.mul(nudge)));
+        const code = next.code.toVar();
         paneLen.addAssign(tA);
         If(isGlassCodeTSL(code), () => {
           pos.assign(npos);
-          cell.assign(next);
+          boxLo.assign(next.lo);
+          boxHi.assign(next.hi);
         }).ElseIf(code.equal(float(0)), () => {
           // Air: leave through nx, or reflect back in.
           const outR = refract(dir, nx.negate(), ior).toVar();
@@ -2865,17 +2951,18 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
             // Into the next pane: its face from the block grid, its tint from
             // the texel the ray enters by, less the Fresnel it reflects away.
             const entry = outO.add(outD.mul(float(-2).sub(hit.w))).toVar();
-            const nf = blockFaceTSL(entry, outD, false).toVar();
+            const nf = blockFaceTSL(entry, outD, false, terrain).toVar();
             const pL = texelLockTSL(entry, nf).toVar();
             const f = boxFaceTSL(pL, nf);
-            tint.assign(texture(terrain.albedo, f.st).depth(int(blockLayerTSL(terrain, f.block, nf)))
+            tint.assign(texture(terrain.albedo, f.st).depth(int(blockLayerTSL(terrain, f.block, nf, pL)))
                           .level(int(0)).rgb);
             const ce = max(outD.dot(nf.negate()), float(1e-4));
             exitW.mulAssign(float(1).sub(fresnelRoughTSL(f0v, ce, alpha).x));
             dir.assign(refract(outD, nf, float(1).div(ior)));
             pos.assign(pL);
-            cell.assign(floor(pL.sub(nf.mul(float(VOXEL_METRES * 0.5))).div(float(BLOCK_METRES))
-                              .add(float(0.5))));
+            const entered = partAtTSL(terrain, pL.sub(nf.mul(nudge)));
+            boxLo.assign(entered.lo);
+            boxHi.assign(entered.hi);
           }).Else(() => {
             seenHit.assign(hit);
             kind.assign(int(5));

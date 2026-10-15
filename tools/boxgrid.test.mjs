@@ -324,6 +324,31 @@ section('half blocks bake over their own span');
   falsy('the gap between them is air', isOccupied(h, 88, 55, 40));
 }
 
+section('vertical halves and panes bake across x and z');
+{
+  createTestArea(12, 12);
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfVertical', facing: 'E' });
+  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'middleVertical', facing: 'S' });
+  const h = createBoxGrid(0, 0);
+  // x 3 is vx 36..47, x 5 60..71; y 1 is vy 48..59; z 3 is vz 36..47.
+  truthy('a vertical half facing E fills its east six voxels, full height',
+         isOccupied(h, 42, 48, 40) && isOccupied(h, 47, 59, 40));
+  falsy('and not its west six', isOccupied(h, 36, 54, 40) || isOccupied(h, 41, 54, 40));
+  truthy('a pane facing S fills vz 40..43 across the cell', isOccupied(h, 60, 54, 40) && isOccupied(h, 71, 54, 43));
+  falsy('and nothing either side of it', isOccupied(h, 64, 54, 39) || isOccupied(h, 64, 54, 44));
+}
+
+section('dual blocks bake each half in its own channel');
+{
+  const { glassDistanceAt } = await import('../js/boxgrid.js');
+  createTestArea(12, 12);
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfBottom', second: 'glass' });
+  const h = createBoxGrid(0, 0);
+  truthy('the low half is opaque', isOccupied(h, 40, 50, 40));
+  falsy('the high half is not', isOccupied(h, 40, 57, 40));
+  truthy('it is glass', glassDistanceAt(h, 40, 57, 40) < 0);
+}
+
 section('slopes bake as staircases under their plane');
 {
   createTestArea(12, 12);

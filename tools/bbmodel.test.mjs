@@ -230,3 +230,36 @@ section('the rays find model cubes by cell');
   truthy('overflow is reported', buildModelHits([{ cubes: [a], model }], undefined, 4).overflow);
 }
 
+
+section('buried faces of placed cubes');
+{
+  const { modelFaceMasks } = await import('../js/bbmodel.js');
+  const bit = { px: 1, nx: 2, py: 4, ny: 8, pz: 16, nz: 32 };
+  // A floor of full blocks at y = 0 (its top is texel 6); a carpet tile one
+  // texel thick on it in cell (0, 1, 0): texels x -6..6, y 6..7, z -6..6.
+  const floor = (x, y, z) => (y === 0 ? [[0, 1, 0, 1, 0, 1]] : []);
+  const carpet = { min: [-6, 6, -6], max: [6, 7, 6] };
+  const [m] = modelFaceMasks([carpet], floor);
+  ok('a carpet\'s underside on the floor is buried', m & bit.ny, 0);
+  ok('its top and sides are drawn', m & (bit.py | bit.px | bit.nx | bit.pz | bit.nz), bit.py | bit.px | bit.nx | bit.pz | bit.nz);
+  // Two tiles side by side: the faces between them are buried.
+  const [a, b] = modelFaceMasks([carpet, { min: [6, 6, -6], max: [18, 7, 6] }], floor);
+  truthy('between two tiles, both faces are buried', !(a & bit.px) && !(b & bit.nx));
+  // A seat on a leg: the leg's top under the seat is buried; the seat's
+  // underside, larger than the leg, is not.
+  const [leg, seat] = modelFaceMasks([{ min: [0, 6, 0], max: [1, 10, 1] }, { min: [-2, 10, -2], max: [3, 11, 3] }], () => []);
+  ok('a leg\'s top under the seat is buried', leg & bit.py, 0);
+  ok('the seat\'s underside is not', seat & bit.ny, bit.ny);
+  // A light cube buries nothing; a face over half a block of floor is drawn.
+  const [lit] = modelFaceMasks([{ min: [0, 6, 0], max: [1, 10, 1] }, { min: [-2, 10, -2], max: [3, 11, 3], light: true }], () => []);
+  ok('a light cube covers nothing', lit & bit.py, bit.py);
+  const [edge] = modelFaceMasks([{ min: [0, 6, -6], max: [12, 7, 6] }], (x, y) => (y === 0 && x === 0 ? [[0, 1, 0, 1, 0, 1]] : []));
+  // A carpet on a low half slab: its underside at mid-cell (texel 0) is covered.
+  const slab = (x, y, z) => (y === 0 ? [[0, 1, 0, 0.5, 0, 1]] : []);
+  const [onSlab] = modelFaceMasks([{ min: [-6, 0, -6], max: [6, 1, 6] }], slab);
+  ok('a carpet on a half slab: its underside is buried', onSlab & bit.ny, 0);
+  // Two half-width cubes under one face together cover it.
+  const [top] = modelFaceMasks([{ min: [0, 10, 0], max: [4, 11, 2] }, { min: [0, 6, 0], max: [2, 10, 2] }, { min: [2, 6, 0], max: [4, 10, 2] }], () => []);
+  ok('covered by two cubes together: buried', top & bit.ny, 0);
+  ok('over a floor only partly there, the underside is drawn', edge & bit.ny, bit.ny);
+}

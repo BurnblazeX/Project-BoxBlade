@@ -13,7 +13,8 @@
 //
 // CPU and pure, so it is tested headlessly. gpu.js createMirrorLightTSL reads
 // the packed form.
-import { BLOCK_METRES, GROUND_Y, blockSpan, isCompound } from './world.js';
+import { BLOCK_METRES, GROUND_Y, blockBoxes, blockParts, isCompound, isDual } from './world.js';
+import { subtractRect } from './rects.js';
 import { BLOCK_TEXELS } from './materials.js';
 import { lightContribution, shadowScore } from './lights.js';
 
@@ -54,64 +55,79 @@ const PLANE_AXES = [[1, 2], [0, 2], [0, 1]];
 // which lies in one rectangle of a group or another, never two.
 export function buildMirrors(world, reflective, isGlass = () => false, { backFaces = true } = {}) {
   const groups = new Map();
-  for (const [key, block] of world) {
-    if (!reflective.has(block.materialId)) continue;
-    // A slope's staircase would be dozens of one-texel rectangles, and stairs
-    // are faces at two depths: they reflect through the view ray, but throw
-    // no mirror light.
-    if (isCompound(block)) continue;
-    const c = key.split(',').map(Number);
-    const glass = isGlass(block.materialId);
-    // A half block (world.js BLOCK_SHAPES) fills [lo, hi] of its cell's height.
-    const [lo, hi] = blockSpan(block);
-    for (let axis = 0; axis < 3; axis++) {
-      for (const sign of [1, -1]) {
-        const nb = c.slice(); nb[axis] += sign;
-        const nbBlock = world.get(nb.join(','));
-        const [nlo, nhi] = nbBlock ? blockSpan(nbBlock) : [0, 0];
-        // The part of the face left exposed, as a span of the cell's height:
-        // [a, b], or null when covered. A top or bottom face is covered only
-        // when it lies on the cell boundary against a neighbour that fills
-        // up (down) to it; a side face loses what its neighbour's span covers,
-        // which with halves leaves the whole face, one half, or nothing.
-        let span;
-        // Beside a slope or stairs: only a top face under it is covered (each
-        // fills its cell's floor); anything else is left whole - conservative,
-        // and the legs are traced through the field anyway.
-        if (nbBlock && isCompound(nbBlock)) span = axis === 1 && sign > 0 ? null : [lo, hi];
-        else if (axis === 1) {
-          const onEdge = sign > 0 ? hi === 1 : lo === 0;
-          const covered = onEdge && nbBlock && (sign > 0 ? nlo === 0 : nhi === 1);
-          span = covered ? null : [lo, hi];
-        } else if (!nbBlock || nhi <= lo || nlo >= hi) span = [lo, hi];
-        else if (nlo <= lo && nhi >= hi) span = null;
-        else span = nlo > lo ? [lo, nlo] : [nhi, hi];
-        if (!span) continue;                            // not exposed
-        // The underside of the ground layer faces the void under the world -
-        // nothing is ever there to receive from it.
-        if (axis === 1 && sign === -1 && c[1] <= GROUND_Y && lo === 0) continue;
-        let thickness = 0;
-        if (glass && backFaces) {
-          // Walk back through the glass behind this face.
-          const q = c.slice();
-          let k = 0;
-          for (; k < 16; k++) {
-            const b = world.get(q.join(','));
-            if (!b || !isGlass(b.materialId)) break;
-            q[axis] -= sign;
-          }
-          thickness = world.has(q.join(',')) ? 0 : k * BLOCK_METRES;
-        }
+  for (const [key, whole] of world) {
+    const dual = isDual(whole);
+    for (const part of blockParts(whole)) {
+      // Each half of a dual block reflects as its own material, and the face
+      // between the halves is covered.
+      const block = { ...whole, materialId: part.materialId };
+      if (!reflective.has(block.materialId)) continue;
+      // A slope's staircase would be dozens of one-texel rectangles, and stairs
+      // are faces at two depths: they reflect through the view ray, but throw
+      // no mirror light.
+      if (isCompound(block)) continue;
+      const c = key.split(',').map(Number);
+      const glass = isGlass(block.materialId);
+      // The block's one box (cell fractions): a half's, a vertical half's or a
+      // pane's faces can sit mid-cell on any axis.
+      const box = part.boxes[0];
+      for (let axis = 0; axis < 3; axis++) {
         const [ua, va] = PLANE_AXES[axis];
-        // The face's plane, in blocks: a half block's top or bottom sits
-        // mid-cell. A side face less than the whole height is grouped by its
-        // span and its row, so it merges only along the row.
-        const level = axis === 1 ? c[1] - 0.5 + (sign > 0 ? hi : lo) : c[axis] + 0.5 * sign;
-        const part = axis !== 1 && (span[0] > 0 || span[1] < 1) ? span : null;
-        const g = `${axis},${sign},${level}` + (part ? `,${c[1]},${part}` : '') +
-                  (backFaces ? `,${glass ? 'g' + thickness : 'o'}` : '');
-        if (!groups.has(g)) groups.set(g, { axis, sign, level, thickness, part, row: c[1], cells: new Set() });
-        groups.get(g).cells.add(`${c[ua]},${c[va]}`);
+        for (const sign of [1, -1]) {
+          const at = box[2 * axis + (sign > 0 ? 1 : 0)];
+          const onEdge = sign > 0 ? at === 1 : at === 0;
+          // The face, as [u0, u1, v0, v1] of the cell, less what the neighbour
+          // across it covers - only a face on the cell's boundary can be
+          // covered. Beside a slope or stairs only a top face under it is (each
+          // fills its cell's floor); anything else is left whole - conservative,
+          // and the legs are traced through the field anyway.
+          const face = [box[2 * ua], box[2 * ua + 1], box[2 * va], box[2 * va + 1]];
+          let parts = [face];
+          const nb = c.slice(); nb[axis] += sign;
+          const nbBlock = onEdge ? world.get(nb.join(',')) : null;
+          if (!onEdge && dual) parts = [];
+          else if (nbBlock && isDual(nbBlock)) parts = [];
+          else if (nbBlock && isCompound(nbBlock)) {
+            if (axis === 1 && sign > 0) parts = [];
+          } else if (nbBlock) {
+            const nbox = blockBoxes(nbBlock)[0];
+            if (sign > 0 ? nbox[2 * axis] === 0 : nbox[2 * axis + 1] === 1) {
+              parts = subtractRect(face, [nbox[2 * ua], nbox[2 * ua + 1], nbox[2 * va], nbox[2 * va + 1]]);
+            }
+          }
+          if (!parts.length) continue;                    // not exposed
+          // The underside of the ground layer faces the void under the world -
+          // nothing is ever there to receive from it.
+          if (axis === 1 && sign === -1 && c[1] <= GROUND_Y && at === 0) continue;
+          let thickness = 0;
+          if (glass && backFaces && (box[2 * axis] > 0 || box[2 * axis + 1] < 1)) {
+            // A glass half or pane: its own depth, with air (or the cell's
+            // other half) behind - conservative, as a slab is.
+            thickness = (box[2 * axis + 1] - box[2 * axis]) * BLOCK_METRES;
+          } else if (glass && backFaces) {
+            // Walk back through the glass behind this face.
+            const q = c.slice();
+            let k = 0;
+            for (; k < 16; k++) {
+              const b = world.get(q.join(','));
+              if (!b || !isGlass(b.materialId)) break;
+              q[axis] -= sign;
+            }
+            thickness = world.has(q.join(',')) ? 0 : k * BLOCK_METRES;
+          }
+          // The face's plane, in blocks. A part short of the cell along u (v)
+          // is grouped by its column (row) and its extent, so it merges only
+          // along the other axis; short along both, it stands alone.
+          const level = c[axis] - 0.5 + at;
+          for (const piece of parts) {
+            const fullU = piece[0] === 0 && piece[1] === 1, fullV = piece[2] === 0 && piece[3] === 1;
+            const g = `${axis},${sign},${level}` +
+                      (fullU && fullV ? '' : fullU ? `,v${c[va]},${piece}` : fullV ? `,u${c[ua]},${piece}` : `,c${c[ua]},${c[va]},${piece}`) +
+                      (backFaces ? `,${glass ? 'g' + thickness : 'o'}` : '');
+            if (!groups.has(g)) groups.set(g, { axis, sign, level, thickness, part: fullU && fullV ? null : piece, cells: new Set() });
+            groups.get(g).cells.add(`${c[ua]},${c[va]}`);
+          }
+        }
       }
     }
   }
@@ -136,10 +152,14 @@ export function buildMirrors(world, reflective, isGlass = () => false, { backFac
       // its share of the row's height.
       const min = [(u0 - 0.5) * BLOCK_METRES, (v0 - 0.5) * BLOCK_METRES];
       const max = [(u1 + 0.5) * BLOCK_METRES, (v1 + 0.5) * BLOCK_METRES];
-      if (g.part) {
-        const k = PLANE_AXES[g.axis].indexOf(1);
-        min[k] = (g.row - 0.5 + g.part[0]) * BLOCK_METRES;
-        max[k] = (g.row - 0.5 + g.part[1]) * BLOCK_METRES;
+      // A part's group holds one column (row) along its short axis.
+      if (g.part && !(g.part[0] === 0 && g.part[1] === 1)) {
+        min[0] = (u0 - 0.5 + g.part[0]) * BLOCK_METRES;
+        max[0] = (u0 - 0.5 + g.part[1]) * BLOCK_METRES;
+      }
+      if (g.part && !(g.part[2] === 0 && g.part[3] === 1)) {
+        min[1] = (v0 - 0.5 + g.part[2]) * BLOCK_METRES;
+        max[1] = (v0 - 0.5 + g.part[3]) * BLOCK_METRES;
       }
       rects.push({
         axis: g.axis, sign: g.sign,
@@ -159,27 +179,25 @@ export const MIRROR_REACH = 24;
 // is its radius (lights.js: the level IS the radius in blocks).
 const SUN_BIT = 1 << 16;
 
-// The mirror-light budget's pick: the lights that light the mirrors most -
-// each scored by its contribution at the nearest point of the best-lit
-// rectangle it faces - not the ones that light the player. Ranked at the
-// player, a lamp beside a mirror lost its slot to whichever lamp the player
-// walked nearer, and its glare blinked in and out with distance. The
-// player's score only breaks ties. rects: buildMirrors'; lights: the
-// liveLights records.
+const nearestOnRect = (r, P) => {
+  const [ua, va] = PLANE_AXES[r.axis];
+  const du = P[ua] - Math.min(Math.max(P[ua], r.min[0]), r.max[0]);
+  const dv = P[va] - Math.min(Math.max(P[va], r.min[1]), r.max[1]);
+  return Math.hypot(P[r.axis] - r.plane, du, dv);
+};
 export function pickMirrored(lights, rects, focus, budget) {
   const n = Math.max(0, Math.floor(budget));
   if (n >= lights.length) return new Set(lights);
   if (n === 0) return new Set();
+  const F = [focus.x, focus.y, focus.z];
+  const near = rects.map(r => Math.max(0, 1 - nearestOnRect(r, F) / MIRROR_REACH));
   const score = l => {
     const P = [l.position.x, l.position.y, l.position.z];
     let best = 0;
-    for (const r of rects) {
-      if ((P[r.axis] - r.plane) * r.sign <= 0) continue;          // behind it
-      const [ua, va] = PLANE_AXES[r.axis];
-      const du = P[ua] - Math.min(Math.max(P[ua], r.min[0]), r.max[0]);
-      const dv = P[va] - Math.min(Math.max(P[va], r.min[1]), r.max[1]);
-      best = Math.max(best, lightContribution(Math.hypot(P[r.axis] - r.plane, du, dv), l.level));
-    }
+    rects.forEach((r, i) => {
+      if (near[i] <= 0 || (P[r.axis] - r.plane) * r.sign <= 0) return;   // too far, or behind it
+      best = Math.max(best, lightContribution(nearestOnRect(r, P), l.level) * near[i]);
+    });
     return best + 1e-6 * shadowScore(l, focus);
   };
   const ranked = lights.map(l => ({ l, s: score(l) })).sort((a, b) => b.s - a.s);

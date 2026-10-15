@@ -280,7 +280,7 @@ export const DEFAULT_SHADOW_BUDGET = 16;
 // hit per light, and these were most of what three lights cost (2026-10-14
 // profile). Ranked as the shadow budget is: the player's torch first.
 export const DEFAULT_HIT_SHADOW_BUDGET = 1;
-export const DEFAULT_MIRROR_LIGHT_BUDGET = 1;
+export const DEFAULT_MIRROR_LIGHT_BUDGET = 4;
 export const DEFAULT_CARD_BUDGET = 16;
 
 // Seconds for a light's shadow to fade in or out when it enters or leaves the

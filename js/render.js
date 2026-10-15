@@ -2,10 +2,11 @@ import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, int, mix, vec3, vec4, uniform, select, positionLocal,
          Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize,
          cameraViewMatrix, clamp, exp2, storage } from 'three/tsl';
-import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey,
-         WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, occludesFaces, ALL_FACES } from './world.js';
+import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey, shapeCode,
+         isDual, blockParts,
+         WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from './world.js';
 import { MODELS, TERRAIN_LAYERS } from './models.js';
-import { lightColourOf, modelInstanceData, buildModelHits, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from './bbmodel.js';
+import { lightColourOf, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from './bbmodel.js';
 export { MODEL_HIT_RECORD };
 import { VOXEL_METRES } from './boxgrid.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
@@ -150,6 +151,12 @@ export function drawnBoxes(block) {
   if (!isSlope(block)) return blockBoxes(block);
   const [lo, hi] = blockSpan(block);
   return [[0, 1, lo, hi, 0, 1]];
+}
+// Per material part (world.js blockParts): a dual block draws each half with
+// its own material.
+function drawnParts(block) {
+  if (!isDual(block)) return [{ materialId: block.materialId, boxes: drawnBoxes(block) }];
+  return blockParts(block);
 }
 
 // A terrain array sampled at this fragment's own layer - at st when given
@@ -532,11 +539,16 @@ async function loadFaceLayers(m, layer) {
 // outside it reads as air to the rays that ask (reflection and glass hits,
 // the GI). Per block:
 //   a block       R layer + 1 (its side), G its top layer, B its bottom, A its
-//                 slope code (render.js slopeCode; 0 not a slope);
+//                 shape code (world.js shapeCode: a slope's is slopeCode's,
+//                 so the split kernels read it as before; a half's or a
+//                 pane's gives the box the glass walk steps to);
 //   a model cell  R 0 (air to the walk through glass, which ignores models),
 //                 G + 256 B its cell in modelHits, A the model's GI entry + 1
 //                 (models.js giIndex);
 //   air           all 0.
+// A dual block (world.js isDual) adds 128 to A, and its other half's R, G, B
+// sit BLOCK_VOLUME_SIZE[2] further along z, in the second half of the
+// texture (dims) - one binding for both (gpu.js volumeAtTSL).
 // modelHits: the model cubes by cell (bbmodel.js buildModelHits) - what
 // gpu.js hitSurfaceTSL needs to find a hit's texel as the cube's own draw does.
 export const BLOCK_VOLUME_ORIGIN = [-96, Y_MIN, -96];
@@ -545,7 +557,7 @@ function buildBlockVolume() {
   const lo = BLOCK_VOLUME_ORIGIN, size = BLOCK_VOLUME_SIZE;
   let v = terrainTextures.blocks;
   if (!v) {
-    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 4), size[0], size[1], size[2]);
+    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 8), size[0], size[1], size[2] * 2);
     tex.format = THREE.RGBAFormat;
     tex.type = THREE.UnsignedByteType;
     tex.minFilter = tex.magFilter = THREE.NearestFilter;
@@ -555,7 +567,8 @@ function buildBlockVolume() {
     v = terrainTextures.blocks = {
       tex,
       origin: uniform(new THREE.Vector3(...lo)),
-      size: uniform(new THREE.Vector3(...size))
+      size: uniform(new THREE.Vector3(...size)),
+      dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * 2))   // the texture's own
     };
     const attr = new THREE.StorageBufferAttribute(new Float32Array(MODEL_HIT_VEC4S * 4), 4);
     terrainTextures.modelHits = {
@@ -575,7 +588,15 @@ function buildBlockVolume() {
     data[o] = layer + 1;
     data[o + 1] = f ? f.top : layer;
     data[o + 2] = f ? f.bottom : layer;
-    data[o + 3] = slopeCode(block);   // a slope's kind and facing (split shading)
+    data[o + 3] = shapeCode(block);   // its shape and facing (world.js shapeCode)
+    if (isDual(block)) {
+      data[o + 3] += 128;
+      const o2 = o + size[0] * size[1] * size[2] * 4;
+      const layer2 = materialLayer(block.second), f2 = MATERIAL_LAYERS.faces[layer2];
+      data[o2] = layer2 + 1;
+      data[o2 + 1] = f2 ? f2.top : layer2;
+      data[o2 + 2] = f2 ? f2.bottom : layer2;
+    }
   }
   const hits = buildModelHits(WorldModels, key => World.has(key));
   if (hits.overflow) console.warn(`[terrain] model hit table full (${MODEL_HIT_VEC4S} vec4): some model cubes reflect as air`);
@@ -694,7 +715,7 @@ let terrain = null;   // { geometry, instanceData, attrs: {...}, capacity }
 
 function instanceCount() {
   let n = 0;
-  for (const block of World.values()) n += drawnBoxes(block).length;
+  for (const block of World.values()) for (const p of drawnParts(block)) n += p.boxes.length;
   for (const m of WorldModels) n += m.cubes.length;
   return n;
 }
@@ -796,7 +817,14 @@ function fillInstances() {
   const matrix = new THREE.Matrix4();
   const white = new THREE.Color(0xffffff);
   const zero4 = [0, 0, 0, 0];
-  const buries = (x, y, z) => occludesFaces(World.get(getVoxelKey(x, y, z)));
+  // What hides a face, per cell (world.js opaqueBoxes), looked up once.
+  const hiding = new Map();
+  const boxesAt = (x, y, z) => {
+    const key = getVoxelKey(x, y, z);
+    let b = hiding.get(key);
+    if (!b) hiding.set(key, b = opaqueBoxes(World.get(key)));
+    return b;
+  };
   const slopeKind = { slope: 0, halfSlope: 1, halfSlopeHigh: 1 };
   let i = 0, glassCount = 0;
   // Every SOLID block renders, not just standable ones: walls, pillars and the
@@ -807,33 +835,40 @@ function fillInstances() {
     // index -> key so a raycast hit (which reports only an instanceId) can be
     // resolved back to the block that was clicked.
     const ids = [];
-    const layer = materialLayer(block.materialId);
-    const glass = isGlassMaterial(block.materialId);
     const slope = slopeCode(block);
     const [bx, by, bz] = key.split(',').map(Number);
-    for (const box of drawnBoxes(block)) {
-      instanceSource[i] = { box, glass, slope: !!slope, cell: [bx, by, bz] };
-      mesh.setMatrixAt(i, instanceMatrix(matrix, i, key));
-      ids.push(i);
-      instanceKeyByIndex[i] = key;
-      mesh.setColorAt(i, white);
-      t.layers.setX(i, layer);
-      t.glassFlags.setX(i, (glass ? 1 : 0) + 2 * exposedFaceMask(bx, by, bz, box, !!slope, buries));
-      t.slopes.setX(i, slope);
-      // A block's modelInfo (w 0): its slope plane's first layer + 1 (0: the
-      // side stretched), its top and bottom layers (terrainSurfaceTSL).
-      const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1] };
-      const sk = slope ? slopeKind[blockShape(block)] : null;
-      t.modelAttrs[0].setXYZW(i, sk == null ? 0 : f.slope[sk] + 1, f.top, f.bottom, 0);
-      for (let k = 1; k < 4; k++) t.modelAttrs[k].setXYZW(i, ...zero4);
-      i++;
-    }
+    let anyGlass = false;
+    drawnParts(block).forEach(({ materialId, boxes }, part) => {
+      const layer = materialLayer(materialId);
+      const glass = isGlassMaterial(materialId);
+      anyGlass = anyGlass || glass;
+      for (const box of boxes) {
+        instanceSource[i] = { box, glass, slope: !!slope, cell: [bx, by, bz], part };
+        mesh.setMatrixAt(i, instanceMatrix(matrix, i, key));
+        ids.push(i);
+        instanceKeyByIndex[i] = key;
+        mesh.setColorAt(i, white);
+        t.layers.setX(i, layer);
+        t.glassFlags.setX(i, (glass ? 1 : 0) + 2 * exposedFaceMask(bx, by, bz, box, !!slope, boxesAt));
+        t.slopes.setX(i, slope);
+        // A block's modelInfo (w 0): its slope plane's first layer + 1 (0: the
+        // side stretched), its top and bottom layers (terrainSurfaceTSL).
+        const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1] };
+        const sk = slope ? slopeKind[blockShape(block)] : null;
+        t.modelAttrs[0].setXYZW(i, sk == null ? 0 : f.slope[sk] + 1, f.top, f.bottom, 0);
+        for (let k = 1; k < 4; k++) t.modelAttrs[k].setXYZW(i, ...zero4);
+        i++;
+      }
+    });
     voxelIndexMap.set(key, ids);
-    if (glass) glassCount++;
+    if (anyGlass) glassCount++;
   }
   // Placed models: each cube an instance, filed under the block the model
   // stands on (or hangs from) - picking, battle hiding and tint treat it as
   // that tile's.
+  // Their buried faces collapse as a block's do (bbmodel.js modelFaceMasks).
+  const masks = modelFaceMasks(WorldModels.flatMap(m => m.cubes), boxesAt);
+  let mi = 0;
   for (const m of WorldModels) {
     const key = getVoxelKey(m.x, m.y, m.z);
     const ids = voxelIndexMap.get(key) || [];
@@ -844,7 +879,7 @@ function fillInstances() {
       instanceKeyByIndex[i] = key;
       mesh.setColorAt(i, white);
       t.layers.setX(i, 0);
-      t.glassFlags.setX(i, 2 * ALL_FACES);
+      t.glassFlags.setX(i, 2 * masks[mi++]);
       t.slopes.setX(i, 0);
       const d = modelInstanceData(cube, m.model);
       t.modelAttrs[0].setXYZW(i, ...d.info);
@@ -882,7 +917,7 @@ export function rebuildWorldInstances() {
 // (null for a block) - for the editor's picking.
 export function instanceInfo(id) {
   const src = instanceSource[id];
-  return src ? { key: instanceKeyByIndex[id], model: src.model || null } : null;
+  return src ? { key: instanceKeyByIndex[id], model: src.model || null, part: src.part || 0 } : null;
 }
 
 const _matrix = new THREE.Matrix4();
@@ -902,15 +937,19 @@ export function updateVoxelVisibility(arenaMap, isBattle) {
   worldInstancedMesh.instanceMatrix.needsUpdate = true;
   // A hidden neighbour buries nothing: the arena's edge shows its sides.
   const shown = key => !(isBattle && (!arenaMap || !arenaMap.has(key)));
-  const buries = (x, y, z) => {
+  const boxesAt = (x, y, z) => {
     const key = getVoxelKey(x, y, z);
-    return shown(key) && occludesFaces(World.get(key));
+    return shown(key) ? opaqueBoxes(World.get(key)) : [];
   };
   instanceSource.forEach((src, i) => {
     if (!src.box) return;
     const [x, y, z] = src.cell;
-    terrain.glassFlags.setX(i, (src.glass ? 1 : 0) + 2 * exposedFaceMask(x, y, z, src.box, src.slope, buries));
+    terrain.glassFlags.setX(i, (src.glass ? 1 : 0) + 2 * exposedFaceMask(x, y, z, src.box, src.slope, boxesAt));
   });
+  // Model cubes the same way (a model at the edge against a hidden block).
+  const cubeIds = [], cubes = [];
+  instanceSource.forEach((src, i) => { if (src.texels) { cubeIds.push(i); cubes.push(src.texels); } });
+  modelFaceMasks(cubes, boxesAt).forEach((m, k) => terrain.glassFlags.setX(cubeIds[k], 2 * m));
   terrain.instanceData.needsUpdate = true;
 }
 

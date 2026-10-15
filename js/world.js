@@ -1,5 +1,6 @@
 import { isGlassMaterial } from './materials.js';
 import { placeModel } from './bbmodel.js';
+import { rectCovered } from './rects.js';
 
 export const World = new Map();
 
@@ -54,6 +55,9 @@ export function isSolid(x, y, z) {
 // terrain box, the field bakes each, and nothing downstream knows the shape.
 //
 // Half tiles: the lower or upper half of the cell, 0.75 m (six texels).
+// Vertical halves: the east half for facing E, turned like the slopes. Panes
+// (middleVertical): four texels thick through the cell's middle, full width
+// and height, facing E across x. Both stand at full height, like a full block.
 //
 // Slopes are SEEN as planes and BAKED as staircases (doc §0). The renderer
 // draws the plane - the terrain box with its downhill top edge dropped, shaded
@@ -68,8 +72,9 @@ export function isSolid(x, y, z) {
 // block.facing (N, E, S, W) is the uphill direction; the boxes below are for
 // E and turned to the others.
 //
-// Glass is always whole: its walk (boxgrid.js walkThroughGlass, and the
-// shader's) steps block by block.
+// Glass takes the one-box shapes (glass: true below - halves, vertical
+// halves, panes); its walk (boxgrid.js walkThroughGlass, and the shader's)
+// steps from box face to box face. A glass slope or stairs is whole.
 
 // Steps are one texel deep: 12 to the block. Step k's top is the plane's
 // height at its downhill edge; a first step of no height is left out.
@@ -78,43 +83,69 @@ const steps = (rise, base) => Array.from({ length: T }, (_, k) =>
   [k / T, (k + 1) / T, 0, base + rise * k / T, 0, 1]).filter(b => b[3] > 0);
 // { boxes: [x0, x1, y0, y1, z0, z1] in cell fractions, facing E;
 //   stand: where an entity stands, as a fraction of the cell's height;
-//   low, high: a slope's height at its downhill and uphill edges }
+//   low, high: a slope's height at its downhill and uphill edges;
+//   turns: turned by block.facing (hasFacing) }
 export const BLOCK_SHAPES = {
-  full:          { boxes: [[0, 1, 0, 1, 0, 1]],   stand: 1 },
-  halfBottom:    { boxes: [[0, 1, 0, 0.5, 0, 1]], stand: 0.5 },
-  halfTop:       { boxes: [[0, 1, 0.5, 1, 0, 1]], stand: 1 },
-  slope:         { boxes: steps(1, 0),     stand: 0.5,  low: 0,   high: 1,   slope: true },
-  halfSlope:     { boxes: steps(0.5, 0),   stand: 0.25, low: 0,   high: 0.5, slope: true },
-  halfSlopeHigh: { boxes: steps(0.5, 0.5), stand: 0.75, low: 0.5, high: 1,   slope: true },
+  full:          { boxes: [[0, 1, 0, 1, 0, 1]],   stand: 1, glass: true },
+  halfBottom:    { boxes: [[0, 1, 0, 0.5, 0, 1]], stand: 0.5, glass: true },
+  halfTop:       { boxes: [[0, 1, 0.5, 1, 0, 1]], stand: 1, glass: true },
+  halfVertical:  { boxes: [[0.5, 1, 0, 1, 0, 1]], stand: 1, turns: true, glass: true },
+  middleVertical: { boxes: [[4 / 12, 8 / 12, 0, 1, 0, 1]], stand: 1, turns: true, glass: true },
+  slope:         { boxes: steps(1, 0),     stand: 0.5,  low: 0,   high: 1,   slope: true, turns: true },
+  halfSlope:     { boxes: steps(0.5, 0),   stand: 0.25, low: 0,   high: 0.5, slope: true, turns: true },
+  halfSlopeHigh: { boxes: steps(0.5, 0.5), stand: 0.75, low: 0.5, high: 1,   slope: true, turns: true },
   // Stairs, as Minecraft's: a lower half slab and, on it, the uphill half of
   // the upper half. Boxes on the texel grid, drawn and baked as they are - no
   // plane. Two treads: the downhill half at half height, the uphill half at
   // full; a character steps from one to the other (groundHeightAt).
   stairs:        { boxes: [[0, 1, 0, 0.5, 0, 1], [0.5, 1, 0.5, 1, 0, 1]],
-                   stand: 0.75, low: 0.5, high: 1, treads: true }
+                   stand: 0.75, low: 0.5, high: 1, treads: true, turns: true }
 };
 // --- Buried faces ---
 //
-// Which of a drawn box's faces can be seen at all: a face on its cell's
-// boundary with a full opaque block beyond it is buried in solid, so the
-// terrain draws it as nothing (render.js terrainShapeTSL). Raster only - the
-// field, the block volume, mirrors and picking all read the world, not these
-// triangles, so shadows, GI and reflections are untouched. A slope's top is
-// its plane, which drops away from the cell's top, so it is never buried.
+// Which of a drawn box's faces can be seen at all: a face is buried when the
+// opaque boxes just past it cover all of it - the next cell's from its near
+// side for a face on the cell's boundary, this cell's others for one inside
+// it (stairs' upper step on its lower, a dual block's two halves). So two
+// half slabs side by side, a slab on a slab, a row of panes or vertical
+// halves hide the faces between them, and a face only partly covered is
+// drawn whole. The terrain draws a buried face as nothing (render.js
+// terrainShapeTSL). Raster only - the field, the block volume, mirrors and
+// picking all read the world, not these triangles, so shadows, GI and
+// reflections are untouched. A slope's top is its plane, which drops away
+// from the cell's top, so it is never buried.
 // Bits d: +x, -x, +y, -y, +z, -z (BoxGeometry's face order); set = drawn.
 export const FACE_STEPS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 export const ALL_FACES = 63;
-export function occludesFaces(block) {
-  return !!block && !isGlassMaterial(block.materialId) && blockShape(block) === 'full';
+// The boxes in a block that hide a face pressed against them, cell
+// fractions: every opaque part's (glass hides nothing - it is seen through),
+// a slope only its floor (its sides are a profile, its top a plane).
+const SLOPE_FLOOR = [[0, 1, 0, 0, 0, 1]];
+export function opaqueBoxes(block) {
+  if (!block) return [];
+  if (isSlope(block)) return isGlassMaterial(block.materialId) ? [] : SLOPE_FLOOR;
+  const out = [];
+  for (const part of blockParts(block)) if (!isGlassMaterial(part.materialId)) out.push(...part.boxes);
+  return out;
 }
-// box: [x0, x1, y0, y1, z0, z1] in cell fractions; occluderAt(x, y, z): a
-// cell that buries a face against it.
-export function exposedFaceMask(x, y, z, box, slope, occluderAt) {
-  const onEdge = [box[1] === 1, box[0] === 0, box[3] === 1, box[2] === 0, box[5] === 1, box[4] === 0];
+// The two in-face axes of a face along axis a.
+const FACE_PLANE = [[1, 2], [0, 2], [0, 1]];
+// box: [x0, x1, y0, y1, z0, z1] in cell fractions; boxesAt(x, y, z): the
+// boxes in that cell that hide faces (opaqueBoxes).
+export function exposedFaceMask(x, y, z, box, slope, boxesAt) {
   let mask = 0;
-  FACE_STEPS.forEach(([dx, dy, dz], d) => {
-    const buried = onEdge[d] && !(slope && d === 2) && occluderAt(x + dx, y + dy, z + dz);
-    if (!buried) mask |= 1 << d;
+  FACE_STEPS.forEach((step, d) => {
+    if (slope && d === 2) { mask |= 1 << d; return; }
+    const a = step.findIndex(v => v !== 0), s = step[a];
+    const [u, v] = FACE_PLANE[a];
+    const at = box[2 * a + (s > 0 ? 1 : 0)];
+    const edge = s > 0 ? at === 1 : at === 0;
+    const others = edge ? boxesAt(x + step[0], y + step[1], z + step[2]) : boxesAt(x, y, z);
+    // Past the face: a box whose near side lies on its plane.
+    const near = edge ? (s > 0 ? 0 : 1) : at;
+    const covers = others.filter(o => o[2 * a + (s > 0 ? 0 : 1)] === near)
+      .map(o => [o[2 * u], o[2 * u + 1], o[2 * v], o[2 * v + 1]]);
+    if (!rectCovered([box[2 * u], box[2 * u + 1], box[2 * v], box[2 * v + 1]], covers)) mask |= 1 << d;
   });
   return mask;
 }
@@ -123,8 +154,8 @@ export function exposedFaceMask(x, y, z, box, slope, occluderAt) {
 export const FACINGS = { N: [0, -1], E: [1, 0], S: [0, 1], W: [-1, 0] };
 
 export function blockShape(block) {
-  if (!block || isGlassMaterial(block.materialId)) return 'full';
-  return BLOCK_SHAPES[block.shape] ? block.shape : 'full';
+  const s = block && BLOCK_SHAPES[block.shape] ? block.shape : 'full';
+  return block && isGlassMaterial(block.materialId) && !BLOCK_SHAPES[s].glass ? 'full' : s;
 }
 
 // A slope: drawn as a plane over its baked staircase (render.js).
@@ -132,9 +163,10 @@ export function isSlope(block) {
   return BLOCK_SHAPES[blockShape(block)].slope === true;
 }
 
-// A shape that turns with block.facing: the slopes and the stairs.
+// A shape that turns with block.facing: the slopes, the stairs, the vertical
+// halves and panes.
 export function hasFacing(shape) {
-  return !!BLOCK_SHAPES[shape] && BLOCK_SHAPES[shape].high !== undefined;
+  return !!BLOCK_SHAPES[shape] && BLOCK_SHAPES[shape].turns === true;
 }
 
 // A shape of more than one box (slopes' staircases, stairs): what the mirror
@@ -156,10 +188,15 @@ export function blockBoxes(block) {
   const k = shape + facing;
   let out = boxCache.get(k);
   if (!out) {
+    // x and z snapped to the texel grid, so a turned face lands on exactly
+    // the plane an unturned one does (1 - 8/12 is not 4/12 in floats) and
+    // faces compare equal (exposedFaceMask, mirrors.js). Not y: a half
+    // slope's steps rise in 24ths.
+    const snap = b => b.map((c, k) => (k === 2 || k === 3 ? c : Math.round(c * 12) / 12));
     out = BLOCK_SHAPES[shape].boxes.map(([x0, x1, y0, y1, z0, z1]) => {
-      if (facing === 'W') return [1 - x1, 1 - x0, y0, y1, z0, z1];
+      if (facing === 'W') return snap([1 - x1, 1 - x0, y0, y1, z0, z1]);
       if (facing === 'S') return [z0, z1, y0, y1, x0, x1];
-      if (facing === 'N') return [z0, z1, y0, y1, 1 - x1, 1 - x0];
+      if (facing === 'N') return snap([z0, z1, y0, y1, 1 - x1, 1 - x0]);
       return [x0, x1, y0, y1, z0, z1];
     });
     boxCache.set(k, out);
@@ -167,11 +204,82 @@ export function blockBoxes(block) {
   return out;
 }
 
+// --- What the rays see of a cell (render.js block volume, gpu.js) ---
+//
+// A block's shape and facing as one byte, the block volume's A: 0 full (and
+// stairs - the rays take them whole), a slope kind * 4 + facing (4..15, as
+// render.js slopeCode), 16 / 17 the low / high half, 20 + facing a vertical
+// half, 24 + facing a pane - facing 0 N, 1 E, 2 S, 3 W.
+const FACING_CODE = { N: 0, E: 1, S: 2, W: 3 };
+const CODE_FACING = ['N', 'E', 'S', 'W'];
+const SLOPE_CODE = { slope: 1, halfSlope: 2, halfSlopeHigh: 3 };
+export function shapeCode(block) {
+  const shape = blockShape(block), f = FACING_CODE[blockFacing(block)];
+  if (SLOPE_CODE[shape]) return SLOPE_CODE[shape] * 4 + f;
+  if (shape === 'halfBottom') return 16;
+  if (shape === 'halfTop') return 17;
+  if (shape === 'halfVertical') return 20 + f;
+  if (shape === 'middleVertical') return 24 + f;
+  return 0;
+}
+// The box the rays take for a code, in cell fractions: one box, the whole
+// cell for anything not listed above (slopes and stairs as solid).
+export function codeBox(code) {
+  const shape = code === 16 ? 'halfBottom' : code === 17 ? 'halfTop'
+              : code >= 20 && code < 24 ? 'halfVertical' : code >= 24 && code < 28 ? 'middleVertical' : 'full';
+  return blockBoxes({ shape, facing: CODE_FACING[code & 3] })[0];
+}
+// A dual block: a half (low, high or vertical) and, in the rest of its cell,
+// a second material's half (block.second). It fills its cell, so the game
+// takes it as a full block - standing, headroom, what is solid; only what is
+// drawn, baked and seen by the rays tells the halves apart (blockParts).
+export function isDual(block) {
+  return !!block && block.second != null && !!complementShape(blockShape(block), blockFacing(block));
+}
+// What a block is made of, part by part: [{ materialId, boxes }] - its own
+// shape, then a dual block's other half.
+export function blockParts(block) {
+  const parts = [{ materialId: block.materialId, boxes: blockBoxes(block) }];
+  if (isDual(block)) {
+    const other = complementShape(blockShape(block), blockFacing(block));
+    parts.push({ materialId: block.second, boxes: blockBoxes({ materialId: block.second, ...other }) });
+  }
+  return parts;
+}
+// The other half of a half shape - what a dual block's second material fills
+// (block.second): low and high, a vertical half and the one facing away.
+// null for a shape with no other half.
+const OPPOSITE = { N: 'S', S: 'N', E: 'W', W: 'E' };
+export function complementShape(shape, facing) {
+  if (shape === 'halfBottom') return { shape: 'halfTop', facing: null };
+  if (shape === 'halfTop') return { shape: 'halfBottom', facing: null };
+  if (shape === 'halfVertical') return { shape, facing: OPPOSITE[facing] || 'W' };
+  return null;
+}
+// What fills the world point (metres) for the rays: { cell, materialId, box }
+// with box in cell fractions - the block's own box, or a dual block's other
+// half - or null for air. Half-open as isSolidAt; a slope or stairs whole.
+export function partAt(wx, wy, wz, world = World) {
+  const cell = [wx, wy, wz].map(v => Math.round(v / BLOCK_METRES));
+  const block = world.get(cell.join(','));
+  if (!block) return null;
+  const f = [wx, wy, wz].map((v, a) => v / BLOCK_METRES - cell[a] + 0.5);
+  const inside = b => f[0] >= b[0] && f[0] < b[1] && f[1] >= b[2] && f[1] < b[3] && f[2] >= b[4] && f[2] < b[5];
+  const box = codeBox(shapeCode(block));
+  if (inside(box)) return { cell, materialId: block.materialId, box };
+  if (isDual(block)) {
+    const ob = blockParts(block)[1].boxes[0];
+    if (inside(ob)) return { cell, materialId: block.second, box: ob };
+  }
+  return null;
+}
+
 // The vertical span a block fills, [lo, hi] in blocks from the cell's floor -
 // its boxes' bounds, or for a slope its PLANE's: from the floor to the top of
 // its head, which its staircase (inscribed under the plane) stops a texel
 // short of. What the slope is drawn over, and its headroom.
 export function blockSpan(block) {
+  if (isDual(block)) return [0, 1];
   const shape = BLOCK_SHAPES[blockShape(block)];
   if (shape.slope) return [0, shape.high];
   let lo = 1, hi = 0;
@@ -201,6 +309,7 @@ export function isSolidAt(wx, wy, wz, slopeClearance = 0) {
   const fx = wx / BLOCK_METRES - bx + 0.5, fy = wy / BLOCK_METRES - by + 0.5;
   const fz = wz / BLOCK_METRES - bz + 0.5;
   if (isSlope(block)) return fy < slopeLevel(block, fx, fz) - slopeClearance;
+  if (isDual(block)) return true;
   return blockBoxes(block).some(b => fx >= b[0] && fx < b[1] && fy >= b[2] && fy < b[3] &&
                                      fz >= b[4] && fz < b[5]);
 }
@@ -220,7 +329,8 @@ export function isStandable(x, y, z) {
 // The standing surface's height, in blocks, measured from the floor of cell
 // y = 0 - so levels compare directly across cells. On a slope, its middle.
 export function surfaceLevel(x, y, z) {
-  return y + BLOCK_SHAPES[blockShape(getBlock(x, y, z))].stand;
+  const block = getBlock(x, y, z);
+  return y + (isDual(block) ? 1 : BLOCK_SHAPES[blockShape(block)].stand);
 }
 
 // The surface's height at the edge toward (dx, dz), in the same levels: on a
@@ -229,6 +339,7 @@ export function surfaceLevel(x, y, z) {
 export function edgeLevel(x, y, z, dx, dz) {
   const block = getBlock(x, y, z);
   const shape = BLOCK_SHAPES[blockShape(block)];
+  if (isDual(block)) return y + 1;
   if (shape.high === undefined) return y + shape.stand;
   const [fx, fz] = FACINGS[blockFacing(block)];
   const d = dx * fx + dz * fz;
@@ -363,15 +474,18 @@ export function removeWorldModel(entry) {
 // What the editor saves and the game loads: every block and every placed
 // model, by name. Entities are not in it yet.
 //   { format: 'boxblade-level', version: 1,
-//     blocks: [[x, y, z, materialId, shape?, facing?], ...],
+//     blocks: [[x, y, z, materialId, shape?, facing?, second?], ...],
 //     models: [[name, x, y, z, yaw], ...]            standing on block (x, y, z)
 //             [[name, x, y, z, 0, wall], ...] }      hung in cell (x, y, z)
 export const LEVEL_FORMAT = 'boxblade-level';
 
-export function newBlock(materialId, shape = null, facing = null) {
+// second: a dual block's other half's material (isDual) - kept only for a
+// shape that has another half.
+export function newBlock(materialId, shape = null, facing = null, second = null) {
   const block = { solid: true, walkable: true, materialId, occupant: null, triggerId: null };
   if (shape && shape !== 'full') block.shape = shape;
   if (facing && hasFacing(shape)) block.facing = facing;
+  if (second != null && complementShape(block.shape, block.facing)) block.second = second;
   return block;
 }
 
@@ -379,8 +493,9 @@ export function serializeLevel() {
   const blocks = [];
   for (const [key, b] of World) {
     const row = [...key.split(',').map(Number), b.materialId ?? null];
-    if (b.shape || b.facing) row.push(b.shape || null);
-    if (b.facing) row.push(b.facing);
+    if (b.shape || b.facing || b.second != null) row.push(b.shape || null);
+    if (b.facing || b.second != null) row.push(b.facing || null);
+    if (b.second != null) row.push(b.second);
     blocks.push(row);
   }
   const models = WorldModels.map(m => m.wall
@@ -395,8 +510,8 @@ export function loadLevel(level, models) {
   if (!level || level.format !== LEVEL_FORMAT) throw new Error('not a BoxBlade level');
   clearWorldModels();
   World.clear();
-  for (const [x, y, z, materialId, shape, facing] of level.blocks) {
-    World.set(getVoxelKey(x, y, z), newBlock(materialId, shape, facing));
+  for (const [x, y, z, materialId, shape, facing, second] of level.blocks) {
+    World.set(getVoxelKey(x, y, z), newBlock(materialId, shape, facing, second));
   }
   const missing = [];
   for (const [name, x, y, z, yaw, wall] of level.models || []) {

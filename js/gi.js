@@ -8,7 +8,7 @@ import { HIT_EPS, MIN_STEP, cascadeVoxelMetres, VOXEL_METRES } from './boxgrid.j
 import {
   decodeFieldTSL, ringUV, createConeTraceSunTSL, createPointLightsTSL,
   createSunUniforms, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
-  sunColourUniform, skyShTSL, glassRayTransmitTSL, createMirrorLightTSL
+  sunColourUniform, skyShTSL, glassRayTransmitTSL, createMirrorLightTSL, volumeAtTSL
 } from './gpu.js';
 import { BLOCK_METRES } from './world.js';
 import { GI_LAYERS } from './models.js';
@@ -172,10 +172,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // A block's entry in the per-layer tables, from the block volume: its
   // material's (R, layer + 1), or in a model's cell the model's (A, giIndex
   // + 1; render.js buildBlockVolume). 0 when there is neither.
-  const layerOf = bi => {
-    const uvw = bi.sub(blocks.origin).add(float(0.5)).div(blocks.size);
-    const v = texture3D(blocks.tex, uvw).level(int(0));
-    const code = round(select(v.r.greaterThan(float(0.5 / 255)), v.r, v.a).mul(float(255)));
+  // q: the world point it is for - a dual block's half is the one holding it.
+  const layerOf = (bi, q) => {
+    const v = volumeAtTSL({ blocks }, bi, q);
+    const code = select(v.r.greaterThan(float(0.5)), v.r, v.a);
     return int(max(code.sub(float(1)), float(0)));
   };
   // Centre of a cell, in world metres.
@@ -212,7 +212,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
       // of the cell is glass (lpv.js glassCellTransmit).
       const frac = glassCount.div(float(27));
       const centre = base.add(cellU.mul(float(0.5)));
-      const tint = blocks ? u.layerTint.element(layerOf(round(centre.div(float(BLOCK_METRES))))).xyz
+      const tint = blocks ? u.layerTint.element(layerOf(round(centre.div(float(BLOCK_METRES))), centre)).xyz
                           : vec3(1, 1, 1);
       const through = pow(max(tint, vec3(1e-3, 1e-3, 1e-3)),
                           vec3(blockShareU, blockShareU, blockShareU));
@@ -254,8 +254,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   const SKY_CONE = float(1);
   // The albedo of the block a probe landed on: which block (the block volume),
   // then that material's diffuse albedo.
-  const blockLayer = (p, n) =>
-    layerOf(round(p.sub(n.mul(c0.voxel.mul(float(0.5)))).div(float(BLOCK_METRES))));
+  const blockLayer = (p, n) => {
+    const q = p.sub(n.mul(c0.voxel.mul(float(0.5)))).toVar();
+    return layerOf(round(q.div(float(BLOCK_METRES))), q);
+  };
   const blockAlbedo = (p, n) => (blocks ? u.layerAlbedo.element(blockLayer(p, n)).xyz : u.albedo);
   // What the surface bounces in all: its diffuse albedo, plus its specular
   // share (lpv.js specularAlbedo) - the rough part only while the mirror light

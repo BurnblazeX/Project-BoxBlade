@@ -25,7 +25,8 @@ export function modelLabel(name) {
                : { category: '', name: titleCase(name) };
 }
 const SHAPE_LABELS = { full: 'Full', halfBottom: 'Half, low', halfTop: 'Half, high', slope: 'Slope',
-                       halfSlope: 'Half slope', halfSlopeHigh: 'Half slope, high', stairs: 'Stairs' };
+                       halfSlope: 'Half slope', halfSlopeHigh: 'Half slope, high', stairs: 'Stairs',
+                       halfVertical: 'Half, vertical', middleVertical: 'Pane' };
 export const shapeLabel = s => SHAPE_LABELS[s] || titleCase(s);
 
 // --- Pictures ---
@@ -275,7 +276,7 @@ export function createPalette({ state, pick, levelName }) {
     const help = el('details');
     help.appendChild(el('summary', '', 'Controls'));
     help.appendChild(el('div', '',
-      'LMB           place on the face\nRMB           remove\nShift+LMB drag  fill a box\n' +
+      'LMB           place on the face\nLMB drag      place a row\nRMB         remove\nShift+LMB drag  fill a box\n' +
       'Shift+RMB drag  clear a box\nRMB drag      look\nWASD, Space   fly  (Shift: fast)\n' +
       'L-Ctrl or C   down\n' +
       'Q / E         turn\nCtrl+S        save'));

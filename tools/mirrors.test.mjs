@@ -175,6 +175,32 @@ section('half blocks: their own faces');
   ok('a half-top\'s underside faces the gap', under.length && under[0].plane / B, 1);
 }
 
+section('vertical halves and panes: faces mid-cell across x and z');
+{
+  const { buildMirrors } = await import('../js/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfVertical', facing: 'E' }],
+                     ['3,0,0', { materialId: 'marble', shape: 'middleVertical', facing: 'N' }],
+                     ['-1,0,0', { materialId: 'marble' }]]);
+  const r = buildMirrors(W, new Set(['marble']));
+  const at = (axis, sign, plane) => r.filter(q => q.axis === axis && q.sign === sign && Math.abs(q.plane - plane * B) < 1e-9);
+  ok("the vertical half's west face sits mid-cell", at(0, -1, 0).length, 1);
+  ok('its top is half a block wide (x 0 .. 0.5)', at(1, 1, 0.5).filter(q => q.min[0] >= -1e-9 && q.max[0] <= B + 1e-9).map(q => `${q.min[0] / B},${q.max[0] / B}`).join(), '0,0.5');
+  ok("the pane's faces sit 4/12 and 8/12 across z", at(2, -1, -1 / 6).length + at(2, 1, 1 / 6).length, 2);
+  ok("the full block's +x face, beside the vertical half's gap, is whole", at(0, 1, -0.5).length, 1);
+}
+
+section('dual blocks: each half by its own material');
+{
+  const { buildMirrors } = await import('../js/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfTop', second: 'grass' }]]);
+  const r = buildMirrors(W, new Set(['marble']));
+  ok('the marble half\'s top is a mirror', r.filter(q => q.axis === 1 && q.sign === 1).length, 1);
+  ok('the face between the halves is not', r.filter(q => q.axis === 1 && q.sign === -1).length, 0);
+  ok('its sides are half a block tall', r.filter(q => q.axis === 0).map(q => (q.max[0] - q.min[0]) / B).join(), '0.5,0.5');
+}
+
 section('slopes throw no mirror light');
 {
   const { buildMirrors } = await import('../js/mirrors.js');
@@ -185,7 +211,7 @@ section('slopes throw no mirror light');
   falsy('the ground block top is covered by the slope', r.some(q => q.axis === 1 && q.sign === 1));
 }
 
-section('the mirror-light budget ranks by the mirrors, not the player');
+section('the mirror-light budget ranks by the mirrors near the player');
 {
   const B = BLOCK_METRES;
   const at = (x, y, z, level = 6) => ({ position: { x: x * B, y: y * B, z: z * B }, level });
@@ -197,4 +223,13 @@ section('the mirror-light budget ranks by the mirrors, not the player');
   truthy('the lamp beside the mirror wins, though the player stands by the other', pick.has(byMirror) && pick.size === 1);
   ok('budget 0 picks none', pickMirrored([byMirror], iron, player, 0).size, 0);
   ok('a budget past the count picks all', pickMirrored([byPlayer, byMirror], iron, player, 4).size, 2);
+  // A mirror past MIRROR_REACH from the player counts for nothing: the lamp
+  // hugging it loses to the torch a few metres from the mirror the player
+  // stands by.
+  const far = [{ axis: 2, sign: -1, plane: 60, min: [60, 0], max: [61.5, 3] }];
+  const near = [{ axis: 1, sign: 1, plane: 0.75, min: [0, 0], max: [3, 3] }];
+  const hugger = { position: { x: 60.75, y: 1.5, z: 59.5 }, level: 10 };
+  const torch = { position: { x: 1.5, y: 5, z: 3.5 }, level: 12 };
+  const picked = pickMirrored([hugger, torch], far.concat(near), { x: 1.5, y: 0.75, z: 3 }, 1);
+  truthy('a lamp by a far mirror does not take the torch\'s slot', picked.has(torch));
 }

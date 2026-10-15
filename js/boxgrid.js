@@ -1,5 +1,5 @@
 import { World, getVoxelKey, CHUNK_SIZE, Y_MIN, CHUNK_HEIGHT, BLOCK_METRES, blockSpan, blockBoxes,
-         ModelBoxes } from './world.js';
+         ModelBoxes, partAt, shapeCode, codeBox, isDual, blockParts } from './world.js';
 import { isGlassMaterial } from './materials.js';
 
 // --- boxGrid: the fine occupancy / light field ---
@@ -824,11 +824,32 @@ export function populateDistanceField(grid, dirty = null) {
     // GLASS goes into G, whole: it is seen through, so its underside is as
     // visible as any other face, and a ray inside it must find the true exit.
     // It is not in R at all - see FIELD_CHANNELS.
+    // A dual block (world.js isDual): each half its own box, in its own
+    // material's channel - a glass half in G, the other in R.
+    if (isDual(block)) {
+      for (const part of blockParts(block)) {
+        const [x0, x1, y0, y1, z0, z1] = part.boxes[0];
+        const glassPart = glassBlock({ ...block, materialId: part.materialId });
+        const vol = (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
+        minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per, vz0 + (z0 + z1) / 2 * per,
+                     (x1 - x0) / 2 * per, (y1 - y0) / 2 * per, (z1 - z0) / 2 * per, rects, range,
+                     glassPart ? GLASS_CHANNEL : OPAQUE_CHANNEL);
+        const range6 = [vx0 + Math.floor(x0 * per), vy0 + Math.floor(y0 * per), vz0 + Math.floor(z0 * per),
+                        vx0 + Math.ceil(x1 * per), vy0 + Math.ceil(y1 * per), vz0 + Math.ceil(z1 * per)];
+        if (glassPart) { glassBlocks.push(...range6); if (inFootprint) glassFilled += vol; }
+        else { blocks.push(...range6); if (inFootprint) filled += vol; }
+      }
+      continue;
+    }
+
+    // A glass half or pane is its own box (world.js BLOCK_SHAPES glass).
     if (glassBlock(block)) {
-      minBoxVoxels(grid, vx0 + per / 2, vy0 + per / 2, vz0 + per / 2,
-                   per / 2, per / 2, per / 2, rects, range, GLASS_CHANNEL);
-      if (inFootprint) glassFilled += per * per * per;
-      glassBlocks.push(vx0, vy0, vz0, vx0 + per, vy0 + per, vz0 + per);
+      const [x0, x1, y0, y1, z0, z1] = blockBoxes(block)[0];
+      minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per, vz0 + (z0 + z1) / 2 * per,
+                   (x1 - x0) / 2 * per, (y1 - y0) / 2 * per, (z1 - z0) / 2 * per, rects, range, GLASS_CHANNEL);
+      if (inFootprint) glassFilled += (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
+      glassBlocks.push(vx0 + Math.floor(x0 * per), vy0 + Math.floor(y0 * per), vz0 + Math.floor(z0 * per),
+                       vx0 + Math.ceil(x1 * per), vy0 + Math.ceil(y1 * per), vz0 + Math.ceil(z1 * per));
       continue;
     }
 
@@ -859,9 +880,11 @@ export function populateDistanceField(grid, dirty = null) {
     // A slope is a staircase of boxes (world.js BLOCK_SHAPES), each baked on
     // its own - the min of their distances is the staircase's. A step is a
     // twelfth of a block: half a voxel at C1, a quarter at C2, placed
-    // continuously like any box.
+    // continuously like any box. So is a box short of the cell across x or z
+    // (a vertical half, a pane): the span below is only the height.
     const boxes = blockBoxes(block);
-    if (boxes.length > 1) {
+    const b0 = boxes[0];
+    if (boxes.length > 1 || b0[0] > 0 || b0[1] < 1 || b0[4] > 0 || b0[5] < 1) {
       for (const [x0, x1, y0, y1, z0, z1] of boxes) {
         minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per,
                      vz0 + (z0 + z1) / 2 * per, (x1 - x0) / 2 * per, (y1 - y0) / 2 * per,
@@ -946,17 +969,22 @@ export function sphereTrace(grid, origin, dir, maxDistance) {
 
 // The CPU mirror of gpu.js blockFaceTSL: the block-grid plane p is nearest to,
 // among those the ray is not parallel to, a tie going to the one it crosses
-// most squarely. leaving: normal along dir, else against it.
-export function blockFaceNormal(p, dir, leaving) {
+// most squarely. leaving: normal along dir, else against it. With a world,
+// the planes of the shape in p's cell count too (world.js codeBox): a pane's
+// or a half's faces sit mid-cell.
+export function blockFaceNormal(p, dir, leaving, world = null) {
   const axes = ['x', 'y', 'z'];
+  const cell = axes.map(a => Math.round(p[a] / BLOCK_METRES));
+  const block = world && world.get(cell.join(','));
+  const box = block ? codeBox(shapeCode(block)) : [0, 1, 0, 1, 0, 1];
   let best = null, bestBack = Infinity;
-  for (const a of axes) {
-    const b = p[a] / BLOCK_METRES + 0.5;
-    const f = b - Math.floor(b);
+  axes.forEach((a, k) => {
+    const f = p[a] / BLOCK_METRES - cell[k] + 0.5;
     const ad = Math.abs(dir[a]);
-    const score = Math.min(f, 1 - f) * BLOCK_METRES - ad * 1e-3 + (ad < 1e-3 ? 1e3 : 0);
+    const near = Math.min(f, 1 - f, Math.abs(f - box[2 * k]), Math.abs(f - box[2 * k + 1]));
+    const score = near * BLOCK_METRES - ad * 1e-3 + (ad < 1e-3 ? 1e3 : 0);
     if (score < bestBack) { bestBack = score; best = a; }
-  }
+  });
   const s = Math.sign(dir[best]) * (leaving ? 1 : -1);
   return { x: best === 'x' ? s : 0, y: best === 'y' ? s : 0, z: best === 'z' ? s : 0 };
 }
@@ -1023,15 +1051,18 @@ export function glassOnRay(grid, origin, dir, maxDistance) {
   return { blocked: false, inGlass };
 }
 
-// --- CPU reference: the walk through glass, block by block ---
+// --- CPU reference: the walk through glass, box by box ---
 //
 // The mirror of the walk in gpu.js glassNode: from p on a glass face (n its
-// outward normal), along dir (already refracted in), stepping block to block.
-// Glass: go on. Air: refract out through that face, or past the critical angle
-// reflect back in (up to maxBounces). Anything else: an opaque block, whose
-// face the glass shows. Returns { kind: 'opaque' | 'exit' | 'trapped', length,
-// bounces, point, normal, dir } - normal is the face crossed (the exit's
-// pointing out, the opaque's toward the ray), dir the ray out for an exit.
+// outward normal), along dir (already refracted in), stepping from the glass
+// box it is in to the next box face along the ray (world.js partAt - a whole
+// block's box is its cell, a half's or a pane's its own). Past that face:
+// glass, go on; air, refract out through that face, or past the critical
+// angle reflect back in (up to maxBounces); anything else, an opaque block,
+// whose face the glass shows. Returns { kind: 'opaque' | 'exit' | 'trapped',
+// length, bounces, point, normal, dir } - normal is the face crossed (the
+// exit's pointing out, the opaque's toward the ray), dir the ray out for an
+// exit.
 export function refractVec(i, n, eta) {
   const d = i.x * n.x + i.y * n.y + i.z * n.z;
   const k = 1 - eta * eta * (1 - d * d);
@@ -1040,32 +1071,33 @@ export function refractVec(i, n, eta) {
   return { x: eta * i.x - s * n.x, y: eta * i.y - s * n.y, z: eta * i.z - s * n.z };
 }
 
+export const GLASS_WALK_NUDGE = 1e-3;   // metres past a face, to ask what is there
 export function walkThroughGlass(p, n, dir, ior, { maxSteps = 32, maxBounces = 4,
-                                                   isGlass = isGlassMaterial } = {}) {
-  const B = BLOCK_METRES;
-  const key = c => getVoxelKey(c.x, c.y, c.z);
+                                                   isGlass = isGlassMaterial, world = World } = {}) {
+  const B = BLOCK_METRES, e = GLASS_WALK_NUDGE;
+  const boxOf = part => ({
+    lo: { x: (part.cell[0] - 0.5 + part.box[0]) * B, y: (part.cell[1] - 0.5 + part.box[2]) * B, z: (part.cell[2] - 0.5 + part.box[4]) * B },
+    hi: { x: (part.cell[0] - 0.5 + part.box[1]) * B, y: (part.cell[1] - 0.5 + part.box[3]) * B, z: (part.cell[2] - 0.5 + part.box[5]) * B }
+  });
   let pos = { ...p }, d = { ...dir }, len = 0, bounces = 0;
-  const h = VOXEL_METRES * 0.5;
-  let cell = { x: Math.floor((p.x - n.x * h) / B + 0.5),
-               y: Math.floor((p.y - n.y * h) / B + 0.5),
-               z: Math.floor((p.z - n.z * h) / B + 0.5) };
+  const start = partAt(p.x - n.x * e, p.y - n.y * e, p.z - n.z * e, world);
+  if (!start) return { kind: 'trapped', length: 0, bounces, point: pos, normal: null, dir: d };
+  let box = boxOf(start);
   for (let i = 0; i < maxSteps; i++) {
     let best = null, bt = Infinity;
     for (const a of ['x', 'y', 'z']) {
       if (Math.abs(d[a]) < 1e-6) continue;
-      const s = Math.sign(d[a]);
-      const t = ((cell[a] + 0.5 * s) * B - pos[a]) / d[a];
+      const t = ((d[a] > 0 ? box.hi[a] : box.lo[a]) - pos[a]) / d[a];
       if (t < bt) { bt = t; best = a; }
     }
     bt = Math.max(bt, 0);
     const npos = { x: pos.x + d.x * bt, y: pos.y + d.y * bt, z: pos.z + d.z * bt };
     const s = Math.sign(d[best]);
     const nx = { x: best === 'x' ? s : 0, y: best === 'y' ? s : 0, z: best === 'z' ? s : 0 };
-    const next = { x: cell.x + nx.x, y: cell.y + nx.y, z: cell.z + nx.z };
-    const block = World.get(key(next));
+    const part = partAt(npos.x + nx.x * e, npos.y + nx.y * e, npos.z + nx.z * e, world);
     len += bt;
-    if (block && isGlass(block.materialId)) { pos = npos; cell = next; continue; }
-    if (!block) {
+    if (part && isGlass(part.materialId)) { pos = npos; box = boxOf(part); continue; }
+    if (!part) {
       const out = refractVec(d, { x: -nx.x, y: -nx.y, z: -nx.z }, ior);
       if (out) return { kind: 'exit', length: len, bounces, point: npos, normal: nx, dir: out };
       bounces++;
