@@ -57,6 +57,10 @@ export const terrainTextures = {
   rgba: [],
   // The same for each layer's _s, or undefined where it has none.
   specRgba: [],
+  // The shaded path's albedo (materials.js, _a): the same layout as albedo's
+  // data, filled only at flatLayers; flatRgba as rgba, per material with one.
+  // setShadedAlbedo swaps them in.
+  flat: null, flatLayers: new Set(), flatRgba: [],
   // What each BLOCK is, as a 3D texture over a fixed box of blocks: what a
   // ray that hit something reads to find its texture (buildBlockVolume).
   // { tex, origin, size } - origin and size in blocks, as vec3 uniforms.
@@ -491,7 +495,7 @@ function writeSplit(tex, first, data, rows) {
 // stretched. A plane with none of the three is not allocated; the shader
 // stretches the side itself.
 async function loadSlopeLayers(m, layer) {
-  const t = terrainTextures;
+  const t = terrainTextures, flatSide = t.flatLayers.has(layer);
   const rowsOf = [SLOPE_ROWS, HALF_SLOPE_ROWS];
   const firsts = MATERIAL_LAYERS.faces[layer].slope;
   for (let kind = 0; kind < 2; kind++) {
@@ -509,6 +513,10 @@ async function loadSlopeLayers(m, layer) {
     writeSplit(t.normal, first, normal || (albedoTD ? terrainNormals(albedoTD, BLOCK_TEXELS, rows)
                                                     : stretched(t.normal, layer, rows)), rows);
     writeSplit(t.specular, first, (await read('_s')) || stretched(t.specular, layer, rows), rows);
+    // Shaded albedo: its own _a, else - a plane drawn with the side's texture
+    // stretched - the side's _a stretched.
+    const flat = m.glass ? null : (await read('_a')) || (!albedoTD && flatSide ? stretched(t.flat, layer, rows) : null);
+    if (flat) { writeSplit(t.flat, first, flat, rows); t.flatLayers.add(first).add(first + 1); }
   }
 }
 
@@ -529,6 +537,12 @@ async function loadFaceLayers(m, layer) {
     else writeSplit(t.normal, dst, rgba ? terrainNormals(rgba, n, n) : stretched(t.normal, layer, n), n);
     if (sUrl) writeLayer(t.specular, dst, imagePixels(await loadImage(sUrl), name + '_s'));
     else writeSplit(t.specular, dst, stretched(t.specular, layer, n), n);
+    // Shaded albedo: its own _a, else the side's _a when it took the side's.
+    const fUrl = m.glass ? null : textureUrl(name + '_a');
+    if (fUrl) writeLayer(t.flat, dst, imagePixels(await loadImage(fUrl), name + '_a'));
+    else if (rgba || m.glass || !t.flatLayers.has(layer)) continue;
+    else writeSplit(t.flat, dst, stretched(t.flat, layer, n), n);
+    t.flatLayers.add(dst);
   }
 }
 
@@ -618,6 +632,9 @@ function initTerrainTextures() {
   terrainTextures.albedo = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
   terrainTextures.normal = makeArray([128, 128, 255, 255], THREE.NoColorSpace);
   terrainTextures.specular = makeArray(DEFAULT_SPECULAR, THREE.NoColorSpace);
+  // CPU only, never bound: the writers above need just image.data and height.
+  terrainTextures.flat = { image: { data: new Uint8Array(terrainTextures.albedo.image.data.length),
+                                    height: BLOCK_TEXELS } };
   const loads = MATERIALS.map(async (m, layer) => {
     const albedoUrl = textureUrl(m.texture);
     if (!albedoUrl) { console.warn(`[terrain] no texture ${m.texture}.png`); return; }
@@ -640,6 +657,13 @@ function initTerrainTextures() {
       terrainTextures.specRgba[layer] = spec;
       writeLayer(terrainTextures.specular, layer, spec);
     }
+    const aUrl = m.glass ? null : textureUrl(m.texture + '_a');
+    if (aUrl) {
+      const flat = imagePixels(await loadImage(aUrl), m.texture + '_a');
+      terrainTextures.flatRgba[layer] = flat;
+      writeLayer(terrainTextures.flat, layer, flat);
+      terrainTextures.flatLayers.add(layer);
+    }
     await loadFaceLayers(m, layer);
     await loadSlopeLayers(m, layer);
   });
@@ -647,7 +671,38 @@ function initTerrainTextures() {
   Promise.allSettled(loads).then(r => {
     for (const x of r) if (x.status === 'rejected') console.warn('[terrain] texture load failed', x.reason);
     terrainTextures.ready = true;
+    applyAlbedoMode();
   });
+}
+
+// --- Shaded albedo ---
+//
+// With shadows on, every layer with an _a (materials.js) draws it in place of
+// its main texture - per texel, so a metal texel (_s G >= 230) keeps its own.
+// Swapped in the albedo array's data, not chosen in the shaders: every reader
+// of the array (the view, reflections, glass, the split kernels) follows with
+// no rebuild. Before the loads are in it is only remembered; they apply it.
+let shadedAlbedo = false, mainAlbedo = null;
+export function setShadedAlbedo(on) {
+  if (shadedAlbedo === on) return;
+  shadedAlbedo = on;
+  if (terrainTextures.ready) applyAlbedoMode();
+}
+function applyAlbedoMode() {
+  const t = terrainTextures, d = t.albedo.image.data, flat = t.flat.image.data;
+  const spec = t.specular.image.data, size = BLOCK_TEXELS * BLOCK_TEXELS * 4;
+  if (!t.flatLayers.size) return;
+  // The main textures, kept the first time - the array holds them until now.
+  mainAlbedo ??= new Map([...t.flatLayers].map(l => [l, d.slice(l * size, (l + 1) * size)]));
+  for (const [l, main] of mainAlbedo) {
+    const o = l * size;
+    d.set(main, o);
+    if (!shadedAlbedo) continue;
+    for (let i = 0; i < size; i += 4) {
+      if (spec[o + i + 1] < 230) d.set(flat.subarray(o + i, o + i + 4), o + i);
+    }
+  }
+  t.albedo.needsUpdate = true;
 }
 
 // A model's textures (models.js), cut into 12 x 12 tiles in its layers of the
@@ -793,7 +848,12 @@ export function initWorldRender(scene) {
     const glassMat = new THREE.MeshStandardNodeMaterial({
       roughness: 0.9, metalness: 0.0, transparent: true, opacity: 0.35, depthWrite: false
     });
-    glassMat.colorNode = mix(terrainSampleTSL(terrainTextures.albedo).rgb, vec3(1, 1, 1), terrainWhite);
+    // From the world position, as the terrain's: the mesh uv squashed the whole
+    // texture onto a pane's top or a half's side.
+    glassMat.colorNode = Fn(() => {
+      const surf = terrainSurfaceTSL();
+      return mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
+    })();
     glassMat.positionNode = terrainKeepTSL(true);
     const g = new THREE.InstancedMesh(geometry, glassMat, capacity);
     g.instanceMatrix = worldInstancedMesh.instanceMatrix;

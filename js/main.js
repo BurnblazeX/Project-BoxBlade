@@ -7,7 +7,7 @@ import { createEditor } from './editor.js';
 import { createObject, rollLootTable } from './objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
          glassInstancedMesh, terrainKeepTSL, terrainShapeTSL,
-         terrainTextures, terrainWhite, terrainSampleTSL, terrainTexelTSL } from './render.js';
+         terrainTextures, terrainWhite, terrainSampleTSL, terrainTexelTSL, setShadedAlbedo } from './render.js';
 import { texelPixels, texelCacheSpacingFor } from './texelcache.js';
 import { createWanderAI } from './ai.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
@@ -26,7 +26,7 @@ import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissN
 import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
          createMirrorBindings, writeMirrorBindings, setHitBounds,
          GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
-         glassBackGlare } from './gpu.js';
+         glassBackGlare, reflectBouncesUniform, REFLECT_MAX_BOUNCES, createTexelGI, GI_LIST_CAP } from './gpu.js';
 import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride,
          MIRROR_CACHE_VEC4S, pickMirrored } from './mirrors.js';
 import { MATERIALS, isGlassMaterial } from './materials.js';
@@ -65,8 +65,8 @@ import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from '
 import { classifyTextureAlpha, registerCutout, syncCutout, wantsTransparent,
          cutoutsEnabled, setCutoutsEnabled } from './cutout.js';
 import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
-import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS,
-         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS } from './lpv.js';
+import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
+         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS, LPV_RES_OPTIONS } from './lpv.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
 import * as UI from './ui.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
@@ -2470,6 +2470,22 @@ scene.backgroundNode = skyShTSL(skyBindings, positionWorldDirection);
 // numbers read each frame. The volume is built once, on the first shadows-on
 // frame that has cascades and a light list, and follows C0 from then on.
 let giOn = true;
+// Which bounce: 'texel' - a radiance cache on the block faces, ray-traced
+// (gpu.js createTexelGI; needs split shading, which finds the patches) - or
+// 'lpv', the light propagation volume.
+let giMode = 'lpv';
+let texelGI = null;
+// Texel GI response time (s): the patches' shown light eases toward each new
+// sum with this time constant, in real time (gpu.js createTexelGI blend).
+let giResponse = 0.15;
+let giLastT = 0;
+function ensureTexelGI() {
+  if (!texelGI) {
+    texelGI = createTexelGI();
+    texelGI.strength = giStrength;
+  }
+  return texelGI;
+}
 let giOnly = false;
 // One volume per level, finest first: C0 at 0.75 m cells, C1 at 1.5 m. They
 // share every setting; the shading pass blends them (lpvSampleTSL).
@@ -2477,6 +2493,11 @@ let lpvs = null;
 let lpvOrigins = [];        // cascade origin each volume was last laid over
 let lpvIterations = DEFAULT_LPV_ITERATIONS;
 let lpvSpread = DEFAULT_LPV_SPREAD;
+let lpvBounces = DEFAULT_GI_BOUNCES;
+// GI resolution (lpv.js LPV_RES_OPTIONS): 1 is 2 x 2 cells a block face.
+// Finer cells keep the reach in metres - the spread per cell is the 1/res
+// power, the iterations res times - so only the detail changes, and the cost.
+let lpvRes = 1;
 let lpvSlices = DEFAULT_LPV_SLICES;
 const giStrength = uniform(DEFAULT_GI_STRENGTH);
 let lastGIms = 0;
@@ -2486,7 +2507,10 @@ function ensureLPV() {
   ensureSunUniforms();
   lpvs = [];
   for (let level = 0; level < LPV_LEVELS; level++) {
-    lpvs.push(createLPV({ cascades: shadowCascades, lights: ensureLightBindings(), level,
+    // Every bounce order fits at res 1 (~3.5 MB each); finer, only the ones
+    // asked for - 16 orders of 8 x 8 would be gigabytes.
+    lpvs.push(createLPV({ cascades: shadowCascades, lights: ensureLightBindings(), level, res: lpvRes,
+                          orders: lpvRes === 1 ? GI_MAX_BOUNCES : lpvBounces,
                           biasUniform: sunBias, fadeStartUniform: sunFadeStart,
                           edgeFadeUniform: sunEdgeFade,
                           sky: skyBindings, ambientUniform: sunAmbient,
@@ -2497,6 +2521,16 @@ function ensureLPV() {
                           terrain: terrainTextures, mirrors: mirrorBindings }));
   }
   return lpvs;
+}
+
+// Throws the volumes away, to be made again at the current resolution and
+// bounce count; the shaders that sample them rebuild with them.
+function rebuildLPV() {
+  if (!lpvs) return;
+  for (const v of lpvs) v.dispose(renderer);
+  lpvs = null;
+  lpvOrigins = [];
+  if (shadowsOn) buildPerPixelShadows();
 }
 
 function giBinding() {
@@ -2604,6 +2638,9 @@ function runSplitShading(resolved) {
   s.count.value = Math.min(rt.width * rt.height, s.lowCap);
   s.viewPos.value.copy(camera.position);
   const list = [];
+  // Texel GI: the patch list starts empty; the base kernel fills it.
+  const gk = activeShadowSet.giKernels;
+  if (gk) list.push(gk.reset);
   if (resolved) {
     const full = texelCache.idRT;
     s.fullWidth.value = full.width;
@@ -2614,6 +2651,15 @@ function runSplitShading(resolved) {
   // This frame's low-res samples, then (resolved) up to missCap misses.
   const n = s.count.value + (resolved ? s.missCap : 0);
   for (const k of ks) { k.count = n; list.push(k); }
+  // Texel GI: each listed patch traces this frame's slice of its directions.
+  if (gk) {
+    const now = performance.now();
+    const dt = giLastT ? Math.min((now - giLastT) / 1000, 0.25) : 1 / 60;
+    giLastT = now;
+    texelGI.blend.value = giResponse > 0 ? 1 - Math.exp(-dt / giResponse) : 1;
+    list.push(gk.patches, gk.sums);
+    texelGI.frame.value = (texelGI.frame.value + 1) >>> 0;
+  }
   renderer.compute(list);
 }
 
@@ -2830,8 +2876,9 @@ let layerAlbedos = null;
 function resolveLayerAlbedos() {
   if (layerAlbedos || !terrainTextures.ready) return;
   const spec = l => terrainTextures.specRgba[l];
+  // The GI runs with shadows on only: what it bounces is the _a, if any.
   layerAlbedos = terrainTextures.rgba.map((rgba, l) =>
-    (rgba ? diffuseAlbedo(rgba, spec(l)) : { r: 0.5, g: 0.5, b: 0.5 }));
+    (rgba ? diffuseAlbedo(terrainTextures.flatRgba[l] || rgba, spec(l)) : { r: 0.5, g: 0.5, b: 0.5 }));
   // The specular share each material bounces (lpv.js specularAlbedo): all of
   // it, and the part too rough for the mirror light, which carries the rest.
   const grey = { r: 0.04, g: 0.04, b: 0.04 };
@@ -2875,7 +2922,7 @@ function packGISprites(u) {
 // One frame of GI, per volume: follow its cascade, then solid / inject /
 // propagate / resolve.
 function updateGI() {
-  if (!giOn || !lpvs) return;
+  if (!giOn || !lpvs || giMode !== 'lpv') return;
   const t0 = performance.now();
   resolveLayerAlbedos();
   giFrame++;
@@ -2889,7 +2936,7 @@ function updateGI() {
     let shift = null;
     if (!was) shift = 'reset';
     else if (at.x !== was.x || at.y !== was.y || at.z !== was.z) {
-      shift = lpvShift(was, at, v.cellMetres) || 'reset';
+      shift = lpvShift(was, at, v.cellMetres, v.dim) || 'reset';
     }
     lpvOrigins[v.level] = at;
     const u = v.uniforms;
@@ -2905,10 +2952,11 @@ function updateGI() {
     u.skyGain.value = SKY_GAIN;
     packGISprites(u);
     u.sunGain.value = sunOn ? 1 : 0;
-    u.spread.value = lpvSpread;
+    u.spread.value = Math.pow(lpvSpread, 1 / v.res);
+    u.bounces.value = Math.min(lpvBounces, v.orders);
     v.slices = lpvSlices;
     writeSunUniforms(v.sun, dirLight.position, sunAngular);
-    v.update(renderer, { shift, iterations: lpvIterations, batch: giBatch });
+    v.update(renderer, { shift, iterations: Math.round(lpvIterations * v.res), batch: giBatch });
   }
   lastGIms = performance.now() - t0;
 }
@@ -3400,7 +3448,8 @@ function shadowNodeOptions() {
     mirrors: mirrorsOn ? mirrorBindings : null, mirrorOnly,
     viewCards: cardsReady && cardsOn ? viewCards : null,
     ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
-    gi: giOn && ensureLPV() ? giBinding() : null, giOnly,
+    gi: giOn && giMode === 'lpv' && ensureLPV() ? giBinding() : null, giOnly,
+    texelGI: giOn && giMode === 'texel' ? ensureTexelGI() : null,
     glassView, glassBounces, glassLayers, glassDispersion, glassShadows,
     mirrorCache: mirrorCacheOn, modelHits: modelHitsOn,
     hitCache: hitCacheOn ? ensureHitCache() : null,
@@ -3543,6 +3592,7 @@ function obtainShadowSet() {
     made: sprites.made, variants: sprites.variants, atlasMats: sprites.atlasMats,
     mirrorCache: built.mirrorCache,
     splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
+    giKernels: lowMat && built.giKernels ? built.giKernels : null,
     resolved: !!(lowMat && built.splitKernels && !missMat),
     mats: [terrainMat, ...[lowMat, missMat].filter(Boolean),
            ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
@@ -3702,6 +3752,7 @@ function buildPerPixelShadows() {
     applyShadowSet(set);
   });
   shadowsOn = true;
+  setShadedAlbedo(true);   // the flatter _a textures (render.js)
   syncEffectsButton();
   updateTorchPosition();
   updateLights();
@@ -3826,6 +3877,7 @@ const bxbApi = installConsole(createConsole({
         shadowBuild++;   // drop any build still compiling
         removeShadowSet();
         shadowsOn = false;
+        setShadedAlbedo(false);
         syncEffectsButton();
         // The field stops following; turning shadows back on rebuilds it.
         // The plain material's AO is the static voxel kind, which needs none.
@@ -4418,6 +4470,22 @@ const bxbApi = installConsole(createConsole({
       return `split kernels on the ${splitLegacy ? 'A08//00a' : 'current'} surface path`;
     }
   },
+  gistats: {
+    help: "texel GI: last frame's patches on screen against the list's room",
+    usage: 'await bxb.gistats()',
+    run: async () => {
+      if (!texelGI || giMode !== 'texel') return 'texel GI is off';
+      let q;
+      try {
+        q = new Uint32Array(await renderer.getArrayBufferAsync(texelGI.queueAttr));
+      } catch { return 'no patches listed yet (split shading off, or the kernels have not run)'; }
+      const n = q[0], claims = q[texelGI.claimsAt];
+      // Claims: patches that took a slot (new, or evicted) - near n every frame
+      // while standing still means history is being lost.
+      return `${n} patches listed (room ${GI_LIST_CAP}${n > GI_LIST_CAP ? ' - OVERFLOWING: the rest go stale' : ''}), ` +
+             `${claims} took a slot this frame`;
+    }
+  },
   splitstats: {
     help: "split shading: last frame's misses against the list's room",
     usage: 'await bxb.splitstats()',
@@ -4941,6 +5009,10 @@ settingsPanel = createSettingsPanel({ groups: [
     { key: 'reflect', label: 'Reflections', type: 'toggle',
       help: 'one ray per texel on smooth surfaces, shading what it hits',
       get: () => reflectionsOn, set: v => flip(reflectionsOn, v, () => bxbApi.spec('reflect')) },
+    { key: 'reflectbounces', label: 'Reflection bounces', type: 'range', min: 1, max: REFLECT_MAX_BOUNCES, step: 1,
+      help: 'reflections in reflections: how many smooth surfaces a reflection ray follows. 1 is the reflection alone',
+      get: () => reflectBouncesUniform.value,
+      set: v => { reflectBouncesUniform.value = Math.max(1, Math.min(REFLECT_MAX_BOUNCES, Math.round(v))); } },
     { key: 'mirrors', label: 'Mirror light', type: 'toggle',
       help: 'polished surfaces throw reflected sunlight onto what faces them',
       get: () => mirrorsOn, set: v => flip(mirrorsOn, v, () => bxbApi.mirrors()) },
@@ -4989,14 +5061,48 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => mirrorBounce, set: v => flip(mirrorBounce, v, () => bxbApi.mirrorbounce()) },
     { key: 'gi', label: 'Bounce light (LPV)', type: 'toggle',
       get: () => giOn, set: v => flip(giOn, v, () => bxbApi.gi()) },
-    { key: 'gistrength', label: 'Strength', type: 'range', min: 0, max: 4, step: 0.05,
+    { key: 'gimode', label: 'Method', type: 'select',
+      options: [{ value: 'texel', label: 'per-texel rays' }, { value: 'lpv', label: 'LPV (volume)' }],
+      help: 'per-texel rays need split shading (Perf); the LPV settings below are its own (rebuilds)',
+      get: () => giMode,
+      set: v => { if (v !== giMode) { giMode = v; if (shadowsOn) buildPerPixelShadows(); } } },
+    { key: 'giabshadow', label: 'A/B: lamps shadowed at GI hits', type: 'toggle',
+      get: () => ensureTexelGI().ab.hitShadows.value === 1, set: v => { ensureTexelGI().ab.hitShadows.value = v ? 1 : 0; } },
+    { key: 'giabphys', label: 'A/B: physical bounce (Fresnel, metal)', type: 'toggle',
+      get: () => ensureTexelGI().ab.physical.value === 1, set: v => { ensureTexelGI().ab.physical.value = v ? 1 : 0; } },
+    { key: 'giabfresh', label: 'A/B: shading reads fresh patches only', type: 'toggle',
+      get: () => ensureTexelGI().ab.fresh.value === 1, set: v => { ensureTexelGI().ab.fresh.value = v ? 1 : 0; } },
+    { key: 'giabanchor', label: 'A/B: rays from anchor texel', type: 'toggle',
+      get: () => ensureTexelGI().ab.anchor.value === 1, set: v => { ensureTexelGI().ab.anchor.value = v ? 1 : 0; } },
+    { key: 'gimissing', label: 'Texel GI: show missing patches', type: 'toggle',
+      help: 'the bounce reads bright red where a texel finds no patch in the table',
+      get: () => ensureTexelGI().debug.value === 1, set: v => { ensureTexelGI().debug.value = v ? 1 : 0; } },
+    { key: 'giresponse', label: 'Texel GI response (s)', type: 'range', min: 0, max: 1, step: 0.01,
+      help: 'time the bounce takes to follow a change - smooths flicker from anything that moves. 0: none',
+      get: () => giResponse, set: v => { giResponse = v; } },
+    { key: 'gireach', label: 'Texel GI reach (m)', type: 'range', min: 1, max: 24, step: 0.5,
+      help: 'how far a GI ray marches before it gives up (a miss bounces nothing)',
+      get: () => ensureTexelGI().reach.value, set: v => { ensureTexelGI().reach.value = v; } },
+    { key: 'gistrength', label: 'Strength', type: 'range', min: 0, max: 8, step: 0.05,
       get: () => giStrength.value, set: v => bxbApi.gi(true, v) },
     { key: 'gispread', label: 'Spread', type: 'range', min: 0.5, max: 0.98, step: 0.01,
       help: 'how far light carries cell to cell - brightness is normalised, only reach changes',
       get: () => lpvSpread, set: v => { lpvSpread = v; } },
+    { key: 'gibounces', label: 'Bounces', type: 'range', min: 1, max: GI_MAX_BOUNCES, step: 1,
+      help: 'orders of bounce light: 1 is light off a surface once, each more lands and leaves again',
+      get: () => lpvBounces,
+      set: v => {
+        lpvBounces = Math.max(1, Math.min(GI_MAX_BOUNCES, Math.round(v)));
+        if (lpvs && lpvs[0].orders < lpvBounces) rebuildLPV();   // finer res: more orders to hold
+      } },
+    { key: 'gires', label: 'Resolution', type: 'select',
+      options: LPV_RES_OPTIONS.map(r => ({ value: r, label: `${2 * r}x${2 * r} a block face (${0.75 / r} m)` })),
+      help: 'GI cells a block face. Finer is sharper bounce and dearer: ~3.4x, 8x, 27x the cells (rebuilds)',
+      get: () => lpvRes,
+      set: v => { const r = Number(v); if (r !== lpvRes) { lpvRes = r; rebuildLPV(); } } },
     { key: 'giiter', label: 'Iterations / frame', type: 'range', min: 2, max: 32, step: 2,
       get: () => lpvIterations, set: v => { lpvIterations = v; } },
-    { key: 'gislices', label: 'Inject 1/N a frame', type: 'range', min: 1, max: 8, step: 1,
+    { key: 'gislices', label: 'Inject 1/N a frame', type: 'range', min: 1, max: 64, step: 1,
       help: 'injection re-marches every light per surface; 1/N of the cells each frame',
       get: () => lpvSlices, set: v => { lpvSlices = v; } },
     { key: 'gionly', label: 'View: bounce only', type: 'toggle',

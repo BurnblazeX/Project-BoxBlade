@@ -15,8 +15,8 @@ import { GI_LAYERS } from './models.js';
 // One entry per material, then per model (models.js giIndex).
 const GI_TABLE = Array.from({ length: GI_LAYERS });
 import {
-  LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, FACE_DIRS, SOLID_THRESHOLD,
-  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES
+  LPV_DIM, LPV_CELL_VOXELS, FACE_DIRS, SOLID_THRESHOLD,
+  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES
 } from './lpv.js';
 
 // --- The LPV on the GPU: solid, inject, propagate, resolve ---
@@ -26,7 +26,9 @@ import {
 //
 //   solid   float   how much of each cell is geometry        every frame
 //   E       vec4    injected light (rgb)                     one slice a frame
+//   W       vec4    what a cell's surfaces bounce (albedo)   one slice a frame
 //   A, B    vec4    propagated light, ping-ponged            N iterations a frame
+//                   - GI_MAX_BOUNCES orders of it, order k at k * CELLS
 //   tex     RGBA16F what the shading pass samples, trilinear  every frame
 //
 // The texture is written by a resolve pass that DILATES into solid cells: a
@@ -35,17 +37,16 @@ import {
 // the zeros inside the ground and darken every contact.
 
 const NO_SKIP = vec2(1e9, 1e9);
-const D = LPV_DIM;
 
-// instanceIndex to cell coordinates, as ints.
-function cellOf(index) {
+// instanceIndex to cell coordinates, as ints, in a volume D cells a side.
+function cellOf(index, D) {
   const i = int(index).toVar();
   return { i, x: i.mod(int(D)), y: i.div(int(D)).mod(int(D)), z: i.div(int(D * D)) };
 }
 
 // The neighbour one step along (dx, dy, dz), or this cell when that is off the
 // volume - the CPU reference's edge rule.
-function neighbour(c, dx, dy, dz) {
+function neighbour(c, dx, dy, dz, D) {
   const nx = c.x.add(int(dx)), ny = c.y.add(int(dy)), nz = c.z.add(int(dz));
   const inside = nx.greaterThanEqual(int(0)).and(ny.greaterThanEqual(int(0)))
     .and(nz.greaterThanEqual(int(0))).and(nx.lessThan(int(D)))
@@ -60,14 +61,21 @@ function neighbour(c, dx, dy, dz) {
 // sky: the sky SH bindings (gpu.js createSkyBindings), with ambientUniform its
 // scale. blocks: render.js's block-material volume, so a probe hit bounces its
 // own block's albedo. Either may be null, and the old behaviour stands.
-export function createLPV({ cascades, lights, level = 0, biasUniform = null,
+// res: a block face's cells a side, halved (lpv.js LPV_RES_OPTIONS) - 1 is
+// 0.75 m over C0, the original. The volume keeps its extent, so it is
+// 24 * res cells a side and res^3 times the cells. orders: how many
+// bounce orders its buffers hold (at most GI_MAX_BOUNCES; the bounces uniform
+// must not exceed it).
+export function createLPV({ cascades, lights, level = 0, biasUniform = null, res = 1,
+                            orders: orderCount = GI_MAX_BOUNCES,
                             fadeStartUniform = null, edgeFadeUniform = null,
                             sky = null, ambientUniform = null, blocks = null,
                             glass = false, terrain = null, mirrors = null }) {
   // terrain: the terrain textures, for the mirror light's texels (with mirrors,
   // the mirror bindings) - see the injection below. Either null: no mirror bounce.
   const cascade = cascades[level];
-  const cellMetres = LPV_CELL_VOXELS * cascadeVoxelMetres(level);
+  const D = LPV_DIM * res, CELLS = D * D * D;
+  const cellMetres = LPV_CELL_VOXELS * cascadeVoxelMetres(level) / res;
   // ONE shader for both volumes: nothing that differs between C0 and C1 is
   // written into the code. The cell size is a uniform, not a literal; and the
   // volume's own cascade is read through uniforms and a texture binding of its
@@ -79,6 +87,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // cascade's objects; the numbers are re-read each frame), and the texture is
   // the same texture, bound twice.
   const cellU = uniform(float(cellMetres));
+  // A sixth of a cell - a voxel at res 1: the solid kernel's sample spacing.
   const voxU = uniform(float(cellMetres / LPV_CELL_VOXELS));
   const blockShareU = uniform(float(cellMetres / BLOCK_METRES));
   // A fresh node per sample (sample() would clone away the override), all
@@ -95,8 +104,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     voxel: uniform(float(cascade.voxel.value)).onFrameUpdate(() => cascade.voxel.value),
     range: uniform(float(cascade.range.value)).onFrameUpdate(() => cascade.range.value)
   };
-  const buf = (itemSize) => new THREE.StorageBufferAttribute(LPV_CELLS, itemSize);
-  const solidBuf = buf(1), eBuf = buf(4), aBuf = buf(4), bBuf = buf(4);
+  const buf = (itemSize) => new THREE.StorageBufferAttribute(CELLS, itemSize);
+  const ORDERS = CELLS * orderCount;
+  const solidBuf = buf(1), eBuf = buf(4), wBuf = buf(4);
+  const aBuf = new THREE.StorageBufferAttribute(ORDERS, 4), bBuf = new THREE.StorageBufferAttribute(ORDERS, 4);
   // Named: an unnamed buffer is NodeBuffer_<global node id> in the WGSL, and
   // that id depends on how many nodes existed before - so the shader text, and
   // with it the browser's pipeline cache key, changed from run to run.
@@ -104,14 +115,15 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   // for C0 and C1 (propagate, resolve, clear, shift, copy) is then the same
   // text, and three compiles one pipeline for both - Firefox compiles every
   // pipeline from scratch.
-  const solid = storage(solidBuf, 'float', LPV_CELLS).setName(`bxbLpvSolid`);
-  const E = storage(eBuf, 'vec4', LPV_CELLS).setName(`bxbLpvE`);
+  const solid = storage(solidBuf, 'float', CELLS).setName(`bxbLpvSolid`);
+  const E = storage(eBuf, 'vec4', CELLS).setName(`bxbLpvE`);
   // Per cell, what its light is multiplied by: glass tints it (lpv.js
   // glassCellTransmit). Only in a world with glass.
   const tBuf = glass ? buf(4) : null;
-  const T = glass ? storage(tBuf, 'vec4', LPV_CELLS).setName(`bxbLpvT`) : null;
-  const A = storage(aBuf, 'vec4', LPV_CELLS).setName(`bxbLpvA`);
-  const B = storage(bBuf, 'vec4', LPV_CELLS).setName(`bxbLpvB`);
+  const T = glass ? storage(tBuf, 'vec4', CELLS).setName(`bxbLpvT`) : null;
+  const W = storage(wBuf, 'vec4', CELLS).setName(`bxbLpvW`);
+  const A = storage(aBuf, 'vec4', ORDERS).setName(`bxbLpvA`);
+  const B = storage(bBuf, 'vec4', ORDERS).setName(`bxbLpvB`);
 
   const tex = new THREE.Storage3DTexture(D, D, D);
   tex.type = THREE.HalfFloatType;
@@ -128,6 +140,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     sunGain: uniform(float(1)),
     slice: uniform(int(0)),
     slices: uniform(int(DEFAULT_LPV_SLICES)),
+    // How many orders of bounce light (1..GI_MAX_BOUNCES): 1 is the injection
+    // alone, as it always was.
+    bounces: uniform(int(Math.min(DEFAULT_GI_BOUNCES, orderCount))),
     shift: uniform(new THREE.Vector3()),
     // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
     layerAlbedo: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
@@ -196,7 +211,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
 
   // --- solid: 27 field samples a cell, at voxel centres spread through it ---
   const solidKernel = Fn(() => {
-    const c = cellOf(instanceIndex);
+    const c = cellOf(instanceIndex, D);
     const base = u.origin.add(vec3(float(c.x), float(c.y), float(c.z))
                                 .mul(cellU)).toVar();
     const count = float(0).toVar();
@@ -227,7 +242,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
       sprite.addAssign(spriteOverlap(base, A, B).mul(u.spriteFill.element(sp)));
     });
     solid.element(c.i).assign(min(count.div(float(27)).add(sprite), float(1)));
-  })().compute(LPV_CELLS).setName(`LPV.Solid`);
+  })().compute(CELLS).setName(`LPV.Solid`);
 
   // --- inject: light leaving the surfaces around each air cell ---
   //
@@ -286,9 +301,12 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     : null;
 
   const injectKernel = Fn(() => {
-    const c = cellOf(instanceIndex);
+    const c = cellOf(instanceIndex, D);
     If(c.i.mod(u.slices).equal(u.slice), () => {
       const out = vec3(0, 0, 0).toVar();
+      // What the surfaces round this cell bounce, summed as the light is: the
+      // later orders' light leaves them by this (propagate).
+      const bounceW = vec3(0, 0, 0).toVar();
       const centre = centreOf(c).toVar();
       const air = solid.element(c.i).lessThan(float(SOLID_THRESHOLD))
                     .and(fieldAt(centre).greaterThan(float(0)));
@@ -337,7 +355,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
                 lit.addAssign(skyShTSL(sky, n, true).mul(ambient).mul(u.skyGain).mul(vis));
               });
             }
-            out.addAssign(lit.mul(blockBounce(p, n)));
+            const bb = blockBounce(p, n).toVar();
+            out.addAssign(lit.mul(bb));
+            bounceW.addAssign(bb);
             if (mirrorLight) {
               If(u.mirrorGain.greaterThan(float(0)), () => {
                 out.addAssign(mirrorLight(p, n, n, n).mul(blockAlbedo(p, n)).mul(u.mirrorGain));
@@ -369,39 +389,59 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
         });
       });
       E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE), 0));
+      W.element(c.i).assign(vec4(bounceW.div(float(6)), 0));
     });
-  })().compute(LPV_CELLS).setName(`LPV.Inject`);
+  })().compute(CELLS).setName(`LPV.Inject`);
 
   // --- propagate: one iteration, src -> dst (lpv.js propagateStep) ---
+  // Every order in one loop. Order 0 is lit by the injection (E); order k by
+  // order k - 1 in this cell, as the shading pass would read it (times
+  // 1 - spread, see resolve), leaving the surfaces here times what they
+  // bounce (W). From the last iteration's answer, so the chain settles over
+  // frames as the propagation itself does.
   const propagate = (src, dst) => Fn(() => {
-    const c = cellOf(instanceIndex);
+    const c = cellOf(instanceIndex, D);
     const open = float(1).sub(solid.element(c.i)).toVar();
-    const sum = vec3(0, 0, 0).toVar();
-    for (const [dx, dy, dz] of FACE_DIRS) {
-      const nb = neighbour(c, dx, dy, dz);
-      const w = select(nb.inside, float(1).sub(solid.element(nb.index)), open);
-      sum.addAssign(src.element(nb.index).xyz.mul(w));
-    }
-    const next = E.element(c.i).xyz.add(sum.mul(u.spread.div(float(6)))).mul(open).toVar();
     // Glass tints the light in its cells (lpv.js propagateStep's trans).
-    if (T) next.mulAssign(T.element(c.i).xyz);
-    dst.element(c.i).assign(vec4(next, 0));
-  })().compute(LPV_CELLS).setName(`LPV.Propagate`);
+    const keep = (T ? T.element(c.i).xyz.mul(open) : vec3(open, open, open)).toVar();
+    const nbs = FACE_DIRS.map(([dx, dy, dz]) => {
+      const nb = neighbour(c, dx, dy, dz, D);
+      return { index: nb.index.toVar(),
+               w: select(nb.inside, float(1).sub(solid.element(nb.index)), open).toVar() };
+    });
+    const rebounce = W.element(c.i).xyz.mul(float(1).sub(u.spread)).toVar();
+    Loop({ start: int(0), end: u.bounces, type: 'int', condition: '<', name: 'order' }, ({ order }) => {
+      const base = order.mul(int(CELLS)).toVar();
+      const sum = vec3(0, 0, 0).toVar();
+      for (const nb of nbs) sum.addAssign(src.element(base.add(nb.index)).xyz.mul(nb.w));
+      const prev = max(base.sub(int(CELLS)), int(0)).add(c.i);
+      const emit = select(order.equal(int(0)), E.element(c.i).xyz, src.element(prev).xyz.mul(rebounce));
+      dst.element(base.add(c.i)).assign(vec4(emit.add(sum.mul(u.spread.div(float(6)))).mul(keep), 0));
+    });
+  })().compute(CELLS).setName(`LPV.Propagate`);
   const aToB = propagate(A, B), bToA = propagate(B, A);
 
   // --- resolve: A into the texture, normalised, dilated into solid cells ---
+  // Every order's light, summed: what the cell holds in all.
+  const totalAt = i => {
+    const s = vec3(0, 0, 0).toVar();
+    Loop({ start: int(0), end: u.bounces, type: 'int', condition: '<', name: 'order' }, ({ order }) => {
+      s.addAssign(A.element(order.mul(int(CELLS)).add(i)).xyz);
+    });
+    return s;
+  };
   const resolveKernel = Fn(() => {
-    const c = cellOf(instanceIndex);
-    const own = A.element(c.i).xyz.toVar();
+    const c = cellOf(instanceIndex, D);
+    const own = totalAt(c.i).toVar();
     const isSolid = solid.element(c.i).greaterThanEqual(float(SOLID_THRESHOLD));
     const outc = own.toVar();
     If(isSolid, () => {
       const sum = vec3(0, 0, 0).toVar();
       const wsum = float(0).toVar();
       for (const [dx, dy, dz] of FACE_DIRS) {
-        const nb = neighbour(c, dx, dy, dz);
+        const nb = neighbour(c, dx, dy, dz, D);
         const w = select(nb.inside, float(1).sub(solid.element(nb.index)), float(0));
-        sum.addAssign(A.element(nb.index).xyz.mul(w));
+        If(w.greaterThan(float(0)), () => { sum.addAssign(totalAt(nb.index).mul(w)); });
         wsum.addAssign(w);
       }
       outc.assign(select(wsum.greaterThan(float(0)), sum.div(max(wsum, float(1e-6))), own));
@@ -409,25 +449,31 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
     // (1 - spread): see DEFAULT_LPV_SPREAD - brightness independent of reach.
     textureStore(tex, uvec3(c.x, c.y, c.z),
                  vec4(outc.mul(float(1).sub(u.spread)), 1));
-  })().compute(LPV_CELLS).setName(`LPV.Resolve`);
+  })().compute(CELLS).setName(`LPV.Resolve`);
 
   // --- shift: when C0 re-origins, move A by whole cells (lpv.js shiftVolume) ---
+  // Over every order: thread k * CELLS + i is cell i of order k.
   const shiftKernel = Fn(() => {
-    const c = cellOf(instanceIndex);
+    const at = int(instanceIndex).toVar();
+    const base = at.sub(at.mod(int(CELLS))).toVar();
+    const c = cellOf(at.mod(int(CELLS)), D);
     const sx = c.x.add(int(u.shift.x)), sy = c.y.add(int(u.shift.y)), sz = c.z.add(int(u.shift.z));
     const inside = sx.greaterThanEqual(int(0)).and(sy.greaterThanEqual(int(0)))
       .and(sz.greaterThanEqual(int(0))).and(sx.lessThan(int(D)))
       .and(sy.lessThan(int(D))).and(sz.lessThan(int(D)));
     const s = sx.add(sy.mul(int(D))).add(sz.mul(int(D * D)));
-    B.element(c.i).assign(select(inside, A.element(select(inside, s, int(0))), vec4(0)));
-  })().compute(LPV_CELLS).setName(`LPV.Shift`);
+    B.element(at).assign(select(inside, A.element(base.add(select(inside, s, int(0)))), vec4(0)));
+  })().compute(ORDERS).setName(`LPV.Shift`);
   const copyBA = Fn(() => {
     A.element(instanceIndex).assign(B.element(instanceIndex));
-  })().compute(LPV_CELLS).setName(`LPV.Copy`);
+  })().compute(ORDERS).setName(`LPV.Copy`);
   const clearA = Fn(() => {
     A.element(instanceIndex).assign(vec4(0));
-    E.element(instanceIndex).assign(vec4(0));
-  })().compute(LPV_CELLS).setName(`LPV.Clear`);
+    If(int(instanceIndex).lessThan(int(CELLS)), () => {
+      E.element(instanceIndex).assign(vec4(0));
+      W.element(instanceIndex).assign(vec4(0));
+    });
+  })().compute(ORDERS).setName(`LPV.Clear`);
 
   let frame = 0;
   // Kept on the CPU: the uniform is overwritten with 1 on a full inject.
@@ -457,9 +503,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
   };
 
   return {
-    tex, uniforms: u, sun, level, cellMetres,
+    tex, uniforms: u, sun, level, cellMetres, dim: D, res, orders: orderCount,
     // What the shading pass needs to sample it: see lpvSampleTSL in gpu.js.
-    binding: { tex, origin: u.origin, extent: LPV_DIM * cellMetres },
+    binding: { tex, origin: u.origin, extent: D * cellMetres, dim: D, cellMetres },
 
     // Injection slices: 1/N of the cells re-injected each frame.
     get slices() { return sliceCount; },
@@ -492,8 +538,12 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null,
       else for (const k of list) renderer.compute(k);
     },
 
-    dispose() {
+    // renderer: frees the storage buffers too - at res 4 they are most of
+    // a hundred MB.
+    dispose(renderer = null) {
       tex.dispose();
+      const attrs = renderer && renderer._attributes;
+      if (attrs) for (const b of [solidBuf, eBuf, wBuf, aBuf, bBuf, tBuf]) if (b) attrs.delete(b);
     }
   };
 }

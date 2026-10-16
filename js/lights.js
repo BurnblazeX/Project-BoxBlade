@@ -278,8 +278,9 @@ export const DEFAULT_SHADOW_BUDGET = 16;
 // Of the shadowed lights, how many march at secondary hits (reflections, the
 // view through glass) and throw mirror light: each is a full extra march per
 // hit per light, and these were most of what three lights cost (2026-10-14
-// profile). Ranked as the shadow budget is: the player's torch first.
-export const DEFAULT_HIT_SHADOW_BUDGET = 1;
+// profile) - 4 by default, the mirror light's. Ranked as the shadow budget
+// is: the player's torch first.
+export const DEFAULT_HIT_SHADOW_BUDGET = 4;
 export const DEFAULT_MIRROR_LIGHT_BUDGET = 4;
 export const DEFAULT_CARD_BUDGET = 16;
 

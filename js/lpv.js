@@ -53,8 +53,19 @@ export const DEFAULT_LPV_ITERATIONS = 8;
 // re-injects one slice of the cells. 4 slices refreshes everything every 4th
 // frame, which at 60 fps is a torch lagging its bounce by ~50 ms.
 export const DEFAULT_LPV_SLICES = 4;
+// Bounces: the injection is the first (direct light off a surface); each one
+// after it is the order before it, landing on the same surfaces and leaving
+// again times their albedo (gi.js). One propagate dispatch carries every order,
+// so a bounce costs ALU and memory, not dispatches.
+export const GI_MAX_BOUNCES = 16;
+export const DEFAULT_GI_BOUNCES = 2;
+// GI resolution (gi.js createLPV res): a block face's cells a side, halved.
+// 1 is the 0.75 m cell over C0 - 2 x 2 a block face; 1.5, 2 and 3 give 3 x 3,
+// 4 x 4 and 6 x 6 over the same extent, at ~3.4x, 8x and 27x the cells. Each
+// keeps a whole number of voxels a cell (6, 4, 3, 2) and of cells a block.
+export const LPV_RES_OPTIONS = [1, 1.5, 2, 3];
 // Scale on the gathered bounce before it is added to the direct light.
-export const DEFAULT_GI_STRENGTH = 2.0;
+export const DEFAULT_GI_STRENGTH = 1.0;
 
 // A cell counts as solid, for injection and for the dilated read-back, at half.
 export const SOLID_THRESHOLD = 0.5;
@@ -120,12 +131,12 @@ export function propagateStep(L, E, solid, alpha, out, dim = LPV_DIM, trans = nu
 // when the move is not a whole number of cells or leaves nothing to keep - both
 // mean start over instead. cellMetres is the volume's cell size: 0.75 m over C0,
 // 1.5 m over C1.
-export function lpvShift(from, to, cellMetres = LPV_CELL_METRES) {
+export function lpvShift(from, to, cellMetres = LPV_CELL_METRES, dim = LPV_DIM) {
   if (!from) return null;
   const s = [to.x - from.x, to.y - from.y, to.z - from.z].map(d => d / cellMetres);
   if (s.some(v => Math.abs(v - Math.round(v)) > 1e-4)) return null;
   const r = s.map(Math.round);
-  if (r.some(v => Math.abs(v) >= LPV_DIM)) return null;
+  if (r.some(v => Math.abs(v) >= dim)) return null;
   return { x: r[0], y: r[1], z: r[2] };
 }
 

@@ -66,7 +66,8 @@ section('materials are found by their texture files');
   const { materialIdsFromFiles } = await import('../js/materials.js');
   const files = ['terrain_grass.png', 'terrain_grass_n.png', 'terrain_grass_s.png', 'terrain_grass_slope.png',
                  'terrain_grass_slope_n.png', 'terrain_grass_halfSlope.png', 'terrain_grass_halfSlope_s.png',
-                 'terrain_sandstone.png', 'terrain_sandstone_e.png', 'terrain_oakPlanks.png', 'other.png',
+                 'terrain_sandstone.png', 'terrain_sandstone_e.png', 'terrain_sandstone_a.png',
+                 'terrain_grass_slope_a.png', 'terrain_oakPlanks.png', 'other.png',
                  '../assets/textures/terrain_cobble.png']
     .map(f => f.includes('/') ? f : '../assets/textures/' + f);
   ok('one material per albedo, companions left out', materialIdsFromFiles(files).join(','),

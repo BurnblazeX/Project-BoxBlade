@@ -13,6 +13,12 @@
 // (specular). A missing _n is generated from the albedo (normals.js); a missing
 // _s is DEFAULT_SPECULAR. Every block texture is BLOCK_TEXELS square - one
 // texel per boxGrid voxel, the §4 lock.
+//
+// <texture>_a.png (and _top_a, _bottom_a, _slope_a, _halfSlope_a): the albedo
+// with shadows on. The main texture has its shading baked in for the plain
+// path; the shaded path lights the surface itself, so it draws this flatter
+// one instead (render.js setShadedAlbedo). Not for glass, and a metal texel
+// (its _s G >= 230) keeps the main texture's - its albedo is its F0.
 export const BLOCK_TEXELS = 12;
 
 export const MATERIALS = [
@@ -37,8 +43,8 @@ export const MATERIALS = [
 //
 // Every other terrain_<id>.png in assets/textures is a material too, found at
 // load: add a texture and it is in the game and the editor's palette, mapped
-// like the rest - no code. Its companions (_n, _s, _slope, _halfSlope, and
-// their _n / _s) are found by name as for the materials above. Properties a
+// like the rest - no code. Its companions (_n, _s, _a, _slope, _halfSlope, and
+// their _n / _s / _a) are found by name as for the materials above. Properties a
 // texture cannot say go in terrain_<id>.json beside it, e.g. { "glass": true }.
 // Appended after the built-in list, alphabetically: a layer is an index into
 // the texture arrays, but levels store materials by id, so the order is free
@@ -48,7 +54,7 @@ export const MATERIALS = [
 // build time, and in node - the tests - the call throws and the built-in list
 // is all there is.
 export const MATERIAL_TEXTURE_PREFIX = 'terrain_';
-const COMPANION = /_(n|s|e)$|_(slope|halfSlope|top|bottom)(_(n|s|e))?$/;
+const COMPANION = /_(n|s|e|a)$|_(slope|halfSlope|top|bottom)(_(n|s|e|a))?$/;
 export function materialIdsFromFiles(paths) {
   const ids = [];
   for (const p of paths) {
@@ -87,7 +93,7 @@ const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
 export const SLOPE_SUFFIXES = ['_slope', '_halfSlope'];
 export function allocateMaterialLayers(materials, has) {
   let next = materials.length;
-  const any = name => has(name) || has(name + '_n') || has(name + '_s');
+  const any = name => has(name) || has(name + '_n') || has(name + '_s') || has(name + '_a');
   const faces = materials.map((m, i) => {
     const top = any(m.texture + '_top') ? next++ : i;
     const bottom = any(m.texture + '_bottom') ? next++ : top;
