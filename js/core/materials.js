@@ -1,0 +1,195 @@
+// --- Block materials ---
+//
+// The table a block's materialId indexes. Deliberately small: this is the
+// rendering half only - which textures a block draws with - until the §6.4
+// material system (gameplay properties, derived PBR) exists to own it.
+//
+// A material's layer is its index here, and that index is what the terrain's
+// texture arrays are stacked by (render.js), so the order is load-bearing:
+// append, never reorder. Layer 0 is the fallback for a block with no id.
+//
+// Textures live in assets/textures as <texture>.png (albedo), with optional
+// LabPBR companions beside it: <texture>_n.png (normal) and <texture>_s.png
+// (specular). A missing _n is generated from the albedo (normals.js); a missing
+// _s is DEFAULT_SPECULAR. Every block texture is BLOCK_TEXELS square - one
+// texel per boxGrid voxel, the §4 lock.
+//
+// <texture>_a.png (and _top_a, _bottom_a, _slope_a, _halfSlope_a): the albedo
+// with shadows on. The main texture has its shading baked in for the plain
+// path; the shaded path lights the surface itself, so it draws this flatter
+// one instead (render.js setShadedAlbedo). Not for glass, and a metal texel
+// (its _s G >= 230) keeps the main texture's - its albedo is its F0.
+export const BLOCK_TEXELS = 12;
+
+export const MATERIALS = [
+  { id: 'grass',     texture: 'terrain_grass' },
+  // Polished black marble: a dielectric mirror-ish finish (see its _s).
+  { id: 'marble',    texture: 'terrain_marble' },
+  // Polished iron plate: LabPBR metal 230.
+  { id: 'ironPlate', texture: 'terrain_ironPlate' },
+  // Clear glass (tools/make-glass-textures.py). glass: true puts it in the
+  // field's glass channel and draws it with the glass mesh, whose shading traces
+  // through it; its albedo is the tint what passes through takes on.
+  { id: 'glass',     texture: 'terrain_glass', glass: true },
+  // Stained glass: four coloured panes in lead. Its texels colour the light
+  // through it - in the view and in the shadows it casts.
+  { id: 'stainedGlass', texture: 'terrain_stainedGlass', glass: true },
+  // Frosted glass: rough (smoothness 155, alpha 0.15), so what shows through it
+  // is jittered per texel into a stable grain.
+  { id: 'frostedGlass', texture: 'terrain_frostedGlass', glass: true }
+];
+
+// --- Discovered materials ---
+//
+// Every other terrain_<id>.png in assets/textures is a material too, found at
+// load: add a texture and it is in the game and the editor's palette, mapped
+// like the rest - no code. Its companions (_n, _s, _a, _slope, _halfSlope, and
+// their _n / _s / _a) are found by name as for the materials above. Properties a
+// texture cannot say go in terrain_<id>.json beside it, e.g. { "glass": true }.
+// Appended after the built-in list, alphabetically: a layer is an index into
+// the texture arrays, but levels store materials by id, so the order is free
+// to grow.
+//
+// Only under Vite (the game and the worker): import.meta.glob is replaced at
+// build time, and in node - the tests - the call throws and the built-in list
+// is all there is.
+export const MATERIAL_TEXTURE_PREFIX = 'terrain_';
+const COMPANION = /_(n|s|e|a)$|_(slope|halfSlope|top|bottom)(_(n|s|e|a))?$/;
+export function materialIdsFromFiles(paths) {
+  const ids = [];
+  for (const p of paths) {
+    const m = p.split('/').pop().match(/^terrain_(.+)\.png$/);
+    if (m && !COMPANION.test(m[1])) ids.push(m[1]);
+  }
+  return ids.sort();
+}
+let textureFiles = {}, propertyFiles = {};
+try {
+  textureFiles = import.meta.glob('../../assets/textures/terrain_*.png', { eager: true, query: '?url', import: 'default' });
+  propertyFiles = import.meta.glob('../../assets/textures/terrain_*.json', { eager: true, import: 'default' });
+} catch { /* not under Vite */ }
+for (const id of materialIdsFromFiles(Object.keys(textureFiles))) {
+  if (MATERIALS.some(m => m.id === id)) continue;
+  const props = Object.entries(propertyFiles).find(([p]) => p.endsWith(`/terrain_${id}.json`));
+  MATERIALS.push({ ...(props ? props[1] : {}), id, texture: MATERIAL_TEXTURE_PREFIX + id });
+}
+
+const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
+
+// --- A material's other faces: top, bottom, slope planes ---
+//
+// A material's own texture (layer = its index) is its SIDE. Optional
+// companions, each with its own _n / _s, add layers after the materials':
+//   <texture>_top.png, <texture>_bottom.png  the +y / -y faces, as a pillar's
+//     ends (a missing _bottom takes the _top, as a log's two ends match);
+//   <texture>_slope.png (12 x 17), <texture>_halfSlope.png (12 x 13)  a
+//     slope's plane, split over two 12 x 12 layers: rows 0-11, then the rest.
+// So every face of everything - blocks, slopes, model tiles - is one read of
+// the same three arrays (render.js terrainTexelTSL).
+// has(name): whether assets/textures holds name.png.
+// Returns { faces: per material { top, bottom, slope: [slope, halfSlope] }
+// (a slope entry -1 when the plane takes the side texture, stretched), end:
+// the first layer after them (where models.js starts) }.
+export const SLOPE_SUFFIXES = ['_slope', '_halfSlope'];
+export function allocateMaterialLayers(materials, has) {
+  let next = materials.length;
+  const any = name => has(name) || has(name + '_n') || has(name + '_s') || has(name + '_a');
+  const faces = materials.map((m, i) => {
+    const top = any(m.texture + '_top') ? next++ : i;
+    const bottom = any(m.texture + '_bottom') ? next++ : top;
+    const slope = SLOPE_SUFFIXES.map(s => {
+      if (!any(m.texture + s)) return -1;
+      next += 2;
+      return next - 2;
+    });
+    return { top, bottom, slope };
+  });
+  return { faces, end: next };
+}
+const hasTexture = name => Object.keys(textureFiles).some(k => k.endsWith('/' + name + '.png'));
+export const MATERIAL_LAYERS = allocateMaterialLayers(MATERIALS, hasTexture);
+
+// What the two faces of a glass slab let through, of light meeting the first at
+// |cos| cosI: each reflects F (Schlick, from its F0), so (1 - F)^2. The CPU
+// mirror of gpu/glass.js glassSurfaceTransmitTSL, which a shadow ray through glass
+// takes - head-on it is (1 - 0.04)^2 = 0.92 for glass, and at grazing, nothing.
+export function glassSurfaceTransmit(f0, cosI) {
+  const c = Math.min(1, Math.max(0, cosI));
+  const F = f0 + (1 - f0) * Math.pow(1 - c, 5);
+  return (1 - F) * (1 - F);
+}
+
+// Glass: a material with glass: true. Baked into the field's glass distance
+// instead of its opaque one (boxgrid.js FIELD_CHANNELS).
+export function isGlassMaterial(id) {
+  const i = id == null ? -1 : layerById.get(id);
+  return i != null && i >= 0 && MATERIALS[i].glass === true;
+}
+
+// A block's layer. No id: layer 0. An id with no material (a level naming a
+// texture since removed): the missingTexture material when there is one, so
+// it shows as missing instead of passing for grass.
+export const MISSING_MATERIAL = 'missingTexture';
+export function materialLayer(id) {
+  return id == null ? 0 : (layerById.get(id) ?? layerById.get(MISSING_MATERIAL) ?? 0);
+}
+
+// --- LabPBR specular ---
+//
+// The layout, per channel (labpbr.github.io, "specular texture"):
+//   R  perceptual smoothness. roughness = (1 - R/255)^2
+//   G  0-229: F0, linear, G/255.  230-237: a predefined metal (below).
+//      238-255: some other metal - its albedo is its F0.
+//   B  0-64: porosity (0-1 over 0-64).  65-255: subsurface scattering
+//      (0-1 over 65-255).  Always 0 for metals.
+//   A  emission, 0-254 over 0-1. 255 is NOT full - it is "no emission", so a
+//      texture authored without alpha does not glow.
+// A surface with no _s texture: rough (0), F0 0.04, nothing else.
+export const DEFAULT_SPECULAR = [0, 10, 0, 255];
+
+// LabPBR's predefined metals, 230-237, as their complex index of refraction
+// (n, k per RGB) from the standard's own table. F0 is derived below rather than
+// stored, so the numbers stay checkable against the source.
+export const LABPBR_METALS = [
+  { id: 230, name: 'iron',
+    n: [2.9114, 2.9497, 2.5845], k: [3.0893, 2.9318, 2.7670] },
+  { id: 231, name: 'gold',
+    n: [0.18299, 0.42108, 1.3734], k: [3.4242, 2.34590, 1.7704] },
+  { id: 232, name: 'aluminum',
+    n: [1.3456, 0.96521, 0.61722], k: [7.4746, 6.3995, 5.3031] },
+  { id: 233, name: 'chrome',
+    n: [3.1071, 3.1812, 2.3230], k: [3.3314, 3.3291, 3.1350] },
+  { id: 234, name: 'copper',
+    n: [0.27105, 0.67693, 1.31640], k: [3.60920, 2.62480, 2.29210] },
+  { id: 235, name: 'lead',
+    n: [1.9100, 1.8300, 1.4400], k: [3.5100, 3.4000, 3.1800] },
+  { id: 236, name: 'platinum',
+    n: [2.3757, 2.0847, 1.8453], k: [4.2655, 3.7153, 3.1365] },
+  { id: 237, name: 'silver',
+    n: [0.15943, 0.14512, 0.13547], k: [3.9291, 3.1900, 2.3808] }
+];
+
+// Fresnel at normal incidence for a conductor: ((n-1)^2 + k^2) / ((n+1)^2 + k^2).
+export function conductorF0(n, k) {
+  return n.map((ni, i) => ((ni - 1) ** 2 + k[i] ** 2) / ((ni + 1) ** 2 + k[i] ** 2));
+}
+export const METAL_F0 = LABPBR_METALS.map(m => conductorF0(m.n, m.k));
+
+// One specular texel, decoded. albedo (linear RGB, 0-1) is only consulted for
+// the 238-255 "albedo is F0" metals. f0 is always RGB.
+export function decodeSpecular([r, g, b, a], albedo = [1, 1, 1]) {
+  const smoothness = r / 255;
+  const roughness = (1 - smoothness) ** 2;
+  const metal = g >= 230;
+  let f0;
+  if (!metal) f0 = [g / 255, g / 255, g / 255];
+  else if (g <= 237) f0 = METAL_F0[g - 230].slice();
+  else f0 = albedo.slice();
+  return {
+    smoothness, roughness, metal, f0,
+    metalName: metal && g <= 237 ? LABPBR_METALS[g - 230].name : (metal ? 'albedo' : null),
+    porosity: !metal && b <= 64 ? b / 64 : 0,
+    sss: !metal && b > 64 ? (b - 65) / 190 : 0,
+    emission: a === 255 ? 0 : a / 254
+  };
+}

@@ -3,10 +3,10 @@ import { createCard, cardDistance, cardFacingFor, cardVisibility,
          cardsVisibility, buildCardAtlas, packCardInstances,
          cullCardsForLight, cardPixelAt, CARD_PAD, CARD_RANGE,
          CARD_LOD_C0_METRES, CARD_LOD_LEVELS, SUN_CARD_LOD_SHIFT,
-         SUN_CARD_LOD_MAX } from '../js/cards.js';
-import { VOXEL_METRES, CASCADE_COUNT } from '../js/boxgrid.js';
-import { decodeDistance } from '../js/boxgrid.js';
-import { facingToward } from '../js/silhouette.js';
+         SUN_CARD_LOD_MAX } from '../js/core/cards.js';
+import { VOXEL_METRES, CASCADE_COUNT } from '../js/core/boxgrid.js';
+import { decodeDistance } from '../js/core/boxgrid.js';
+import { facingToward } from '../js/core/silhouette.js';
 
 file('cards.test.mjs - analytic sprite cards, one facing per light');
 

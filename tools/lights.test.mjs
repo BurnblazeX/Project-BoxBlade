@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { BLOCK_METRES } from '../js/world.js';
+import { BLOCK_METRES } from '../js/core/world.js';
 import {
   LIGHT_BITS, LIGHT_LEVELS, MAX_LIGHT_LEVEL, clampLevel,
   lightRadiusBlocks, lightRadiusMetres, lightIntensity, lightFalloff,
@@ -8,7 +8,7 @@ import {
   MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY, liveLights, packLight, parseColour,
   cutAmount, DEFAULT_LIGHT_CUTOFF, shadowScore, pickShadowed, easeShadowWeight,
   SHADOW_FADE_SECONDS
-} from '../js/lights.js';
+} from '../js/core/lights.js';
 
 file('lights.test.mjs - the 4-bit level every dynamic light carries');
 

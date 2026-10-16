@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
-import { cornerAO, faceAO, VOXEL_AO_MIN } from '../js/voxelao.js';
+import { cornerAO, faceAO, VOXEL_AO_MIN } from '../js/core/voxelao.js';
 
 file('voxelao.test.mjs - static voxel AO for shadows off');
 

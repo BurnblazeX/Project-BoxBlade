@@ -4,7 +4,7 @@ import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid,
          getBlock, stepLevel, surfaceLevel, surfaceHeight, isSolidAt, blockShape, blockBoxes, edgeLevel,
          slopeLevel, groundHeightAt, followGround, blockSpan, hasFacing, newBlock,
          pathDistance, attackRange, getAbilityModifier,
-         BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/world.js';
+         BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/core/world.js';
 
 file('world.test.mjs - vertical world, standability, pathfinding');
 
@@ -134,7 +134,7 @@ section('vertical halves and panes: turned boxes, full-height tops');
 
 section('dual blocks: two materials, one full cell');
 {
-  const { isDual, blockParts, partAt, serializeLevel, loadLevel } = await import('../js/world.js');
+  const { isDual, blockParts, partAt, serializeLevel, loadLevel } = await import('../js/core/world.js');
   const dual = newBlock('marble', 'halfBottom', null, 'glass');
   truthy('a low half with a second material is dual', isDual(dual));
   ok('its parts: marble low, glass high', blockParts(dual).map(p => `${p.materialId}:${p.boxes[0].join(',')}`).join(' '),
@@ -373,8 +373,8 @@ section('findPath: identical to the old array search, ties included');
 section('levels: the world as data');
 {
   const { serializeLevel, loadLevel, newBlock, WorldModels, ModelBoxes, removeWorldModel,
-          addWorldModel, mountWorldModel, clearWorldModels, LEVEL_FORMAT } = await import('../js/world.js');
-  const { parseBBModel } = await import('../js/bbmodel.js');
+          addWorldModel, mountWorldModel, clearWorldModels, LEVEL_FORMAT } = await import('../js/core/world.js');
+  const { parseBBModel } = await import('../js/core/bbmodel.js');
   const { readFileSync } = await import('node:fs');
   const models = new Map(['decor_chair', 'decor_wallTorch'].map(n => [n, parseBBModel(
     readFileSync(new URL(`../assets/objects/${n}.bbmodel`, import.meta.url), 'utf8'), n)]));
@@ -422,7 +422,7 @@ section('levels: the world as data');
 
 section('stairs');
 {
-  const { blockShape: shapeOf, hasFacing, isCompound, isSlope: slopeOf, groundHeightAt: ground } = await import('../js/world.js');
+  const { blockShape: shapeOf, hasFacing, isCompound, isSlope: slopeOf, groundHeightAt: ground } = await import('../js/core/world.js');
   const lower = getBlock(18, 1, 12), upper = getBlock(19, 2, 12);
   ok('marble stairs', `${lower.materialId},${shapeOf(lower)},${lower.facing}`, 'marble,stairs,E');
   truthy('stairs turn', hasFacing('stairs'));
@@ -446,7 +446,7 @@ section('stairs');
 
 section('buried faces are not drawn');
 {
-  const { exposedFaceMask, opaqueBoxes, ALL_FACES } = await import('../js/world.js');
+  const { exposedFaceMask, opaqueBoxes, ALL_FACES } = await import('../js/core/world.js');
   const full = [0, 1, 0, 1, 0, 1];
   const cells = new Map([['1,0,0', [full]], ['0,-1,0', [full]]]);
   const at = (x, y, z) => cells.get(`${x},${y},${z}`) || [];

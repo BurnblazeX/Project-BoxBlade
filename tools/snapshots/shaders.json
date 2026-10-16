@@ -1,0 +1,193 @@
+{
+ "default/low": {
+  "vertex": "dd41116873473c17",
+  "fragment": "ca824d1cc8423acc"
+ },
+ "default/terrain": {
+  "vertex": "a2a43e3f31462109",
+  "fragment": "f9ae2df730f861e3"
+ },
+ "default/glassLow": {
+  "vertex": "7199d59ca8b5d4b8",
+  "fragment": "9eeae6c6a452c514"
+ },
+ "default/glass": {
+  "vertex": "76978ee0f8292300",
+  "fragment": "f9ae2df730f861e3"
+ },
+ "default/sprite": {
+  "vertex": "e9ec7d771d8bbf59",
+  "fragment": "d940cdcfa7f1dce0"
+ },
+ "default/split.0:splitBase": {
+  "compute": "84291083b70aa032"
+ },
+ "default/split.1:splitPoints": {
+  "compute": "b5edb5d3f50d78b7"
+ },
+ "default/split.2:splitMirror": {
+  "compute": "f91e65d7d6fc8edc"
+ },
+ "default/split.3:splitFinal": {
+  "compute": "076d768b533bbcde"
+ },
+ "default/split.4:splitGlassSurface": {
+  "compute": "851be831ce616c50"
+ },
+ "default/split.5:splitGlassReflect": {
+  "compute": "a8ec9195bb034f24"
+ },
+ "default/split.6:splitGlassThrough": {
+  "compute": "f9bc2afb611cff3e"
+ },
+ "default/split.7:splitGlassCompose": {
+  "compute": "04cea75b7deccb1d"
+ },
+ "default/mirror": {
+  "compute": "1aa6867fdf3b445f"
+ },
+ "texelgi/low": {
+  "vertex": "dd41116873473c17",
+  "fragment": "ca824d1cc8423acc"
+ },
+ "texelgi/terrain": {
+  "vertex": "a2a43e3f31462109",
+  "fragment": "f9ae2df730f861e3"
+ },
+ "texelgi/glassLow": {
+  "vertex": "7199d59ca8b5d4b8",
+  "fragment": "9eeae6c6a452c514"
+ },
+ "texelgi/glass": {
+  "vertex": "76978ee0f8292300",
+  "fragment": "f9ae2df730f861e3"
+ },
+ "texelgi/sprite": {
+  "vertex": "2cf251a83b9e2cbe",
+  "fragment": "671f5abeec578e38"
+ },
+ "texelgi/split.0:splitBase": {
+  "compute": "d86238d612ebeed2"
+ },
+ "texelgi/split.1:splitPoints": {
+  "compute": "b5edb5d3f50d78b7"
+ },
+ "texelgi/split.2:splitMirror": {
+  "compute": "f91e65d7d6fc8edc"
+ },
+ "texelgi/split.3:splitFinal": {
+  "compute": "a2c6d72822c57d2a"
+ },
+ "texelgi/split.4:splitGlassSurface": {
+  "compute": "851be831ce616c50"
+ },
+ "texelgi/split.5:splitGlassReflect": {
+  "compute": "893dd4e37b611cfe"
+ },
+ "texelgi/split.6:splitGlassThrough": {
+  "compute": "2718d5ad682fd290"
+ },
+ "texelgi/split.7:splitGlassCompose": {
+  "compute": "04cea75b7deccb1d"
+ },
+ "texelgi/gi.reset:giPatchReset": {
+  "compute": "2e2d602bc54595e2"
+ },
+ "texelgi/gi.patches:giPatches": {
+  "compute": "2692b6a3071c41e9"
+ },
+ "texelgi/gi.sums:giSums": {
+  "compute": "dd5ea1919c66cb43"
+ },
+ "texelgi/mirror": {
+  "compute": "1aa6867fdf3b445f"
+ },
+ "cache/low": {
+  "vertex": "b702a71c98258273",
+  "fragment": "fd8e2d87f0563485"
+ },
+ "cache/terrain": {
+  "vertex": "328e1971ecff9367",
+  "fragment": "4b22e42707069d9c"
+ },
+ "cache/miss": {
+  "vertex": "a32fae39ae320386",
+  "fragment": "2533a643e15fea42"
+ },
+ "cache/glassLow": {
+  "vertex": "28898215b4adc20e",
+  "fragment": "ce92276b9d164348"
+ },
+ "cache/glass": {
+  "vertex": "aacde6e27d55394f",
+  "fragment": "4b22e42707069d9c"
+ },
+ "cache/glassMiss": {
+  "vertex": "6a04f11ea5c34324",
+  "fragment": "b97611575573a3b9"
+ },
+ "cache/sprite": {
+  "vertex": "e9ec7d771d8bbf59",
+  "fragment": "d940cdcfa7f1dce0"
+ },
+ "cache/mirror": {
+  "compute": "1aa6867fdf3b445f"
+ },
+ "plain/terrain": {
+  "vertex": "9235a0cf9d8c2611",
+  "fragment": "e4aa79c4a7f67851"
+ },
+ "plain/glass": {
+  "vertex": "28df3842e3b60af8",
+  "fragment": "93a5c6179eb8b869"
+ },
+ "plain/sprite": {
+  "vertex": "f7a80dbb93284409",
+  "fragment": "e8f1e01fc6440a29"
+ },
+ "plain/mirror": {
+  "compute": "1aa6867fdf3b445f"
+ },
+ "lpv0/0:LPV.Clear": {
+  "compute": "afddfef0d4ede80b"
+ },
+ "lpv0/1:LPV.Solid": {
+  "compute": "e44523e50b1ffe64"
+ },
+ "lpv0/2:LPV.Inject": {
+  "compute": "0f5b928b4d1ec1be"
+ },
+ "lpv0/3:LPV.Propagate": {
+  "compute": "e3bcd42ed52be182"
+ },
+ "lpv0/4:LPV.Propagate": {
+  "compute": "69cd52c3c380dc0d"
+ },
+ "lpv0/5:LPV.Resolve": {
+  "compute": "f111f3072a2fd9ae"
+ },
+ "lpv1/0:LPV.Clear": {
+  "compute": "afddfef0d4ede80b"
+ },
+ "lpv1/1:LPV.Solid": {
+  "compute": "e44523e50b1ffe64"
+ },
+ "lpv1/2:LPV.Inject": {
+  "compute": "0f5b928b4d1ec1be"
+ },
+ "lpv1/3:LPV.Propagate": {
+  "compute": "e3bcd42ed52be182"
+ },
+ "lpv1/4:LPV.Propagate": {
+  "compute": "69cd52c3c380dc0d"
+ },
+ "lpv1/5:LPV.Resolve": {
+  "compute": "f111f3072a2fd9ae"
+ },
+ "diag/parity": {
+  "compute": "63aba38d0ce7dad7"
+ },
+ "diag/cardparity": {
+  "compute": "60935f3e3668b018"
+ }
+}

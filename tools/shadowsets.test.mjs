@@ -1,5 +1,5 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
-import { keyPart, createSetCache } from '../js/shadowsets.js';
+import { keyPart, createSetCache } from '../js/core/shadowsets.js';
 
 file('shadowsets.test.mjs - kept shadow material sets');
 
@@ -52,7 +52,7 @@ ok('delete removes it', c.size, 0);
 
 section('shader text stability');
 {
-  const { unstableNames, hashText } = await import('../js/shadowsets.js');
+  const { unstableNames, hashText } = await import('../js/core/shadowsets.js');
   ok('finds an id-named buffer', unstableNames('var<uniform> NodeBuffer_412 : X; NodeBuffer_412.value')[0], 'NodeBuffer_412');
   ok('once per name', unstableNames('NodeBuffer_1 NodeBuffer_1 NodeBuffer_2').length, 2);
   ok('named buffers pass', unstableNames('var<uniform> bxbLights : bxbLightsStruct;').length, 0);
@@ -63,7 +63,7 @@ section('shader text stability');
 
 section('why a build missed');
 {
-  const { diffKeyParts } = await import('../js/shadowsets.js');
+  const { diffKeyParts } = await import('../js/core/shadowsets.js');
   ok('names the parts that differ', diffKeyParts({ cone: 'true', rays: '1' }, { cone: 'false', rays: '1' }).join(), 'cone');
   ok('and ones only one side has', diffKeyParts({ a: '1' }, { a: '1', b: '2' }).join(), 'b');
   ok('nothing when equal', diffKeyParts({ a: '1' }, { a: '1' }).length, 0);

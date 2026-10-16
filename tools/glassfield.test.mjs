@@ -1,8 +1,8 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
-import { createTestArea, World, getVoxelKey } from '../js/world.js';
+import { createTestArea, World, getVoxelKey } from '../js/core/world.js';
 import { createBoxGridAt, populateDistanceField, distanceAt, glassDistanceAt, gridIndex,
-         worldToVoxel, GRID_DIM, FIELD_CHANNELS, FAR_BYTE, TEXELS_PER_BLOCK } from '../js/boxgrid.js';
-import { isGlassMaterial } from '../js/materials.js';
+         worldToVoxel, GRID_DIM, FIELD_CHANNELS, FAR_BYTE, TEXELS_PER_BLOCK } from '../js/core/boxgrid.js';
+import { isGlassMaterial } from '../js/core/materials.js';
 
 file('glassfield.test.mjs - two distances per voxel: opaque (R) and glass (G)');
 
@@ -84,7 +84,7 @@ section('the field worker bakes glass as glass');
   // The worker's copy of the world comes from worldMirrorEntries; baked from
   // it, glass must land in G exactly as it does from the real World. It used
   // to be keys only, which baked glass as rock in every strip the worker made.
-  const { worldMirrorEntries, loadWorldMirror } = await import('../js/world.js');
+  const { worldMirrorEntries, loadWorldMirror } = await import('../js/core/world.js');
   createTestArea(36, 36);
   // Origin (6, 6): the footprint covers blocks 6-17, so the cube at x 12 is in it.
   const real = createBoxGridAt(6, 6);
@@ -104,8 +104,8 @@ section('the field worker bakes glass as glass');
 
 section('through the cube - the CPU mirror of the glass march');
 {
-  const { marchThroughGlass, VOXEL_METRES } = await import('../js/boxgrid.js');
-  const { BLOCK_METRES } = await import('../js/world.js');
+  const { marchThroughGlass, VOXEL_METRES } = await import('../js/core/boxgrid.js');
+  const { BLOCK_METRES } = await import('../js/core/world.js');
   createTestArea(36, 36);
   const g = createBoxGridAt(6, 6);            // covers the cube at (12, 1, 13)
   const cx = 12 * BLOCK_METRES, cy = 1 * BLOCK_METRES, cz = 13 * BLOCK_METRES;
@@ -128,8 +128,8 @@ section('through the cube - the CPU mirror of the glass march');
 
 section('exact face normals at edges and corners');
 {
-  const { blockFaceNormal } = await import('../js/boxgrid.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { blockFaceNormal } = await import('../js/core/boxgrid.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   const face = (x, y, z, d, leaving) => {
     const n = blockFaceNormal({ x, y, z }, d, leaving);
     return `${n.x},${n.y},${n.z}`;
@@ -148,8 +148,8 @@ section('exact face normals at edges and corners');
 
 section('the walk through glass, block by block (the shader\'s path, on the CPU)');
 {
-  const { walkThroughGlass, refractVec } = await import('../js/boxgrid.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { walkThroughGlass, refractVec } = await import('../js/core/boxgrid.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   createTestArea(36, 36);
   const ior = 1.5;
   const norm = v => { const l = Math.hypot(v.x, v.y, v.z); return { x: v.x / l, y: v.y / l, z: v.z / l }; };
@@ -196,8 +196,8 @@ section('the walk through glass, block by block (the shader\'s path, on the CPU)
 
 section('glass halves and panes: the walk steps to their own faces');
 {
-  const { walkThroughGlass, refractVec, blockFaceNormal, populateDistanceField: bakeField } = await import('../js/boxgrid.js');
-  const { BLOCK_METRES: B, partAt } = await import('../js/world.js');
+  const { walkThroughGlass, refractVec, blockFaceNormal, populateDistanceField: bakeField } = await import('../js/core/boxgrid.js');
+  const { BLOCK_METRES: B, partAt } = await import('../js/core/world.js');
   const W = new Map([['50,1,50', { materialId: 'glass', shape: 'middleVertical', facing: 'S' }],
                      ['52,1,50', { materialId: 'glass', shape: 'halfBottom' }],
                      ['52,0,50', { materialId: 'grass' }],
@@ -238,7 +238,7 @@ section('glass halves and panes: the walk steps to their own faces');
 
 section('dual blocks: glass over another material');
 {
-  const { walkThroughGlass, refractVec } = await import('../js/boxgrid.js');
+  const { walkThroughGlass, refractVec } = await import('../js/core/boxgrid.js');
   const W = new Map([['60,1,60', { materialId: 'glass', shape: 'halfTop', second: 'marble' }]]);
   const down = refractVec({ x: 0, y: -1, z: 0 }, { x: 0, y: 1, z: 0 }, 1 / 1.5);
   const w = walkThroughGlass({ x: 90, y: 2.25, z: 90 }, { x: 0, y: 1, z: 0 }, down, 1.5, { world: W });
@@ -248,8 +248,8 @@ section('dual blocks: glass over another material');
 
 section('shadow rays through glass - metres of glass crossed');
 {
-  const { glassOnRay } = await import('../js/boxgrid.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { glassOnRay } = await import('../js/core/boxgrid.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   createTestArea(36, 36);
   const g = createBoxGridAt(6, 6);
   const ground = 0.5 * B + 0.75 * 0.125;       // just above the grass, lifted as the shader does
@@ -271,7 +271,7 @@ section('shadow rays through glass - metres of glass crossed');
 
 section('the overlay sees glass (debug.js draws it from these)');
 {
-  const { isGlassVoxel, isOccupied, scrollForHandoff, applyHandoff } = await import('../js/boxgrid.js');
+  const { isGlassVoxel, isOccupied, scrollForHandoff, applyHandoff } = await import('../js/core/boxgrid.js');
   createTestArea(36, 36);
   const g = createBoxGridAt(6, 6);
   truthy('glass blocks are recorded', g.glassBlocks.length >= 3 * 3);
@@ -288,7 +288,7 @@ section('the overlay sees glass (debug.js draws it from these)');
 
 section('light through glass loses what the surfaces reflect, at the real angle');
 {
-  const { glassSurfaceTransmit } = await import('../js/materials.js');
+  const { glassSurfaceTransmit } = await import('../js/core/materials.js');
   const f0 = 10 / 255;
   near('head-on: (1 - 0.04)^2', glassSurfaceTransmit(f0, 1), (1 - f0) ** 2, 1e-12);
   truthy('a low sun (80 degrees off the normal) loses much more',

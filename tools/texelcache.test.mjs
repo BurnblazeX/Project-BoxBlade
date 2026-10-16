@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { texelPixels, texelCacheSpacingFor, TEXEL_METRES, TEXEL_SPACING_MIN,
-         TEXEL_SPACING_MAX } from '../js/texelcache.js';
+         TEXEL_SPACING_MAX } from '../js/core/texelcache.js';
 
 file('texelcache.test.mjs - the texel cache follows the texel size on screen');
 

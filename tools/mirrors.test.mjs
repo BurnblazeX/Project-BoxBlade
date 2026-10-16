@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { World, createTestArea, BLOCK_METRES } from '../js/world.js';
-import { buildMirrors, packMirrors, isReflective, mirrorReach, MAX_MIRRORS, MIRROR_SUN_BIT, pickMirrored } from '../js/mirrors.js';
+import { World, createTestArea, BLOCK_METRES } from '../js/core/world.js';
+import { buildMirrors, packMirrors, isReflective, mirrorReach, MAX_MIRRORS, MIRROR_SUN_BIT, pickMirrored } from '../js/core/mirrors.js';
 
 file('mirrors.test.mjs - reflective surfaces as rectangles');
 
@@ -72,9 +72,9 @@ ok('nothing lit, nothing packed',
 
 section('glass rectangles: thickness for the back-face glare');
 {
-  const { buildMirrors } = await import('../js/mirrors.js');
-  const { isGlassMaterial } = await import('../js/materials.js');
-  const { createTestArea, World: W, BLOCK_METRES: B } = await import('../js/world.js');
+  const { buildMirrors } = await import('../js/core/mirrors.js');
+  const { isGlassMaterial } = await import('../js/core/materials.js');
+  const { createTestArea, World: W, BLOCK_METRES: B } = await import('../js/core/world.js');
   createTestArea(36, 36);
   const glassRects = buildMirrors(W, new Set(['glass', 'marble', 'ironPlate']), isGlassMaterial)
     .filter(r => r.thickness !== undefined);
@@ -95,8 +95,8 @@ section('glass rectangles: thickness for the back-face glare');
 
 section('front-only glare: coplanar faces merge whatever is behind them');
 {
-  const { buildMirrors: build } = await import('../js/mirrors.js');
-  const { isGlassMaterial } = await import('../js/materials.js');
+  const { buildMirrors: build } = await import('../js/core/mirrors.js');
+  const { isGlassMaterial } = await import('../js/core/materials.js');
   const W = new Map();
   const put = (x, y, z, materialId) => W.set(`${x},${y},${z}`, { materialId });
   // A pane two blocks wide along x, facing +z: the left block has glass behind
@@ -117,7 +117,7 @@ section('front-only glare: coplanar faces merge whatever is behind them');
 
 section('the mirror texel cache: bases and budget');
 {
-  const { mirrorTexelDims, mirrorCacheStride, MIRROR_TEXEL } = await import('../js/mirrors.js');
+  const { mirrorTexelDims, mirrorCacheStride, MIRROR_TEXEL } = await import('../js/core/mirrors.js');
   near('a texel is an eighth of a metre', MIRROR_TEXEL, 0.125, 1e-12);
   ok('a block face is 12 x 12 texels', mirrorTexelDims({ min: [0, 0], max: [BLOCK_METRES, BLOCK_METRES] }).join(), '12,12');
   ok('stride: the sun, then three per light', mirrorCacheStride(0), 2);
@@ -149,8 +149,8 @@ section('the mirror texel cache: bases and budget');
 
 section('half blocks: their own faces');
 {
-  const { buildMirrors } = await import('../js/mirrors.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { buildMirrors } = await import('../js/core/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   const m = (shape) => ({ materialId: 'marble', ...(shape ? { shape } : {}) });
   // A full marble block at (0,1,0) with a half-bottom beside it at (1,1,0),
   // both on marble ground.
@@ -177,8 +177,8 @@ section('half blocks: their own faces');
 
 section('vertical halves and panes: faces mid-cell across x and z');
 {
-  const { buildMirrors } = await import('../js/mirrors.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { buildMirrors } = await import('../js/core/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfVertical', facing: 'E' }],
                      ['3,0,0', { materialId: 'marble', shape: 'middleVertical', facing: 'N' }],
                      ['-1,0,0', { materialId: 'marble' }]]);
@@ -192,8 +192,8 @@ section('vertical halves and panes: faces mid-cell across x and z');
 
 section('dual blocks: each half by its own material');
 {
-  const { buildMirrors } = await import('../js/mirrors.js');
-  const { BLOCK_METRES: B } = await import('../js/world.js');
+  const { buildMirrors } = await import('../js/core/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
   const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfTop', second: 'grass' }]]);
   const r = buildMirrors(W, new Set(['marble']));
   ok('the marble half\'s top is a mirror', r.filter(q => q.axis === 1 && q.sign === 1).length, 1);
@@ -203,7 +203,7 @@ section('dual blocks: each half by its own material');
 
 section('slopes throw no mirror light');
 {
-  const { buildMirrors } = await import('../js/mirrors.js');
+  const { buildMirrors } = await import('../js/core/mirrors.js');
   const W = new Map([['0,0,0', { materialId: 'marble' }],
                      ['0,1,0', { materialId: 'marble', shape: 'slope', facing: 'E' }]]);
   const r = buildMirrors(W, new Set(['marble']));

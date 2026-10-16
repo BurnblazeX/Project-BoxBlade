@@ -4,11 +4,11 @@
 // distance, and how many steps a ray takes to cross open air.
 //
 //   node tools/field.bench.mjs
-import { World, getVoxelKey } from '../js/world.js';
+import { World, getVoxelKey } from '../js/core/world.js';
 import { createBoxGridAt, populateDistanceField, sphereTrace, decodeDistance,
          GRID_DIM, VOXEL_METRES, DISTANCE_RANGE, CASCADE_COUNT,
          cascadeVoxelMetres, cascadeBlocks, cascadeExtentMetres,
-         cascadeRangeVoxels } from '../js/boxgrid.js';
+         cascadeRangeVoxels } from '../js/core/boxgrid.js';
 
 function groundWorld(n = 12) {
   World.clear();

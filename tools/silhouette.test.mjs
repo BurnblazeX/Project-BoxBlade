@@ -1,14 +1,14 @@
 import { file, section, ok, near, truthy, falsy, note } from './lib/harness.mjs';
-import { World, createTestArea } from '../js/world.js';
+import { World, createTestArea } from '../js/core/world.js';
 import { createBoxGridAt, isOccupied, worldToVoxel, sphereTrace,
          DISTANCE_RANGE, VOXEL_METRES, CASCADE_COUNT,
-         cascadeVoxelMetres } from '../js/boxgrid.js';
+         cascadeVoxelMetres } from '../js/core/boxgrid.js';
 import {
   maskFromRGBA, downsampleMask, signedDistanceTransform,
   createSilhouette, createSilhouetteSet, silhouetteDistance, ALPHA_THRESHOLD,
   facingToward, AXIS_X, AXIS_Z
-} from '../js/silhouette.js';
-import { createOccluder, placeOccluder, applyOccluders } from '../js/occluders.js';
+} from '../js/core/silhouette.js';
+import { createOccluder, placeOccluder, applyOccluders } from '../js/core/occluders.js';
 
 file('silhouette.test.mjs - tracing against the sprite cutout');
 

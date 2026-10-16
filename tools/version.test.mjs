@@ -1,5 +1,5 @@
 import { file, section, ok, truthy } from './lib/harness.mjs';
-import { VERSION, bundleHash, buildLabel } from '../js/version.js';
+import { VERSION, bundleHash, buildLabel } from '../js/core/version.js';
 
 file('version.test.mjs - version and build stamp');
 

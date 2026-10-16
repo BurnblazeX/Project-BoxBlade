@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { skyPalette, skyRadiance, projectSH, evalSH, shBasis, skyAmbientGain, sunLight, DEFAULT_SKY_HOUR,
-         sunForHour, SKY_KEYS } from '../js/sky.js';
+         sunForHour, SKY_KEYS } from '../js/core/sky.js';
 
 file('sky.test.mjs - authored gradient, L2 SH');
 

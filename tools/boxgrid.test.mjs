@@ -1,9 +1,9 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
-import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE } from '../js/world.js';
+import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE } from '../js/core/world.js';
 import { CASCADE_COUNT, cascadeVoxelsPerBlock, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, cascadeRangeVoxels, DISTANCE_RANGE_METRES,
          createBoxGrid, createBoxGridAt, gridOriginFor, GRID_DIM, VOXEL_METRES, TEXELS_PER_BLOCK, worldToVoxel,
-         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow } from '../js/boxgrid.js';
+         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow } from '../js/core/boxgrid.js';
 
 file('boxgrid.test.mjs - occupancy grid and DDA traversal');
 
@@ -340,7 +340,7 @@ section('vertical halves and panes bake across x and z');
 
 section('dual blocks bake each half in its own channel');
 {
-  const { glassDistanceAt } = await import('../js/boxgrid.js');
+  const { glassDistanceAt } = await import('../js/core/boxgrid.js');
   createTestArea(12, 12);
   World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfBottom', second: 'glass' });
   const h = createBoxGrid(0, 0);
@@ -370,8 +370,8 @@ section('slopes bake as staircases under their plane');
 
 section('placed models bake as their cubes');
 {
-  const { addWorldModel, clearWorldModels, isStandable: standable } = await import('../js/world.js');
-  const { parseBBModel } = await import('../js/bbmodel.js');
+  const { addWorldModel, clearWorldModels, isStandable: standable } = await import('../js/core/world.js');
+  const { parseBBModel } = await import('../js/core/bbmodel.js');
   createTestArea(12, 12);
   // A fixed test model (not the authored chair, which changes): a 4 x 1 x 4
   // seat 3 up, a 1 x 3 x 1 leg under one corner, a 1 x 9 x 1 post.

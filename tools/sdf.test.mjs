@@ -1,11 +1,11 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
-import { createTestArea, BLOCK_METRES } from '../js/world.js';
+import { createTestArea, BLOCK_METRES } from '../js/core/world.js';
 import {
   createBoxGrid, gridIndex, scrollForHandoff, applyHandoff, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
   DISTANCE_RANGE, FAR_BYTE, encodeDistance, decodeDistance,
   distanceAt, isOccupied, sampleDistance, boxDistance,
   sphereTrace, marchOccupancy, voxelCentreToWorld, createBoxGridAt
-} from '../js/boxgrid.js';
+} from '../js/core/boxgrid.js';
 
 file('sdf.test.mjs - signed distance field and sphere tracing');
 

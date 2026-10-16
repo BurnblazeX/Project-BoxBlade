@@ -1,5 +1,5 @@
 import { file, section, ok, truthy } from './lib/harness.mjs';
-import { coerceSetting, optionList } from '../js/settings.js';
+import { coerceSetting, optionList } from '../js/tools/settings.js';
 
 file('settings.test.mjs - what a panel control hands to a setter');
 

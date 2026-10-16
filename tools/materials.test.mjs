@@ -1,7 +1,7 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
 import { readFileSync } from 'node:fs';
 import { MATERIALS, materialLayer, decodeSpecular, METAL_F0, DEFAULT_SPECULAR,
-         BLOCK_TEXELS, allocateMaterialLayers, materialIdsFromFiles } from '../js/materials.js';
+         BLOCK_TEXELS, allocateMaterialLayers, materialIdsFromFiles } from '../js/core/materials.js';
 
 file('materials.test.mjs - block materials and LabPBR specular');
 
@@ -63,7 +63,7 @@ for (const t of ['terrain_marble', 'terrain_ironPlate']) {
 
 section('materials are found by their texture files');
 {
-  const { materialIdsFromFiles } = await import('../js/materials.js');
+  const { materialIdsFromFiles } = await import('../js/core/materials.js');
   const files = ['terrain_grass.png', 'terrain_grass_n.png', 'terrain_grass_s.png', 'terrain_grass_slope.png',
                  'terrain_grass_slope_n.png', 'terrain_grass_halfSlope.png', 'terrain_grass_halfSlope_s.png',
                  'terrain_sandstone.png', 'terrain_sandstone_e.png', 'terrain_sandstone_a.png',

@@ -1,10 +1,10 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
-import { GRID_DIM, VOXEL_METRES } from '../js/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES } from '../js/core/boxgrid.js';
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, LPV_CELL_METRES, LPV_EXTENT_METRES,
   cellIndex, cellCoords, propagateStep, lpvShift, shiftVolume, averageAlbedo,
   diffuseAlbedo, boxCellOverlap
-} from '../js/lpv.js';
+} from '../js/core/lpv.js';
 
 file('lpv.test.mjs - the light propagation volume, CPU reference');
 
@@ -116,7 +116,7 @@ section('sprite box overlap');
 
 section('specular share in the bounce (specularAlbedo)');
 {
-  const { specularAlbedo, glassCellTransmit, propagateStep, LPV_CELLS } = await import('../js/lpv.js');
+  const { specularAlbedo, glassCellTransmit, propagateStep, LPV_CELLS } = await import('../js/core/lpv.js');
   const tex = (n, rgba) => { const a = new Uint8Array(n * 4); for (let i = 0; i < n; i++) a.set(rgba, i * 4); return a; };
   const albedo = tex(4, [128, 128, 128, 255]);
   // Polished iron (LabPBR metal 230, smoothness 255): its F0, not nothing.

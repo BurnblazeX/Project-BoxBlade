@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { file, section, ok, near, truthy, falsy, note } from './lib/harness.mjs';
-import { createTestArea, BLOCK_METRES } from '../js/world.js';
-import { makeClipSamples, isQuadClipping, updateCharacterClipping, CHARACTER_RENDER_ORDER } from '../js/sprites.js';
+import { createTestArea, BLOCK_METRES } from '../js/core/world.js';
+import { makeClipSamples, isQuadClipping, updateCharacterClipping, CHARACTER_RENDER_ORDER } from '../js/render/sprites.js';
 
 file('sprites.test.mjs - character quad vs world geometry');
 
@@ -96,7 +96,7 @@ if (nowClipping) {
 
 section('sprite geometry - merged crossed planes');
 {
-  const { addSpriteTangent, crossedPlanesGeometry } = await import('../js/sprites.js');
+  const { addSpriteTangent, crossedPlanesGeometry } = await import('../js/render/sprites.js');
   const plane = addSpriteTangent(new THREE.PlaneGeometry(1, 2));
   const pt = plane.attributes.tangent;
   ok('a plain quad gets a tangent per vertex', pt.count, plane.attributes.position.count);
@@ -138,7 +138,7 @@ section('sprite geometry - merged crossed planes');
 section('sprite texel atlas - planes, sides and packing');
 {
   const { addSpriteTangent, crossedPlanesGeometry, spriteAtlasGeometry, spriteAtlasRegion,
-          packSpriteAtlas } = await import('../js/sprites.js');
+          packSpriteAtlas } = await import('../js/render/sprites.js');
   const plane = addSpriteTangent(new THREE.PlaneGeometry(1, 2));
   ok('a plain quad is one plane', plane.userData.spritePlanes, 1);
   truthy('its vertices are all on plane 0', [...plane.attributes.spritePlane.array].every(v => v === 0));

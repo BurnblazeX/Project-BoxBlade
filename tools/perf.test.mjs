@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ, WINDOW_MS, worstPerColumn } from "../js/perf.js";
-import { createConsole, installConsole } from '../js/console.js';
+import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ, WINDOW_MS, worstPerColumn } from "../js/tools/perf.js";
+import { createConsole, installConsole } from '../js/tools/console.js';
 
 file('perf.test.mjs - frame stats ring buffer and bxb console');
 

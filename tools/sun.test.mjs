@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
-import { World, getVoxelKey, BLOCK_METRES } from '../js/world.js';
-import { createBoxGridAt, VOXEL_METRES, sphereTrace, DISTANCE_RANGE } from '../js/boxgrid.js';
+import { World, getVoxelKey, BLOCK_METRES } from '../js/core/world.js';
+import { createBoxGridAt, VOXEL_METRES, sphereTrace, DISTANCE_RANGE } from '../js/core/boxgrid.js';
 import {
   SUN_ANGULAR_SIZE, penumbraMetres, penumbraTexels, coneRadius, sunBasis,
   coneOffsets, coneDirections, coneVisibility, coneTraceVisibility,
@@ -8,7 +8,7 @@ import {
   fadeWeight, SHADOW_FADE_START, EDGE_FADE_VOXELS,
   sunShade, DEFAULT_AMBIENT, GROUND_REFERENCE_FLOOR,
   BAYER4, bayer4, quantiseShadow, worldTexelIndex, texelLock
-} from '../js/sun.js';
+} from '../js/core/sun.js';
 
 file('sun.test.mjs - the marched cone and its distance-based softening');
 

@@ -1,7 +1,7 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { spriteNormals, terrainNormals, encodeNormal, decodeNormal,
-         SPRITE_BEVEL_PX } from '../js/normals.js';
-import { createCard, CARD_PAD } from '../js/cards.js';
+         SPRITE_BEVEL_PX } from '../js/core/normals.js';
+import { createCard, CARD_PAD } from '../js/core/cards.js';
 
 file('normals.test.mjs - generated tangent-space normal maps');
 

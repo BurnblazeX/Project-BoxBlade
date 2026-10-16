@@ -32,7 +32,7 @@ yield`.split(/\s+/).filter(Boolean));
 const here = dirname(fileURLToPath(import.meta.url));
 const js = join(here, '..', 'js');
 const names = [];
-for (const f of readdirSync(js).filter(f => f.endsWith('.js'))) {
+for (const f of readdirSync(js, { recursive: true }).filter(f => f.endsWith('.js'))) {
   const src = readFileSync(join(js, f), 'utf8');
   for (const m of src.matchAll(/name:\s*'([A-Za-z_][A-Za-z0-9_]*)'/g)) names.push([f, m[1]]);
 }

@@ -1,6 +1,6 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { paceTick, normalisePacing, createFramePacer, PACING_MODES, DEFAULT_PACING, DEFAULT_IN_FLIGHT, MAX_IN_FLIGHT }
-  from '../js/pacing.js';
+  from '../js/tools/pacing.js';
 
 file('pacing.test.mjs - frame pacing caps and modes');
 

@@ -1,13 +1,13 @@
 import { file, section, ok, truthy, falsy, note } from './lib/harness.mjs';
-import { World, createTestArea, getVoxelKey } from '../js/world.js';
+import { World, createTestArea, getVoxelKey } from '../js/core/world.js';
 import {
   createBoxGridAt, populateDistanceField, isOccupied, sphereTrace,
   worldToVoxel, voxelIndex, gridIndex, GRID_DIM, VOXEL_METRES
-} from '../js/boxgrid.js';
+} from '../js/core/boxgrid.js';
 import {
   createOccluder, placeOccluder, applyOccluders,
   PROXY_WIDTH, PROXY_HEIGHT
-} from '../js/occluders.js';
+} from '../js/core/occluders.js';
 
 file('occluders.test.mjs - dynamic occluders in the distance field');
 

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { parseBBModel, placeModel, facePixel, faceSwapped, transformCube, quarterTurn,
-         FACE_DIRS, buildModelHits, modelInstanceData, MODEL_HIT_RECORD } from '../js/bbmodel.js';
+         FACE_DIRS, buildModelHits, modelInstanceData, MODEL_HIT_RECORD } from '../js/core/bbmodel.js';
 
 file('bbmodel.test.mjs - Blockbench import and placement');
 
@@ -124,8 +124,8 @@ section('cube rotations');
 
 section('a lightSource cube makes a light');
 {
-  const { lightColourOf } = await import('../js/bbmodel.js');
-  const { addWorldModel, clearWorldModels, ModelBoxes, createTestArea: area } = await import('../js/world.js');
+  const { lightColourOf } = await import('../js/core/bbmodel.js');
+  const { addWorldModel, clearWorldModels, ModelBoxes, createTestArea: area } = await import('../js/core/world.js');
   const face = uv => ({ uv, texture: 0 });
   // Sides uv (a column of pixels); top and bottom one pixel of it.
   const allFaces = uv => Object.fromEntries(['north', 'south', 'east', 'west', 'up', 'down'].map(f =>
@@ -168,7 +168,7 @@ section('a light level in the cube name');
   ok('past 15 is 15', m.cubes[2].lightLevel, 15);
   truthy('and says so', m.warnings.some(w => /past 15/.test(w)));
   falsy('another name is no light', m.cubes[3].light);
-  const { addWorldModel, clearWorldModels, createTestArea: area } = await import('../js/world.js');
+  const { addWorldModel, clearWorldModels, createTestArea: area } = await import('../js/core/world.js');
   area(4, 4);
   ok('the level reaches the placed light', addWorldModel(m, 1, 0, 1).lights[0].level, 12);
   clearWorldModels();
@@ -181,7 +181,7 @@ section('a light level in the cube name');
 section('wall models hang with their north against the wall');
 {
   const { mountWorldModel, clearWorldModels, createTestArea: area, World: W, getVoxelKey: key } =
-    await import('../js/world.js');
+    await import('../js/core/world.js');
   const torch = parseBBModel(readFileSync(new URL('../assets/objects/decor_wallTorch.bbmodel', import.meta.url), 'utf8'));
   area(8, 8);
   // A wall block in each direction around cell (4, 1, 4).
@@ -233,7 +233,7 @@ section('the rays find model cubes by cell');
 
 section('buried faces of placed cubes');
 {
-  const { modelFaceMasks } = await import('../js/bbmodel.js');
+  const { modelFaceMasks } = await import('../js/core/bbmodel.js');
   const bit = { px: 1, nx: 2, py: 4, ny: 8, pz: 16, nz: 32 };
   // A floor of full blocks at y = 0 (its top is texel 6); a carpet tile one
   // texel thick on it in cell (0, 1, 0): texels x -6..6, y 6..7, z -6..6.

@@ -1,7 +1,7 @@
 import { file, section, ok, truthy, falsy, inRange, note, near } from './lib/harness.mjs';
-import { createTestArea, World, getVoxelKey } from '../js/world.js';
-import { GRID_DIM, TEXELS_PER_BLOCK, cascadeExtentMetres, gridOriginFor, CASCADE_COUNT, cascadeVoxelMetres } from '../js/boxgrid.js';
-import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible, getBoxGridDebugOrigin } from '../js/debug.js';
+import { createTestArea, World, getVoxelKey } from '../js/core/world.js';
+import { GRID_DIM, TEXELS_PER_BLOCK, cascadeExtentMetres, gridOriginFor, CASCADE_COUNT, cascadeVoxelMetres } from '../js/core/boxgrid.js';
+import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible, getBoxGridDebugOrigin } from '../js/tools/debug.js';
 
 file('debug.test.mjs - Alt+X boxGrid overlay');
 

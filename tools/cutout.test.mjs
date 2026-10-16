@@ -1,6 +1,6 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { alphaIsBinary, cutoutOpaque, wantsTransparent, registerCutout,
-         syncCutout, classifyTextureAlpha, cutoutsEnabled, setCutoutsEnabled } from '../js/cutout.js';
+         syncCutout, classifyTextureAlpha, cutoutsEnabled, setCutoutsEnabled } from '../js/render/cutout.js';
 
 file('cutout.test.mjs - binary-alpha sprites drawn opaque');
 

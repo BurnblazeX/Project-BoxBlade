@@ -1,75 +1,87 @@
 import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3, positionWorldDirection } from 'three/tsl';
-import { MODELS } from './models.js';
+import { MODELS } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, pathDistance, findPath, enterBattle, exitBattle, getReachableVoxels, addToInventory, isInInteractRange, isStandable, getColumnTop, CHUNK_SIZE, isSolid, worldMirrorEntries, surfaceHeight, stepLevel, followGround, ModelBoxes, addWorldModel,
-         WorldModels, mountWorldModel, loadLevel } from './world.js';
-import { createEditor } from './editor.js';
-import { createObject, rollLootTable } from './objects.js';
+         WorldModels, mountWorldModel, loadLevel } from './core/world.js';
+import { createEditor } from './tools/editor.js';
+import { createObject, rollLootTable } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints, updateVoxelVisibility, worldInstancedMesh, keyForInstance, voxelIndexMap,
-         glassInstancedMesh, terrainKeepTSL, terrainShapeTSL,
-         terrainTextures, terrainWhite, terrainSampleTSL, terrainTexelTSL, setShadedAlbedo } from './render.js';
-import { texelPixels, texelCacheSpacingFor } from './texelcache.js';
-import { createWanderAI } from './ai.js';
-import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './debug.js';
+         glassInstancedMesh, terrainTextures, setShadedAlbedo } from './render/render.js';
+import { terrainKeepTSL, terrainShapeTSL, terrainWhite, terrainSampleTSL, terrainTexelTSL } from './gpu/terrain.js';
+import { texelPixels, texelCacheSpacingFor } from './core/texelcache.js';
+import { createWanderAI } from './game/ai.js';
+import { createGameState } from './game/state.js';
+import { createEncounter } from './game/encounter.js';
+import { createInteraction } from './game/interaction.js';
+import { createInput, INPUT_RULES } from './game/input.js';
+import { createMarkers } from './render/markers.js';
+import { createPicker } from './render/picking.js';
+import { createCameraRig } from './render/camera.js';
+import { getSpriteWorldPos, followPath, walk, WALK_SPEED, ENEMY_SPEED } from './game/movement.js';
+import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './tools/debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          SUN_BIAS_BLOCKS, CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres,
-         VOXEL_METRES, applyHandoff } from './boxgrid.js';
+         VOXEL_METRES, applyHandoff } from './core/boxgrid.js';
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
          crossedPlanesGeometry, spriteAtlasGeometry, spriteAtlasRegion,
-         packSpriteAtlas } from './sprites.js';
-import { createPerfOverlay } from './perf.js';
-import { createFramePacer, describePacing } from './pacing.js';
-import { VERSION, bundleHash, buildLabel } from './version.js';
-import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
-         createVoxelAONode, terrainEmissiveTSL, createHitCache,
-         createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode, roughReach, splitDebug } from './gpu.js';
-import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform,
-         createMirrorBindings, writeMirrorBindings, setHitBounds,
-         GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics,
-         glassBackGlare, reflectBouncesUniform, REFLECT_MAX_BOUNCES, createTexelGI, GI_LIST_CAP } from './gpu.js';
-import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride,
-         MIRROR_CACHE_VEC4S, pickMirrored } from './mirrors.js';
-import { MATERIALS, isGlassMaterial } from './materials.js';
-import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
-         DEFAULT_SKY_HOUR } from './sky.js';
+         packSpriteAtlas } from './render/sprites.js';
+import { createPerfOverlay } from './tools/perf.js';
+import { createFramePacer, describePacing } from './tools/pacing.js';
+import { VERSION, bundleHash, buildLabel } from './core/version.js';
+import { createVoxelAONode, AO_DISTANCE } from './gpu/ambient.js';
 import { createCardBindings, createCardAtlasTexture, createCardColourTexture, writeCardBindings,
-         runGPUCards, MAX_CARDS, createLightBindings,
-         writeLightBindings } from './gpu.js';
-import { runComputeSmokeTest, createDistanceTexture, updateDistanceTexture,
-         runGPUMarch, createShadowColorNode, createShadowMaterial,
-         restoreOriginalMaterial, followShadowGrid, commitShadowGrid, createSpriteShadowMaterial,
-         createSpriteAtlasMaterial,
-         createNormalTexture,
-         createBayerTexture, writeSunUniforms,
-         SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS,
-         DEFAULT_AMBIENT, cascadeBindings, writeCascadeBindings, AO_DISTANCE, SEAM_BAND_VOXELS } from './gpu.js';
-import { SUN_ANGULAR_SIZE, penumbraTexels } from './sun.js';
+         MAX_CARDS } from './gpu/cards.js';
+import { runGPUCards, runComputeSmokeTest, runGPUMarch } from './gpu/diagnostics.js';
+import { createDistanceTexture, updateDistanceTexture, followShadowGrid, commitShadowGrid,
+         SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS, cascadeBindings,
+         writeCascadeBindings, SEAM_BAND_VOXELS } from './gpu/field.js';
+import { GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics, glassBackGlare } from './gpu/glass.js';
+import { createHitCache } from './gpu/hitcache.js';
+import { createMirrorBindings, writeMirrorBindings } from './gpu/mirrorlight.js';
+import { createNormalTexture } from './gpu/normals.js';
+import { createLightBindings, writeLightBindings } from './gpu/pointlights.js';
+import { terrainEmissiveTSL, roughReach, splitDebug, createShadowColorNode } from './gpu/shade.js';
+import { createSkyBindings, writeSkyBindings, skyShTSL, sunColourUniform } from './gpu/sky.js';
+import { reflectBouncesUniform, REFLECT_MAX_BOUNCES } from './gpu/specular.js';
+import { createSpriteShadowMaterial, createSpriteAtlasMaterial } from './gpu/sprite.js';
+import { createBayerTexture, writeSunUniforms, DEFAULT_AMBIENT } from './gpu/sun.js';
+import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
+         createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode,
+         createShadowMaterial, restoreOriginalMaterial } from './gpu/texel.js';
+import { createTexelGI, GI_LIST_CAP } from './gpu/texelgi.js';
+import { setHitBounds } from './gpu/volume.js';
+import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride,
+         MIRROR_CACHE_VEC4S, pickMirrored } from './core/mirrors.js';
+import { MATERIALS, isGlassMaterial } from './core/materials.js';
+import { skyPalette, skyRadiance, projectSH, skyAmbientGain, sunForHour, sunLight,
+         DEFAULT_SKY_HOUR } from './core/sky.js';
+import { SUN_ANGULAR_SIZE, penumbraTexels } from './core/sun.js';
 import { TORCH_COLOUR, TORCH_LEVEL, TORCH_HEIGHT, TORCH_FORWARD,
          TORCH_SIDE, MAX_LIGHT_LEVEL,
          LIGHT_SOURCE_RADIUS, clampLevel, lightRadiusMetres,
          pointPenumbraMetres, MAX_LIGHTS, LIGHT_FLOATS, POINT_CARD_CAPACITY,
          liveLights, packLight, parseColour, DEFAULT_SHADOW_BUDGET,
          DEFAULT_LIGHT_CUTOFF, pickShadowed, easeShadowWeight,
-         DEFAULT_CARD_BUDGET, LIGHT_VEC4S, DEFAULT_HIT_SHADOW_BUDGET, DEFAULT_MIRROR_LIGHT_BUDGET } from './lights.js';
-import { createOccluder, placeOccluder, applyOccluders } from './occluders.js';
+         DEFAULT_CARD_BUDGET, LIGHT_VEC4S, DEFAULT_HIT_SHADOW_BUDGET, DEFAULT_MIRROR_LIGHT_BUDGET } from './core/lights.js';
+import { createOccluder, placeOccluder, applyOccluders } from './core/occluders.js';
 import { maskFromRGBA, createSilhouetteSet, facingToward,
-         AXIS_X, AXIS_Z } from './silhouette.js';
+         AXIS_X, AXIS_Z } from './core/silhouette.js';
 import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
          cullCardsForLight, cardsVisibility, CARD_PAD, SUN_CARD_LOD_SHIFT,
-         SUN_CARD_LOD_MAX } from './cards.js';
-import { spriteNormals } from './normals.js';
-import { createConsole, installConsole } from './console.js';
-import { createSettingsPanel } from './settings.js';
-import { createLPV } from './gi.js';
-import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from './shadowsets.js';
+         SUN_CARD_LOD_MAX } from './core/cards.js';
+import { spriteNormals } from './core/normals.js';
+import { createConsole, installConsole } from './tools/console.js';
+import { createSettingsPanel } from './tools/settings.js';
+import { createLPV } from './gpu/gi.js';
+import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from './core/shadowsets.js';
 import { classifyTextureAlpha, registerCutout, syncCutout, wantsTransparent,
-         cutoutsEnabled, setCutoutsEnabled } from './cutout.js';
-import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './lpv.js';
+         cutoutsEnabled, setCutoutsEnabled } from './render/cutout.js';
+import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL } from './core/lpv.js';
 import { averageAlbedo, lpvShift, DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
-         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS, LPV_RES_OPTIONS } from './lpv.js';
-import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './battle.js';
-import * as UI from './ui.js';
-import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
+         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS, LPV_RES_OPTIONS } from './core/lpv.js';
+import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity, nextTurn, addParticipant } from './game/battle.js';
+import * as UI from './game/ui.js';
+import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './game/combat.js';
 
 import bobTextureUrl from '../assets/sprites/character_Bob.png'
 import evilBobTextureUrl from '../assets/sprites/character_EvilBob.png'
@@ -77,64 +89,12 @@ import treeTextureUrl from '../assets/sprites/decor_tree.png'
 import chestTextureUrl from '../assets/sprites/container_chest.png'
 import chestOpenTextureUrl from '../assets/sprites/container_chest_open.png'
 
-UI.initUI(
-  // Attack Button Callback
-  () => {
-    if (currentMode !== 'battle') return;
-    const current = getCurrentEntity(battleParticipants);
-    if (current.id !== player.id) return; 
+// Mode, walk, battle and arena: what the game modules share (game/state.js).
+const game = createGameState();
 
-    // 1. Check Range 
-    if (!isInMeleeRange(player, enemy)) {
-       UI.logDiceRoll("<i>Target is out of range!</i>", "system");
-       return; 
-    }
+// The battle buttons (game/encounter.js, made below).
+UI.initUI(() => encounter.attack(), () => encounter.endTurn());
 
-    // 2. Roll Attack
-    const res = performAttack(player, enemy);
-    if (!res.success) {
-      UI.logDiceRoll("<i>You have no action left!</i>", "system");
-      return;
-    }
-
-    // 3. Provoke Mechanic: If enemy wasn't in combat, add them now!
-    if (!battleParticipants.some(p => p.id === enemy.id)) {
-       battleParticipants.push(enemy);
-       addParticipant(enemy);
-       UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
-       UI.logDiceRoll(`<i>${enemy.name} was provoked and joined the battle!</i>`, "system");
-    }
-
-    // 4. Resolve Hit/Damage
-    if (res.hit) {
-      UI.logDiceRoll(`<b>${player.name}</b> hits ${enemy.name}! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}] <br>Deals <b>${res.damage} damage!</b>`, "player-turn");
-      if (isDefeated(enemy)) {
-        enemySprite.visible = false;
-        const v = World.get(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z));
-        if (v && v.occupant === enemy.id) v.occupant = null;
-        endBattleSequence("VICTORY! You slew Evil Bob!");
-      }
-    } else {
-      UI.logDiceRoll(`<b>${player.name}</b> misses! <br>[Roll: ${res.attackTotal} vs AC ${enemy.ac}]`, "player-turn");
-    }
-    
-    UI.updateHUD(player); 
-    UI.updateActionResources(player.turnResources);
-  },
-  // End Turn Button Callback
-  () => {
-    if (currentMode !== 'battle') return;
-    if (getCurrentEntity(battleParticipants)?.id !== player.id) return;
-    
-    UI.logDiceRoll(`<i>${player.name} ends their turn.</i>`, "system");
-    nextTurn(battleParticipants, onTurnStart);
-  }
-);
-
-const inputRules = {
-  explore: { click: true, keyboard: true },
-  battle:  { click: true, keyboard: false }
-};
 
 // --- SCENE SETUP ---
 const scene = new THREE.Scene();
@@ -319,13 +279,6 @@ const characterClipSamples = makeClipSamples(VOXEL_SIZE, VOXEL_SIZE * 2);
 const playerTex = loadSpriteTexture(bobTextureUrl);
 const playerSprite = createCharacterMesh(playerTex);
 
-// An entity's gridPos.y is the block it stands ON, so its sprite sits on that
-// block's top face - half a block lower on a half-bottom (world.js).
-const getSpriteWorldPos = (gridPos) => new THREE.Vector3(
-  gridPos.x * VOXEL_SIZE,
-  surfaceHeight(gridPos.x, gridPos.y, gridPos.z),
-  gridPos.z * VOXEL_SIZE
-);
 playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
 scene.add(playerSprite);
 
@@ -948,9 +901,8 @@ worldObjects.push({ data: barrel, mesh: barrelSprite });
 // in explore mode everything shows; in battle, only objects inside the current
 // arena chunk render at all.
 // Reflections and the view through glass land only on what battle shows:
-// the arena's blocks, as a box in world metres (gpu.js hitBounds). Block b
+// the arena's blocks, as a box in world metres (gpu/volume.js hitBounds). Block b
 // spans (b - 0.5) to (b + 0.5) blocks.
-let currentArenaBounds = null;
 function setArenaHitBounds(bounds) {
   if (!bounds) { setHitBounds(null); return; }
   const lo = b => (b - 0.5) * VOXEL_SIZE, hi = b => (b + 0.5) * VOXEL_SIZE;
@@ -980,169 +932,20 @@ const spriteBaseColor = new Map([
   [chestSprite, 0xffffff],
   [barrelSprite, 0x8b5a2b]
 ]);
-// --- BATTLE STATE ---
-export let battleParticipants = [];
-// Bumped every time battle is entered or exited, so timers scheduled by a
-// previous battle can detect they're stale even if currentMode flips back
-// to 'battle' before they fire.
-let battleSessionId = 0;
-
-// SPRITE FLIP HELPER
-function updateSpriteFacing(sprite, isFacingRight) {
-  if (isFacingRight) {
-    sprite.material.map.repeat.x = -1;  
-    sprite.material.map.offset.x = 1; 
-  } else {
-    sprite.material.map.repeat.x = 1;   
-    sprite.material.map.offset.x = 0; 
-  }
-}
-
-// VISUAL AIDS (HIGHLIGHT & PATH DOTS)
-// 1. Blue Hover Highlight (Edge Outline Only)
-const shapeGeo = new THREE.PlaneGeometry(VOXEL_SIZE * 0.95, VOXEL_SIZE * 0.95);
-shapeGeo.rotateX(-Math.PI / 2); // Lay flat on the ground
-const highlightGeo = new THREE.EdgesGeometry(shapeGeo);
-const highlightMat = new THREE.LineBasicMaterial({ 
-  color: 0x0088ff, 
-  transparent: true, 
-  opacity: 0.8
-});
-const highlightMesh = new THREE.LineSegments(highlightGeo, highlightMat);
-highlightMesh.visible = false;
-scene.add(highlightMesh);
-
-// 2. Path Dots
-const pathGroup = new THREE.Group();
-scene.add(pathGroup);
-const dotGeo = new THREE.SphereGeometry(0.12, 8, 8);
-const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-const dotMatOut = new THREE.MeshBasicMaterial({ color: 0xff3030 });
-
-// Battle hover colours, BG3-style: white inside this turn's movement, red past
-// it. Nothing on the terrain is tinted - the border and dots carry it alone.
-const REACH_COLOUR = 0xffffff;
-const OUT_OF_REACH_COLOUR = 0xff3030;
-const HOVER_COLOUR = 0x0088ff;   // explore
-
-// reach: how many steps of the path are affordable. Dots past it turn red, so
-// the path shows exactly where the movement runs out.
-function updatePathDots(path, reach = Infinity) {
-  pathGroup.clear();
-  for (let i = 0; i < path.length; i++) {
-    const node = path[i];
-    const dot = new THREE.Mesh(dotGeo, i < reach ? dotMat : dotMatOut);
-    // Position slightly above the surface
-    dot.position.set(node.x * VOXEL_SIZE, surfaceHeight(node.x, node.y, node.z) + 0.1, node.z * VOXEL_SIZE);
-    pathGroup.add(dot);
-  }
-}
 
 
-// --- CAMERA RIG SYSTEM ---
-let aspect = window.innerWidth / window.innerHeight;
+// The hover border and the path dots (render/markers.js).
+const markers = createMarkers(scene);
 
-// We use one PerspectiveCamera to allow buttery smooth lerping (no janky swaps).
-// We mimic Orthographic for battle mode by lowering the FOV and pulling back distance.
-const camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 1000);
-const pivot = new THREE.Object3D();
-let arenaCenter = new THREE.Vector3(); 
-scene.add(pivot);
+// --- The camera rig (render/camera.js) ---
+const rig = createCameraRig(scene);
+const camera = rig.camera;
+const pivot = rig.pivot;
 
-const cameraConfigs = {
-  explore: { 
-    fov: 45,        
-    distance: 22,   
-    pitch: Math.PI / 3.43, 
-    headingOffset: 0
-  },
-  battle: { 
-    fov: 8,         
-    distance: 125,  
-    pitch: Math.atan(1 / Math.sqrt(2)), 
-    headingOffset: Math.PI / 4
-  }
-};
-
-let currentMode = 'explore';
-let rotationStep = 0; 
-let currentFov = cameraConfigs.explore.fov;
-let currentPitch = cameraConfigs.explore.pitch;
-let currentHeading = cameraConfigs.explore.headingOffset;
-let currentDistance = cameraConfigs.explore.distance;
-const CAMERA_LERP_SPEED = 0.1;
-const CAMERA_DISTANCE = 50; 
-
-function updateCameraTargets() {
-  const config = cameraConfigs[currentMode];
-  return {
-    targetViewSize: config.viewSize,
-    targetPitch: config.pitch,
-    targetHeading: (rotationStep * Math.PI / 2) + config.headingOffset
-  };
-}
-
-// --- MOVEMENT STATE ---
-let currentPath = [];
 const timer = new THREE.Timer();
-const keyState = { w: false, a: false, s: false, d: false };
 
-// --- Free cam (Alt+C, debug) ---
-//
-// Detaches the camera from Bob: WASD flies the pivot instead of walking him,
-// Q/E still turn it. Only the CAMERA moves - the cascades, the boxGrid overlay
-// and everything else that follows the player keep following player.gridPos,
-// so flying away shows the field's footprint staying put around Bob.
-let freeCam = false;
-const FREE_CAM_SPEED = 12;   // m/s
-function moveFreeCam(dt) {
-  let rx = 0, rz = 0;
-  if (keyState.w) rz -= 1;
-  if (keyState.s) rz += 1;
-  if (keyState.a) rx -= 1;
-  if (keyState.d) rx += 1;
-  if (!rx && !rz) return;
-  const len = Math.hypot(rx, rz);
-  // Screen-relative, the same basis Bob walks in.
-  const h = (rotationStep * Math.PI / 2) + cameraConfigs[currentMode].headingOffset;
-  const c = Math.cos(h), s = Math.sin(h);
-  const step = FREE_CAM_SPEED * dt / len;
-  pivot.position.x += (rx * c + rz * s) * step;
-  pivot.position.z += (-rx * s + rz * c) * step;
-}
-
-// --- INPUT HANDLING ---
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-// Helper: Convert screen coords to the grid cell whose top face was clicked.
-// This raycasts the terrain mesh rather than a single horizontal plane - with
-// real elevation there is no one ground height, and only a block's TOP face is
-// somewhere an entity can stand, so side-face hits on walls are skipped.
-// Instances carry no rotation, so the box geometry's local +Y normal is world up.
-// Hits arrive sorted by distance, making the first top face the nearest surface.
-function getGridIntersection(clientX, clientY) {
-  mouse.x = (clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(clientY / window.innerHeight) * 2 + 1;
-
-  if (!worldInstancedMesh) return null;
-  raycaster.setFromCamera(mouse, camera);
-
-  for (const hit of raycaster.intersectObject(worldInstancedMesh, false)) {
-    if (!hit.face || hit.face.normal.y < 0.5) continue;
-    const key = keyForInstance(hit.instanceId);
-    if (!key) continue;
-    const [gx, gy, gz] = key.split(',').map(Number);
-    return { gx, gy, gz };
-  }
-  return null;
-}
-
-let lastHoveredKey = null;
-let clickPulseTime = 0; 
-let currentReachable = null; 
-let currentArenaMap = null;
-let isPointerDown = false;
-let currentMoveTargetKey = null;
+// --- What is under the cursor (render/picking.js) ---
+const picker = createPicker(camera);
 
 // --- THE EDITOR (js/editor.js): Tab ---
 // An edit changes World / WorldModels; this rebuilds what is made from them.
@@ -1168,531 +971,70 @@ const editor = createEditor({
   scene, camera, dom: renderer.domElement,
   onEdit: applyWorldEdit,
   onToggle: on => {
-    if (on && currentMode !== 'explore') { console.log('the editor opens in explore mode only'); return false; }
+    if (on && game.mode !== 'explore') { console.log('the editor opens in explore mode only'); return false; }
     // Nothing carries over: no walk in progress, no key held down.
-    currentPath = [];
-    currentMoveTargetKey = null;
-    for (const k of Object.keys(keyState)) keyState[k] = false;
+    game.path = [];
+    game.moveTargetKey = null;
+    for (const k of Object.keys(game.keys)) game.keys[k] = false;
     return true;
   }
 });
-let enemyPath = []; // Tracks AI movement animation
 
-// Handles resetting resources and triggering AI
-function onTurnStart(entity) {
-  entity.turnResources.actionAvailable = true;
-  entity.turnResources.bonusActionAvailable = true;
-  entity.turnResources.spellAvailable = true;
-  entity.turnResources.moveRemaining = entity.speed;
-
-  if (entity.id === player.id) {
-    refreshReachableTiles();
-  } else if (entity.id === enemy.id) {
-
-    // GUARD: Only trigger AI if the battle wasn't abruptly ended (or replaced by a new one)
-    const scheduledSession = battleSessionId;
-    setTimeout(() => {
-      if (currentMode === 'battle' && battleSessionId === scheduledSession) processEnemyAI();
-    }, 500);
-  }
-}
-
-function endBattleSequence(message) {
-  console.log(`[Combat] ${message}`);
-  currentMode = 'explore';
-  battleSessionId++;
-  document.getElementById('mode-text').innerText = 'Explore';
-  exitBattle();
-  currentArenaMap = null;
-  updateVoxelVisibility(null, false);
-  updateObjectVisibility(null, false);
-  setArenaHitBounds(null);
-
-  if (!isDefeated(enemy)) enemyAI.isPaused = false;
-  
-  resetBattleState(battleParticipants);
-  battleParticipants = [];
-  refreshReachableTiles();
-}
-
-function processEnemyAI() {
-  if (currentMode !== 'battle') return;
-
-  const aiDecision = takeEnemyTurn(enemy, player);
-
-  if (aiDecision.action === 'move') {
-    enemyPath = aiDecision.path;
-  } else if (aiDecision.action === 'attack') {
-    const res = aiDecision.result;
-    if (res.hit) {
-      console.log(`[Combat] ${enemy.name} hits for ${res.damage}! (HP: ${player.hp.current}/${player.hp.max})`);
-      if (isDefeated(player)) {
-        endBattleSequence("GAME OVER. You have been defeated!");
-        return; 
-      }
-    } else {
-      console.log(`[Combat] ${enemy.name} misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
-    }
-
-    const scheduledSessionAttack = battleSessionId;
-    setTimeout(() => {
-      if (currentMode === 'battle' && battleSessionId === scheduledSessionAttack) nextTurn(battleParticipants, onTurnStart);
-    }, 1000);
-
-  } else if (aiDecision.action === 'end') {
-    const scheduledSessionEnd = battleSessionId;
-    setTimeout(() => {
-      if (currentMode === 'battle' && battleSessionId === scheduledSessionEnd) nextTurn(battleParticipants, onTurnStart);
-    }, 500);
-  }
-}
-
-// Modify refreshReachableTiles to dynamically use moveRemaining
-function refreshReachableTiles() {
-  if (currentMode === 'battle') {
-    const currentSpeed = player.turnResources ? player.turnResources.moveRemaining : player.speed;
-    currentReachable = getReachableVoxels(player.gridPos, currentSpeed);
-  }
-  // Never tinted: reach is shown by the hover border and path dots instead.
-  updateVoxelTints(null, null, false);
-}
-
-// The last click-to-move search that found nothing, as "start>target".
-let lastFailedPath = null;
-function processClickToMove(clientX, clientY, isDownEvent = false) {
-  if (!inputRules[currentMode].click) return;
-  // Strict lock for Battle mode turns: No interruptions allowed
-  if (currentMode === 'battle' && currentPath.length > 0) return; 
-
-  const intersect = getGridIntersection(clientX, clientY);
-  if (!intersect) return;
-
-  const { gx, gy, gz } = intersect;
-  const targetKey = getVoxelKey(gx, gy, gz);
-
-  if (currentMode === 'battle') {
-    if (!currentReachable || !currentReachable.has(targetKey)) {
-      if (isDownEvent) console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
-      return; 
-    }
-  }
-
-  // Prevent spamming pathfinder calculations if we are holding the mouse and hovering the same tile
-  if (!isDownEvent && targetKey === currentMoveTargetKey && currentPath.length > 0) return;
-
-  // A target that just failed from this tile is not searched again while
-  // the mouse is held or hovers on it (an unreachable one searches all).
-  const failKey = `${getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z)}>${targetKey}`;
-  if (failKey === lastFailedPath) return;
-
-  if (World.has(targetKey)) {
-    const allowDiagonals = currentMode === 'explore'; 
-    const path = findPath(player.gridPos, { x: gx, y: gy, z: gz }, allowDiagonals);
-    lastFailedPath = path.length ? null : failKey;
-    
-    if (currentMode === 'battle' && path.length > player.speed) return;
-
-    if (path.length > 0) {
-      currentPath = path; // Instant override of the path!
-      currentMoveTargetKey = targetKey;
-      
-      highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
-      highlightMesh.visible = true;
-      
-      if (isDownEvent) {
-         clickPulseTime = 1.0; 
-         highlightMesh.material.color.setHex(0xffff00); 
-      }
-      
-      if (currentMode === 'explore') {
-          pathGroup.clear(); // No dots in explore mode
-      } else {
-          updatePathDots(path);
-      }
-    }
-  }
-}
-
-window.addEventListener('pointerdown', (e) => {
-  // A move still waiting for the frame came before this: handle it first, in order.
-  flushPointerMove();
-  if (e.target.tagName !== 'CANVAS') return; 
-  if (e.button !== 0) return; 
-
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouse, camera);
-
-  // Intercept clicks on ANY sprite (including the tree) so you can't walk through them
-  const spriteIntersects = raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes]);
-  if (spriteIntersects.length > 0) {
-     const hitSprite = spriteIntersects[0].object;
-     let target = spriteToTarget.get(hitSprite); // undefined for the tree - no panel, by design
-
-      // Check if the target is an Object instead of an Entity
-     if (target && target.subType) {
-        // Ignore Decor and Lights; only allow interaction with Containers
-        if (target.subType !== "Container") {
-           target = undefined; 
-        }
-     }
-
-     if (currentMode === 'explore' && target) {
-        if (pathDistance(player.gridPos, target.gridPos) <= 2) {
-            openInteractionPanel(target);
-        } else {
-            console.log(`${target.name} is too far away to interact!`);
-        }
-     }
-
-     // Consume the click if a sprite was hit
-     isPointerDown = false;
-     currentPath = [];
-     return;
-  }
-
-  isPointerDown = true;
-  processClickToMove(e.clientX, e.clientY, true);
-});
-
-// --- INTERACTION PANEL (generic: enemy dialogue + object "Open") ---
-let isDialogueOpen = false;
-let interactionTarget = null;
-
-function openInteractionPanel(target) {
-  interactionTarget = target;
-  isDialogueOpen = true;
-
-  document.getElementById('dialogue-panel').style.display = 'block';
-  document.getElementById('dialogue-name').innerText = target.name;
-
-  // World objects come from createObject() and always include subType/model.
-  // Entities (player/enemies) do not, so they are the only valid fight/talk targets.
-  const isObject = !!target && typeof target.subType === 'string' && typeof target.model === 'string';
-  const isContainer = isObject && target.subType === 'Container';
-  const isEnemy = !isObject;
-  document.getElementById('btn-talk').style.display = isEnemy ? 'inline-block' : 'none';
-  document.getElementById('btn-fight').style.display = isEnemy ? 'inline-block' : 'none';
-  document.getElementById('btn-open').style.display = isContainer ? 'inline-block' : 'none';
-
-  updateInteractionButtons();
-}
-
-function closeInteractionPanel() {
-  document.getElementById('dialogue-panel').style.display = 'none';
-  isDialogueOpen = false;
-  interactionTarget = null;
-}
-
-// Live adjacency gate: the panel opens from "look" range, but each action button
-// only enables at true adjacency, re-checked every frame while the panel is open.
-function updateInteractionButtons() {
-  if (!interactionTarget) return;
-  const inRange = isInInteractRange(player, interactionTarget);
-
-  for (const id of ['btn-talk', 'btn-fight', 'btn-open']) {
-    const btn = document.getElementById(id);
-    if (btn.style.display === 'none') continue;
-    btn.disabled = !inRange;
-    btn.classList.toggle('disabled', !inRange);
-  }
-}
-
-function formatItemName(itemId) {
-  return itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-}
-
-// Fix 1: Stop UI clicks from falling through to the game world
-document.getElementById('dialogue-panel').addEventListener('pointerdown', (e) => e.stopPropagation());
-
-document.getElementById('btn-open').addEventListener('click', () => {
-  const obj = interactionTarget;
-  if (!obj || obj.subType !== 'Container') return;
-  if (!isInInteractRange(player, obj)) return; 
-
-  if (!obj.looted) {
-    const result = obj.lootTable ? rollLootTable(obj.lootTable) : obj.fixedItem;
-    if (result) {
-      addToInventory(player, result.itemId, result.quantity);
-      UI.logChatMessage(`Found ${result.quantity}x ${formatItemName(result.itemId)} in the ${obj.name}.`);
-    }
-    obj.looted = true;
-  } else {
-    UI.logChatMessage(`The ${obj.name} is already empty.`);
-  }
-
-  obj.state = 'open';
-
-  // Find the visual mesh associated with this object data
-  const objRender = worldObjects.find(wo => wo.data.id === obj.id);
-  
-  if (objRender && obj.model === 'chest') {
-    const targetSprite = objRender.mesh;
-    
-    // Swap to pre-loaded Open Texture
-    targetSprite.material.map = chestOpenTexture;
-    targetSprite.material.needsUpdate = true;
-
-    // 2-Second Rummaging State
-    setTimeout(() => {
-      obj.state = 'closed';
-      targetSprite.material.map = chestTexture; 
-      targetSprite.material.needsUpdate = true;
-      UI.logChatMessage(`Finished checking the ${obj.name}.`);
-    }, 2000);
-    
-  } else if (objRender) {
-    // Fallback for Barrel (no open texture exists yet, just state delay)
-    setTimeout(() => {
-      obj.state = 'closed';
-      UI.logChatMessage(`Finished checking the ${obj.name}.`);
-    }, 2000);
+// --- Battle and the interaction panel (game/encounter.js, game/interaction.js) ---
+//
+// The rules live there; what they look like is this view.
+const encounter = createEncounter({
+  game, player, enemy, playerSprite, enemySprite, enemyAI,
+  view: {
+    enterArena(arena, bounds) {
+      const centerX = (bounds.minX + bounds.maxX) / 2;
+      const centerZ = (bounds.minZ + bounds.maxZ) / 2;
+      rig.arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
+      updateVoxelVisibility(arena, true);
+      updateObjectVisibility(arena, true);
+      setArenaHitBounds(bounds);
+    },
+    exitArena() {
+      updateVoxelVisibility(null, false);
+      updateObjectVisibility(null, false);
+      setArenaHitBounds(null);
+    },
+    clearHover() {
+      markers.reset();
+      input.forgetHover();
+    },
+    refreshTints() { updateVoxelTints(null, null, false); }
   }
 });
-
-document.getElementById('btn-fight').addEventListener('click', () => {
-  if (!interactionTarget || typeof interactionTarget.subType === 'string') return;
-  closeInteractionPanel();
-
-  // Snap player to grid
-  player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
-  player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
-  playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
-  
-  // FIX 6: Force Enemy into the Player's 12x12 Arena Chunk
-  const chunkSize = 12;
-  const minX = Math.floor(player.gridPos.x / chunkSize) * chunkSize;
-  const maxX = minX + chunkSize - 1;
-  const minZ = Math.floor(player.gridPos.z / chunkSize) * chunkSize;
-  const maxZ = minZ + chunkSize - 1;
-  
-  let ex = Math.round(enemySprite.position.x / VOXEL_SIZE);
-  let ez = Math.round(enemySprite.position.z / VOXEL_SIZE);
-  
-  if (ex < minX || ex > maxX || ez < minZ || ez > maxZ) {
-    const oldV = World.get(getVoxelKey(ex, enemy.gridPos.y, ez));
-    if (oldV && oldV.occupant === enemy.id) oldV.occupant = null; 
-    
-    // Clamp to arena edges
-    ex = Math.max(minX, Math.min(ex, maxX));
-    ez = Math.max(minZ, Math.min(ez, maxZ));
-    
-    // Safe Radial Search: Find nearest vacant tile in the chunk
-    let found = false;
-    for (let radius = 0; radius < 5; radius++) {
-      for (let dx = -radius; dx <= radius; dx++) {
-        for (let dz = -radius; dz <= radius; dz++) {
-          const cx = ex + dx;
-          const cz = ez + dz;
-          if (cx >= minX && cx <= maxX && cz >= minZ && cz <= maxZ) {
-            const checkV = World.get(getVoxelKey(cx, enemy.gridPos.y, cz));
-            if (checkV && isStandable(cx, enemy.gridPos.y, cz) && !checkV.occupant) {
-              ex = cx;
-              ez = cz;
-              found = true;
-              break;
-            }
-          }
-        }
-        if (found) break;
-      }
-      if (found) break;
-    }
-  }
-  
-  enemy.gridPos.x = ex;
-  enemy.gridPos.z = ez;
-  enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
-  
-  const newV = World.get(getVoxelKey(ex, enemy.gridPos.y, ez));
-  if (newV) newV.occupant = enemy.id;
-
-  battleParticipants = [player, enemy];
-  enemyAI.isPaused = true;
-
-  currentMode = 'battle';
-  battleSessionId++;
-  document.getElementById('mode-text').innerText = 'Battle';
-  highlightMesh.visible = false;
-  pathGroup.clear();
-  lastHoveredKey = null;
-  clickPulseTime = 0;
-  
-  // Enter Battle Centered on PLAYER'S chunk (since enemy was pulled into it)
-  const battleData = enterBattle(player.gridPos);
-  currentArenaMap = battleData.arena;
-  currentArenaBounds = battleData.bounds;
-  
-  const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
-  const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
-  arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
-  
-  updateVoxelVisibility(currentArenaMap, true);
-  updateObjectVisibility(currentArenaMap, true);
-  setArenaHitBounds(currentArenaBounds);
-  refreshReachableTiles();
-
-  // PHASE 7: Roll Initiative & Start Turn Queue
-  rollInitiativeForParticipants(battleParticipants);
-  UI.toggleBattleUI(true);
-  UI.updateHUD(player);
-  UI.updatePartyView(battleParticipants, player.id);
-  UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
-  
-  const activeEntity = getCurrentEntity(battleParticipants);
-  onTurnStart(activeEntity); 
-});
-
-window.addEventListener('pointerup', (e) => {
-  flushPointerMove();
-  if (e.button === 0) isPointerDown = false;
-  if (e.target.tagName !== 'CANVAS') return; 
-  if (!inputRules[currentMode].click) return;
-  if (currentPath.length > 0) return; 
-
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouse, camera);
-  if (raycaster.intersectObjects([playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes]).length > 0) return;
-
-  const intersect = getGridIntersection(e.clientX, e.clientY);
-  if (!intersect) return; 
-
-  const { gx, gy, gz } = intersect;
-  const targetKey = getVoxelKey(gx, gy, gz);
-
-  if (currentMode === 'battle') {
-    if (!currentReachable || !currentReachable.has(targetKey)) {
-      console.warn(`Rejected: Tile ${targetKey} is outside speed range or arena bounds.`);
-      return; 
-    }
-  }
-
-  if (World.has(targetKey)) {
-    const allowDiagonals = currentMode === 'explore';
-    const path = findPath(player.gridPos, { x: gx, y: gy, z: gz }, allowDiagonals);
-    
-    if (currentMode === 'battle' && path.length > player.turnResources.moveRemaining) {
-       console.warn(`Rejected: Path length exceeds speed stat.`);
-       return;
-    }
-
-    if (path.length > 0) {
-      currentPath = path;
-      currentMoveTargetKey = targetKey;
-      clickPulseTime = 1.0; 
-      highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
-      highlightMesh.visible = true;
-      highlightMesh.material.color.setHex(0xffff00); 
-      
-      if (currentMode === 'explore') {
-          pathGroup.clear(); 
-      } else {
-          updatePathDots(path);
-      }
+const interaction = createInteraction({
+  game, player, encounter,
+  view: {
+    hasMesh: obj => worldObjects.some(wo => wo.data.id === obj.id),
+    // A chest swaps to its open texture; a barrel has no open look yet.
+    showOpen(obj, open) {
+      const r = worldObjects.find(wo => wo.data.id === obj.id);
+      if (!r || obj.model !== 'chest') return;
+      r.mesh.material.map = open ? chestOpenTexture : chestTexture;
+      r.mesh.material.needsUpdate = true;
     }
   }
 });
 
-// Pointer moves are handled once a frame, from the frame loop, with the latest
-// event. A mouse can report far faster than the frame rate (150-190 moves a
-// second in a Firefox profile, some faster still), and each move raycast the
-// terrain - and, with the button held, re-pathed to the tile under the cursor,
-// which moves as the camera follows Bob. That was a steady fps drop while
-// click-walking. Only the newest position matters: the path it sets is read
-// once a frame anyway.
-let pendingPointerMove = null;
-window.addEventListener('pointermove', (e) => { pendingPointerMove = e; });
-function flushPointerMove() {
-  const e = pendingPointerMove;
-  if (!e) return;
-  pendingPointerMove = null;
-  handlePointerMove(e);
-}
-function handlePointerMove(e) {
-  if (e.target.tagName !== 'CANVAS') {
-      document.body.style.cursor = 'default';
-      return;
-  }
-
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-
-  const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
-  const isWalkingInBattle = (currentMode === 'battle' && currentPath.length > 0);
-  
-  // Reset each interactable sprite to its own base tint (not a shared white -
-  // chest/barrel are untextured color sprites, not tinted photos like enemySprite).
-  for (const [sprite, baseColor] of spriteBaseColor) {
-    sprite.material.color.setHex(baseColor);
-  }
-  document.body.style.cursor = 'default';
-
-  if (currentMode === 'explore' && !isDialogueOpen) {
-     raycaster.setFromCamera(mouse, camera);
-     const hoverIntersects = raycaster.intersectObjects([enemySprite, chestSprite, barrelSprite]);
-     if (hoverIntersects.length > 0) {
-        const hovered = hoverIntersects[0].object;
-        const target = spriteToTarget.get(hovered);
-        if (target && pathDistance(player.gridPos, target.gridPos) <= 2) {
-           hovered.material.color.setHex(0xffff00);
-           document.body.style.cursor = 'pointer';
-        }
-     }
-  }
-
-  if (!inputRules[currentMode].click || isWalkingManual || isWalkingInBattle) {
-    highlightMesh.visible = false;
-    lastHoveredKey = null;
-    if (!isWalkingInBattle) pathGroup.clear();
-    return;
-  }
-  
-  if (isPointerDown && currentMode === 'explore') {
-     processClickToMove(e.clientX, e.clientY, false);
-     return;
-  }
-  
-  if (clickPulseTime > 0) return;
-
-  const intersect = getGridIntersection(e.clientX, e.clientY);
-  if (intersect) {
-    const { gx, gy, gz } = intersect;
-    const targetKey = getVoxelKey(gx, gy, gz);
-
-    if (targetKey !== lastHoveredKey) {
-      lastHoveredKey = targetKey;
-      const voxel = World.get(targetKey);
-
-      const inArena = currentMode === 'explore' || !currentArenaMap || currentArenaMap.has(targetKey);
-      if (voxel && isStandable(gx, gy, gz) && inArena) {
-        highlightMesh.position.set(gx * VOXEL_SIZE, surfaceHeight(gx, gy, gz) + 0.02, gz * VOXEL_SIZE);
-        highlightMesh.visible = true;
-
-        if (currentMode === 'battle') {
-          // Every standable tile gets a border and a path; reachable ones are
-          // white, the rest red, with the dots turning red where movement runs
-          // out. No path at all is red with no dots.
-          const reachable = !!(currentReachable && currentReachable.has(targetKey));
-          const path = findPath(player.gridPos, { x: gx, y: gy, z: gz }, false);
-          const reach = player.turnResources ? player.turnResources.moveRemaining : player.speed;
-          highlightMesh.material.color.setHex(reachable ? REACH_COLOUR : OUT_OF_REACH_COLOUR);
-          updatePathDots(path, reachable ? Infinity : reach);
-        } else {
-          highlightMesh.material.color.setHex(HOVER_COLOUR);
-          pathGroup.clear();
-        }
-      } else {
-        highlightMesh.visible = false;
-        pathGroup.clear();
-      }
+// --- Pointer and keys (game/input.js) ---
+const input = createInput({
+  game, player, interaction, encounter, picker, markers,
+  sprites: {
+    clickable: () => [playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes],
+    hoverable: () => [enemySprite, chestSprite, barrelSprite],
+    targetOf: sprite => spriteToTarget.get(sprite),
+    // Each hoverable back to its own base tint (not a shared white - chest/barrel
+    // are untextured color sprites, not tinted photos like enemySprite).
+    highlight(lit) {
+      for (const [sprite, baseColor] of spriteBaseColor) sprite.material.color.setHex(baseColor);
+      if (lit) lit.material.color.setHex(0xffff00);
     }
-  } else {
-    highlightMesh.visible = false;
-    pathGroup.clear();
-    lastHoveredKey = null;
   }
-}
+});
 
 // Whiteworld draws the terrain plain white. One uniform, read by both the plain
 // and the shadowed terrain materials (render.js), so toggling it is a write.
@@ -1782,8 +1124,8 @@ window.addEventListener('keydown', (e) => {
   // Alt+<key> is reserved for debug modes.
   if (e.altKey && e.code === 'KeyC') {
     e.preventDefault();
-    freeCam = !freeCam;
-    console.log(freeCam ? 'free cam on - WASD flies the camera, Bob stays put'
+    rig.freeCam = !rig.freeCam;
+    console.log(rig.freeCam ? 'free cam on - WASD flies the camera, Bob stays put'
                         : 'free cam off - camera returns to Bob');
     return;
   }
@@ -1816,19 +1158,14 @@ window.addEventListener('keydown', (e) => {
   if (e.altKey && e.code === 'KeyG') {
     e.preventDefault();
     const msg = toggleBoxGridDebug(scene, player.gridPos, worldInstancedMesh,
-                                   currentMode, { sunDirection: dirLight.position,
+                                   game.mode, { sunDirection: dirLight.position,
                                                   bias: sunGridBias });
     console.log(msg || '[boxGrid debug] off');
     return;
   }
 
-if (key === 'escape' && isDialogueOpen) {
-     closeInteractionPanel();
-  }
-
-  if (keyState.hasOwnProperty(key)) {
-    keyState[key] = true;
-  }
+  // The game's keys: walking, Escape, B (game/input.js).
+  input.keyDown(key);
 
   // R: every advanced effect on or off. On: the frame graph, then the
   // cone-traced sun, then the marched shadows (and with them AO cones, GI,
@@ -1849,96 +1186,15 @@ if (key === 'escape' && isDialogueOpen) {
     return;
   }
 
-  if (key === 'b') {
-    currentMode = currentMode === 'explore' ? 'battle' : 'explore';
-    battleSessionId++;
-    document.getElementById('mode-text').innerText = currentMode.charAt(0).toUpperCase() + currentMode.slice(1);
-    
-    currentPath = []; 
-    highlightMesh.visible = false;
-    pathGroup.clear();
-    lastHoveredKey = null;
-    clickPulseTime = 0;
-    highlightMesh.material.color.setHex(HOVER_COLOUR);
-    
-    if (currentMode === 'battle') {
-      player.gridPos.x = Math.round(playerSprite.position.x / VOXEL_SIZE);
-      player.gridPos.z = Math.round(playerSprite.position.z / VOXEL_SIZE);
-      playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
-      
-      const battleData = enterBattle(player.gridPos);
-      currentArenaMap = battleData.arena;
-      currentArenaBounds = battleData.bounds;
-      
-      const centerX = (battleData.bounds.minX + battleData.bounds.maxX) / 2;
-      const centerZ = (battleData.bounds.minZ + battleData.bounds.maxZ) / 2;
-      arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
-      
-      updateVoxelVisibility(currentArenaMap, true);
-      updateObjectVisibility(currentArenaMap, true);
-      setArenaHitBounds(currentArenaBounds);
-
-      // FIX: Only the player starts in combat automatically
-      battleParticipants = [player];
-      
-      const enemyInChunk = currentArenaMap.has(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z));
-      
-      // Freeze them if they are in the chunk, hide them if they aren't
-      if (enemyInChunk) {
-         enemyAI.isPaused = true;
-         enemySprite.visible = true;
-      } else {
-         enemySprite.visible = false;
-      }
-      
-      refreshReachableTiles();
-
-      rollInitiativeForParticipants(battleParticipants);
-      UI.toggleBattleUI(true);
-      UI.updateHUD(player);
-      UI.updatePartyView(battleParticipants, player.id);
-      UI.updateActionOrder(turnOrder, currentTurnIndex, battleParticipants);
-      
-      const activeEntity = getCurrentEntity(battleParticipants);
-      if (activeEntity) onTurnStart(activeEntity);
-
-    } else {
-      // EXITING BATTLE
-      exitBattle();
-      currentArenaMap = null;
-      updateVoxelVisibility(null, false);
-      updateObjectVisibility(null, false);
-      setArenaHitBounds(null);
-      refreshReachableTiles();
-
-      if (!isDefeated(enemy)) {
-         enemyAI.isPaused = false;
-         enemySprite.visible = true;
-      }
-      
-      resetBattleState(battleParticipants);
-      battleParticipants = [];
-      
-      UI.toggleBattleUI(false);
-      UI.clearDiceLog();
-    }
-  }
-  
-  if (key === 'q') rotationStep += 1;
-  if (key === 'e') rotationStep -= 1;
+  if (key === 'q') rig.rotationStep += 1;
+  if (key === 'e') rig.rotationStep -= 1;
 
 });
 
-window.addEventListener('keyup', (e) => {
-  const key = e.key.toLowerCase();
-  if (keyState.hasOwnProperty(key)) {
-    keyState[key] = false;
-  }
-});
+window.addEventListener('keyup', (e) => input.keyUp(e.key.toLowerCase()));
 
 window.addEventListener('resize', () => {
-  aspect = window.innerWidth / window.innerHeight;
-  camera.aspect = aspect;
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
@@ -1951,192 +1207,45 @@ function animate(time) {
   timer.update(time);
   const dt = Math.min(timer.getDelta(), 0.1);
 
-  if (currentMode === 'explore' && !editor.active) {
-    enemyAI.update(dt, currentHeading);
+  if (game.mode === 'explore' && !editor.active) {
+    enemyAI.update(dt, rig.heading);
   }
 
-  // The newest pointer move since the last frame (see handlePointerMove).
-  flushPointerMove();
+  // The newest pointer move since the last frame (game/input.js).
+  input.flush();
 
-  // Handle Highlight Pulse Animation
-  if (clickPulseTime > 0) {
-    clickPulseTime -= dt * 4; // Roughly 0.25 sec total duration
-    const scale = 1 + Math.sin(clickPulseTime * Math.PI) * 0.15; // Pop scale effect
-    highlightMesh.scale.set(scale, scale, 1);
-    
-    if (clickPulseTime <= 0) {
-      // Reset after pulse completes
-      highlightMesh.material.color.setHex(HOVER_COLOUR);
-      highlightMesh.material.opacity = 0.5;
-      highlightMesh.scale.set(1, 1, 1);
-      lastHoveredKey = null; // Force an update check next frame
-    }
-  }
+  // The click pop; once it ends the hover is looked at afresh.
+  if (markers.update(dt)) input.forgetHover();
 
   // 1. Process Movement Logic
-  const isWalkingManual = (keyState.w || keyState.a || keyState.s || keyState.d);
+  const isWalkingManual = (game.keys.w || game.keys.a || game.keys.s || game.keys.d);
 
-  if (isWalkingManual && !freeCam && currentMode === 'explore' && currentPath.length > 0) {
-    currentPath = [];
-    currentMoveTargetKey = null;
+  if (isWalkingManual && !rig.freeCam && game.mode === 'explore' && game.path.length > 0) {
+    game.path = [];
+    game.moveTargetKey = null;
   }
 
-  if (currentPath.length > 0) {
-    const targetNode = currentPath[0];
-    const targetWorldPos = getSpriteWorldPos(targetNode);
-    // Across the ground only: followGround sets the height under the sprite.
-    targetWorldPos.y = playerSprite.position.y;
-    const step = 8 * dt;
-    
-    if (playerSprite.position.distanceTo(targetWorldPos) <= step) {
-      playerSprite.position.copy(targetWorldPos);
-      
-      const oldVoxel = World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z));
-      if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
-      
-      player.gridPos = currentPath.shift();
-      
-      const newVoxel = World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z));
-      if (newVoxel) newVoxel.occupant = player.id;
-
-      if (currentMode === 'battle') {
-        player.turnResources.moveRemaining -= 1;
-        updatePathDots(currentPath);
-      }
-      
-      if (currentPath.length === 0 && currentMode === 'battle') {
-         refreshReachableTiles();
-      }
-    } else {
-      const dir = targetWorldPos.clone().sub(playerSprite.position).normalize();
-      
-      const dot = dir.x * Math.cos(currentHeading) - dir.z * Math.sin(currentHeading);
-      if (Math.abs(dot) > 0.05) updateSpriteFacing(playerSprite, dot > 0);
-      
-      playerSprite.position.add(dir.multiplyScalar(step));
-      
-      if (currentMode === 'explore') {
-        const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
-        const newGridZ = Math.round(playerSprite.position.z / VOXEL_SIZE);
-        
-        if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
-          const oldVoxel = World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z));
-          // FIX: Only clear if we own it
-          if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
-          
-          // The column's level: half a block up or down is a step (world.js).
-          const newGridY = stepLevel(player.gridPos.x, player.gridPos.y, player.gridPos.z,
-                                     newGridX, newGridZ) ?? player.gridPos.y;
-          const newVoxel = World.get(getVoxelKey(newGridX, newGridY, newGridZ));
-          if (newVoxel) newVoxel.occupant = player.id;
-          
-          player.gridPos.x = newGridX;
-          player.gridPos.y = newGridY;
-          player.gridPos.z = newGridZ;
-        }
-      }
+  if (game.path.length > 0) {
+    // In explore the occupied column follows Bob as he walks; in battle only
+    // each arrival moves him, and each costs a step of movement.
+    const arrived = followPath(player, playerSprite, game.path, WALK_SPEED, dt, rig.heading,
+                               game.mode === 'explore');
+    if (arrived && game.mode === 'battle') {
+      player.turnResources.moveRemaining -= 1;
+      markers.path(game.path);
+      if (game.path.length === 0) encounter.refreshReachableTiles();
     }
-  } 
-  // ENEMY AI MOVEMENT LOGIC
-  if (enemyPath.length > 0) {
-    const targetNode = enemyPath[0];
-    const targetWorldPos = getSpriteWorldPos(targetNode);
-    targetWorldPos.y = enemySprite.position.y;   // across the ground only
-    const step = 5 * dt; 
-    
-    if (enemySprite.position.distanceTo(targetWorldPos) <= step) {
-      enemySprite.position.copy(targetWorldPos);
-      
-      const oldVoxel = World.get(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z));
-      if (oldVoxel && oldVoxel.occupant === enemy.id) oldVoxel.occupant = null;
-      
-      enemy.gridPos = enemyPath.shift();
-      
-      const newVoxel = World.get(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z));
-      if (newVoxel) newVoxel.occupant = enemy.id;
-      
+  }
+  // The enemy's battle move.
+  if (game.enemyPath.length > 0) {
+    if (followPath(enemy, enemySprite, game.enemyPath, ENEMY_SPEED, dt, rig.heading)) {
       enemy.turnResources.moveRemaining -= 1;
-      
-      if (enemyPath.length === 0) {
-         processEnemyAI(); // Trigger the attack check now that movement is finished
-      }
-    } else {
-      const dir = targetWorldPos.clone().sub(enemySprite.position).normalize();
-      const dot = dir.x * Math.cos(currentHeading) - dir.z * Math.sin(currentHeading);
-      if (Math.abs(dot) > 0.05) updateSpriteFacing(enemySprite, dot > 0);
-      enemySprite.position.add(dir.multiplyScalar(step));
+      // Trigger the attack check now that movement is finished
+      if (game.enemyPath.length === 0) encounter.processEnemyAI();
     }
-  }
-  else if (currentMode === 'explore' && inputRules.explore.keyboard && !freeCam) {
-    let rawDx = 0, rawDz = 0;
-    if (keyState.w) rawDz -= 1; 
-    if (keyState.s) rawDz += 1; 
-    if (keyState.a) rawDx -= 1; 
-    if (keyState.d) rawDx += 1; 
-
-    if (rawDx !== 0 || rawDz !== 0) {
-      if (rawDx !== 0) updateSpriteFacing(playerSprite, rawDx > 0);
-
-      if (rawDx !== 0 && rawDz !== 0) {
-        const invSqrt2 = 1 / Math.sqrt(2);
-        rawDx *= invSqrt2;
-        rawDz *= invSqrt2;
-      }
-
-      const targetHeading = (rotationStep * Math.PI / 2) + cameraConfigs.explore.headingOffset;
-      const cosH = Math.cos(targetHeading);
-      const sinH = Math.sin(targetHeading);
-
-      const dx = rawDx * cosH + rawDz * sinH;
-      const dz = -rawDx * sinH + rawDz * cosH;
-
-      const moveSpeed = 8;
-      const stepX = dx * moveSpeed * dt;
-      const stepZ = dz * moveSpeed * dt;
-
-      const newX = playerSprite.position.x + stepX;
-      const newZ = playerSprite.position.z + stepZ;
-
-      const nextGX = Math.round(newX / VOXEL_SIZE);
-      const nextGZ = Math.round(newZ / VOXEL_SIZE);
-      
-      // The level a column is entered at: the same, or a half-block step
-      // (world.js stepLevel). A full block's rise needs Jump.
-      const levelAt = (gx, gz) => (gx === player.gridPos.x && gz === player.gridPos.z)
-        ? player.gridPos.y
-        : stepLevel(player.gridPos.x, player.gridPos.y, player.gridPos.z, gx, gz);
-      const canWalk = (gx, gz) => {
-         const y = levelAt(gx, gz);
-         if (y === null) return false;
-         const v = World.get(getVoxelKey(gx, y, gz));
-         return !v.occupant || v.occupant === player.id;
-      };
-
-      if (canWalk(nextGX, nextGZ)) {
-        playerSprite.position.x = newX;
-        playerSprite.position.z = newZ;
-      } else {
-        if (canWalk(nextGX, Math.round(playerSprite.position.z / VOXEL_SIZE))) playerSprite.position.x = newX;
-        if (canWalk(Math.round(playerSprite.position.x / VOXEL_SIZE), nextGZ)) playerSprite.position.z = newZ;
-      }
-
-      const newGridX = Math.round(playerSprite.position.x / VOXEL_SIZE);
-      const newGridZ = Math.round(playerSprite.position.z / VOXEL_SIZE);
-      
-      if (newGridX !== player.gridPos.x || newGridZ !== player.gridPos.z) {
-        const oldVoxel = World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z));
-        // FIX: Strict ownership check
-        if (oldVoxel && oldVoxel.occupant === player.id) oldVoxel.occupant = null;
-        
-        const newGridY = levelAt(newGridX, newGridZ) ?? player.gridPos.y;
-        const newVoxel = World.get(getVoxelKey(newGridX, newGridY, newGridZ));
-        if (newVoxel) newVoxel.occupant = player.id;
-        
-        player.gridPos.x = newGridX;
-        player.gridPos.y = newGridY;
-        player.gridPos.z = newGridZ;
-      }
-    }
+  } else if (game.mode === 'explore' && INPUT_RULES.explore.keyboard && !rig.freeCam) {
+    walk(player, playerSprite, game.keys,
+         rig.settledHeading('explore'), dt);
   }
   // Characters move across the ground; their height is the ground under
   // them, followed exactly up a slope and eased over a half-block ledge
@@ -2144,55 +1253,20 @@ function animate(time) {
   followGround(playerSprite, player.gridPos, dt);
   followGround(enemySprite, enemy.gridPos, dt);
 
-  // Auto-close the panel if the player walks out of look-range of whichever
-  // target is open; otherwise keep its action buttons' enabled state live.
-  if (isDialogueOpen && interactionTarget) {
-     if (pathDistance(player.gridPos, interactionTarget.gridPos) > 2) {
-        closeInteractionPanel();
-     } else {
-        updateInteractionButtons();
-     }
-  }
+  // The panel closes once Bob walks out of look-range of its target;
+  // otherwise its action buttons' enabled state stays live.
+  interaction.update();
 
-  // 2. Camera Lerping & Pivot Tracking
-  // The lerp factors were tuned as "per frame at 60 Hz". Converted to the
-  // equivalent fraction for this frame's dt, so a 240 Hz screen eases at the
-  // same speed as a 60 Hz one instead of four times faster.
-  const ease = 1 - Math.pow(1 - CAMERA_LERP_SPEED, dt * 60);
-  if (freeCam) {
-    moveFreeCam(dt);
-  } else if (currentMode === 'explore') {
-    pivot.position.lerp(playerSprite.position, ease);
-  } else {
-    pivot.position.lerp(arenaCenter, ease);
-  }
-
-  const config = cameraConfigs[currentMode];
-  const targetHeading = (rotationStep * Math.PI / 2) + config.headingOffset;
-  
-  // Lerp all camera properties smoothly
-  currentFov += (config.fov - currentFov) * ease;
-  currentPitch += (config.pitch - currentPitch) * ease;
-  currentHeading += (targetHeading - currentHeading) * ease;
-  currentDistance += (config.distance - currentDistance) * ease;
-
-  camera.fov = currentFov;
-  camera.updateProjectionMatrix();
-
-  const xzLen = currentDistance * Math.cos(currentPitch);
-  camera.position.x = pivot.position.x + xzLen * Math.sin(currentHeading);
-  camera.position.y = pivot.position.y + currentDistance * Math.sin(currentPitch);
-  camera.position.z = pivot.position.z + xzLen * Math.cos(currentHeading);
-  
-  camera.lookAt(pivot.position);
+  // 2. The camera: eased toward the mode's framing, around Bob or the arena.
+  rig.update(dt, game.mode, playerSprite.position, game.keys);
   editor.update(dt);
 
   // Clamped billboard: characters turn to face the camera's heading, plus lean
   // back toward its pitch up to MAX_CHARACTER_TILT - enough to avoid looking
   // flat/squished, not enough to swing into adjacent geometry like the tree.
-  const characterTilt = Math.min(currentPitch, MAX_CHARACTER_TILT);
-  playerSprite.rotation.set(-characterTilt, currentHeading, 0);
-  enemySprite.rotation.set(-characterTilt, currentHeading, 0);
+  const characterTilt = Math.min(rig.pitch, MAX_CHARACTER_TILT);
+  playerSprite.rotation.set(-characterTilt, rig.heading, 0);
+  enemySprite.rotation.set(-characterTilt, rig.heading, 0);
 
   // Checked after the rotation is applied, since whether the quad penetrates
   // geometry depends on this frame's yaw and lean.
@@ -2201,7 +1275,7 @@ function animate(time) {
 
   // Rebuilds the overlay if the player has walked into a different chunk.
   // No-op when the overlay is off or the chunk is unchanged.
-  refreshBoxGridDebug(scene, player.gridPos, currentMode,
+  refreshBoxGridDebug(scene, player.gridPos, game.mode,
                       { sunDirection: dirLight.position, bias: sunGridBias });
 
   // The cascades follow the player so shading works wherever they are, not only
@@ -2291,7 +1365,7 @@ let shadowOrigins = [];     // block origin each level is currently built at
 // Called on turn-on and whenever a level's origin moves.
 function ensureShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const o = gridOriginFor(currentMode, fieldFocus(), dirLight.position, sunGridBias, l);
+    const o = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sunGridBias, l);
     shadowGrids[l] = createBoxGridAt(o.x, o.z, shadowGrids[l] || null, l);
     if (!shadowTexes[l]) shadowTexes[l] = createDistanceTexture(shadowGrids[l]);
     updateDistanceTexture(shadowTexes[l]);
@@ -2319,7 +1393,7 @@ let fieldApplied = false;   // for the spike log: a hand-off landed this frame
 function resetFieldWorker() {
   if (!fieldWorker) {
     try {
-      fieldWorker = new Worker(new URL('./fieldWorker.js', import.meta.url), { type: 'module' });
+      fieldWorker = new Worker(new URL('./render/fieldWorker.js', import.meta.url), { type: 'module' });
     } catch (err) {
       console.warn('[shadows] no field worker, re-origins stay on the main thread', err);
       fieldWorker = false;
@@ -2355,7 +1429,7 @@ function followShadowGrids() {
   let moved = fieldApplied;
   fieldApplied = false;
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const want = gridOriginFor(currentMode, fieldFocus(), dirLight.position, sunGridBias, l);
+    const want = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sunGridBias, l);
     const at = shadowOrigins[l];
     if (at && want.x === at.x && want.z === at.z) continue;
     if (fieldWorker) {
@@ -2389,7 +1463,7 @@ function followShadowGrids() {
 let sunRays = 1;
 // Which way the penumbra is obtained. false samples the solar disc with sunRays
 // rays; true gets the whole thing from a single cone trace against the widened
-// field. Both are the same march and the same field - see gpu.js for the one
+// field. Both are the same march and the same field - see gpu/sun.js for the one
 // thing the cone gives up, which is occluder shape. The cone is the default:
 // it is what R turns on, and so what the load-time compile builds.
 let sunCone = true;
@@ -2430,7 +1504,7 @@ const aoDistance = uniform(AO_DISTANCE);
 // View: the terrain's raw LabPBR specular texel in place of the lit colour.
 // Compiled in, like the other views.
 let specularOnly = false;
-// Specular (gpu.js section 7): GGX highlights from every light, and one
+// Specular (gpu/specular.js): GGX highlights from every light, and one
 // reflection ray per texel on smooth surfaces. Both compiled in. The sky is
 // what a ray that leaves the field sees - the background, as a uniform.
 let specularOn = true;
@@ -2471,12 +1545,12 @@ scene.backgroundNode = skyShTSL(skyBindings, positionWorldDirection);
 // frame that has cascades and a light list, and follows C0 from then on.
 let giOn = true;
 // Which bounce: 'texel' - a radiance cache on the block faces, ray-traced
-// (gpu.js createTexelGI; needs split shading, which finds the patches) - or
+// (gpu/texelgi.js createTexelGI; needs split shading, which finds the patches) - or
 // 'lpv', the light propagation volume.
 let giMode = 'lpv';
 let texelGI = null;
 // Texel GI response time (s): the patches' shown light eases toward each new
-// sum with this time constant, in real time (gpu.js createTexelGI blend).
+// sum with this time constant, in real time (gpu/texelgi.js createTexelGI blend).
 let giResponse = 0.15;
 let giLastT = 0;
 function ensureTexelGI() {
@@ -2537,7 +1611,7 @@ function giBinding() {
   return { levels: lpvs.map(v => v.binding), strength: giStrength };
 }
 
-// --- Texel-rate shading (gpu.js section 8) ---
+// --- Texel-rate shading (gpu/texel.js) ---
 //
 // The terrain is shaded in a low-res pass - 1/texelCacheScale per axis - into
 // a float target of vec4(colour, texel id); the full-res pass then reuses the
@@ -2606,7 +1680,7 @@ const _drawSize = new THREE.Vector2();
 function sizeTexelCache() {
   renderer.getDrawingBufferSize(_drawSize);
   texelCacheScale = texelCacheSpacing ||
-    texelCacheSpacingFor(texelPixels(_drawSize.y, camera.fov, currentDistance), texelCacheScale);
+    texelCacheSpacingFor(texelPixels(_drawSize.y, camera.fov, rig.distance), texelCacheScale);
   const w = Math.max(1, Math.ceil(_drawSize.x / texelCacheScale));
   const h = Math.max(1, Math.ceil(_drawSize.y / texelCacheScale));
   if (!texelCache.rt) {
@@ -2787,7 +1861,7 @@ let giFarHalf = true;
 // one by one as before, for A/B.
 let giBatch = true;
 let giFrame = 0;
-// Glass debug views (gpu.js glassNode): null, 'thickness', 'through' or 'path'.
+// Glass debug views (gpu/shade.js glassNode): null, 'thickness', 'through' or 'path'.
 let glassView = null;
 // Internal reflections a ray through glass may take before it counts as trapped.
 let glassBounces = GLASS_MAX_BOUNCES;
@@ -2796,7 +1870,7 @@ let glassLayers = GLASS_LAYERS;
 // Dispersion: off (0) by default - three traces instead of one. Debug.
 let glassDispersion = 0;
 // Glare off glass: 0 off, 1 its front surface (glass joins the mirror light's
-// rectangles), 2 its back face too (gpu.js glassBackGlare). Only while the
+// rectangles), 2 its back face too (gpu/glass.js glassBackGlare). Only while the
 // mirror light itself is on. Front-surface glare by default.
 let glassGlare = 1;
 // Shadow rays tint through glass. Off only inside bxb.gpuprofile, to price it.
@@ -3019,12 +2093,12 @@ let mirrorLightBudget = DEFAULT_MIRROR_LIGHT_BUDGET;
 let lightMirrorRows = [];
 // Profiling only (bxb.gpuprofile): the model lookup in reflection hits.
 let modelHitsOn = true;
-// The hit lighting cache (gpu.js createHitCache): reflections reuse what the
+// The hit lighting cache (gpu/hitcache.js createHitCache): reflections reuse what the
 // terrain lit on screen last frame. A rebuild to switch (bxb.hitcache()).
 // Off by default: on the glass bed it saved ~0 (the low-res pass loses early
 // depth tests to the writes) and the one-frame lag shimmered in motion.
 let hitCacheOn = false;
-// Split shading (gpu.js createSplitShading): the low-res pass writes samples,
+// Split shading (gpu/texel.js createSplitShading): the low-res pass writes samples,
 // compute kernels light them a feature at a time. A rebuild to switch
 // (bxb.splitshading()); off by itself if the GPU rejects it.
 let splitOn = true;
@@ -3220,7 +2294,7 @@ function updateTorchPosition() {
 function heldLightPosition(out) {
   // The sprite's own +Z in world space, which is where it is facing - it is
   // yawed to meet the camera every frame, so this is "toward the viewer" without
-  // having to re-derive it from currentHeading. Reading the orientation the
+  // having to re-derive it from rig.heading. Reading the orientation the
   // sprite actually has, rather than the one it was asked for, keeps the flame
   // from lagging a frame behind on a camera spin.
   playerSprite.getWorldDirection(torchForward);
@@ -3233,7 +2307,7 @@ function heldLightPosition(out) {
 
   // The sprite's own right, in world space: X = up cross Z for a right-handed
   // basis, which for a flattened forward is (fz, -fx). Taken from the forward
-  // vector rather than from currentHeading for the same reason forward itself is
+  // vector rather than from rig.heading for the same reason forward itself is
   // - one source of truth for where the sprite is actually pointing.
   const rightX = torchForward.z, rightZ = -torchForward.x;
   // Bob mirrors when he turns, so the hand holding the torch swaps with him.
@@ -3456,7 +2530,7 @@ function shadowNodeOptions() {
     split: splitOn && texelCacheOn ? ensureSplitShading() : null,
     splitResolve: splitResolveOn,
     splitLegacy,
-    // The world has glass: shadow rays tint through it (gpu.js createConeTraceSunTSL).
+    // The world has glass: shadow rays tint through it (gpu/trace.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
 }
@@ -3529,7 +2603,7 @@ function obtainShadowSet() {
     lowMat = new THREE.MeshBasicNodeMaterial();
     // outputNode, not colorNode: the stored colour must not carry the
     // per-instance tint, which the lookup material applies once itself.
-    // The low-res pass alone also fills the hit lighting cache (gpu.js makeNode).
+    // The low-res pass alone also fills the hit lighting cache (gpu/shade.js makeNode).
     const split = built.splitKernels ? opts.split : null;
     lowMat.outputNode = split ? createTexelGBufferNode(false, splitLegacy)
       : createTexelCacheWriteNode(terrainEmissiveTSL(built.nodeCaching, terrainTextures));
@@ -3817,7 +2891,7 @@ const bxbApi = installConsole(createConsole({
   parity: {
     help: 'march the same rays on CPU and GPU and diff them',
     run: async (n = 256) => {
-      const origin = gridOriginFor(currentMode, player.gridPos, dirLight.position, sunGridBias);
+      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sunGridBias);
       const grid = createBoxGridAt(origin.x, origin.z);
       const tex = createDistanceTexture(grid);
 
@@ -4797,14 +3871,14 @@ const bxbApi = installConsole(createConsole({
   grid: {
     help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+G)',
     run: () => toggleBoxGridDebug(
-      scene, player.gridPos, worldInstancedMesh, currentMode,
+      scene, player.gridPos, worldInstancedMesh, game.mode,
       { sunDirection: dirLight.position, bias: sunGridBias }
     ) || 'boxGrid overlay off'
   },
   stats: {
     help: 'print world, grid and frame statistics',
     run: () => {
-      const origin = gridOriginFor(currentMode, player.gridPos, dirLight.position, sunGridBias);
+      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sunGridBias);
       const grid = createBoxGridAt(origin.x, origin.z);
       const s = perf.stats();
       const out = {
@@ -4813,7 +3887,7 @@ const bxbApi = installConsole(createConsole({
         gridOccupied: grid.occupiedCount,
         gridVoxels: GRID_DIM ** 3,
         gridMB: +(grid.data.length / 1048576).toFixed(2),
-        mode: currentMode,
+        mode: game.mode,
         fps: +s.fps.toFixed(1),
         frameMs: +s.avg.toFixed(2)
       };
@@ -4828,7 +3902,7 @@ const bxbApi = installConsole(createConsole({
       const out = {
         x: p.x, y: p.y, z: p.z,
         chunk: Math.floor(p.x / CHUNK_SIZE) + ',' + Math.floor(p.z / CHUNK_SIZE),
-        mode: currentMode
+        mode: game.mode
       };
       console.log(out);
       return out;
@@ -4846,7 +3920,7 @@ const bxbApi = installConsole(createConsole({
       const next = World.get(getVoxelKey(x, top, z));
       if (next) next.occupant = player.id;
       playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
-      currentPath = [];
+      game.path = [];
       return 'teleported to ' + x + ',' + top + ',' + z;
     }
   },
@@ -5147,7 +4221,7 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => isBoxGridDebugVisible(),
       set: v => flip(isBoxGridDebugVisible(), v, () => bxbApi.grid()) },
     { key: 'freecam', label: 'Free cam (Alt+C)', type: 'toggle',
-      get: () => freeCam, set: v => { freeCam = !!v; } },
+      get: () => rig.freeCam, set: v => { rig.freeCam = !!v; } },
     { key: 'hud', label: 'HUD (Alt+U)', type: 'toggle',
       get: () => !document.body.classList.contains('ui-hidden'),
       set: v => { document.body.classList.toggle('ui-hidden', !v); } },
