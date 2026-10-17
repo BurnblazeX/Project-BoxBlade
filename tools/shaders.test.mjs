@@ -3,7 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
-import { buildAllShaders, buildViewShaders, buildProfilingShaders } from './lib/shaders.mjs';
+import { buildAllShaders, buildViewShaders, buildProfilingShaders, buildExposureShaders,
+         buildFadeShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
 // moves code must leave all of them identical - this is what proves it, where
@@ -75,4 +76,18 @@ section('gpuprofile flags build');
 for (const [id, set] of Object.entries(buildProfilingShaders())) {
   const empty = Object.entries(set).filter(([, st]) => Object.values(st).some(w => !w || !w.length));
   ok(`${id}: ${Object.keys(set).length} shaders`, empty.map(([k]) => k).join(', '), '');
+}
+
+section('interior fade builds');
+for (const [id, set] of Object.entries(buildFadeShaders())) {
+  ok(`${id}: vertex and fragment`, !!(set.vertex && set.vertex.length && set.fragment && set.fragment.length), true);
+}
+
+section('exposure meter builds');
+for (const [id, set] of Object.entries(buildExposureShaders())) {
+  ok(`${id}: compute`, !!(set.compute && set.compute.length), true);
+  // A uniform read in a shader must be declared in it (an undeclared 'object' is an invalid module).
+  if (id.startsWith('tonemap/')) {
+    ok(`${id}: declares the look uniforms`, /var<uniform>\s+object/.test(set.compute) && /bxbAgXPower\s*:/.test(set.compute), true);
+  }
 }

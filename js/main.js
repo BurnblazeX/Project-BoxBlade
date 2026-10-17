@@ -29,20 +29,20 @@ import { createSpriteAtlas } from './render/features/spriteatlas.js';
 import { createCards } from './render/features/cards.js';
 import { createSun } from './render/features/sun.js';
 import { createShadowSets, nextFrame } from './render/shadowsets.js';
+import { createToneMap } from './render/features/tonemap.js';
+import { createOcclusion } from './render/features/occlusion.js';
 import { getSpriteWorldPos, followPath, walk, WALK_SPEED, ENEMY_SPEED } from './game/movement.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './tools/debug.js';
 import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          CASCADE_COUNT, applyHandoff } from './core/boxgrid.js';
-import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
-         crossedPlanesGeometry } from './render/sprites.js';
+import { makeClipSamples, updateCharacterClipping, addSpriteTangent, crossedPlanesGeometry } from './render/sprites.js';
 import { createPerfOverlay } from './tools/perf.js';
 import { createFramePacer, describePacing } from './tools/pacing.js';
 import { VERSION, bundleHash, buildLabel } from './core/version.js';
 import { createVoxelAONode, AO_DISTANCE } from './gpu/ambient.js';
 import { runComputeSmokeTest, runGPUMarch } from './gpu/diagnostics.js';
 import { createDistanceTexture, updateDistanceTexture, followShadowGrid, commitShadowGrid,
-         cascadeBindings,
-         writeCascadeBindings } from './gpu/field.js';
+         cascadeBindings, writeCascadeBindings } from './gpu/field.js';
 import { GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics } from './gpu/glass.js';
 import { createHitCache } from './gpu/hitcache.js';
 import { createNormalTexture } from './gpu/normals.js';
@@ -54,8 +54,7 @@ import { lightRadiusMetres } from './core/lights.js';
 import { createConsole, installConsole } from './tools/console.js';
 import { createSettingsPanel } from './tools/settings.js';
 import { unstableNames, hashText } from './core/shadowsets.js';
-import { classifyTextureAlpha, registerCutout,
-         cutoutsEnabled, setCutoutsEnabled } from './render/cutout.js';
+import { classifyTextureAlpha, registerCutout, cutoutsEnabled, setCutoutsEnabled } from './render/cutout.js';
 import { averageAlbedo } from './core/lpv.js';
 import * as UI from './game/ui.js';
 
@@ -70,7 +69,6 @@ const game = createGameState();
 
 // The battle buttons (game/encounter.js, made below).
 UI.initUI(() => encounter.attack(), () => encounter.endTurn());
-
 
 // --- SCENE SETUP ---
 const scene = new THREE.Scene();
@@ -172,8 +170,6 @@ if (testTorch) {
 }
 }
 initWorldRender(scene);
-
-
 
 // --- PLAYER ENTITY & SPRITE SETUP ---
 const player = createEntity({
@@ -406,8 +402,6 @@ createTrees([
   { x: 17, y: 0, z: 9 }
 ]);
 
-
-
 const chest = createObject({
   id: "obj_chest_1",
   name: "Old Chest",
@@ -489,7 +483,6 @@ const spriteBaseColor = new Map([
   [chestSprite, 0xffffff],
   [barrelSprite, 0x8b5a2b]
 ]);
-
 
 // The hover border and the path dots (render/markers.js).
 const markers = createMarkers(scene);
@@ -853,8 +846,10 @@ function animate(time) {
   if (shadowsOn) gi.update();
 
   const tRender = performance.now();
+  occlusion.update();   // the cut-out's circle, before the first terrain pass
   texel.render();
   spriteAtlas.render();
+  tonemap.update();   // meters this frame's terrain, before the main render
   renderer.render(scene, camera);
   resolveGPUTime();
   const tEnd = performance.now();
@@ -1062,6 +1057,8 @@ const texel = engine.add(createTexelCache({
   rebuild: () => buildPerPixelShadows()
 }));
 // The shader sets: built from every feature's options, kept compiled.
+const tonemap = engine.add(createToneMap({ renderer, effectsOn: () => shadowsOn, meterSource: () => texel.meterSource() }));
+const occlusion = engine.add(createOcclusion({ renderer, scene, camera, feet: () => playerSprite.position, fadeMat: () => shadowsOn && sets.active?.fadeMat }));
 const sets = createShadowSets({
   renderer, scene, camera, options: () => shadowNodeOptions(), texel, spriteAtlas, sun,
   sprites: { meshes: () => spriteMeshes(), clipping: () => [playerSprite, enemySprite],
@@ -1601,7 +1598,7 @@ const bxbApi = installConsole(createConsole({
     }
   },
   light: sun.commands.light,
-  ...sky.commands,
+  ...sky.commands, ...tonemap.commands, ...occlusion.commands,
   sun: sun.commands.sun
 }));
 
@@ -1656,6 +1653,7 @@ settingsPanel = createSettingsPanel({ groups: [
     ...sun.shadowSettings
   ]},
   sun.settings,
+  tonemap.settings, occlusion.settings,
   { title: 'Shading', settings: [
     ...sun.shadingSettings,
     { key: 'aodist', label: 'AO reach (m)', type: 'range', min: 0.25, max: 3, step: 0.05,

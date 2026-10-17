@@ -7,6 +7,7 @@
 import { attribute, texture, uv, int, vec3, vec4, uniform, select, positionLocal, Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize, clamp, exp2 } from 'three/tsl';
 import { BLOCK_METRES } from '../core/world.js';
 import { VOXEL_METRES } from '../core/boxgrid.js';
+import { occlusionRevealTSL } from './occlusion.js';
 
 // 1 draws the terrain plain white (whiteworld) - a uniform, so both the plain
 // and the shadowed materials follow it with no rebuild.
@@ -22,9 +23,9 @@ export const terrainLayerTSL = () => int(attribute('blockLayer', 'float').add(0.
 // already the placed block.
 // blockGlass also carries the instance's drawn faces: glass + 2 * mask
 // (world.js exposedFaceMask), read by terrainShapeTSL.
-export const terrainKeepTSL = glass => {
+export const terrainKeepTSL = (glass, reveal = true) => {
   const isGlass = attribute('blockGlass', 'float').mod(float(2)).greaterThan(0.5);
-  return select(glass ? isGlass : isGlass.not(), terrainShapeTSL(), vec3(0, 0, 0));
+  return select(glass ? isGlass : isGlass.not(), terrainShapeTSL(reveal), vec3(0, 0, 0));
 };
 
 // --- Slopes, as drawn ---
@@ -58,8 +59,12 @@ export function slopeFromCodeTSL(code) {
 // instancing, like terrainKeepTSL, so the drop is in world metres.
 //
 // A buried face (world.js exposedFaceMask, bits in blockGlass / 2) collapses
-// to a point - zero area, no fragments - in every pass that draws the terrain.
-export const terrainShapeTSL = () => {
+// to a point - zero area, no fragments - in every pass that draws the terrain;
+// unless the block across it is being cut away from in front of the player
+// (gpu/occlusion.js occlusionRevealTSL), when it is the surface the cut opens on.
+// reveal false: the buried faces stay buried (the interiors' translucent fade,
+// which draws a faded block's outside only).
+export const terrainShapeTSL = (reveal = true) => {
   const s = slopeTSL();
   const raw = attribute('position', 'vec3');
   const low = s.on.and(raw.y.greaterThan(float(0)))
@@ -70,7 +75,8 @@ export const terrainShapeTSL = () => {
   const d = select(abs(nr.x).greaterThan(float(0.5)), select(nr.x.greaterThan(float(0)), float(0), float(1)),
             select(abs(nr.y).greaterThan(float(0.5)), select(nr.y.greaterThan(float(0)), float(2), float(3)),
                    select(nr.z.greaterThan(float(0)), float(4), float(5))));
-  const shown = floor(mask.div(exp2(d))).mod(float(2)).greaterThan(float(0.5));
+  const exposed = floor(mask.div(exp2(d))).mod(float(2)).greaterThan(float(0.5));
+  const shown = reveal ? exposed.or(occlusionRevealTSL(positionLocal, raw, nr)) : exposed;
   return select(shown, shaped, vec3(0, 0, 0));
 };
 

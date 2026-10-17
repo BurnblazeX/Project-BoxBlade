@@ -24,6 +24,7 @@ import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissN
          createShadowMaterial } from '../../gpu/texel.js';
 import { terrainKeepTSL, terrainShapeTSL } from '../../gpu/terrain.js';
 import { terrainEmissiveTSL } from '../../gpu/shade.js';
+import { applyOcclusionMask, interiorFadeTSL } from '../../gpu/occlusion.js';
 import { worldInstancedMesh, glassInstancedMesh, terrainTextures } from '../render.js';
 import { flip } from '../engine.js';
 
@@ -99,7 +100,23 @@ export function buildTerrainMaterials({ built, opts, cache, cached }) {
   // Each draws only its own blocks - terrainKeepTSL in render.js.
   for (const m of [terrainMat, lowMat, missMat]) if (m) m.positionNode = terrainKeepTSL(false);
   for (const m of [glassMat, glassLow, glassMiss]) if (m) m.positionNode = terrainKeepTSL(true);
-  return { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss };
+  // The occlusion cut-out, in every opaque pass alike (gpu/occlusion.js) -
+  // never glass. The miss pass writes no depth - the prepass already holds
+  // it - so its discard leaves the stencil test early, before the heavy
+  // shader starts.
+  for (const m of [terrainMat, lowMat, missMat]) if (m) applyOcclusionMask(m);
+  if (missMat) missMat.depthWrite = false;
+  // The occlusion fade's colour (render/features/occlusion.js): what the
+  // opaque passes left out, drawn again translucent with this set's full
+  // shading - so a block fading looks exactly as it did solid, and never pops.
+  const fadeMat = createShadowMaterial(worldInstancedMesh, node);
+  fadeMat.transparent = true;
+  fadeMat.depthWrite = false;
+  fadeMat.positionNode = terrainKeepTSL(false, false);
+  const fade = interiorFadeTSL();
+  fadeMat.maskNode = fade.mask;
+  fadeMat.opacityNode = fade.opacity;
+  return { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss, fadeMat };
 }
 
 export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, activeSet, gi, rebuild }) {
@@ -152,6 +169,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
     // The same vertex code as the shaded draws: a slope's plane, not its box.
     depthOnly.positionNode = terrainShapeTSL();
+    applyOcclusionMask(depthOnly, true);   // its glass instances never cut
     // The prepass keeps every block, glass included: glass is the front surface
     // wherever it is, so the terrain behind it fails the depth test and is never
     // shaded.
@@ -376,6 +394,16 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     get on() { return texelCacheOn; },
     get splitOn() { return splitOn; },
     set splitOn(v) { splitOn = !!v; },
+    // Where the terrain's lit colour is this frame, for the exposure meter
+    // (gpu/exposure.js): split shading's result buffer, or the low-res target
+    // (under split shading that holds positions, not colour). null with no
+    // cached set showing.
+    meterSource() {
+      const set = activeSet();
+      if (!texelCacheOn || !shadowsOn() || !set || !set.lowMat) return null;
+      if (set.splitKernels) return splitShading ? { split: splitShading } : null;
+      return texelCache.tex ? { cache: texelCache } : null;
+    },
     // The target bindings, and the meshes drawing the full-res passes.
     cache: texelCache,
     twins: terrainTwins,

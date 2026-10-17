@@ -170,7 +170,7 @@ function shaderSet(name, over) {
   const built = G.createShadowColorNode(opts);
   const world = R.worldInstancedMesh, glass = R.glassInstancedMesh;
   const m = buildTerrainMaterials({ built, opts, cache: texelCache, cached: !!(opts.split || over.texelCache) });
-  const mats = { low: m.lowMat, terrain: m.terrainMat, miss: m.missMat,
+  const mats = { low: m.lowMat, terrain: m.terrainMat, miss: m.missMat, fade: m.fadeMat,
                  glassLow: m.glassLow, glass: m.glassMat, glassMiss: m.glassMiss };
   for (const k of Object.keys(mats)) if (!mats[k]) delete mats[k];
   for (const [k, m] of Object.entries(mats)) {
@@ -267,4 +267,43 @@ export function buildViewShaders() {
 export function buildProfilingShaders() {
   return { 'sun march off': shaderSet('profile-sunmarch', { sunMarch: false }),
            'AO off': shaderSet('profile-ao', { ao: false }) };
+}
+
+// The exposure meter's kernels (gpu/exposure.js), over each source it reads -
+// built, not snapshotted.
+// The interiors' translucent fade twin (render/features/occlusion.js): its
+// depth and colour materials, as the feature makes them - built, not held to
+// the snapshot.
+export function buildFadeShaders() {
+  const depth = new THREE.MeshBasicNodeMaterial({ colorWrite: false, transparent: true, depthWrite: true });
+  depth.maskNode = G.interiorFadeTSL().mask;
+  const colour = R.plainTerrainMaterial({ transparent: true, depthWrite: false });
+  const f = G.interiorFadeTSL();
+  colour.maskNode = f.mask;
+  colour.opacityNode = f.opacity;
+  const out = {};
+  for (const [k, mat] of [['depth', depth], ['colour', colour]]) {
+    mat.positionNode = terrainKeepTSL(false, false);
+    out[`fade/${k}`] = wgslOf(R.worldInstancedMesh, mat);
+  }
+  return out;
+}
+
+export function buildExposureShaders() {
+  const meter = G.createExposureMeter();
+  const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  const out = {};
+  for (const [name, source] of [['split', { split }], ['target', { cache: texelCache }]]) {
+    meter.kernels(source).forEach((k, i) => { out[`exposure/${name}/${i}`] = wgslOf(k); });
+  }
+  // Our AgX (gpu/tonemap.js), on a plain material: proves the function builds.
+  // Built twice, as the output pass is when the tone mapping is switched off
+  // and on again: the second must still declare the look's uniforms.
+  const agx = G.createAgXLook();
+  for (const k of ['first', 'second']) {
+    const mat = new THREE.MeshBasicNodeMaterial();
+    mat.colorNode = agx.fn(vec3(0.5, 0.25, 0.1), uniform(1));
+    out[`tonemap/agx-${k}`] = { compute: wgslOf(new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat), mat).fragment };
+  }
+  return out;
 }

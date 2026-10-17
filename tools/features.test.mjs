@@ -404,3 +404,48 @@ section('shadow sets');
   ok('the setting reads it', sets.setting.get(), false);
   ok('on again', sets.commands.shadowcache.run(), 'shadow sets kept (newest 2)');
 }
+
+section('tone map');
+{
+  const { createToneMap } = await import('../js/render/features/tonemap.js');
+  const { METER_LOG_MIN, METER_LOG_SCALE } = await import('../js/core/exposure.js');
+  // The meter's words for a frame of uniform luminance L.
+  const words = L => new Uint32Array([Math.floor((Math.log2(L) - METER_LOG_MIN) * METER_LOG_SCALE) * 100, 100]).buffer;
+  let lum = 0.18 / 8, computes = 0, source = null;
+  const registered = new Map();
+  const renderer = { toneMapping: null, toneMappingExposure: 1, library: { addToneMapping: (fn, k) => registered.set(k, fn) },
+                     compute: () => { computes++; }, getArrayBufferAsync: async () => words(lum) };
+  let effects = false;
+  const tm = createToneMap({ renderer, effectsOn: () => effects, meterSource: () => source });
+  ok('the basic mode is never tone mapped', renderer.toneMapping, THREE.NoToneMapping);
+  ok('and says so', tm.commands.exposure.run().endsWith('(the basic mode is never tone mapped)'), true);
+  effects = true;
+  tm.update(990);
+  ok('our AgX with the effects on', renderer.toneMapping, THREE.CustomToneMapping);
+  ok('registered as the custom tone mapping', registered.has(THREE.CustomToneMapping), true);
+  tm.update(1000);
+  ok('no source: nothing metered, exposure 1', `${computes}/${renderer.toneMappingExposure}`, '0/1');
+  source = { split: {} };
+  // A stand-in source: the kernels are only built into WGSL by the renderer (shaders.test).
+  tm.update(1016);
+  ok('meters every eighth frame', computes, 0);
+  for (let i = 0; i < 7; i++) tm.update(1032 + i * 16);
+  ok('the eighth frame meters', computes, 1);
+  await new Promise(r => setTimeout(r, 0));
+  for (let t = 1200; t < 12000; t += 16) tm.update(t);
+  near('a frame 8x too dark adapts to +3 EV, less the default half stop', tm.ev, 2.5, 0.01);
+  near('the output pass gets 2^EV', renderer.toneMappingExposure, 2 ** 2.5, 0.1);
+  ok('fixed exposure', tm.commands.exposure.run(-1).startsWith('AgX punchy, exposure fixed -1.00 EV'), true);
+  ok('the base look', tm.commands.agxlook.run('base').startsWith('AgX base,'), true);
+  ok('numbers are a custom look', tm.commands.agxlook.run(1.2, 1.25).startsWith('AgX custom,'), true);
+  ok('the look select reads custom', tm.settings.settings.find(x => x.key === 'agxlook').get(), 'custom');
+  tm.settings.settings.find(x => x.key === 'agxlook').set('punchy');
+  ok('and sets a preset', tm.settings.settings.find(x => x.key === 'agxlook').get(), 'punchy');
+  tm.update(12016);
+  ok('applied at once', renderer.toneMappingExposure, 0.5);
+  ok('off', tm.commands.tonemap.run('off'), 'tone mapping off (exposure has no effect)');
+  ok('the renderer is told', renderer.toneMapping, THREE.NoToneMapping);
+  ok('toggles back to AgX', (tm.commands.tonemap.run(), tm.mode), 'agx');
+  ok('an unknown mode is ignored', (tm.commands.tonemap.run('aces'), tm.mode), 'agx');
+  ok('the section', tm.settings.settings.length, 11);
+}

@@ -1,19 +1,23 @@
 {
  "default/low": {
-  "vertex": "dd41116873473c17",
-  "fragment": "ca824d1cc8423acc"
+  "vertex": "f457a7cd767f34bd",
+  "fragment": "c123bd939376c560"
  },
  "default/terrain": {
-  "vertex": "a2a43e3f31462109",
-  "fragment": "f9ae2df730f861e3"
+  "vertex": "9ad14e2756c7bf5d",
+  "fragment": "e2025abcb248ac91"
+ },
+ "default/fade": {
+  "vertex": "36bd57d1a3e52588",
+  "fragment": "98fbad564d891daa"
  },
  "default/glassLow": {
-  "vertex": "7199d59ca8b5d4b8",
-  "fragment": "9eeae6c6a452c514"
+  "vertex": "e900042f9eaf4757",
+  "fragment": "6b668ff3f20d830d"
  },
  "default/glass": {
-  "vertex": "76978ee0f8292300",
-  "fragment": "f9ae2df730f861e3"
+  "vertex": "4ef020b1853492c8",
+  "fragment": "c8eb55156734d27a"
  },
  "default/sprite": {
   "vertex": "e9ec7d771d8bbf59",
@@ -47,20 +51,24 @@
   "compute": "1aa6867fdf3b445f"
  },
  "texelgi/low": {
-  "vertex": "dd41116873473c17",
-  "fragment": "ca824d1cc8423acc"
+  "vertex": "f457a7cd767f34bd",
+  "fragment": "c123bd939376c560"
  },
  "texelgi/terrain": {
-  "vertex": "a2a43e3f31462109",
-  "fragment": "f9ae2df730f861e3"
+  "vertex": "9ad14e2756c7bf5d",
+  "fragment": "e2025abcb248ac91"
+ },
+ "texelgi/fade": {
+  "vertex": "5a08617f6e1103b4",
+  "fragment": "2948e86cd4ccaf6d"
  },
  "texelgi/glassLow": {
-  "vertex": "7199d59ca8b5d4b8",
-  "fragment": "9eeae6c6a452c514"
+  "vertex": "e900042f9eaf4757",
+  "fragment": "6b668ff3f20d830d"
  },
  "texelgi/glass": {
-  "vertex": "76978ee0f8292300",
-  "fragment": "f9ae2df730f861e3"
+  "vertex": "4ef020b1853492c8",
+  "fragment": "c8eb55156734d27a"
  },
  "texelgi/sprite": {
   "vertex": "a092a1b5b6d95a5a",
@@ -103,28 +111,32 @@
   "compute": "1aa6867fdf3b445f"
  },
  "cache/low": {
-  "vertex": "b702a71c98258273",
-  "fragment": "fd8e2d87f0563485"
+  "vertex": "1468d6e419184d2c",
+  "fragment": "d15da604a2c6fd7c"
  },
  "cache/terrain": {
-  "vertex": "328e1971ecff9367",
-  "fragment": "4b22e42707069d9c"
+  "vertex": "51432a3a78aeb6b8",
+  "fragment": "08b01552a0db2ca4"
  },
  "cache/miss": {
-  "vertex": "a32fae39ae320386",
-  "fragment": "2533a643e15fea42"
+  "vertex": "84ab2a36591cb11e",
+  "fragment": "f3d6340ad506e03d"
+ },
+ "cache/fade": {
+  "vertex": "0cb7d4d644ad9436",
+  "fragment": "6bc41e2fbd9cce26"
  },
  "cache/glassLow": {
-  "vertex": "28898215b4adc20e",
-  "fragment": "ce92276b9d164348"
+  "vertex": "30461a6823595d4d",
+  "fragment": "d877bc7551605f79"
  },
  "cache/glass": {
-  "vertex": "aacde6e27d55394f",
-  "fragment": "4b22e42707069d9c"
+  "vertex": "79f73883d7371ec4",
+  "fragment": "c7d2f9bc94554f1a"
  },
  "cache/glassMiss": {
-  "vertex": "6a04f11ea5c34324",
-  "fragment": "b97611575573a3b9"
+  "vertex": "68c6783c7dc51ad9",
+  "fragment": "a0d49ba9d3d0e742"
  },
  "cache/sprite": {
   "vertex": "e9ec7d771d8bbf59",
@@ -134,12 +146,16 @@
   "compute": "1aa6867fdf3b445f"
  },
  "plain/terrain": {
-  "vertex": "9235a0cf9d8c2611",
-  "fragment": "e4aa79c4a7f67851"
+  "vertex": "253005f26224007b",
+  "fragment": "bfd6cec3459adb94"
+ },
+ "plain/fade": {
+  "vertex": "c6b66c2b383d6fb9",
+  "fragment": "869bff538ed20626"
  },
  "plain/glass": {
-  "vertex": "28df3842e3b60af8",
-  "fragment": "93a5c6179eb8b869"
+  "vertex": "9f7eda4c9ad09ff5",
+  "fragment": "5d3ce8e9fa38a561"
  },
  "plain/sprite": {
   "vertex": "f7a80dbb93284409",

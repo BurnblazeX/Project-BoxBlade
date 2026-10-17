@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, mix, vec3, vec4, uniform, select, Fn, floor, normalize, cameraViewMatrix, storage } from 'three/tsl';
 import { terrainWhite, terrainKeepTSL, terrainShapeTSL, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL } from '../gpu/terrain.js';
+import { applyOcclusionMask } from '../gpu/occlusion.js';
 import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey, shapeCode,
          isDual, blockParts,
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
@@ -486,6 +487,33 @@ function instanceCount() {
   return n;
 }
 
+// The plain terrain's look on a fresh material: also the interiors' fade
+// (render/features/occlusion.js), which must match it. params: the
+// material's own (transparent, depthWrite...).
+export function plainTerrainMaterial(params = {}) {
+  const material = new THREE.MeshStandardNodeMaterial({ roughness: 0.9, metalness: 0.0, ...params });
+  // At the surface's texel (terrainSurfaceTSL): the face uv from the world
+  // position, not the mesh uv, and on a slope its own texture. Each node gets
+  // a surface of its OWN, built inside its own Fn: the normal is built in a
+  // separate pass (three's NORMAL sub-build), and a surface shared with it
+  // left the colour reading variables declared there - zero, so every
+  // fragment sampled texel (0, 0).
+  material.colorNode = Fn(() => {
+    const surf = terrainSurfaceTSL();
+    const c = mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
+    return select(surf.emissive, vec3(0, 0, 0), c);
+  })();
+  // A lightSource cube is unlit: all of its colour is emission.
+  material.emissiveNode = Fn(() => {
+    const surf = terrainSurfaceTSL();
+    return select(surf.emissive, terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(0, 0, 0));
+  })();
+  // Lit by the plane's own normal: the mesh's is still the box top's.
+  material.normalNode = Fn(() =>
+    normalize(cameraViewMatrix.mul(vec4(terrainSurfaceTSL().n, 0)).xyz))();
+  return material;
+}
+
 export function initWorldRender(scene) {
   const needed = instanceCount();
   if (needed === 0) return;
@@ -519,27 +547,9 @@ export function initWorldRender(scene) {
   };
   // The unshadowed path. Standard lighting, but the colour is the block's own
   // layer - a plain `map` would put layer 0 on everything.
-  const material = new THREE.MeshStandardNodeMaterial({ roughness: 0.9, metalness: 0.0 });
-  // At the surface's texel (terrainSurfaceTSL): the face uv from the world
-  // position, not the mesh uv, and on a slope its own texture. Each node gets
-  // a surface of its OWN, built inside its own Fn: the normal is built in a
-  // separate pass (three's NORMAL sub-build), and a surface shared with it
-  // left the colour reading variables declared there - zero, so every
-  // fragment sampled texel (0, 0).
-  material.colorNode = Fn(() => {
-    const surf = terrainSurfaceTSL();
-    const c = mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
-    return select(surf.emissive, vec3(0, 0, 0), c);
-  })();
-  // A lightSource cube is unlit: all of its colour is emission.
-  material.emissiveNode = Fn(() => {
-    const surf = terrainSurfaceTSL();
-    return select(surf.emissive, terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(0, 0, 0));
-  })();
+  const material = plainTerrainMaterial();
   material.positionNode = terrainKeepTSL(false);
-  // Lit by the plane's own normal: the mesh's is still the box top's.
-  material.normalNode = Fn(() =>
-    normalize(cameraViewMatrix.mul(vec4(terrainSurfaceTSL().n, 0)).xyz))();
+  applyOcclusionMask(material);      // the occlusion cut-out (gpu/occlusion.js)
 
   worldInstancedMesh = new THREE.InstancedMesh(geometry, material, capacity);
   worldInstancedMesh.receiveShadow = true;
