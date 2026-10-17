@@ -1575,7 +1575,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
               const ht = hitTexelTSL(terrain, hitAt, hit.xyz, dir);
               const hp = ht.p.toVar(), nh = ht.n.toVar();
               const hs = hitSurfaceTSL(terrain, hp, nh, null);
-              If(hs.emissive.greaterThan(float(0.5)), () => { L.assign(hs.albedo); }).Else(() => {
+              If(hs.emissive.greaterThan(float(0.5)), () => { L.assign(hs.raw); }).Else(() => {
                 const light = skyIrradiance(nh).toVar();
                 if (sunOn) {
                   const vis = sunVisZero();
@@ -1596,12 +1596,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                 // specular share F, but only the part too rough for the mirror
                 // light when that is on (it throws the smooth part itself, and
                 // counting it here too was double). As the LPV's blockBounce.
-                const sd = decodeSpecularTSL(hs.spec, hs.albedo);
+                const sd = decodeSpecularTSL(hs.spec, hs.raw);
                 const F = fresnelRoughTSL(sd.f0, max(nh.dot(dir.negate()), float(1e-4)), sd.alpha).toVar();
                 const kd = vec3(1, 1, 1).sub(F).mul(float(1).sub(sd.metal));
                 const specShare = mirrorTrace
                   ? F.mul(smoothstep(float(REFLECT_ROUGH_START), float(REFLECT_ROUGH_END), sd.alpha)) : F;
-                L.assign(light.mul(select(texelGI.ab.physical.equal(int(1)), hs.albedo.mul(kd).add(specShare), hs.albedo)));
+                L.assign(light.mul(select(texelGI.ab.physical.equal(int(1)), hs.raw.mul(kd).add(specShare), hs.raw)));
               });
             });
             c[0].addAssign(L.mul(dir.x));

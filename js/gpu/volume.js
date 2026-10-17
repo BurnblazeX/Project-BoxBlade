@@ -147,7 +147,10 @@ export function hitSurfaceTSL(terrain, hp, nh, near = null) {
   } else read();
   // The raw _s texel, for a hit that reflects in turn (nestedReflect).
   const spec = texture(terrain.specular, st).depth(int(layer)).level(int(0));
-  return { albedo: mix(a, vec3(1, 1, 1), terrainWhite), n, ao, layer, st, emissive, spec };
+  // albedo is as drawn - white under whiteworld, which reflections show;
+  // raw is the texture's own, which is what a surface bounces (texel GI):
+  // whiteworld and the GI-only view whiten the surface lit, not its light.
+  return { albedo: mix(a, vec3(1, 1, 1), terrainWhite), raw: a, n, ao, layer, st, emissive, spec };
 }
 
 // A reflection hit's face and locked texel, checked against the block volume.

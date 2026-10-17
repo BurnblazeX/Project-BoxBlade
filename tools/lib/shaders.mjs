@@ -10,15 +10,16 @@ import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3 } from 'three/tsl';
 import { createTestArea } from '../../js/core/world.js';
 import { createBoxGridAt, gridOriginFor, CASCADE_COUNT } from '../../js/core/boxgrid.js';
-import { MAX_LIGHTS, DEFAULT_LIGHT_CUTOFF, POINT_CARD_CAPACITY } from '../../js/core/lights.js';
-import { MAX_MIRRORS } from '../../js/core/mirrors.js';
+import { POINT_CARD_CAPACITY } from '../../js/core/lights.js';
 import { SUN_CARD_LOD_SHIFT, SUN_CARD_LOD_MAX } from '../../js/core/cards.js';
-import { LPV_LEVELS, GI_MAX_BOUNCES } from '../../js/core/lpv.js';
 import { SUN_ANGULAR_SIZE } from '../../js/core/sun.js';
 import { terrainTextures, initWorldRender } from '../../js/render/render.js';
 import * as R from '../../js/render/render.js';
 import { terrainKeepTSL, terrainTexelTSL, terrainWhite } from '../../js/gpu/terrain.js';
-import { createLPV } from '../../js/gpu/gi.js';
+import { createSky } from '../../js/render/features/sky.js';
+import { createLights } from '../../js/render/features/lights.js';
+import { createMirrors } from '../../js/render/features/mirrors.js';
+import { createGI } from '../../js/render/features/gi.js';
 import { readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -81,29 +82,42 @@ for (let l = 0; l < CASCADE_COUNT; l++) {
   const grid = createBoxGridAt(o.x, o.z, null, l);
   cascades.push(G.cascadeBindings(G.createDistanceTexture(grid), grid));
 }
-const lights = G.createLightBindings(MAX_LIGHTS);
-lights.cutoff.value = DEFAULT_LIGHT_CUTOFF;
 const sunCards = G.createCardBindings(G.MAX_CARDS, 'bxbSunCards');
 sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
 sunCards.lodMax.value = SUN_CARD_LOD_MAX;
 const lightCards = G.createCardBindings(POINT_CARD_CAPACITY, 'bxbLightCards');
 const viewCards = G.createCardBindings(G.MAX_CARDS, 'bxbViewCards');
-const sky = G.createSkyBindings();
-const mirrors = G.createMirrorBindings(MAX_MIRRORS);
+// The render features, made as main.js makes them; their options are what
+// the shading build is given.
+const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+sunLight.position.copy(sunDirection);
+const lighting = createLights({
+  scene, shadowsOn: () => true, mirrorRects: () => [],
+  holder: { sprite: new THREE.Object3D(), facingRight: () => false },
+  cards: { active: () => false }
+});
+const mirrorFeature = createMirrors({
+  sunLight, sunOn: () => true, lighting, focus: new THREE.Vector3(), footprint: () => null, rebuild() {}
+});
+const features = [createSky({ scene, sunLight, moveSun() {} }), lighting, mirrorFeature];
+const sky = features[0].bindings;
+const lights = lighting.bindings();
+const mirrors = mirrorFeature.bindings;
 const sunU = {
   bayerTex: G.createBayerTexture(), stepsUniform: uniform(4), biasUniform: uniform(G.SURFACE_BIAS_VOXELS),
   fadeStartUniform: uniform(G.SHADOW_FADE_START), edgeFadeUniform: uniform(G.EDGE_FADE_VOXELS),
   ambientUniform: uniform(G.DEFAULT_AMBIENT)
 };
-const giStrength = uniform(1);
-const lpvs = [];
-for (let level = 0; level < LPV_LEVELS; level++) {
-  lpvs.push(createLPV({ cascades, lights, level, res: 1, orders: GI_MAX_BOUNCES,
-                        biasUniform: sunU.biasUniform, fadeStartUniform: sunU.fadeStartUniform,
-                        edgeFadeUniform: sunU.edgeFadeUniform, sky, ambientUniform: sunU.ambientUniform,
-                        blocks: terrainTextures.blocks, glass: terrainTextures,
-                        terrain: terrainTextures, mirrors }));
-}
+// GI: its compute dispatches caught from a stand-in renderer, as lists.
+const dispatched = [];
+const giFeature = createGI({
+  renderer: { compute: k => dispatched.push([k].flat()) },
+  cascades: () => cascades, lighting, sky: features[0], mirrors: mirrorFeature,
+  sun: { uniforms: () => sunU, on: () => true, angular: () => SUN_ANGULAR_SIZE, light: sunLight },
+  sprites: { casters: () => [], types: [] }, terrainAlbedo: () => null,
+  syncWhite() {}, shadowsOn: () => true, rebuild() {}
+});
+features.push(giFeature);
 const rt = (w, h) => {
   const t = new THREE.RenderTarget(w, h, { type: THREE.FloatType, depthBuffer: true });
   t.texture.minFilter = t.texture.magFilter = THREE.NearestFilter;
@@ -122,17 +136,17 @@ function options(over = {}) {
     cascades, sunDirection,
     rays: 1, angular: SUN_ANGULAR_SIZE, cone: true, quantise: false, ...sunU,
     shadeMode: 'lambert', shadowOnly: false, sun: true,
-    lights, cards: sunCards, lightCards, terrain: terrainTextures, specularOnly: false,
+    cards: sunCards, lightCards, terrain: terrainTextures, specularOnly: false,
     albedo: (st, surf = null) => mix(terrainTexelTSL(terrainTextures.albedo, st, surf).rgb,
                                      vec3(1, 1, 1), terrainWhite),
-    specular: true, reflections: true, sky,
-    mirrors, mirrorOnly: false, viewCards,
+    specular: true, reflections: true,
+    viewCards,
     ao: true, aoDistanceUniform: uniform(G.AO_DISTANCE), aoOnly: false,
-    gi: null, giOnly: false, texelGI: null,
     glassView: null, glassBounces: G.GLASS_MAX_BOUNCES, glassLayers: G.GLASS_LAYERS,
     glassDispersion: 0, glassShadows: true,
-    mirrorCache: true, modelHits: true, hitCache: null, split: null,
+    modelHits: true, hitCache: null, split: null,
     splitResolve: true, splitLegacy: false, glass: !!R.glassInstancedMesh,
+    ...Object.assign({}, ...features.map(f => f.options())),
     ...over
   };
 }
@@ -215,19 +229,29 @@ export async function buildAllShaders() {
     s.resolve = G.createSplitResolve(s, texelCache);
     return s;
   };
-  const sets = {
-    ...shaderSet('default', { split: splitShading(), gi: { levels: lpvs.map(v => v.binding), strength: giStrength } }),
-    ...shaderSet('texelgi', { split: splitShading(), texelGI: G.createTexelGI() }),
-    ...shaderSet('cache', { texelCache: true, hitCache, gi: { levels: lpvs.map(v => v.binding), strength: giStrength } }),
-    ...shaderSet('plain', {})
+  // Each set with GI as main.js would have it: the LPV, texel GI, the LPV, off.
+  const giSet = (mode, on = true) => {
+    const settings = giFeature.settings.settings;
+    settings.find(x => x.key === 'gimode').set(mode);
+    settings.find(x => x.key === 'gi').set(on);
   };
-  // The LPV's own kernels: what one reset frame dispatches, caught from a
-  // stand-in renderer.
-  for (const [i, v] of lpvs.entries()) {
-    const list = [];
-    v.update({ compute: k => list.push(...[k].flat()) }, { shift: 'reset', iterations: 2 });
+  const sets = {};
+  giSet('lpv');
+  Object.assign(sets, shaderSet('default', { split: splitShading() }));
+  giSet('texel');
+  Object.assign(sets, shaderSet('texelgi', { split: splitShading() }));
+  giSet('lpv');
+  Object.assign(sets, shaderSet('cache', { texelCache: true, hitCache }));
+  giSet('lpv', false);
+  Object.assign(sets, shaderSet('plain', {}));
+  // The LPV's own kernels: what one frame with both volumes resetting
+  // dispatches (the far volume every frame, for this).
+  giSet('lpv', true);
+  giFeature.commands.gifar.run();
+  giFeature.update();
+  dispatched.forEach((list, i) => {
     [...new Set(list)].forEach((c, j) => { sets[`lpv${i}/${j}:${c.name}`] = wgslOf(c); });
-  }
+  });
   Object.assign(sets, await diagnosticKernels());
   return sets;
 }

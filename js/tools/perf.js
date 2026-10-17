@@ -109,9 +109,11 @@ export const SECTIONS = [
   ['logic', '#60a5fa'],    // input, movement, camera, AI
   ['grids', '#f472b6'],    // cascade follow and worker hand-offs
   ['cards', '#a78bfa'],    // cards, occluders, torch
-  ['submit', '#fbbf24']    // renderer.render: encoding and submission
+  ['submit', '#fbbf24'],   // renderer.render: encoding and submission
+  ['other', '#94a3b8']     // this overlay's own work, timed by update itself
 ];
 const GPU_COLOUR = '#f8fafc';
+const COMPUTE_COLOUR = '#cbd5e1';
 export const DEFAULT_DRAW_HZ = 60;
 // Frame times jitter around vsync: at exactly 60 fps a frame can land a hair
 // before the 16.67 ms mark, and a strict test would then skip every other one
@@ -150,7 +152,7 @@ export function worstPerColumn(v, t, end, windowMs, columns) {
 }
 
 const BREAK_TOP = 30 + GRAPH_H + 10;
-const HEIGHT = BREAK_TOP + GRAPH_H + 44;
+const HEIGHT = BREAK_TOP + GRAPH_H + 57;
 
 export function createPerfOverlay(doc = document) {
   // All on one time axis. The sections are pushed with the frame, at the same
@@ -193,6 +195,9 @@ export function createPerfOverlay(doc = document) {
   // 0 repaints every frame.
   let drawHz = DEFAULT_DRAW_HZ;
   let drawDue = -Infinity;
+  // update's own time, sampling and drawing. It cannot report itself before it
+  // returns, so each frame's 'other' is the previous frame's.
+  let tail = 0;
 
   function draw() {
     const s = stats.stats();
@@ -260,9 +265,14 @@ export function createPerfOverlay(doc = document) {
   // the worst one - so the two graphs describe the same frame.
   function drawBreakdown(s, frameCols, end) {
     const cols = SECTIONS.map(([k]) => parts[k].toArray());
-    const all = gpu.series();
-    const keep = end === null ? [] : all.t.map((t, i) => i).filter(i => all.t[i] >= end - WINDOW_MS);
-    const g = keep.map(i => all.v[i]), gt = keep.map(i => all.t[i]);
+    // The GPU series cut to the window.
+    const recent = series => {
+      const all = series.series();
+      const keep = end === null ? [] : all.t.map((t, i) => i).filter(i => all.t[i] >= end - WINDOW_MS);
+      return { v: keep.map(i => all.v[i]), t: keep.map(i => all.t[i]) };
+    };
+    const { v: g, t: gt } = recent(gpu);
+    const gc = recent(gpuCompute).v;
     const scale = Math.max(1, s.p95 || 0, ...g) * 1.1;
     const y0 = BREAK_TOP + GRAPH_H;
     const paths = SECTIONS.map(() => new Path2D());
@@ -300,19 +310,27 @@ export function createPerfOverlay(doc = document) {
     // read as its steady cost.
     const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
     ctx.font = '10px monospace';
-    let x = 6, y = y0 + 13;
+    // Three to a row: the CPU stages, then the GPU's render and compute passes
+    // and the sum of everything - the frame's cost if none of it overlapped.
+    const COL = 78;
+    let y = y0 + 13;
     SECTIONS.forEach(([k, colour], i) => {
       ctx.fillStyle = colour;
-      ctx.fillText(`${k} ${avg(cols[i]).toFixed(2)}`, x, y);
-      x += 58;
+      ctx.fillText(`${k} ${avg(cols[i]).toFixed(2)}`, 6 + (i % 3) * COL, y + Math.floor(i / 3) * 13);
     });
+    y += Math.ceil(SECTIONS.length / 3) * 13;
+    const total = cols.reduce((sum, c) => sum + avg(c), 0) + avg(g) + avg(gc);
     ctx.fillStyle = GPU_COLOUR;
-    ctx.fillText(g.length ? `gpu ${avg(g).toFixed(2)}ms` : 'gpu n/a (no timestamp-query)', 6, y + 13);
+    ctx.fillText(g.length ? `gpu ${avg(g).toFixed(2)}` : 'gpu n/a', 6, y);
+    ctx.fillStyle = COMPUTE_COLOUR;
+    ctx.fillText(gc.length ? `compute ${avg(gc).toFixed(2)}` : 'compute n/a', 6 + COL, y);
+    ctx.fillStyle = '#e5e7eb';
+    ctx.fillText(`total ${total.toFixed(2)}`, 6 + 2 * COL, y);
     if (renderer && renderer.info && renderer.info.render) {
       const r = renderer.info.render;
       ctx.fillStyle = '#9ca3af';
       ctx.fillText(`draws ${r.drawCalls ?? '-'}  tris ${(r.triangles ?? 0).toLocaleString()}`,
-                   6, y + 26);
+                   6, y + 13);
     }
     ctx.font = '11px monospace';
   }
@@ -328,11 +346,11 @@ export function createPerfOverlay(doc = document) {
       if (skipNext) { skipNext = false; return; }
       const now = performance.now();
       stats.push(dt * 1000, now);
-      for (const [k] of SECTIONS) parts[k].push(sections ? sections[k] || 0 : 0, now);
+      for (const [k] of SECTIONS) parts[k].push(k === 'other' ? tail : sections ? sections[k] || 0 : 0, now);
       const r = nextRedraw(now, drawDue, drawHz);
       drawDue = r.due;
-      if (!r.draw) return;
-      draw();
+      if (r.draw) draw();
+      tail = performance.now() - now;
     },
     get drawHz() { return drawHz; },
     set drawHz(hz) { drawHz = Math.max(0, Number(hz) || 0); drawDue = -Infinity; },
