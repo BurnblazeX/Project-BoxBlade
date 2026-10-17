@@ -16,8 +16,9 @@ import { spriteShadeNormalTSL, spriteTexelLockTSL } from './sprite.js';
 import { REFLECT_MAX_DISTANCE, REFLECT_ROUGH_END, REFLECT_ROUGH_START, ROUGH_SPEC, SPEC_MAX, decodeSpecularTSL, fresnelRoughTSL, reflectBouncesUniform, specularTSL } from './specular.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { HIT_FAR_METRES, hitCacheReadTSL, hitCacheWriteTSL } from './hitcache.js';
-import { GI_ANCHORS, GI_BLEND_VOXELS, GI_CHECK, GI_CLAIMS, GI_DIRS, GI_FADE_VOXELS, GI_FILLED, GI_FRESH, GI_LAST, GI_LIST_CAP, GI_SLICES, GI_SLICE_MASK, GI_SLOTS, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, GI_SUM, GI_WORDS, GI_WORD_INDEX, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchLightTSL, patchSideTSL, shPackTSL, shUnpackTSL } from './texelgi.js';
+import { GI_ANCHORS, GI_CHECK, GI_CLAIMS, GI_DIRS, GI_FILLED, GI_FRESH, GI_LAST, GI_LIST_CAP, GI_SLICES, GI_SLICE_MASK, GI_SLOTS, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, GI_SUM, GI_WORDS, GI_WORD_INDEX, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchLightTSL, patchSideTSL, shPackTSL, shUnpackTSL, texelGILevelTSL } from './texelgi.js';
 import { createPointLightsTSL } from './pointlights.js';
+import { RAW_VIEWS, SPLIT_VIEWS, surfaceViewTSL } from './debugview.js';
 import { TEXEL_ID_OFFSET, slopeLayerTable } from './texel.js';
 import { DEFAULT_AMBIENT, GROUND_REFERENCE_FLOOR, createSoftSunTSL, createSunUniforms, sunShadeTSL } from './sun.js';
 
@@ -86,21 +87,22 @@ export function terrainEmissiveTSL(shade, terrain) {
 
 export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12,
                                         ambientUniform = null, shadeMode = 'ground',
-                                        rays = 1, shadowOnly = false, lights = null, sun: sunOn = true,
+                                        rays = 1, view = null, lights = null, sun: sunOn = true,
                                         angular = SUN_ANGULAR_SIZE,
                                         bayerTex = null, stepsUniform = null,
                                         biasUniform = null,
                                         cone = false, quantise = true,
                                   fadeStartUniform = null, edgeFadeUniform = null,
                                   cards = null, lightCards = null,
-                                  terrain = null, specularOnly = false,
+                                  terrain = null,
                                   albedo = null, specular: specOn = true,
                                   reflections: reflectOn = true, sky = null,
-                                  mirrors = null, mirrorOnly = false,
+                                  mirrors = null,
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
-                                  aoOnly = false, gi = null, giOnly = false,
+                                  gi = null,
                                   glassView = null, glass = false, glassShadows = true,
+                                  sunMarch = true,
                                   glassBounces = GLASS_MAX_BOUNCES,
                                   glassLayers = GLASS_LAYERS, glassDispersion = 0,
                                   mirrorCache = true, modelHits = true, hitCache = null,
@@ -123,12 +125,14 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const sun = createSunUniforms(sunDirection, angular);
   const maxDist = uniform(float(maxDistance));
   const ambient = ambientUniform || uniform(float(DEFAULT_AMBIENT));
-  const sunShadow = createSoftSunTSL({
+  // sunMarch false (profiling only): the sun is unshadowed everywhere - to
+  // measure what its march costs. The GI's own sun march is left alone.
+  const sunShadow = sunMarch ? createSoftSunTSL({
     cascades, sunDir: sun.dir, sunTangent: sun.tangent,
     sunBitangent: sun.bitangent, maxDist, coneRadiusUniform: sun.coneRadius,
     rayCount: rays, bayerTex, stepsUniform, biasUniform, cone, quantise,
     fadeStartUniform, edgeFadeUniform, cards, glass: glassT
-  });
+  }) : () => asColour(float(1));
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
   // The cones are built for AO, for GI, or both - GI gathers along them - so
@@ -147,30 +151,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // disc and its normal map's own AO, so one cone along its normal is plenty.
   // (A cascade LOD - cheaper shading past C0 - was tried and removed: it was
   // no faster, and it dropped reflections at distance.)
-  // Texel GI's patch level at p: { lvl (uint) 0 inside C1, 1 inside C2, else
-  // 2; next, the level past it; blend, how much of next to take - 0 inside,
-  // rising to 1 over the cascade's outer GI_BLEND_VOXELS (x and z: the world
-  // is shallower than any cascade) }.
-  const giLevel = texelGI ? p => {
-    const at = c => {
-      const vp = p.sub(c.origin).div(c.voxel).toVar();
-      const dim = float(GRID_DIM);
-      const inside = vp.x.greaterThanEqual(float(0)).and(vp.y.greaterThanEqual(float(0)))
-        .and(vp.z.greaterThanEqual(float(0))).and(vp.x.lessThan(dim)).and(vp.y.lessThan(dim)).and(vp.z.lessThan(dim));
-      const edge = min(min(vp.x, vp.z), min(dim.sub(vp.x), dim.sub(vp.z)));
-      return { inside, edge };
-    };
-    const a = at(cascades[Math.min(1, cascades.length - 1)]);
-    const b = at(cascades[Math.min(2, cascades.length - 1)]);
-    const lvl = select(a.inside, uint(0), select(b.inside, uint(1), uint(2))).toVar();
-    const edge = select(a.inside, a.edge, b.edge);
-    const blend = select(lvl.lessThan(uint(2)),
-      float(1).sub(smoothstep(float(0), float(GI_BLEND_VOXELS), edge)), float(0)).toVar();
-    // 1 inside C1, fading to 0 across C2's outer band, 0 past it.
-    const fade = select(a.inside, float(1),
-      select(b.inside, smoothstep(float(0), float(GI_FADE_VOXELS), b.edge), float(0))).toVar();
-    return { lvl, next: min(lvl.add(uint(1)), uint(2)).toVar(), blend, fade };
-  } : null;
+  const giLevel = texelGI ? texelGILevelTSL(cascades) : null;
   // The bounce at a texel, blended across a level step.
   // buf: the read-only table (shading: fresh patches only), or the patch
   // kernel's read-write one (a ray's hit: any).
@@ -919,34 +900,32 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // The face's exact frame, not a derivative one - see boxBumpedNormalTSL.
     const nS = lab ? surfaceBumpTSL(face, lab.xyz).toVar() : n;
     const texAO = lab ? lab.w : float(1);
-    // The raw LabPBR specular texel: R smoothness, G F0 / metal, B porosity or
-    // SSS - how an authored _s is checked in place.
-    if (specularOnly && terrain) return sample(terrain.specular).rgb;
-    // The views below show a light term; they keep the albedo multiply they
-    // always had.
     // albedo: a function of the face uv (main.js), so it is read here too.
     const base = albedo && st ? albedo(st, face).toVar() : vec3(1, 1, 1);
-    const view = x => base.mul(x);
+    // The debug views that need no light; the light-term views below show the
+    // term raw, not times the albedo.
+    const shown = view && surfaceViewTSL(view, { p, n, nS, base,
+      specular: terrain && (() => sample(terrain.specular).rgb) }, cascades);
+    if (shown) return shown;
     // Traced AO times the texture's own. The hemisphere is the geometric face,
     // not the bumped normal - the rays test real geometry.
     const occ = occlusion(p, n, n, NO_SKIP, texAO, false, nS);
     const ao = occ.ao;
-    if (aoOnly) return view(vec3(ao, ao, ao));
-    if (giOnly && occ.gi) return view(occ.gi);
+    if (view === 'ao') return vec3(ao, ao, ao);
+    if (view === 'gi') return occ.gi || vec3(0, 0, 0);
     // The bounce adds under everything else - it is light, like the others.
     const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
     // The sky ambient, along the bent normal - bent further by the normal
     // map, so the bumps catch the sky as they catch the sun.
     const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao).toVar();
 
-    // The mirror light alone, raw (not times albedo), so what the mirrors
-    // throw can be judged by itself - it is not in the GI bounce view, since
-    // it never goes through the LPV.
-    if (mirrorOnly) return mirrorTrace ? mirrorLight(p, n, nS, n) : vec3(0, 0, 0);
+    // The mirror light alone - not in the GI view, as it never goes through the LPV.
+    if (view === 'mirror') return mirrorTrace ? mirrorLight(p, n, nS, n) : vec3(0, 0, 0);
     // Light thrown here by the mirrors - the iron floor's glare on the wall,
     // from the sun and every lamp. Added under the sun-on and sun-off paths.
     const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n).toVar() : null;
     const plusMirror = col => (mirrored ? col.add(mirrored) : col);
+    if (view === 'indirect') return plusGI(plusMirror(amb));
 
     // The surface's specular response, when it has one. V from the locked
     // position, so the whole texel shares one view direction.
@@ -966,7 +945,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         const write = () => hitCacheWriteTSL(hitCache, p, n, base.mul(light));
         if (face.on) If(face.on.not(), write); else write();
       }
-      if (!surf) return base.mul(light);
+      if (!surf) return view ? vec3(0, 0, 0) : base.mul(light);
+      const highlights = min(direct, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX));
+      if (view === 'highlights') return highlights;
       const nv = max(nS.dot(surf.v), float(1e-4));
       const F = fresnelRoughTSL(surf.f0, nv, surf.alpha).toVar();
       // What a rough surface reflects: the ambient light around it, the same
@@ -996,10 +977,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
           env.assign(mix(env, reflectedTSL(origin, dir, reach), w));
         });
       }
+      if (view === 'reflection') return F.mul(env).mul(texAO);
       const kd = vec3(1, 1, 1).sub(F).mul(float(1).sub(surf.metal));
-      return base.mul(light).mul(kd)
-        .add(min(direct, vec3(SPEC_MAX, SPEC_MAX, SPEC_MAX)))
-        .add(F.mul(env).mul(texAO));
+      return base.mul(light).mul(kd).add(highlights).add(F.mul(env).mul(texAO));
     };
     const noSpec = vec3(0, 0, 0);
     // The light list: diffuse, and the highlights from the same visibility.
@@ -1012,29 +992,34 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // dynamic light does not reach.
     if (!sunOn) {
       const dark = plusMirror(amb);
+      if (view === 'shadow' || (view === 'direct' && !pointLight)) return vec3(0, 0, 0);
       if (!pointLight) return finish(plusGI(dark), noSpec);
       const pl = points();
+      if (view === 'direct') return pl.diffuse;
       return finish(plusGI(dark.add(pl.diffuse)), pl.spec);
     }
     // Faces turned from the sun get N.L = 0, so the march result is multiplied
-    // away - skip it. Not in shadowOnly, which shows the raw term everywhere.
+    // away - skip it. Not in the shadow view, which shows the raw term everywhere.
     let visible;
-    if (shadowOnly) visible = sunShadow(p, n, NO_SKIP);
+    if (view === 'shadow') visible = sunShadow(p, n, NO_SKIP);
     else {
       visible = sunVisZero();
       If(n.dot(sun.dir).greaterThan(float(0)), () => {
         visible.assign(sunShadow(p, n, NO_SKIP));
       });
     }
-    // shadowOnly writes the raw visibility term. Ambient and N.L both compress
-    // the shadowed range toward the middle, so acne that is plain here is
-    // invisible in the shaded result - which is why it has been hard to name.
-    if (shadowOnly) return asColour(visible);
-    const sunLit = plusMirror(amb.add(sunColourUniform.mul(sunDirect(visible, nS, shadeMode))));
+    // The shadow view writes the raw visibility term. Ambient and N.L both
+    // compress the shadowed range toward the middle, so acne that is plain
+    // here is invisible in the shaded result.
+    if (view === 'shadow') return asColour(visible);
+    const sunTerm = sunColourUniform.mul(sunDirect(visible, nS, shadeMode));
+    const sunLit = plusMirror(amb.add(sunTerm));
     const sunSpec = surf
       ? surf.brdf(sun.dir).mul(visible).mul(sunLight()).mul(sunColourUniform) : noSpec;
+    if (view === 'direct' && !pointLight) return sunTerm;
     if (!pointLight) return finish(plusGI(sunLit), sunSpec);
     const pl = points();
+    if (view === 'direct') return sunTerm.add(pl.diffuse);
     return finish(plusGI(sunLit.add(pl.diffuse)), sunSpec.add(pl.spec));
   })();
   const node = makeNode(false);
@@ -1044,11 +1029,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // per kernel, over the low-res samples. The same functions, the same
   // inputs - the surface is rebuilt from the sample's position and face the
   // way a reflection hit rebuilds one (hitSurfaceTSL), which for a box face
-  // is the drawn face's own texel. Not under the debug views.
+  // is the drawn face's own texel. Not under the debug views, but the bounce ones.
   let splitKernels = null;
   // Glass splits too, unless a glass debug view is on (glassNode keeps those).
   const splitGlass = !!(split && glass && reflectTrace && !glassView);
-  if (split && terrain && !specularOnly && !aoOnly && (!giOnly || texelGI) && !mirrorOnly && !shadowOnly) {
+  if (split && terrain && (!view || (texelGI && SPLIT_VIEWS.has(view)))) {
     const faceNormal = id => {
       const f = floor(id.sub(float(TEXEL_ID_OFFSET)).div(float(2097152)));
       return select(f.lessThan(float(0.5)), vec3(1, 0, 0), select(f.lessThan(float(1.5)), vec3(-1, 0, 0),
@@ -1230,7 +1215,6 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       If(L.blend.greaterThan(float(0)), () => registerLevel(p, n, L.next));
     };
     splitKernels = [];
-    splitKernels = [];
     // Glowing cubes are a kernel case unless legacy (then they are misses).
     const unlessGlowing = (S, fn) => (splitLegacy ? fn() : If(S.emissive.lessThan(float(0.5)), fn));
     splitKernels.push(kernel('splitBase', (idx, s, geo) => {
@@ -1247,13 +1231,15 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         else registerPatch(p, n);
       }
       const occ = occlusion(p, n, n, NO_SKIP, S.texAO, false, S.nS);
-      if (giOnly) {
-        // The bounce alone: the split kernels stay on for it, so it is traced.
-        split.result.rw.element(idx).assign(vec4(S.base.mul(occ.gi || vec3(0, 0, 0)), s.w));
+      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao);
+      if (view) {
+        // The bounce views: the split kernels stay on for them, so it is traced.
+        const bounce = occ.gi || vec3(0, 0, 0);
+        split.result.rw.element(idx).assign(vec4(view === 'gi' ? bounce
+          : amb.add(bounce).add(mirrorTrace ? mirrorLight(p, n, S.nS, n) : vec3(0, 0, 0)), s.w));
         writeLight(idx, vec3(0, 0, 0), vec3(0, 0, 0));
         return;
       }
-      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao);
       const env = (occ.gi ? amb.add(occ.gi) : amb).toVar();
       const light = env.toVar();
       const sunSpec = vec3(0, 0, 0).toVar();
@@ -1275,7 +1261,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         split.result.rw.element(idx).assign(vec4(0, 0, 0, 0));
       });
     }));
-    if (pointLight && !giOnly) {
+    if (pointLight && !view) {
       splitKernels.push(kernel('splitPoints', (idx, s, geo) => {
         const { p, n } = geo;
         const S = surfaceAt(geo);
@@ -1288,7 +1274,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         });
       }));
     }
-    if (mirrorTrace && !giOnly) {
+    if (mirrorTrace && !view) {
       splitKernels.push(kernel('splitMirror', (idx, s, geo) => {
         const { p, n } = geo;
         const S = surfaceAt(geo);
@@ -1297,7 +1283,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         });
       }));
     }
-    if (spec && !giOnly) {
+    if (spec && !view) {
       splitKernels.push(kernel('splitFinal', (idx, s, geo) => {
         const { p, n } = geo;
         const S = surfaceAt(geo);
@@ -1320,7 +1306,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
               env.assign(mix(env, reflectedTSL(origin, dir, reach), w));
               return;
             }
-            // shadeTraced, spelled out so bxb.splitdebug can show its parts.
+            // shadeTraced, spelled out so the reflection-hit debug views (bxb.view) can show its parts.
             const hit = reflectTrace(origin, dir, reach).toVar();
             const rec = traceRecord(origin, dir, hit);
             const [o] = lightBatch([hitRequest(rec)]);
@@ -1450,6 +1436,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const texAO = shade.ao.toVar();
     const out = vec3(0, 0, 0).toVar();
     If(drawn, () => {
+      const shown = view && surfaceViewTSL(view, { p, n, nS, base: vec3(1, 1, 1), specular: null }, cascades);
+      if (shown) { out.assign(shown); return; }
+      if (view === 'reflection' || view === 'highlights') return;   // a sprite has no specular
       // Over the shading normal's hemisphere - a billboard has no geometric
       // face in the field, so the way its texels face is the best there is.
       // Texel GI: a sprite is in no face's patches, so each of its texels
@@ -1459,34 +1448,37 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const occ = occlusion(p, nS, n, skip, texAO, true, nS,
                             texelGI ? { p: vec3(p.x, feet, p.z), n: vec3(0, 1, 0) } : null);
       const ao = occ.ao;
-      if (aoOnly) { out.assign(vec3(ao, ao, ao)); return; }
-      if (giOnly && occ.gi) { out.assign(occ.gi); return; }
+      if (view === 'ao') { out.assign(vec3(ao, ao, ao)); return; }
+      if (view === 'gi') { if (occ.gi) out.assign(occ.gi); return; }
       const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
-      if (mirrorOnly) { out.assign(mirrorTrace ? mirrorLight(p, n, nS, n, skip) : vec3(0, 0, 0)); return; }
+      if (view === 'mirror') { if (mirrorTrace) out.assign(mirrorLight(p, n, nS, n, skip)); return; }
       // A sprite by a mirror catches its glare too, sun or lamp. Lifted
       // straight up, as the sprite's own rays are.
       const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n, skip) : null;
       const amb0 = ambientLight(occ.bent, ao);
       const amb = mirrored ? amb0.add(mirrored) : amb0;
+      if (view === 'indirect') { out.assign(plusGI(amb)); return; }
       if (!sunOn) {
-        out.assign(plusGI(pointLight ? amb.add(pointLight(p, n, skip, nS)) : amb));
+        if (view === 'direct') { if (pointLight) out.assign(pointLight(p, n, skip, nS)); return; }
+        if (view !== 'shadow') out.assign(plusGI(pointLight ? amb.add(pointLight(p, n, skip, nS)) : amb));
         return;
       }
       const visible = sunShadow(p, n, skip);
-      if (shadowOnly) { out.assign(asColour(visible)); return; }
+      if (view === 'shadow') { out.assign(asColour(visible)); return; }
       // Plain Lambert on the normal-mapped normal: a sprite is lit by which way
       // each of its texels faces, so turning the camera round to the sun's far
       // side shows its dark side.
-      const lit = amb.add(sunColourUniform.mul(sunDirect(visible, nS, 'lambert')));
+      const sunTerm = sunColourUniform.mul(sunDirect(visible, nS, 'lambert'));
+      if (view === 'direct') { out.assign(pointLight ? sunTerm.add(pointLight(p, n, skip, nS)) : sunTerm); return; }
+      const lit = amb.add(sunTerm);
       out.assign(plusGI(pointLight ? lit.add(pointLight(p, n, skip, nS)) : lit));
     });
     return out;
   })();
 
-  // In the terrain's debug views (AO, bounce, shadow, mirror light, raw
-  // specular) glass is shaded as any block is: the view shows that term at its
-  // surface, not the glass's own appearance. glassView is glass's own views.
-  const terrainView = aoOnly || giOnly || shadowOnly || mirrorOnly || specularOnly;
+  // Under a debug view glass is shaded as any block is: the view shows that
+  // term at its surface, not glass's own look. glassView is glass's own views.
+  const terrainView = !!view;
   // --- Texel GI's patch kernel: each listed patch traces this frame's slice ---
   // (createTexelGI). reset empties the list before the split kernels fill it;
   // patches runs after them. Reads and writes the table through its
@@ -1659,7 +1651,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   }
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
-           glassNode: terrainView ? node : glassNode, spriteLight, sun, cascades, lights,
+           glassNode: terrainView ? node : glassNode, sun, cascades, lights,
+           // A raw view: the sprite draws the term itself, not times its art (gpu/sprite.js).
+           spriteLight: Object.assign(spriteLight, { raw: RAW_VIEWS.has(view) }),
            mirrorCache: (mirrorLight && mirrorLight.cacheKernel) || null,
            maxDistUniform: maxDist, ambientUniform: ambient };
 }
@@ -1668,6 +1662,6 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
 // quarter; 0 = full reach everywhere (bxb.roughreach()). A uniform: no rebuild.
 export const roughReach = uniform(float(0.75));
 
-// Split shading's reflection debug (bxb.splitdebug): 0 off, 1 hit colour
-// unlit, 2 hit distance, 3 no reflection. A uniform: no rebuild.
+// Split shading's reflection-hit views (bxb.view, render/features/debugview.js):
+// 0 off, 1 hit colour unlit, 2 hit distance, 3 no reflection. A uniform: no rebuild.
 export const splitDebug = uniform(int(0));

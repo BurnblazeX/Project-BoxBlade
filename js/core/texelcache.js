@@ -3,6 +3,15 @@
 import { BLOCK_METRES } from './world.js';
 import { BLOCK_TEXELS } from './materials.js';
 
+// The screen can be smaller than an emulated/rendered viewport. Always cover
+// the actual drawing size too, including odd dimensions at spacing two.
+export function splitCapacityFor(width, height) {
+  const w = Math.max(1, Math.ceil(width)), h = Math.max(1, Math.ceil(height));
+  const full = Math.min(w * h, 1 << 24);
+  return { full, low: Math.min(Math.ceil(w / 2) * Math.ceil(h / 2), 1 << 22),
+           miss: Math.ceil(full / 16) };
+}
+
 // The texel cache's low-res pass samples every `spacing` pixels, and each
 // sample shades its whole texel. Any spacing gives the same image - a pixel
 // with no sample of its own texel nearby shades itself in the miss pass - so

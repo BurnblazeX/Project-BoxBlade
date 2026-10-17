@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
-import { If, float, vec3, uniform, storage, floor, max, abs, vec2, length, uniformArray, int, select, uint, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16 } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { If, float, vec3, uniform, storage, floor, max, abs, vec2, length, uniformArray, int, select, uint, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep } from 'three/tsl';
+import { GRID_DIM, VOXEL_METRES } from '../core/boxgrid.js';
 import { mix32TSL } from './hitcache.js';
 
 // --- Texel GI: a radiance cache on the block faces ---
@@ -224,3 +224,28 @@ export function patchLightTSL(tg, p, n, nS, lvl, buf = tg.dataRead, fresh = true
   const out = max(light.mul(inv), vec3(0, 0, 0));
   return select(tg.debug.equal(int(1)).and(wsum.lessThanEqual(float(0))), vec3(4, 0, 0), out);
 }
+
+// Texel GI's patch level at p: { lvl (uint) 0 inside C1, 1 inside C2, else
+// 2; next, the level past it; blend, how much of next to take - 0 inside,
+// rising to 1 over the cascade's outer GI_BLEND_VOXELS (x and z: the world
+// is shallower than any cascade) }.
+export const texelGILevelTSL = cascades => p => {
+  const at = c => {
+    const vp = p.sub(c.origin).div(c.voxel).toVar();
+    const dim = float(GRID_DIM);
+    const inside = vp.x.greaterThanEqual(float(0)).and(vp.y.greaterThanEqual(float(0)))
+      .and(vp.z.greaterThanEqual(float(0))).and(vp.x.lessThan(dim)).and(vp.y.lessThan(dim)).and(vp.z.lessThan(dim));
+    const edge = min(min(vp.x, vp.z), min(dim.sub(vp.x), dim.sub(vp.z)));
+    return { inside, edge };
+  };
+  const a = at(cascades[Math.min(1, cascades.length - 1)]);
+  const b = at(cascades[Math.min(2, cascades.length - 1)]);
+  const lvl = select(a.inside, uint(0), select(b.inside, uint(1), uint(2))).toVar();
+  const edge = select(a.inside, a.edge, b.edge);
+  const blend = select(lvl.lessThan(uint(2)),
+    float(1).sub(smoothstep(float(0), float(GI_BLEND_VOXELS), edge)), float(0)).toVar();
+  // 1 inside C1, fading to 0 across C2's outer band, 0 past it.
+  const fade = select(a.inside, float(1),
+    select(b.inside, smoothstep(float(0), float(GI_FADE_VOXELS), b.edge), float(0))).toVar();
+  return { lvl, next: min(lvl.add(uint(1)), uint(2)).toVar(), blend, fade };
+};

@@ -1,6 +1,7 @@
 // --- GI: the bounce - the LPV (core/lpv.js, gpu/gi.js), or texel GI ---
 //
-// On/off and the GI-only view are compiled into the shading kernel, like AO.
+// On/off is compiled into the shading kernel, like AO (its view is the render
+// debugger's: render/features/debugview.js).
 // Strength and spread are uniforms; iterations and injection slices are CPU
 // numbers read each frame. The volume is built once, on the first shadows-on
 // frame that has cascades and a light list, and follows C0 from then on.
@@ -16,7 +17,6 @@
 //   sprites        { casters() this frame's card casters; types the card
 //                    types they index }: the sprites the LPV bounces
 //   terrainAlbedo() the terrain's mean albedo, once its textures are in
-//   syncWhite()    the GI-only view draws on whiteworld
 //   shadowsOn()    whether the marched shading is on
 //   rebuild()      the shading rebuilt, when a kernel flag changed
 import { uniform } from 'three/tsl';
@@ -32,7 +32,7 @@ import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
 export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, sprites, terrainAlbedo,
-                           syncWhite, shadowsOn, rebuild }) {
+                           shadowsOn, rebuild }) {
   let giOn = true;
   // Which bounce: 'texel' - a radiance cache on the block faces, ray-traced
   // (gpu/texelgi.js createTexelGI; needs split shading, which finds the patches) - or
@@ -50,7 +50,6 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     }
     return texelGI;
   }
-  let giOnly = false;
   // One volume per level, finest first: C0 at 0.75 m cells, C1 at 1.5 m. They
   // share every setting; the shading pass blends them (lpvSampleTSL).
   let lpvs = null;
@@ -241,23 +240,20 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       }
     },
     gi: {
-      help: 'global illumination: the LPV bounce. On/off, strength, or "only" to view it alone',
-      usage: "bxb.gi()  toggles  |  bxb.gi(true, 1.5) strength  |  bxb.gi('only')",
+      help: "global illumination: the LPV bounce. On/off and strength (bxb.view('gi') shows it alone)",
+      usage: 'bxb.gi()  toggles  |  bxb.gi(true, 1.5) strength',
       run: (a = null, strength = null) => {
-        const was = `${giOn}${giOnly}`;
-        if (a === 'only') giOnly = !giOnly;
-        else if (a !== null || strength === null) giOn = a === null ? !giOn : !!a;
-        syncWhite();
+        const was = giOn;
+        if (a !== null || strength === null) giOn = a === null ? !giOn : !!a;
         if (strength !== null) giStrength.value = Math.max(0, Number(strength));
         if (!giOn) lpvOrigins = [];   // stale while off; start over when it returns
-        if (was !== `${giOn}${giOnly}`) rebuild();
+        if (was !== giOn) rebuild();
         if (!shadowsOn()) return 'run bxb.shadows() first';
         if (!giOn) return 'GI off';
         return `GI on - two 24^3 volumes, over C0 (0.75 m cells) and C1 (1.5 m), ` +
                `strength ${giStrength.value.toFixed(2)}, spread ${lpvSpread.toFixed(2)}, ` +
                `${lpvIterations} iterations, 1/${lpvSlices} injected a frame, ` +
-               `${lastGIms.toFixed(2)} ms CPU to encode` +
-               `${giOnly ? ' - showing the bounce alone' : ''}`;
+               `${lastGIms.toFixed(2)} ms CPU to encode`;
       }
     },
     gistats: {
@@ -285,12 +281,11 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
   return {
     name: 'gi',
     options: () => ({
-      gi: giOn && giMode === 'lpv' && ensureLPV() ? giBinding() : null, giOnly,
+      gi: giOn && giMode === 'lpv' && ensureLPV() ? giBinding() : null,
       texelGI: giOn && giMode === 'texel' ? ensureTexelGI() : null
     }),
     update,
     stepTexel,
-    get only() { return giOnly; },
     commands,
     // For the Perf section.
     perfSettings: [
@@ -316,9 +311,6 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       ab('giabphys', 'A/B: physical bounce (Fresnel, metal)', 'physical'),
       ab('giabfresh', 'A/B: shading reads fresh patches only', 'fresh'),
       ab('giabanchor', 'A/B: rays from anchor texel', 'anchor'),
-      { key: 'gimissing', label: 'Texel GI: show missing patches', type: 'toggle',
-        help: 'the bounce reads bright red where a texel finds no patch in the table',
-        get: () => ensureTexelGI().debug.value === 1, set: v => { ensureTexelGI().debug.value = v ? 1 : 0; } },
       { key: 'giresponse', label: 'Texel GI response (s)', type: 'range', min: 0, max: 1, step: 0.01,
         help: 'time the bounce takes to follow a change - smooths flicker from anything that moves. 0: none',
         get: () => giResponse, set: v => { giResponse = v; } },
@@ -346,9 +338,11 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
         get: () => lpvIterations, set: v => { lpvIterations = v; } },
       { key: 'gislices', label: 'Inject 1/N a frame', type: 'range', min: 1, max: 64, step: 1,
         help: 'injection re-marches every light per surface; 1/N of the cells each frame',
-        get: () => lpvSlices, set: v => { lpvSlices = v; } },
-      { key: 'gionly', label: 'View: bounce only', type: 'toggle',
-        get: () => giOnly, set: v => flip(giOnly, v, () => commands.gi.run('only')) }
-    ]}
+        get: () => lpvSlices, set: v => { lpvSlices = v; } }
+    ]},
+    // For the Debug section: an overlay on the bounce, not a view of its own.
+    missingSetting: { key: 'gimissing', label: 'Texel GI: show missing patches', type: 'toggle',
+      help: 'the bounce reads bright red where a texel finds no patch in the table',
+      get: () => ensureTexelGI().debug.value === 1, set: v => { ensureTexelGI().debug.value = v ? 1 : 0; } }
   };
 }

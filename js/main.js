@@ -9,8 +9,7 @@ import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
          updateVoxelVisibility, worldInstancedMesh, glassInstancedMesh, terrainTextures,
          setShadedAlbedo } from './render/render.js';
-import { terrainKeepTSL, terrainShapeTSL, terrainWhite, terrainTexelTSL } from './gpu/terrain.js';
-import { texelPixels, texelCacheSpacingFor } from './core/texelcache.js';
+import { terrainWhite, terrainTexelTSL } from './gpu/terrain.js';
 import { createWanderAI } from './game/ai.js';
 import { createGameState } from './game/state.js';
 import { createEncounter } from './game/encounter.js';
@@ -24,48 +23,38 @@ import { createSky } from './render/features/sky.js';
 import { createLights } from './render/features/lights.js';
 import { createMirrors } from './render/features/mirrors.js';
 import { createGI } from './render/features/gi.js';
+import { createDebugView } from './render/features/debugview.js';
+import { createTexelCache } from './render/features/texelcache.js';
+import { createSpriteAtlas } from './render/features/spriteatlas.js';
+import { createCards } from './render/features/cards.js';
+import { createSun } from './render/features/sun.js';
+import { createShadowSets, nextFrame } from './render/shadowsets.js';
 import { getSpriteWorldPos, followPath, walk, WALK_SPEED, ENEMY_SPEED } from './game/movement.js';
 import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './tools/debug.js';
-import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace, SUN_BIAS_BLOCKS,
-         CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres, applyHandoff } from './core/boxgrid.js';
+import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
+         CASCADE_COUNT, applyHandoff } from './core/boxgrid.js';
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent,
-         crossedPlanesGeometry, spriteAtlasGeometry, spriteAtlasRegion,
-         packSpriteAtlas } from './render/sprites.js';
+         crossedPlanesGeometry } from './render/sprites.js';
 import { createPerfOverlay } from './tools/perf.js';
 import { createFramePacer, describePacing } from './tools/pacing.js';
 import { VERSION, bundleHash, buildLabel } from './core/version.js';
 import { createVoxelAONode, AO_DISTANCE } from './gpu/ambient.js';
-import { createCardBindings, createCardAtlasTexture, createCardColourTexture, writeCardBindings,
-         MAX_CARDS } from './gpu/cards.js';
-import { runGPUCards, runComputeSmokeTest, runGPUMarch } from './gpu/diagnostics.js';
+import { runComputeSmokeTest, runGPUMarch } from './gpu/diagnostics.js';
 import { createDistanceTexture, updateDistanceTexture, followShadowGrid, commitShadowGrid,
-         SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS, cascadeBindings,
-         writeCascadeBindings, SEAM_BAND_VOXELS } from './gpu/field.js';
+         cascadeBindings,
+         writeCascadeBindings } from './gpu/field.js';
 import { GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics } from './gpu/glass.js';
 import { createHitCache } from './gpu/hitcache.js';
 import { createNormalTexture } from './gpu/normals.js';
-import { terrainEmissiveTSL, roughReach, splitDebug, createShadowColorNode } from './gpu/shade.js';
+import { roughReach } from './gpu/shade.js';
 import { reflectBouncesUniform, REFLECT_MAX_BOUNCES } from './gpu/specular.js';
-import { createSpriteShadowMaterial, createSpriteAtlasMaterial } from './gpu/sprite.js';
-import { createBayerTexture, writeSunUniforms, DEFAULT_AMBIENT } from './gpu/sun.js';
-import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
-         createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode,
-         createShadowMaterial } from './gpu/texel.js';
 import { setHitBounds } from './gpu/volume.js';
 import { sunForHour, DEFAULT_SKY_HOUR } from './core/sky.js';
-import { SUN_ANGULAR_SIZE, penumbraTexels } from './core/sun.js';
-import { lightRadiusMetres, POINT_CARD_CAPACITY } from './core/lights.js';
-import { createOccluder, placeOccluder, applyOccluders } from './core/occluders.js';
-import { maskFromRGBA, createSilhouetteSet, facingToward,
-         AXIS_X, AXIS_Z } from './core/silhouette.js';
-import { createCard, cardFacingFor, buildCardAtlas, packCardInstances,
-         cullCardsForLight, cardsVisibility, CARD_PAD, SUN_CARD_LOD_SHIFT,
-         SUN_CARD_LOD_MAX } from './core/cards.js';
-import { spriteNormals } from './core/normals.js';
+import { lightRadiusMetres } from './core/lights.js';
 import { createConsole, installConsole } from './tools/console.js';
 import { createSettingsPanel } from './tools/settings.js';
-import { keyPart, createSetCache, unstableNames, hashText, diffKeyParts } from './core/shadowsets.js';
-import { classifyTextureAlpha, registerCutout, syncCutout, wantsTransparent,
+import { unstableNames, hashText } from './core/shadowsets.js';
+import { classifyTextureAlpha, registerCutout,
          cutoutsEnabled, setCutoutsEnabled } from './render/cutout.js';
 import { averageAlbedo } from './core/lpv.js';
 import * as UI from './game/ui.js';
@@ -119,7 +108,7 @@ async function requestGPUDevice() {
 }
 // trackTimestamp gives the perf graph the GPU's own frame time. It only takes
 // effect when the device has timestamp-query; without it the graph says so.
-// stencil: the texel cache's miss pass is gated by it - see renderTexelCache.
+// stencil: the texel cache's miss pass is gated by it - see render/features/texelcache.js.
 const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: true, stencil: true,
                                            device: await requestGPUDevice() });
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -274,49 +263,6 @@ scene.add(enemySprite);
 
 const enemyAI = createWanderAI(enemy, enemySprite, 4);
 
-// --- Shadow-casting proxies ---
-//
-// A sprite is a camera-facing quad with no thickness, so it is not something the
-// distance field can be baked from directly - see occluders.js for why
-// voxelising the quad itself would make a character's shadow change shape as the
-// camera orbits. Each caster gets a world-locked box instead, and the box is all
-// the grid ever sees.
-//
-// Sized against the sprite quads rather than guessed. The character quad is
-// VOXEL_SIZE x VOXEL_SIZE*2, translated so its base sits at the mesh position -
-// so mesh.position is the FEET, which is what placeOccluder wants. The figure
-// does not fill its quad (pixel art carries transparent padding), so the proxy
-// is narrower and shorter than the geometry: roughly the body, not the canvas.
-const CHARACTER_PROXY = { width: VOXEL_SIZE * 0.5, height: VOXEL_SIZE * 1.6 };
-// A tree's quad is VOXEL_SIZE*2 x VOXEL_SIZE*3, and the same reasoning applies -
-// a trunk and canopy inside a mostly-empty rectangle.
-const TREE_PROXY = { width: VOXEL_SIZE * 0.9, height: VOXEL_SIZE * 2.4 };
-
-// --- Reading the cutout off the sprite ---
-//
-// The only DOM-shaped part of the silhouette path, and the reason it lives here
-// rather than in silhouette.js: a canvas cannot exist in the headless test
-// suite, so the module that does the maths takes a plain mask array and this
-// function is the one thing that has to be trusted by inspection.
-//
-// Drawn at native size with smoothing off. The sprite is 12 x 24 and the voxel
-// grid it is about to become is also 12 x 24 - any scaling here would resample
-// an exact correspondence into an approximate one.
-function imageRGBA(image) {
-  const canvas = document.createElement('canvas');
-  canvas.width = image.width;
-  canvas.height = image.height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(image, 0, 0);
-  return ctx.getImageData(0, 0, image.width, image.height).data;
-}
-
-function maskFromTexture(image) {
-  return { mask: maskFromRGBA(imageRGBA(image), image.width, image.height),
-           w: image.width, h: image.height };
-}
-
 // --- Normal maps ---
 //
 // Generated for every sprite and block texture (normals.js). A hand-authored
@@ -345,367 +291,12 @@ function resolveTerrainAlbedo() {
   terrainAlbedo = averageAlbedo(terrainTextures.rgba[0]);
 }
 
-// Textures load asynchronously, so a silhouette cannot be built at module scope.
-// Until one arrives the proxy is a box - which is a working shadow, not a
-// placeholder, so there is no first-frame flicker of nothing being cast.
-//
-// RESOLVED BY POLLING, NOT BY AN EVENT, and that is not laziness. THREE.Texture
-// dispatches exactly one event, 'dispose' - there is no 'load', and
-// TextureLoader only assigns texture.image inside ImageLoader's own callback. An
-// addEventListener('load') on the texture therefore never fires, which is how
-// every silhouette here silently stayed a box: the fallback is a working shadow,
-// so nothing looked broken, it just looked rectangular.
-//
-// Checking each frame cannot miss a load the way a missing event can, costs one
-// truthiness test per proxy once resolved, and self-heals if a texture is ever
-// swapped at runtime.
-const pendingSilhouettes = [];
-
-function attachSilhouette(proxy, texture, widthMetres, heightMetres) {
-  pendingSilhouettes.push({ proxy, texture, widthMetres, heightMetres });
-}
-
-function resolveSilhouettes() {
-  for (let i = pendingSilhouettes.length - 1; i >= 0; i--) {
-    const p = pendingSilhouettes[i];
-    const img = p.texture.image;
-    if (!img || !img.width) continue;
-    const { mask, w, h } = maskFromTexture(img);
-    // One per cascade. A single silhouette is expressed in the voxels of the
-    // level it was built for, so sharing it across levels makes the character
-    // twice as wide in C1 and four times in C2 - see createSilhouetteSet.
-    p.proxy.silhouettes = createSilhouetteSet({
-      mask, w, h,
-      widthMetres: p.widthMetres, heightMetres: p.heightMetres
-    });
-    pendingSilhouettes.splice(i, 1);
-  }
-}
-
-// How the cards are turned. 'sun' points each card's normal along the sun's
-// azimuth, so the full silhouette always faces the light and the fixed-facing
-// degeneracy - a card edge-on to the sun casting a line - cannot arise.
-//
-// This is still not a CAMERA-facing proxy, which is what S9 rules out and for a
-// specific reason: a camera-facing card's thickness is camera-relative, so the
-// shadow changes shape as the player orbits. A sun-facing card is world-locked
-// with respect to the viewer and re-orients only when the light moves, which is
-// what a real silhouette does anyway.
-//
-// 'x' and 'z' lock to a world plane instead, kept for comparison.
-let cardMode = 'sun';
-
-function cardFacing() {
-  if (cardMode === 'x') return AXIS_X;
-  if (cardMode === 'z') return AXIS_Z;
-  return facingToward(dirLight.position.x, dirLight.position.z);
-}
-
 // Sprites are turned around by mirroring their UVs - repeat.x goes to -1, see
 // updateSpriteFacing - not by scaling the mesh. So that is where any mirror
 // state has to be read from. One definition rather than one per caller: the
 // cutout and the torch both need it, and a torch that disagreed with the
 // silhouette about which way Bob faces would swap sides a frame early or late.
 const mirrored = sprite => sprite.material.map.repeat.x < 0;
-
-const playerProxy = createOccluder('player', CHARACTER_PROXY);
-const enemyProxy = createOccluder('enemy', CHARACTER_PROXY);
-attachSilhouette(playerProxy, bobTexture, VOXEL_SIZE, VOXEL_SIZE * 2);
-attachSilhouette(enemyProxy, evilBobTexture, VOXEL_SIZE, VOXEL_SIZE * 2);
-// Trees never move, so after the first frame they cost exactly nothing - the
-// snapped box compares equal and applyOccluders does no work. They are in the
-// list for the same reason the characters are: they are sprites, so they are
-// not in the World map, so without a proxy they cast nothing at all.
-const treeProxies = [];
-// The baked proxies are OFF by default: analytic cards (above) are the shadow
-// path now, and running both would have every sprite occlude twice. Kept
-// switchable because the bake is what reflections and GI will need.
-let proxiesOn = false;
-
-// --- Analytic cards: the shadow path sprites actually use ---
-//
-// The distance field is geometry shared by every light, so a sprite baked into
-// it faces one direction and every other light gets the wrong silhouette. These
-// live OUTSIDE the field: each light intersects each card, turned to face that
-// light. See cards.js.
-//
-// The baked proxies above are kept and still work - bxb.proxies() turns them on
-// - but they are off by default now, because the two would double-count. What
-// they are for from here is reflections and GI (S9), which need sprites present
-// in the grid rather than tested against a ray.
-const cardTypes = [];          // { card, typeIndex }, one per sprite texture
-let cardAtlas = null;
-let cardAtlasTex = null;
-const pendingCards = [];
-
-// The texture arrives as a THUNK rather than a value, and that is about module
-// order rather than laziness. These registrations sit next to the rest of the
-// sprite-shadow code, but the textures they name are created wherever their
-// sprite happens to be set up - treeTexture is nearly two hundred lines further
-// down. Naming one directly here reads it during module evaluation, before the
-// const exists, which is a TDZ error at load and not something a build catches.
-//
-// A thunk is evaluated in resolveCards, long after every module-level const has
-// settled, so where a texture is declared stops mattering at all.
-// name is the texture's file name, which is what a normal-map override is
-// matched by.
-function registerCard(key, name, getTexture, widthMetres, heightMetres) {
-  const entry = { key, name, getTexture, widthMetres, heightMetres, card: null,
-                  normalTex: null };
-  pendingCards.push(entry);
-  return entry;
-}
-
-const bobCard = registerCard('bob', 'character_Bob', () => bobTexture,
-                             VOXEL_SIZE, VOXEL_SIZE * 2);
-const evilCard = registerCard('evil', 'character_EvilBob', () => evilBobTexture,
-                              VOXEL_SIZE, VOXEL_SIZE * 2);
-const treeCard = registerCard('tree', 'decor_tree', () => treeTexture,
-                              VOXEL_SIZE * 2, VOXEL_SIZE * 3);
-
-// Same polling as the silhouettes, and for the same reason: THREE.Texture has no
-// 'load' event, so there is nothing to listen to.
-function resolveCards() {
-  let built = false;
-  for (let i = pendingCards.length - 1; i >= 0; i--) {
-    const p = pendingCards[i];
-    const tex = p.getTexture();
-    const img = tex && tex.image;
-    if (!img || !img.width) continue;
-    // Per sprite, so one unreadable texture cannot take the rest down with it -
-    // and so the reason is reported rather than surfacing as "still loading"
-    // forever, which is what it looked like.
-    let mask, w, h, rgba;
-    try {
-      rgba = imageRGBA(img);
-      w = img.width; h = img.height;
-      mask = maskFromRGBA(rgba, w, h);
-    } catch (err) {
-      p.error = String(err && err.message || err);
-      continue;
-    }
-    // How much of the sprite is opaque. Kept because a mask that comes back
-    // fully solid is indistinguishable from a working one until you look at the
-    // shadow: every card becomes its own bounding box and casts a slab.
-    let solid = 0;
-    for (let k = 0; k < mask.length; k++) solid += mask[k];
-    p.coverage = solid / mask.length;
-    p.card = createCard({ mask, w, h, rgba,
-                          widthMetres: p.widthMetres, heightMetres: p.heightMetres });
-    // From the card's own distance transform: the silhouette the shadow uses
-    // is the silhouette the bevel follows.
-    const card = p.card;
-    p.normalTex = normalMapFor(p.name, () => ({
-      data: spriteNormals(card.dt, card.w, card.cols, card.rows, CARD_PAD), w, h
-    }));
-    p.typeIndex = cardTypes.length;
-    cardTypes.push(p);
-    pendingCards.splice(i, 1);
-    built = true;
-  }
-  if (!built) return false;
-  // Repacked whole rather than appended: the atlas is a handful of small
-  // bitmaps, and a rect that moved would silently point every instance of that
-  // card at the wrong pixels.
-  cardAtlas = buildCardAtlas(cardTypes.map(t => t.card));
-  return true;
-}
-
-// Every sprite that should cast, with no facing yet - the facing is per light
-// and is filled in per light below.
-function cardCasters() {
-  const out = [];
-  const add = (entry, sprite, flip) => {
-    if (!entry || !entry.card || !sprite.visible) return;
-    out.push({
-      card: entry.card, typeIndex: entry.typeIndex,
-      // The card's centre, not its feet: the mask is centred on the quad.
-      centre: { x: sprite.position.x,
-                y: sprite.position.y + entry.heightMetres / 2,
-                z: sprite.position.z },
-      flip, enabled: true
-    });
-  };
-  add(bobCard, playerSprite, mirrored(playerSprite));
-  add(evilCard, enemySprite, mirrored(enemySprite));
-  for (const m of treeMeshes) add(treeCard, m, false);
-  return out;
-}
-
-// Rebuilt each frame rather than kept in sync by hand. The set is small and the
-// alternative is a registration path that has to be remembered at every spawn
-// and despawn - a corpse that keeps casting is exactly the bug that costs.
-function activeProxies() {
-  if (!proxiesOn) return [];
-  const out = [];
-  if (playerSprite.visible) {
-    out.push(placeOccluder(playerProxy, playerSprite.position.x,
-                           playerSprite.position.y, playerSprite.position.z,
-                           mirrored(playerSprite)));
-  }
-  if (enemySprite.visible) {
-    out.push(placeOccluder(enemyProxy, enemySprite.position.x,
-                           enemySprite.position.y, enemySprite.position.z,
-                           mirrored(enemySprite)));
-  }
-  for (let i = 0; i < treeMeshes.length; i++) {
-    const m = treeMeshes[i];
-    if (!m.visible) continue;
-    if (!treeProxies[i]) {
-      treeProxies[i] = createOccluder('tree' + i, TREE_PROXY);
-      // One silhouette per tree rather than one shared: createSilhouette is
-      // cheap and called once, and sameBox compares the object by identity, so a
-      // shared instance would be fine too - but a per-tree one leaves room for
-      // variants (a stump, a dead tree) without restructuring.
-      attachSilhouette(treeProxies[i], treeTexture, VOXEL_SIZE * 2, VOXEL_SIZE * 3);
-    }
-    out.push(placeOccluder(treeProxies[i], m.position.x, m.position.y, m.position.z));
-  }
-  return out;
-}
-
-// Write the proxies into every cascade and report whether anything changed.
-//
-// Every cascade, not just C0: a shadow ray leaves C0 after 18 m and continues in
-// C1, so a caster present only in the fine level would stop casting at exactly
-// the distance the ray crossed over - a character's shadow vanishing partway
-// across the ground for no visible reason.
-//
-// The texture upload is conditional on the SAME flag, which is the point of
-// applyOccluders returning one: a 3 MB Data3DTexture re-upload per cascade per
-// frame would cost more than the bake it is reporting, and in a turn-based scene
-// most frames have nobody mid-step.
-// One slice per LIGHT, because the facing is the whole point: a card turned
-// toward the sun is not the card the torch needs, and one slice can only hold
-// one orientation. The sun has its own buffer; the point lights share one, each
-// owning the slice its light-list row points at.
-let sunCards = null, lightCards = null;
-// A third set, for reflections: every sprite turned the way its billboard is
-// drawn, toward the camera's heading, with the sprites' colour atlas beside the
-// silhouette one. A reflection ray that crosses one of these sees the sprite.
-let viewCards = null;
-let cardPack = null;
-let cardsReady = false;
-
-function ensureCardBindings() {
-  if (sunCards) return;
-  sunCards = createCardBindings(MAX_CARDS, 'bxbSunCards');
-  sunCards.lodShift.value = SUN_CARD_LOD_SHIFT;
-  sunCards.lodMax.value = SUN_CARD_LOD_MAX;
-  lightCards = createCardBindings(POINT_CARD_CAPACITY, 'bxbLightCards');
-  viewCards = createCardBindings(MAX_CARDS, 'bxbViewCards');
-  cardPack = new Float32Array(POINT_CARD_CAPACITY * 16);
-}
-
-// Fill one light's buffer: cull to what that light can reach, turn each card to
-// face it, pack, upload.
-function writeCardsFor(binding, casters, lightPos, radiusMetres, directional) {
-  const n = packCardsFor(casters, lightPos, radiusMetres, directional,
-                         cardPack, binding.capacity);
-  writeCardBindings(binding, cardPack, n);
-  return n;
-}
-
-// Cull, face and pack one light's cards into `out`, at most `capacity` of them.
-// Returns how many were written. Split from the upload so the point lights can
-// pack their slices back to back into one buffer.
-function packCardsFor(casters, lightPos, radiusMetres, directional, out, capacity) {
-  const near = cullCardsForLight(casters, lightPos, radiusMetres, capacity);
-  for (const c of near) {
-    // A directional light is the same direction from everywhere, so every card
-    // turns the same way. A point light is in a DIFFERENT direction from every
-    // sprite, which is the case a baked field cannot express at all.
-    c.facing = directional
-      ? facingToward(lightPos.x, lightPos.z)
-      : cardFacingFor(c.centre, lightPos.x, lightPos.z);
-  }
-  return packCardInstances(near, cardAtlas, out, capacity);
-}
-
-let lastCardCount = 0;
-
-// Which cascade a card stands in, as the lod createCardsTSL reads: the level,
-// plus how far into the last SEAM_BAND_VOXELS of it toward the next. null when
-// it is outside every level - no terrain shadow reaches there either, so the
-// card is dropped before it costs any fragment anything.
-function cardLod(centre) {
-  for (let l = 0; l < CASCADE_COUNT; l++) {
-    const g = shadowGrids[l];
-    if (!g) return 0;
-    const side = cascadeExtentMetres(l);
-    const ex = Math.min(centre.x - g.origin.x, g.origin.x + side - centre.x);
-    const ez = Math.min(centre.z - g.origin.z, g.origin.z + side - centre.z);
-    if (ex < 0 || ez < 0) continue;
-    const edge = Math.min(ex, ez) / cascadeVoxelMetres(l);
-    const t = Math.min(1, edge / SEAM_BAND_VOXELS);
-    return l + (1 - t * t * (3 - 2 * t));   // 1 - smoothstep, as c0WeightTSL
-  }
-  return null;
-}
-
-function updateCards() {
-  resolveTerrainAlbedo();
-  if (pendingCards.length && resolveCards()) {
-    // The atlas exists now where it did not before, and the kernel branches on
-    // whether there is one - so the material has to be rebuilt once. A one-frame
-    // hitch on load, and nothing afterwards.
-    cardAtlasTex = createCardAtlasTexture(cardAtlas);
-    ensureCardBindings();
-    sunCards.atlas = lightCards.atlas = viewCards.atlas = cardAtlasTex;
-    if (viewCards.colour) viewCards.colour.dispose();
-    viewCards.colour = createCardColourTexture(cardAtlas);
-    for (const b of [sunCards, lightCards, viewCards]) {
-      b.atlasSize.value.set(cardAtlas.width, cardAtlas.height);
-    }
-    cardsReady = true;
-    if (shadowsOn) { buildPerPixelShadows(); }
-    // The plain material's AO takes the sprites' contact discs from here on.
-    enableAlwaysOnAO();
-  }
-  if (!cardsReady || !cardsOn) {
-    lastCardCount = 0; frameCasters = null;
-    if (sunCards) sunCards.count.value = 0;   // no discs either
-    return;
-  }
-
-  // Each card's cascade LOD - with shadows off the cascades are not kept, and
-  // the only reader is the contact disc, which has no LOD: every card counts.
-  const casters = cardCasters()
-    .filter(c => (c.lod = shadowsOn ? cardLod(c.centre) : 0) !== null);
-  // The sun is directional: its "position" is a direction, and everything is
-  // within reach of it.
-  lastCardCount = writeCardsFor(sunCards, casters, dirLight.position, Infinity, true);
-  // The view cards: the direction from the pivot to the camera IS the way the
-  // billboards face (rotation.y = heading), so every card takes it. Nearest the
-  // camera first, so the cap drops the sprites least likely to be seen.
-  const near = cullCardsForLight(casters, camera.position, Infinity, viewCards.capacity);
-  const facing = facingToward(camera.position.x - pivot.position.x,
-                              camera.position.z - pivot.position.z);
-  for (const c of near) c.facing = facing;
-  writeCardBindings(viewCards, cardPack,
-                    packCardInstances(near, cardAtlas, cardPack, viewCards.capacity));
-  // The point lights' cards are packed with the light list, in lighting.update -
-  // after the torch has moved this frame rather than before.
-  frameCasters = casters;
-}
-let frameCasters = null;
-
-let cardsOn = true;
-
-function updateOccluders() {
-  // Cheap once everything has loaded, and the only thing that turns a box back
-  // into a cutout - see attachSilhouette for why this is not an event handler.
-  if (pendingSilhouettes.length) resolveSilhouettes();
-
-  const proxies = activeProxies();
-  const facing = cardFacing();
-  for (let l = 0; l < shadowGrids.length; l++) {
-    if (!shadowGrids[l]) continue;
-    if (applyOccluders(shadowGrids[l], proxies, facing)) {
-      updateDistanceTexture(shadowTexes[l]);
-    }
-  }
-}
 
 // --- WORLD OBJECTS (Phase 10: Tree, Chest, Barrel) ---
 // Untextured colored placeholder sprites - no dedicated object art yet.
@@ -795,7 +386,7 @@ function setTreeMerge(on) {
     tree.add(...into);
   }
   // The meshes now drawn need their atlas twins and regions.
-  if (activeShadowSet && activeShadowSet.atlasMats) ensureSpriteAtlas(activeShadowSet.atlasMats);
+  if (sets.active && sets.active.atlasMats) spriteAtlas.ensure(sets.active.atlasMats);
 }
 
 function createTrees(treePositions) {
@@ -922,7 +513,7 @@ const picker = createPicker(camera);
 function applyWorldEdit() {
   const r = rebuildWorldInstances();
   if (!r.ok) return { message: `${r.count} pieces is past the terrain mesh's room - save and reload` };
-  for (const t of Object.values(terrainTwins)) if (t) t.count = worldInstancedMesh.count;
+  texel.syncCount();
   mirrors.invalidate();
   lighting.syncModelLights();
   if (shadowsOn) {
@@ -1006,15 +597,9 @@ const input = createInput({
 // and the shadowed terrain materials (render.js), so toggling it is a write.
 let whiteWorld = false;
 const whiteUniform = terrainWhite;
-// The GI-only view draws on whiteworld too: the receiving surface goes white so
-// the bounce reads as the colour it is. What the terrain INJECTS is still its
-// real texture's albedo (terrainAlbedo), so green grass still bounces green.
-function syncWhite() {
-  whiteUniform.value = whiteWorld || gi.only ? 1 : 0;
-}
 function toggleWhiteWorld() {
   whiteWorld = !whiteWorld;
-  syncWhite();
+  whiteUniform.value = whiteWorld ? 1 : 0;
   return `whiteworld ${whiteWorld ? 'on' : 'off'}`;
 }
 
@@ -1040,14 +625,14 @@ async function toggleAdvancedEffects() {
     }
     const out = [];
     if (!perf.visible) out.push(bxbApi.perf());
-    if (!sunCone) out.push(await bxbApi.soften('cone'));
+    if (!sun.cone) out.push(await bxbApi.soften('cone'));
     if (shadowTurnOnCompiles()) {
       notice = showNotice('Preparing shaders\u2026');
       // Two frames, so the notice is on screen before the compile holds them.
       await nextFrame(); await nextFrame();
     }
     out.push(await bxbApi.shadows());
-    await shadowBuildDone;
+    await sets.done;
     // The GI's compute kernels compile on their first dispatch, the next frame.
     if (notice) { await nextFrame(); await nextFrame(); }
     console.log(out.join('\n'));
@@ -1078,14 +663,14 @@ window.addEventListener('keydown', (e) => {
 
   // Alt+X: whiteworld - terrain drawn plain white so light and shadow can be
   // judged without the grass texture in the way. Sprites keep their textures.
-  // Matched on e.code, not e.key, because holding Alt changes the reported
-  // character on several keyboard layouts while the physical key code stays put.
-  // preventDefault stops Alt from reaching the browser's own menu handling.
+  // Alt keys match e.code, not e.key: holding Alt changes the reported character
+  // on several layouts. preventDefault keeps Alt from the browser's own menu.
   if (e.altKey && e.code === 'KeyX') {
     e.preventDefault();
     console.log(toggleWhiteWorld());
     return;
   }
+  if (debugView.key(e)) return;   // Alt+B: cycle the render debug views
 
   // Alt+<key> is reserved for debug modes.
   if (e.altKey && e.code === 'KeyC') {
@@ -1123,7 +708,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     const msg = toggleBoxGridDebug(scene, player.gridPos, worldInstancedMesh,
                                    game.mode, { sunDirection: dirLight.position,
-                                                  bias: sunGridBias });
+                                                  bias: sun.gridBias });
     console.log(msg || '[boxGrid debug] off');
     return;
   }
@@ -1240,7 +825,7 @@ function animate(time) {
   // Rebuilds the overlay if the player has walked into a different chunk.
   // No-op when the overlay is off or the chunk is unchanged.
   refreshBoxGridDebug(scene, player.gridPos, game.mode,
-                      { sunDirection: dirLight.position, bias: sunGridBias });
+                      { sunDirection: dirLight.position, bias: sun.gridBias });
 
   // The cascades follow the player so shading works wherever they are, not only
   // in the patch the grid happened to be built in. Nothing else has to happen
@@ -1252,13 +837,14 @@ function animate(time) {
   // The sun's cards. The point lights' are packed in lighting.update below, after
   // the torch has moved, so they face where the flame IS this frame.
   // Always: with shadows off the sprites' contact AO still reads the sun's cards.
-  updateCards();
+  resolveTerrainAlbedo();
+  cards.update();
   sky.update();
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
   // remembered boxes into the new coordinates - so running this first would
   // write proxies the scroll then destroys, and cost the bake twice.
-  if (shadowsOn) updateOccluders();
+  if (shadowsOn) cards.updateOccluders();
   lighting.moveTorch();
   if (shadowsOn) lighting.update();
   // After the light list: the mirrors are culled against where the lights are now.
@@ -1267,8 +853,8 @@ function animate(time) {
   if (shadowsOn) gi.update();
 
   const tRender = performance.now();
-  renderTexelCache();
-  renderSpriteAtlas();
+  texel.render();
+  spriteAtlas.render();
   renderer.render(scene, camera);
   resolveGPUTime();
   const tEnd = performance.now();
@@ -1322,14 +908,13 @@ function fieldFocus() {
 let shadowGrids = [];
 let shadowTexes = [];
 let shadowCascades = [];   // the GPU bindings for each level
-let shadowSun = null;       // live sun uniform set, so bxb.light can move it
 let shadowOrigins = [];     // block origin each level is currently built at
 
 // Builds every cascade at its own footprint, reusing the buffers if they exist.
 // Called on turn-on and whenever a level's origin moves.
 function ensureShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const o = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sunGridBias, l);
+    const o = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sun.gridBias, l);
     shadowGrids[l] = createBoxGridAt(o.x, o.z, shadowGrids[l] || null, l);
     if (!shadowTexes[l]) shadowTexes[l] = createDistanceTexture(shadowGrids[l]);
     updateDistanceTexture(shadowTexes[l]);
@@ -1393,7 +978,7 @@ function followShadowGrids() {
   let moved = fieldApplied;
   fieldApplied = false;
   for (let l = 0; l < CASCADE_COUNT; l++) {
-    const want = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sunGridBias, l);
+    const want = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sun.gridBias, l);
     const at = shadowOrigins[l];
     if (at && want.x === at.x && want.z === at.z) continue;
     if (fieldWorker) {
@@ -1413,61 +998,13 @@ function followShadowGrids() {
   return moved;
 }
 
-// --- The sun: a marched cone ---
-//
-// The CSM is gone; see sun.js for why. The sun is now the same sphere-traced ray
-// bxb.shadows always cast, widened into a cone over the solar disc, so softening
-// and shadowing are one technique rather than a shadow plus a filter.
-//
-// sunRays is the sample count and is a COMPILE-TIME property of the kernel: 1 is
-// the hard reference, and anything above it is soft. Tracked alongside the other
-// pass-shape flags because reusing a pass built at a different count is silent -
-// everything runs and nothing on screen changes, which is exactly what toggling
-// the old bxb.csm() off and on used to do.
-let sunRays = 1;
-// Which way the penumbra is obtained. false samples the solar disc with sunRays
-// rays; true gets the whole thing from a single cone trace against the widened
-// field. Both are the same march and the same field - see gpu/sun.js for the one
-// thing the cone gives up, which is occluder shape. The cone is the default:
-// it is what R turns on, and so what the load-time compile builds.
-let sunCone = true;
-let sunAngular = SUN_ANGULAR_SIZE;
-let sunBayer = null;
-let sunSteps = null;    // quantisation levels for the soft tail
-let sunBias = null;     // ray origin lift off the face, in voxels
-// Where a shadow starts dissolving as its ray runs out of reach. Uniforms rather
-// than constants because this is the knob that decides whether the march's limits
-// are visible, and it has to be found by eye.
-let sunFadeStart = null, sunEdgeFade = null;
-// Set for exactly one pass to overwrite every cached texel. A stored shadow is
-// only good while the sun and the world it was measured against hold, so moving
-// either invalidates all of them at once.
-// How N.L is applied; 'lambert' (raw N.L) by default. 'ground' normalises against what a horizontal surface
-// receives, so the sun's ANGLE sets shadow direction and length rather than the
-// whole scene's brightness - see sunShadeTSL. A kernel branch, so changing it
-// rebuilds; ambient beside it is a plain uniform.
-let shadeMode = 'lambert';
-// How far the explore footprint leans toward the sun, in blocks. A plain number
-// rather than a uniform: it changes WHERE the grid is baked, so it takes effect
-// on the next re-origin, not on the next shade.
-let sunGridBias = SUN_BIAS_BLOCKS;
-let sunAmbient = null;
-// The sun, off. Not a zero direction or a black colour - a KERNEL flag, so the
-// material has no sun march in it at all and a torch-only scene pays for one
-// light instead of two. This is what a cave or a night is.
-let sunOn = true;
-let shadowOnly = false; // raw visibility, no albedo or N.L, for judging artifacts
 // Cone-traced AO. On/off is compiled into the kernel; the distance is a
-// uniform. aoOnly shows the AO term alone.
+// uniform.
 // Always on, by two methods swapped with shadows: traced cones through the
 // field with shadows on, static voxel AO with them off (see enableAlwaysOnAO).
-// Not a switch.
-const aoOn = true;
-let aoOnly = false;
+// Not a switch: off only inside bxb.gpuprofile, to price the cones.
+let aoOn = true;
 const aoDistance = uniform(AO_DISTANCE);
-// View: the terrain's raw LabPBR specular texel in place of the lit colour.
-// Compiled in, like the other views.
-let specularOnly = false;
 // Specular (gpu/specular.js): GGX highlights from every light, and one
 // reflection ray per texel on smooth surfaces. Both compiled in. The sky is
 // what a ray that leaves the field sees - the background, as a uniform.
@@ -1475,267 +1012,62 @@ let specularOn = true;
 let reflectionsOn = true;
 // --- The render features (render/engine.js, render/features/) ---
 const engine = createEngine();
-const sky = engine.add(createSky({ scene, sunLight: dirLight, moveSun: (x, y, z) => bxbLight(x, y, z) }));
+const sun = engine.add(createSun({
+  sunLight: dirLight, shadowsOn: () => shadowsOn, rebuild: () => buildPerPixelShadows(),
+  reorigin: () => { shadowOrigins = []; }
+}));
+// Before the GI: it is handed their card types.
+const cards = engine.add(createCards({
+  renderer, camera, pivot, sunLight: dirLight, sunAngular: () => sun.angular,
+  sprites: { player: { mesh: playerSprite, texture: bobTexture },
+             enemy: { mesh: enemySprite, texture: evilBobTexture },
+             trees: () => treeMeshes, treeTexture, mirrored },
+  normalMap: normalMapFor,
+  grids: () => shadowGrids, textures: () => shadowTexes, shadowsOn: () => shadowsOn,
+  rebuild: () => buildPerPixelShadows(), onReady: () => enableAlwaysOnAO()
+}));
+const sky = engine.add(createSky({ scene, sunLight: dirLight, moveSun: (x, y, z) => sun.move(x, y, z) }));
 const lighting = engine.add(createLights({
   scene, shadowsOn: () => shadowsOn, mirrorRects: () => mirrors.rects,
   holder: { sprite: playerSprite, facingRight: () => mirrored(playerSprite) },
   // A light's sprite cards, in its slice of the shared point-light buffer.
   cards: {
-    active: () => !!(frameCasters && lightCards && cardsReady && cardsOn),
-    pack: (l, used, room) => packCardsFor(frameCasters, l.position, lightRadiusMetres(l.level),
-                                          false, cardPack.subarray(used * 16), room),
-    commit: used => writeCardBindings(lightCards, cardPack, used)
+    active: cards.lightSlices.active,
+    pack: (l, used, room) => cards.lightSlices.pack(l.position, lightRadiusMetres(l.level), used, room),
+    commit: cards.lightSlices.commit
   }
 }));
 const mirrors = engine.add(createMirrors({
-  sunLight: dirLight, sunOn: () => sunOn, lighting, focus: playerSprite.position,
+  sunLight: dirLight, sunOn: () => sun.on, lighting, focus: playerSprite.position,
   footprint: () => shadowGrids[Math.min(1, shadowGrids.length - 1)],
   rebuild: () => { if (shadowsOn) buildPerPixelShadows(); }
 }));
 const gi = engine.add(createGI({
   renderer, cascades: () => shadowCascades, lighting, sky, mirrors,
-  sun: {
-    uniforms: () => {
-      ensureSunUniforms();
-      return { biasUniform: sunBias, fadeStartUniform: sunFadeStart, edgeFadeUniform: sunEdgeFade,
-               ambientUniform: sunAmbient };
-    },
-    on: () => sunOn, angular: () => sunAngular, light: dirLight
-  },
-  sprites: { casters: () => frameCasters, types: cardTypes },
+  sun: { uniforms: () => sun.uniforms(), on: () => sun.on, angular: () => sun.angular, light: dirLight },
+  sprites: { casters: () => cards.casters(), types: cards.types },
   terrainAlbedo: () => terrainAlbedo,
-  syncWhite, shadowsOn: () => shadowsOn,
+  shadowsOn: () => shadowsOn,
   rebuild: () => { if (shadowsOn) buildPerPixelShadows(); }
 }));
-
-// --- Texel-rate shading (gpu/texel.js) ---
-//
-// The terrain is shaded in a low-res pass - 1/texelCacheScale per axis - into
-// a float target of vec4(colour, texel id); the full-res pass then reuses the
-// colour of a nearby sample from the same texel, and shades only pixels that
-// have none. Exact, since a texel's colour is the same everywhere in it.
-// The low-res pass draws only layer TEXEL_LAYER, which only the terrain is on.
-const TEXEL_LAYER = 1;
-let texelCacheOn = true;
-// The sample spacing in pixels: 0 follows the texel's size on screen
-// (render.js texelCacheSpacingFor), a number fixes it. texelCacheScale is the
-// spacing in use.
-let texelCacheSpacing = 0;
-let texelCacheScale = 4;
-const texelCache = {
-  rt: null,
-  tex: null,
-  scale: uniform(new THREE.Vector2(1, 1)),   // low-res / full-res, per axis
-  size: uniform(new THREE.Vector2(1, 1)),    // low-res pixels
-  showMisses: false                          // debug view, compiled in
-};
-let terrainLowMat = null;      // the low-res pass's material, when the cache is on
-let terrainLookupMat = null;   // the terrain's material it belongs with
-let glassLowMat = null;        // the same pair for the glass mesh
-let glassLookupMat = null;
-
-// The full-res terrain is three draws of the same instances, in this order:
-//
-//   prepass  depth only - so each pixel's visible terrain fragment, and only
-//            it, passes the depth tests of the two after it
-//   lookup   the terrain mesh itself: the cached colour, stencil set to 1 on
-//            every pixel it fills; a pixel with no matching sample discards
-//   miss     the full shading, stencil-tested against 0: a pixel the lookup
-//            filled is rejected BEFORE its shader runs, so the heavy shader
-//            only ever starts on the misses
-//
-// The twins share the terrain's geometry and instance buffers, so arena
-// hiding and tinting reach them with no extra writes. Identical vertex code in
-// all three, so the visible fragment's depth matches exactly.
-const terrainTwins = { prepass: null, miss: null };
-function terrainTwin(material, renderOrder) {
-  const src = worldInstancedMesh;
-  const m = new THREE.InstancedMesh(src.geometry, material, src.count);
-  m.instanceMatrix = src.instanceMatrix;
-  m.instanceColor = src.instanceColor;
-  m.frustumCulled = false;
-  m.raycast = () => {};          // picking stays on the terrain mesh itself
-  m.renderOrder = renderOrder;
-  m.visible = false;
-  scene.add(m);
-  return m;
-}
-function ensureTerrainTwins() {
-  if (terrainTwins.prepass) return terrainTwins;
-  const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
-  // The same vertex code as the shaded draws: a slope's plane, not its box.
-  depthOnly.positionNode = terrainShapeTSL();
-  // The prepass keeps every block, glass included: glass is the front surface
-  // wherever it is, so the terrain behind it fails the depth test and is never
-  // shaded.
-  terrainTwins.prepass = terrainTwin(depthOnly, -3);
-  terrainTwins.miss = terrainTwin(depthOnly, -1);   // real material set per build
-  if (glassInstancedMesh) terrainTwins.glassMiss = terrainTwin(depthOnly, -1);
-  return terrainTwins;
-}
-const _drawSize = new THREE.Vector2();
-function sizeTexelCache() {
-  renderer.getDrawingBufferSize(_drawSize);
-  texelCacheScale = texelCacheSpacing ||
-    texelCacheSpacingFor(texelPixels(_drawSize.y, camera.fov, rig.distance), texelCacheScale);
-  const w = Math.max(1, Math.ceil(_drawSize.x / texelCacheScale));
-  const h = Math.max(1, Math.ceil(_drawSize.y / texelCacheScale));
-  if (!texelCache.rt) {
-    texelCache.rt = new THREE.RenderTarget(w, h, { type: THREE.FloatType, depthBuffer: true });
-    texelCache.tex = texelCache.rt.texture;
-    texelCache.tex.minFilter = texelCache.tex.magFilter = THREE.NearestFilter;
-    texelCache.tex.generateMipmaps = false;
-  } else if (texelCache.rt.width !== w || texelCache.rt.height !== h) {
-    texelCache.rt.setSize(w, h);
-  }
-  texelCache.scale.value.set(w / _drawSize.x, h / _drawSize.y);
-  texelCache.size.value.set(w, h);
-  // The full-res G-buffer for split shading's resolve.
-  const fw = Math.max(1, _drawSize.x), fh = Math.max(1, _drawSize.y);
-  if (!texelCache.idRT) {
-    texelCache.idRT = new THREE.RenderTarget(fw, fh, { type: THREE.FloatType, depthBuffer: true });
-    texelCache.idRT.texture.minFilter = texelCache.idRT.texture.magFilter = THREE.NearestFilter;
-    texelCache.idRT.texture.generateMipmaps = false;
-  } else if (texelCache.idRT.width !== fw || texelCache.idRT.height !== fh) {
-    texelCache.idRT.setSize(fw, fh);
-  }
-}
-// Split shading's kernels over this frame's low-res samples, in one submit.
-function runSplitShading(resolved) {
-  const ks = activeShadowSet && activeShadowSet.splitKernels;
-  if (!ks || !splitShading) return;
-  const s = splitShading, rt = texelCache.rt;
-  s.width.value = rt.width;
-  s.count.value = Math.min(rt.width * rt.height, s.lowCap);
-  s.viewPos.value.copy(camera.position);
-  const list = [];
-  // Texel GI: the patch list starts empty; the base kernel fills it.
-  const gk = activeShadowSet.giKernels;
-  if (gk) list.push(gk.reset);
-  if (resolved) {
-    const full = texelCache.idRT;
-    s.fullWidth.value = full.width;
-    s.fullCount.value = Math.min(full.width * full.height, s.fullCap);
-    s.resolve[1].count = s.fullCount.value;
-    list.push(...s.resolve);
-  }
-  // This frame's low-res samples, then (resolved) up to missCap misses.
-  const n = s.count.value + (resolved ? s.missCap : 0);
-  for (const k of ks) { k.count = n; list.push(k); }
-  // Texel GI: each listed patch traces this frame's slice of its directions.
-  if (gk) gi.stepTexel(gk, list);
-  renderer.compute(list);
-}
-
-// The low-res pass, before the main render. Only while the terrain wears the
-// material this cache was built for - mid-rebuild it may not.
-function renderTexelCache() {
-  const mesh = worldInstancedMesh;
-  const active = texelCacheOn && shadowsOn && terrainLowMat && mesh
-    && mesh.material === terrainLookupMat;
-  // Glass joins the same cache: its own low-res, lookup and miss materials,
-  // the same target and ids (a glass texel is a world texel), one prepass.
-  const glass = glassInstancedMesh;
-  const glassActive = !!active && glass && glassLowMat && glass.material === glassLookupMat;
-  // The twins follow the terrain's own visibility (the grid overlay hides it).
-  const resolved = !!(activeShadowSet && activeShadowSet.resolved);
-  if (terrainTwins.prepass) {
-    terrainTwins.prepass.visible = terrainTwins.miss.visible = !!active && mesh.visible && !resolved;
-  }
-  if (terrainTwins.glassMiss) {
-    terrainTwins.glassMiss.visible = !!glassActive && mesh.visible && glass.visible && !resolved;
-  }
-  if (!active) return;
-  sizeTexelCache();
-  const mask = camera.layers.mask;
-  mesh.material = terrainLowMat;
-  if (glassActive) glass.material = glassLowMat;
-  camera.layers.set(TEXEL_LAYER);
-  renderer.setRenderTarget(texelCache.rt);
-  renderer.render(scene, camera);
-  // Resolved: the same G-buffer draws at full res, so every pixel knows its texel.
-  if (resolved) {
-    renderer.setRenderTarget(texelCache.idRT);
-    renderer.render(scene, camera);
-  }
-  renderer.setRenderTarget(null);
-  camera.layers.mask = mask;
-  runSplitShading(resolved);
-  mesh.material = terrainLookupMat;
-  if (glassActive) glass.material = glassLookupMat;
-}
-
-// --- Sprite texel atlas (sprites.js) ---
-//
-// The sprites' light, shaded once per art texel into a float target by one
-// pass of twins, then read back by the sprites' own draws - the texel cache's
-// idea for sprites, with a fixed slot per texel instead of a screen lookup.
-// Each sprite mesh has a twin: its child (so the same world matrix), on
-// SPRITE_ATLAS_LAYER only, drawing sprites.js spriteAtlasGeometry. Culled with
-// its sprite; a slot off screen goes stale, and nothing reads it.
-// bxb.spriteatlas() turns it off, back to shading every pixel, for A/B.
-const SPRITE_ATLAS_LAYER = 2;
-const SPRITE_ATLAS_WIDTH = 512;
-let spriteAtlasOn = true;
-const spriteAtlas = {
-  rt: null,
-  tex: null,
-  size: uniform(new THREE.Vector2(1, 1))
-};
-// Every sprite's art must be loaded to size its region.
-const spriteArtReady = () => spriteMeshes().every(m => {
-  const map = (m.userData.originalMaterial || m.material).map;
-  return map && map.image && map.image.width > 0;
+const debugView = engine.add(createDebugView({
+  shadowsOn: () => shadowsOn, shadows: () => bxbApi.shadows(), rebuild: () => buildPerPixelShadows()
+}));
+const spriteAtlas = engine.add(createSpriteAtlas({
+  renderer, scene, camera, meshes: () => spriteMeshes(), shadowsOn: () => shadowsOn,
+  activeSet: () => sets.active, rebuild: () => buildPerPixelShadows()
+}));
+const texel = engine.add(createTexelCache({
+  renderer, scene, camera, rig, shadowsOn: () => shadowsOn, activeSet: () => sets.active, gi,
+  rebuild: () => buildPerPixelShadows()
+}));
+// The shader sets: built from every feature's options, kept compiled.
+const sets = createShadowSets({
+  renderer, scene, camera, options: () => shadowNodeOptions(), texel, spriteAtlas, sun,
+  sprites: { meshes: () => spriteMeshes(), clipping: () => [playerSprite, enemySprite],
+             normalFor: m => cards.normalFor(m) }
 });
-// Twins for the meshes drawn now, and their regions. Run on each build and
-// whenever the drawn meshes change (bxb.treemerge). mats: base material ->
-// atlas material, for the twins; null leaves their materials as they are.
-function ensureSpriteAtlas(mats = null) {
-  const meshes = spriteMeshes();
-  const sizes = meshes.map(m => {
-    const img = (m.userData.originalMaterial || m.material).map.image;
-    return spriteAtlasRegion(img.width, img.height, m.geometry.userData.spritePlanes || 1);
-  });
-  const { at, height } = packSpriteAtlas(sizes, SPRITE_ATLAS_WIDTH);
-  meshes.forEach((m, i) => {
-    let twin = m.userData.spriteAtlasTwin;
-    if (!twin) {
-      twin = new THREE.Mesh(spriteAtlasGeometry(m.geometry), new THREE.MeshBasicNodeMaterial());
-      twin.layers.set(SPRITE_ATLAS_LAYER);
-      twin.raycast = () => {};
-      twin.userData.spriteAtlasOrigin = m.userData.spriteAtlasOrigin = new THREE.Vector2();
-      m.userData.spriteAtlasTwin = twin;
-      m.add(twin);
-    }
-    twin.userData.spriteAtlasOrigin.set(at[i][0], at[i][1]);
-    const lit = mats && mats.get(m.userData.originalMaterial || m.material);
-    if (lit) twin.material = lit;
-  });
-  const h = Math.max(1, height);
-  if (!spriteAtlas.rt) {
-    spriteAtlas.rt = new THREE.RenderTarget(SPRITE_ATLAS_WIDTH, h,
-                                            { type: THREE.FloatType, depthBuffer: false });
-    spriteAtlas.tex = spriteAtlas.rt.texture;
-    spriteAtlas.tex.minFilter = spriteAtlas.tex.magFilter = THREE.NearestFilter;
-    spriteAtlas.tex.generateMipmaps = false;
-  } else if (spriteAtlas.rt.height !== h) {
-    spriteAtlas.rt.setSize(SPRITE_ATLAS_WIDTH, h);
-  }
-  spriteAtlas.size.value.set(SPRITE_ATLAS_WIDTH, h);
-}
-// The atlas pass, before the main render. Only while the showing set reads it.
-function renderSpriteAtlas() {
-  if (!shadowsOn || !activeShadowSet || !activeShadowSet.atlasMats) return;
-  const mask = camera.layers.mask;
-  camera.layers.set(SPRITE_ATLAS_LAYER);
-  renderer.setRenderTarget(spriteAtlas.rt);
-  renderer.render(scene, camera);
-  renderer.setRenderTarget(null);
-  camera.layers.mask = mask;
-}
 
-// Glass debug views (gpu/shade.js glassNode): null, 'thickness', 'through' or 'path'.
-let glassView = null;
 // Internal reflections a ray through glass may take before it counts as trapped.
 let glassBounces = GLASS_MAX_BOUNCES;
 // Panes a view ray refracts through (2: one more glass seen through the first).
@@ -1747,7 +1079,7 @@ let glassShadows = true;
 // The cache pass, after the mirrors and lights are packed and before anything
 // that reads it is drawn. Only for a set built to read it.
 function runMirrorCache() {
-  const k = shadowsOn && activeShadowSet && activeShadowSet.mirrorCache;
+  const k = shadowsOn && sets.active && sets.active.mirrorCache;
   // The hit cache's halves swap, and the one written this frame is cleared -
   // in the same submit as the mirror cache.
   const list = [];
@@ -1762,11 +1094,6 @@ function runMirrorCache() {
   if (list.length) renderer.compute(list.length === 1 ? list[0] : list);
 }
 
-// Quantisation is a KERNEL flag, not a uniform, so changing it rebuilds. Off by
-// default now: it was inherited from the sampled path, where a fixed sample
-// pattern genuinely does band, and applied to the cone trace, whose output is
-// analytic and already smooth. Dithering a smooth gradient only adds crosshatch.
-let sunQuantise = false;
 // Profiling only (bxb.gpuprofile): the model lookup in reflection hits.
 let modelHitsOn = true;
 // The hit lighting cache (gpu/hitcache.js createHitCache): reflections reuse what the
@@ -1774,489 +1101,33 @@ let modelHitsOn = true;
 // Off by default: on the glass bed it saved ~0 (the low-res pass loses early
 // depth tests to the writes) and the one-frame lag shimmered in motion.
 let hitCacheOn = false;
-// Split shading (gpu/texel.js createSplitShading): the low-res pass writes samples,
-// compute kernels light them a feature at a time. A rebuild to switch
-// (bxb.splitshading()); off by itself if the GPU rejects it.
-let splitOn = true;
-let splitShading = null;
-// The ambient / highlights between kernels at half precision (bxb.splithalf()).
-let splitHalf = true;
-// Misses resolved in the kernels (no miss pass) - bxb.splitresolve().
-let splitResolveOn = true;
-// Debug: the kernels' A08//00a surface path (bxb.splitlegacy()).
-let splitLegacy = false;
-let splitFailed = false;
-function ensureSplitShading() {
-  if (splitShading) return splitShading;
-  // Room for every sample at the finest spacing (2) on this screen, misses
-  // for 1 pixel in 16, and every pixel.
-  const dpr = window.devicePixelRatio || 1;
-  const full = Math.min(Math.ceil(screen.width * dpr) * Math.ceil(screen.height * dpr), 1 << 24);
-  const low = Math.min(Math.ceil(screen.width * dpr / 2) * Math.ceil(screen.height * dpr / 2), 1 << 22);
-  splitShading = createSplitShading(low, Math.ceil(full / 16), full, splitHalf);
-  splitShading.resolve = createSplitResolve(splitShading, texelCache);
-  return splitShading;
-}
-// A validation error soon after split shading goes on: fall back to the
-// one-shader path for the session rather than draw nothing.
-let splitSince = 0;
-function watchSplitErrors() {
-  const device = renderer.backend && renderer.backend.device;
-  if (!device || watchSplitErrors.done) return;
-  watchSplitErrors.done = true;
-  device.addEventListener('uncapturederror', e => {
-    if (!splitOn || splitFailed || performance.now() - splitSince > 20000) return;
-    splitFailed = true;
-    splitOn = false;
-    console.warn('[split] the GPU rejected split shading - back to one shader. First error:',
-                 e.error && e.error.message);
-    buildPerPixelShadows();
-  });
-}
 let hitCache = null;
 function ensureHitCache() {
   if (!hitCache) hitCache = createHitCache();
   return hitCache;
 }
-function ensureSunUniforms() {
-  sunBayer = sunBayer || createBayerTexture();
-  sunSteps = sunSteps || uniform(4);
-  sunBias = sunBias || uniform(SURFACE_BIAS_VOXELS);
-  sunFadeStart = sunFadeStart || uniform(SHADOW_FADE_START);
-  sunEdgeFade = sunEdgeFade || uniform(EDGE_FADE_VOXELS);
-  sunAmbient = sunAmbient || uniform(DEFAULT_AMBIENT);
-}
-
-function bxbLight(x, y, z) {
-  dirLight.position.set(x, y, z);
-  // The cone's basis has to be rewritten WITH the direction. A basis left over
-  // from the previous sun tilts the penumbra off to one side, which reads as a
-  // softening bug rather than as a stale uniform - which is why this goes
-  // through writeSunUniforms instead of setting the direction alone.
-  if (shadowSun) writeSunUniforms(shadowSun, dirLight.position, sunAngular);
-  // The footprint leans toward the sun, so moving the sun moves WHERE the field
-  // should be baked, not just how it is lit. Dropping the remembered origin makes
-  // the next frame notice and re-origin; without this the grid would keep the
-  // previous sun's lean until the player happened to step a block. With no
-  // lean (the default) the sun does not move the footprint at all, and the
-  // forced re-origin would only rebake it for nothing.
-  if (sunGridBias) shadowOrigins = [];
-  return 'sun toward ' + x.toFixed(2) + ',' + y.toFixed(2) + ',' + z.toFixed(2);
-}
-
-// The per-pixel path, as a function rather than only a console command: the ray
-// count is baked into the material, so bxb.soften() has to rebuild it, and
-// reaching back through globalThis.bxb to do that would make the console the
-// owner of state main.js owns.
-// Sprites receive the same lights as the terrain. One lit material per ORIGINAL
-// material, so the trees' planes and all eight trees still share one. The lit
-// materials belong to their shadow set (see obtainShadowSet), which disposes them.
+// Every sprite mesh drawn now.
 function spriteMeshes() {
   return [playerSprite, enemySprite, ...treeMeshes.flatMap(g => g.children)];
 }
-function restoreSpriteMaterials() {
-  for (const m of spriteMeshes()) {
-    if (!m.userData.originalMaterial) continue;
-    m.material = m.userData.originalMaterial;
-    if (m.userData.depthVariants) {
-      m.userData.depthVariants = null;
-      // The plain material missed any clip transitions while it was parked.
-      const top = !!m.userData.drawingOnTop;
-      if (m.material.depthTest === top) {
-        m.material.depthTest = m.material.depthWrite = !top;
-        m.material.needsUpdate = true;
-      }
-    }
-    // Its transparent flag too - the clip state, or bxb.cutouts(), may have
-    // moved on while it was parked.
-    syncCutout(m.material);
-  }
-}
-// The characters also get an always-on-top variant for the clip fix in
-// sprites.js - compiled here with the rest, so leaning into a wall never
-// compiles anything.
-const clippingSprites = () => [playerSprite, enemySprite];
-// Null until that sprite's card has resolved; the sprite is shaded flat until
-// the rebuild that follows.
-const spriteNormalFor = m =>
-  (m === playerSprite ? bobCard : m === enemySprite ? evilCard : treeCard).normalTex;
-// atlas: shade into the sprite texel atlas and read it back (ensureSpriteAtlas
-// has made the twins); false shades every pixel.
-function buildSpriteShadows(spriteLight, atlas = false) {
-  const made = new Map();
-  const pairs = [];
-  const variants = new Map();
-  const atlasMats = atlas ? new Map() : null;
-  const reads = atlas ? spriteAtlas : null;
-  for (const m of spriteMeshes()) {
-    const base = m.userData.originalMaterial || m.material;
-    m.userData.originalMaterial = base;
-    if (atlas && !atlasMats.has(base)) {
-      atlasMats.set(base, createSpriteAtlasMaterial(base, spriteLight, spriteNormalFor(m), spriteAtlas));
-    }
-    if (atlas) pairs.push([m.userData.spriteAtlasTwin, atlasMats.get(base), spriteAtlas.rt]);
-    if (!made.has(base)) {
-      const mat = createSpriteShadowMaterial(base, spriteLight, spriteNormalFor(m), reads);
-      mat.depthTest = mat.depthWrite = true;
-      // Opaque when its texture's alpha is binary (js/cutout.js). Set from the
-      // texture, not copied from base: a character parked mid-clip has a
-      // transparent base, and this is the variant for NOT clipping.
-      mat.transparent = wantsTransparent(base);
-      made.set(base, mat);
-    }
-    pairs.push([m, made.get(base)]);
-  }
-  const mats = [...made.values()];
-  for (const m of clippingSprites()) {
-    const top = createSpriteShadowMaterial(m.userData.originalMaterial, spriteLight,
-                                           spriteNormalFor(m), reads);
-    top.depthTest = top.depthWrite = false;
-    // Always transparent: drawn last, over everything, is the transparent pass.
-    top.transparent = true;
-    variants.set(m, { normal: made.get(m.userData.originalMaterial), onTop: top });
-    pairs.push([m, top]);
-    mats.push(top);
-  }
-  if (atlasMats) mats.push(...atlasMats.values());
-  return { pairs, mats, variants, made, atlasMats };
-}
-
-// Compile the new materials before anything visible uses them, so the swap
-// costs nothing and the previous materials keep drawing meanwhile.
-//
-// Against the REAL mesh in the REAL scene: compileAsync keys its cache on the
-// scene it is handed, so compiling stand-ins in a scratch scene produced
-// pipelines the actual render never looked up. The new material is put on the
-// mesh only for the synchronous part of the call - which is where the render
-// object is captured - and taken off again before any frame can draw it. Culling
-// is lifted for the same span, or an off-screen sprite would be skipped and
-// compile on first sight instead.
-//
-// One material per frame: building the node graph into WGSL is synchronous
-// JavaScript, and doing all four in one frame is a hitch of its own.
-const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
-
-// Compile everything in the scene that has not been drawn yet, with culling
-// lifted - otherwise a sprite first seen on walking into new ground compiles
-// its pipeline right then, which is the hitch. Anything already compiled is a
-// cache hit, so this is cheap to repeat.
-async function warmScene() {
-  const lifted = [];
-  scene.traverse(o => { if (o.frustumCulled) { lifted.push(o); o.frustumCulled = false; } });
-  let pending;
-  try { pending = renderer.compileAsync(scene, camera); }
-  finally { for (const o of lifted) o.frustumCulled = true; }
-  await pending;
-}
-async function compileOffscreen(pairs) {
-  const seen = new Set();
-  for (const [mesh, mat, target = null] of pairs) {
-    if (seen.has(mat)) continue;   // meshes sharing a material share its pipeline
-    seen.add(mat);
-    const old = mesh.material, culled = mesh.frustumCulled;
-    const oldTarget = renderer.getRenderTarget();
-    const mask = camera.layers.mask;
-    mesh.material = mat;
-    mesh.frustumCulled = false;
-    // compileAsync skips what the camera's layers leave out - a sprite atlas
-    // twin is on its own layer only.
-    camera.layers.mask |= mesh.layers.mask;
-    let pending;
-    // A pipeline is per target format: compile against the one it draws into.
-    if (target) renderer.setRenderTarget(target);
-    try { pending = renderer.compileAsync(mesh, camera, scene); }
-    finally {
-      mesh.material = old; mesh.frustumCulled = culled;
-      camera.layers.mask = mask;
-      if (target) renderer.setRenderTarget(oldTarget);
-    }
-    await pending;
-    await nextFrame();
-  }
-}
-let shadowBuild = 0;
-
-// --- Shadow material sets, kept compiled (js/shadowsets.js) ---
-//
-// A set is everything one build makes: the terrain's material (and the texel
-// cache's low-res and miss materials), the sprites' lit materials, and the sun
-// uniforms they read. Kept after shadows go off, and after a rebuild replaces
-// it, so turning shadows back on - or flipping a setting back - is a swap, not
-// a compile. The newest SHADOW_SETS_KEPT are kept. bxb.shadowcache() turns
-// keeping off: each set is then disposed as soon as it is replaced, as before.
-const SHADOW_SETS_KEPT = 2;
-const shadowSets = createSetCache(SHADOW_SETS_KEPT);
-let shadowCacheOn = true;
-let activeShadowSet = null;
-
+// The shading build's options: the features' slices, and the settings main.js
+// still owns (render/shadowsets.js builds and keeps the sets).
 function shadowNodeOptions() {
   return {
     cascades: shadowCascades,
-    sunDirection: dirLight.position,
-    rays: sunRays, angular: sunAngular, cone: sunCone, quantise: sunQuantise,
-    bayerTex: sunBayer, stepsUniform: sunSteps, biasUniform: sunBias,
-    fadeStartUniform: sunFadeStart, edgeFadeUniform: sunEdgeFade,
-    ambientUniform: sunAmbient, shadeMode, shadowOnly, sun: sunOn,
-    // Sprites are not in the field; they are these. Null until the textures have
-    // loaded and the atlas is built, which is what the rebuild in updateCards
-    // is for.
-    cards: cardsReady && cardsOn ? sunCards : null,
-    lightCards: cardsReady && cardsOn ? lightCards : null,
-    terrain: terrainTextures, specularOnly,
+    terrain: terrainTextures,
     // At the surface's texel - on a slope's plane, its own texture (render.js).
     albedo: (st, surf = null) => mix(terrainTexelTSL(terrainTextures.albedo, st, surf).rgb,
                                      vec3(1, 1, 1), whiteUniform),
     specular: specularOn, reflections: reflectionsOn,
     ...engine.options(),
-    viewCards: cardsReady && cardsOn ? viewCards : null,
-    ao: aoOn, aoDistanceUniform: aoDistance, aoOnly,
-    glassView, glassBounces, glassLayers, glassDispersion, glassShadows,
+    ao: aoOn, aoDistanceUniform: aoDistance,
+    glassBounces, glassLayers, glassDispersion, glassShadows,
     modelHits: modelHitsOn,
     hitCache: hitCacheOn ? ensureHitCache() : null,
-    split: splitOn && texelCacheOn ? ensureSplitShading() : null,
-    splitResolve: splitResolveOn,
-    splitLegacy,
     // The world has glass: shadow rays tint through it (gpu/trace.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
-}
-
-// Everything a set's shaders depend on: the node options, the terrain mesh and
-// the texel cache, and per sprite its plain material, its normal map and
-// whether it draws opaque.
-function shadowSetKeyParts(opts) {
-  const parts = {};
-  for (const [k, v] of Object.entries(opts)) parts[k] = keyPart(v);
-  // The terrain bag also carries load progress (ready, the per-layer pixels the
-  // GI averages), which no shader reads - keying on it would miss the cache
-  // whenever textures finished loading between two builds. Only the textures
-  // the shaders bind.
-  const t = terrainTextures;
-  parts.terrain = keyPart([t.albedo, t.normal, t.specular, t.blocks]);
-  parts.mesh = keyPart(worldInstancedMesh);
-  parts.glass = keyPart(glassInstancedMesh);
-  parts.texelCache = keyPart([texelCacheOn, texelCacheOn ? texelCache.rt : null]);
-  parts.spriteAtlas = keyPart(spriteAtlasOn && spriteArtReady());
-  parts.sprites = keyPart(spriteMeshes().map(m => {
-    const base = m.userData.originalMaterial || m.material;
-    return [base, spriteNormalFor(m), wantsTransparent(base)];
-  }));
-  return parts;
-}
-
-function disposeShadowSet(set) {
-  for (const m of set.mats) m.dispose();
-}
-
-// The set for the current settings: kept, or built and compiling. set.ready
-// resolves once it is compiled, either way.
-function obtainShadowSet() {
-  if (texelCacheOn) { sizeTexelCache(); ensureTerrainTwins(); }
-  const opts = shadowNodeOptions();
-  const parts = shadowSetKeyParts(opts);
-  const key = keyPart(parts);
-  const kept = shadowCacheOn ? shadowSets.get(key) : null;
-  if (kept) return kept;
-  // A compile is the hitch this cache exists to avoid, so say what forced it:
-  // which inputs differ from the newest kept set.
-  const newest = shadowSets.values().pop();
-  if (newest) {
-    console.log(`[shadows] compiling a new shader set - differs from the kept one in: ` +
-                diffKeyParts(parts, newest.parts).join(', '));
-  }
-
-  if (opts.split) {
-    sizeTexelCache();
-    opts.split.rt = texelCache.tex;
-    opts.split.idRT = texelCache.idRT.texture;
-    splitSince = performance.now();
-    watchSplitErrors();
-  }
-  const built = createShadowColorNode(opts);
-  const { spriteLight, sun } = built;
-  // A model's lightSource cube draws unlit, in every terrain pass.
-  const node = terrainEmissiveTSL(built.node, terrainTextures);
-  // The node applies the albedo itself - specular adds after it, not under it.
-  // With the texel cache, the terrain's own material looks its colour up and
-  // a second, low-res material does the shading - see renderTexelCache.
-  let lowMat = null, missMat = null;
-  let terrainMat;
-  // Glass, when the world has any and the node could be built (it needs the
-  // reflection trace): its own materials, drawing only glass blocks.
-  const glassNode = glassInstancedMesh ? built.glassNode : null;
-  let glassMat = null, glassLow = null, glassMiss = null;
-  if (texelCacheOn) {
-    lowMat = new THREE.MeshBasicNodeMaterial();
-    // outputNode, not colorNode: the stored colour must not carry the
-    // per-instance tint, which the lookup material applies once itself.
-    // The low-res pass alone also fills the hit lighting cache (gpu/shade.js makeNode).
-    const split = built.splitKernels ? opts.split : null;
-    lowMat.outputNode = split ? createTexelGBufferNode(false, splitLegacy)
-      : createTexelCacheWriteNode(terrainEmissiveTSL(built.nodeCaching, terrainTextures));
-    // Resolved: misses shaded by the kernels too, read per pixel - only when
-    // glass (if any) is split as well, as it shares the passes.
-    // Legacy sends slopes and glowing cubes to the miss pass, so not resolved.
-    const resolved = split && splitResolveOn && !splitLegacy && (built.splitGlass || !glassNode);
-    if (resolved) {
-      terrainMat = createShadowMaterial(worldInstancedMesh, createSplitReadNode(texelCache, split));
-    } else {
-    terrainMat = createShadowMaterial(worldInstancedMesh, createTexelCacheLookupNode(texelCache, split));
-    terrainMat.stencilWrite = true;
-    terrainMat.stencilFunc = THREE.AlwaysStencilFunc;
-    terrainMat.stencilRef = 1;
-    terrainMat.stencilZPass = THREE.ReplaceStencilOp;
-    missMat = createShadowMaterial(worldInstancedMesh, createTexelMissNode(texelCache, node));
-    missMat.stencilWrite = true;           // enables the test; nothing is written
-    missMat.stencilFunc = THREE.EqualStencilFunc;
-    missMat.stencilRef = 0;
-    missMat.stencilZPass = THREE.KeepStencilOp;
-    }
-    if (glassNode && resolved) {
-      glassLow = new THREE.MeshBasicNodeMaterial();
-      glassLow.outputNode = createTexelGBufferNode(true, splitLegacy);
-      glassMat = createShadowMaterial(glassInstancedMesh, createSplitReadNode(texelCache, split));
-    } else if (glassNode) {
-      glassLow = new THREE.MeshBasicNodeMaterial();
-      glassLow.outputNode = built.splitGlass ? createTexelGBufferNode(true)
-        : createTexelCacheWriteNode(glassNode, !!split);
-      glassMat = createShadowMaterial(glassInstancedMesh, createTexelCacheLookupNode(texelCache, split));
-      glassMat.stencilWrite = true;
-      glassMat.stencilFunc = THREE.AlwaysStencilFunc;
-      glassMat.stencilRef = 1;
-      glassMat.stencilZPass = THREE.ReplaceStencilOp;
-      glassMiss = createShadowMaterial(glassInstancedMesh, createTexelMissNode(texelCache, glassNode));
-      glassMiss.stencilWrite = true;
-      glassMiss.stencilFunc = THREE.EqualStencilFunc;
-      glassMiss.stencilRef = 0;
-      glassMiss.stencilZPass = THREE.KeepStencilOp;
-    }
-  } else {
-    terrainMat = createShadowMaterial(worldInstancedMesh, node);
-    if (glassNode) glassMat = createShadowMaterial(glassInstancedMesh, glassNode);
-  }
-  // Each draws only its own blocks - terrainKeepTSL in render.js.
-  for (const m of [terrainMat, lowMat, missMat]) if (m) m.positionNode = terrainKeepTSL(false);
-  for (const m of [glassMat, glassLow, glassMiss]) if (m) m.positionNode = terrainKeepTSL(true);
-  const atlas = spriteAtlasOn && spriteArtReady();
-  if (atlas) ensureSpriteAtlas();
-  const sprites = buildSpriteShadows(spriteLight, atlas);
-  const pairs = [[worldInstancedMesh, terrainMat], ...sprites.pairs];
-  // Compiled against the float target it will draw into.
-  if (lowMat) pairs.push([worldInstancedMesh, lowMat, texelCache.rt]);
-  if (missMat) pairs.push([terrainTwins.miss, missMat], [terrainTwins.prepass, terrainTwins.prepass.material]);
-  if (glassMat) pairs.push([glassInstancedMesh, glassMat]);
-  if (glassLow) pairs.push([glassInstancedMesh, glassLow, texelCache.rt]);
-  if (glassMiss) pairs.push([terrainTwins.glassMiss, glassMiss]);
-  const set = {
-    key, parts, sun, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
-    made: sprites.made, variants: sprites.variants, atlasMats: sprites.atlasMats,
-    mirrorCache: built.mirrorCache,
-    splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
-    giKernels: lowMat && built.giKernels ? built.giKernels : null,
-    resolved: !!(lowMat && built.splitKernels && !missMat),
-    mats: [terrainMat, ...[lowMat, missMat].filter(Boolean),
-           ...[glassMat, glassLow, glassMiss].filter(Boolean), ...sprites.mats],
-    compiled: false
-  };
-  set.ready = compileOffscreen(pairs).catch(err => {
-    console.warn('[shadows] background compile failed, swapping anyway', err);
-  }).then(() => {
-    set.compiled = true;
-    for (const old of shadowSets.evict(activeShadowSet)) disposeShadowSet(old);
-  });
-  if (shadowCacheOn) shadowSets.set(key, set);
-  return set;
-}
-
-// Puts a compiled set on the meshes.
-function applyShadowSet(set) {
-  const prev = activeShadowSet;
-  const mesh = worldInstancedMesh;
-  if (set.lowMat) {
-    mesh.layers.enable(TEXEL_LAYER);
-    mesh.renderOrder = -2;
-  }
-  mesh.material = set.terrainMat;
-  terrainLowMat = set.lowMat;
-  terrainLookupMat = set.terrainMat;
-  if (terrainTwins.miss && set.missMat) terrainTwins.miss.material = set.missMat;
-  // Glass: its traced material, drawn after the terrain's lookup when cached.
-  // Without one (reflections off) it stays the plain, blended glass.
-  // Every field set either way, so a set without the cache (or without glass
-  // shading) never inherits the last one's layer or order.
-  const glass = glassInstancedMesh;
-  if (glass) {
-    if (set.glassLow) glass.layers.enable(TEXEL_LAYER);
-    else glass.layers.disable(TEXEL_LAYER);
-    glass.renderOrder = set.glassLow ? -2 : 0;
-    glass.material = set.glassMat || glass.userData.originalMaterial || glass.material;
-    if (terrainTwins.glassMiss && set.glassMiss) terrainTwins.glassMiss.material = set.glassMiss;
-  }
-  glassLowMat = set.glassLow || null;
-  glassLookupMat = set.glassLow ? set.glassMat : null;
-  restoreSpriteMaterials();
-  if (set.atlasMats) ensureSpriteAtlas(set.atlasMats);
-  for (const m of spriteMeshes()) {
-    const v = set.variants.get(m);
-    if (v) {
-      m.userData.depthVariants = v;
-      m.material = m.userData.drawingOnTop ? v.onTop : v.normal;
-    } else {
-      const base = m.userData.originalMaterial || m.material;
-      const lit = set.made.get(base);
-      if (lit) { m.userData.originalMaterial = base; m.material = lit; }
-    }
-  }
-  // A kept set's sun uniforms were last written when it was last shown.
-  shadowSun = set.sun;
-  writeSunUniforms(shadowSun, dirLight.position, sunAngular);
-  activeShadowSet = set;
-  // Replaced and not kept: disposed now, as before the cache.
-  if (prev && prev !== set && !shadowSets.has(prev.key)) disposeShadowSet(prev);
-  warmScene();
-  // And the plain materials, so turning shadows off swaps without compiling.
-  // Cheap while they are still compiled; if not, compiled now, while this
-  // turn-on is already the moment that paid.
-  warmPlainMaterials();
-}
-
-async function warmPlainMaterials() {
-  const pairs = [];
-  const base = worldInstancedMesh.userData.originalMaterial;
-  if (base) pairs.push([worldInstancedMesh, base]);
-  const glassBase = glassInstancedMesh && glassInstancedMesh.userData.originalMaterial;
-  if (glassBase) pairs.push([glassInstancedMesh, glassBase]);
-  for (const m of spriteMeshes()) {
-    if (m.userData.originalMaterial) pairs.push([m, m.userData.originalMaterial]);
-  }
-  await compileOffscreen(pairs);
-}
-
-// Back to the plain materials. The set is kept (or disposed, cache off).
-function removeShadowSet() {
-  const set = activeShadowSet;
-  const mesh = worldInstancedMesh;
-  if (mesh.userData.originalMaterial) mesh.material = mesh.userData.originalMaterial;
-  const glass = glassInstancedMesh;
-  if (glass && glass.userData.originalMaterial) {
-    glass.material = glass.userData.originalMaterial;
-    glass.renderOrder = 0;
-  }
-  glassLowMat = glassLookupMat = null;
-  restoreSpriteMaterials();
-  activeShadowSet = null;
-  if (set && !shadowSets.has(set.key)) disposeShadowSet(set);
-}
-
-// bxb.shadowcache(): off disposes every kept set but the one showing, and
-// from then on each set is disposed as soon as it is replaced.
-function setShadowCache(on) {
-  shadowCacheOn = !!on;
-  if (shadowCacheOn) return;
-  for (const s of shadowSets.drain(activeShadowSet)) {
-    if (s.compiled) disposeShadowSet(s);
-  }
-  if (activeShadowSet) shadowSets.delete(activeShadowSet.key);
 }
 
 // --- "Preparing shaders" ---
@@ -2284,14 +1155,8 @@ function showNotice(text) {
 // settings as they stand. Before the first turn-on there are no cascades to
 // key on, and that first one always compiles.
 function shadowTurnOnCompiles() {
-  if (!shadowCacheOn || !shadowGrids[0]) return true;
-  ensureSunUniforms();
-  const kept = shadowSets.peek(keyPart(shadowSetKeyParts(shadowNodeOptions())));
-  return !kept || !kept.compiled;
+  return !shadowGrids[0] || sets.wouldCompile();
 }
-
-// Resolves once the latest build is compiled and on screen (or superseded).
-let shadowBuildDone = Promise.resolve();
 
 function buildPerPixelShadows() {
   // Turning shadows on builds the field fresh - it did not follow the player
@@ -2299,28 +1164,18 @@ function buildPerPixelShadows() {
   // again.
   if (!shadowsOn || !shadowGrids[0]) ensureShadowGrids();
   const origin = shadowOrigins[0];
-  ensureSunUniforms();
-  const set = obtainShadowSet();
-  const id = ++shadowBuild;
-  shadowBuildDone = set.ready.then(() => {
-    // A newer build, or shadows turned off, while this one compiled. A kept
-    // set stays in the cache; one nothing holds is disposed.
-    if (id !== shadowBuild) {
-      if (!shadowSets.has(set.key) && set !== activeShadowSet) disposeShadowSet(set);
-      return;
-    }
-    applyShadowSet(set);
-  });
+  sun.ensureUniforms();
+  sets.build();
   shadowsOn = true;
   setShadedAlbedo(true);   // the flatter _a textures (render.js)
   syncEffectsButton();
   lighting.moveTorch();
   lighting.update();
-  return `shadows on - ${sunCone ? 'one cone trace' : sunRays + ' sun ray' +
-           (sunRays === 1 ? '' : 's')} per texel, ` +
+  return `shadows on - ${sun.cone ? 'one cone trace' : sun.rays + ' sun ray' +
+           (sun.rays === 1 ? '' : 's')} per texel, ` +
          `12m march cap, grid covering blocks ` +
          `${origin.x}..${origin.x + CHUNK_SIZE - 1} x ${origin.z}..${origin.z + CHUNK_SIZE - 1}` +
-         (sunRays === 1 ? '. bxb.soften() for a penumbra.' : '');
+         (sun.rays === 1 ? '. bxb.soften() for a penumbra.' : '');
 }
 
 const perf = createPerfOverlay();
@@ -2335,7 +1190,7 @@ const bxbApi = installConsole(createConsole({
   parity: {
     help: 'march the same rays on CPU and GPU and diff them',
     run: async (n = 256) => {
-      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sunGridBias);
+      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
       const grid = createBoxGridAt(origin.x, origin.z);
       const tex = createDistanceTexture(grid);
 
@@ -2392,8 +1247,7 @@ const bxbApi = installConsole(createConsole({
     help: 'toggle marched shadows on the terrain (one light, locked per texel)',
     run: () => {
       if (shadowsOn) {
-        shadowBuild++;   // drop any build still compiling
-        removeShadowSet();
+        sets.remove();   // drops any build still compiling
         shadowsOn = false;
         setShadedAlbedo(false);
         syncEffectsButton();
@@ -2404,156 +1258,9 @@ const bxbApi = installConsole(createConsole({
       return buildPerPixelShadows();
     }
   },
-  proxies: {
-    help: 'toggle the shadow-casting proxies for sprites, or resize the character box',
-    usage: 'bxb.proxies()  |  bxb.proxies(0.75, 2.4)  - width and height in metres',
-    run: (w = null, h = null) => {
-      if (w !== null) CHARACTER_PROXY.width = Math.max(0.05, w);
-      if (h !== null) CHARACTER_PROXY.height = Math.max(0.05, h);
-      const sizeOnly = w !== null || h !== null;
-      if (sizeOnly) {
-        // A resize is not a toggle. The box is remembered by its snapped extent,
-        // so changing the size makes every proxy compare unequal next frame and
-        // rewrite itself - no invalidation needed beyond setting the number.
-        playerProxy.width = enemyProxy.width = CHARACTER_PROXY.width;
-        playerProxy.height = enemyProxy.height = CHARACTER_PROXY.height;
-      } else {
-        proxiesOn = !proxiesOn;
-      }
-      if (!proxiesOn) return 'proxies off - sprites cast nothing, terrain still does';
-      if (!shadowsOn) return 'proxies on - run bxb.shadows() to see them';
-      // Which path each proxy is actually on. A silhouette that failed to build
-      // falls back to its box silently and still casts, so without this the
-      // difference between "the cutout is working" and "the cutout never loaded"
-      // is a judgement call about how blocky a shadow looks.
-      const sil = playerProxy.silhouettes && playerProxy.silhouettes[0];
-      const shape = sil
-        ? `CUTOUT ${playerProxy.silhouettes.map(v => v.cols + 'x' + v.rows).join(' / ')}` +
-          ` per cascade, facing ${cardMode}`
-        : `BOX ${CHARACTER_PROXY.width.toFixed(2)} x ` +
-          `${CHARACTER_PROXY.height.toFixed(2)} m (cutout not loaded yet)`;
-      const trees = treeProxies.filter(p => p && p.silhouettes).length;
-      return `proxies on - characters cast as ${shape}, ` +
-             `${trees}/${treeProxies.length} trees as cutouts. ` +
-             `Expect the shadow to STEP a texel at a time as you walk, not slide, ` +
-             `and to have a GAP between the legs - that gap is the whole ` +
-             `difference from a box. bxb.cardface() to compare sun-facing ` +
-             `cards against ones locked to a world plane.`;
-    }
-  },
-  cardparity: {
-    help: 'run the same rays through the card shader and the CPU reference and diff them',
-    run: async (n = 128, line = false) => {
-      if (!cardsReady) return 'no cards yet - bxb.shadows() first, then retry';
-      const casters = cardCasters();
-      for (const c of casters) {
-        c.facing = facingToward(dirLight.position.x, dirLight.position.z);
-      }
-      const near = cullCardsForLight(casters, dirLight.position, Infinity,
-                                     sunCards.capacity);
-      const count = packCardInstances(near, cardAtlas, cardPack, sunCards.capacity);
-      writeCardBindings(sunCards, cardPack, count);
-
-      // Spread over the ground around the player, along the sun. The rays that
-      // matter are the ones that graze a card, so the sample box is sized to the
-      // sprites rather than to the map.
-      const L = dirLight.position.clone().normalize();
-      const slope = sunAngular ? Math.tan(sunAngular / 2) : 0.06;
-      const samples = [];
-      if (line) {
-        // A WALK down-sun from the player instead of a scatter. Random points
-        // report whether the two agree on average; a line reports WHERE they
-        // stop agreeing, which is what a visible edge needs.
-        for (let i = 0; i < n; i++) {
-          const d = (i / (n - 1)) * 24;
-          samples.push({
-            from: { x: playerSprite.position.x - L.x * d, y: 0.8,
-                    z: playerSprite.position.z - L.z * d },
-            dir: { x: L.x, y: L.y, z: L.z }, maxDist: 12
-          });
-        }
-      } else {
-        for (let i = 0; i < n; i++) {
-          samples.push({
-            from: { x: playerSprite.position.x + (Math.random() - 0.5) * 12,
-                    y: 0.75 + Math.random() * 2,
-                    z: playerSprite.position.z + (Math.random() - 0.5) * 12 },
-            dir: { x: L.x, y: L.y, z: L.z },
-            maxDist: 12
-          });
-        }
-      }
-
-      const gpu = await runGPUCards(renderer, sunCards, samples, slope);
-      if (line) {
-        const rows = samples.map((sm, i) => {
-          const cpu = cardsVisibility(near, sm.from, sm.dir, 12, slope);
-          return `${((i / (n - 1)) * 24).toFixed(1).padStart(5)}m cpu ` +
-                 `${cpu.toFixed(3)} gpu ${gpu[i].toFixed(3)}` +
-                 (Math.abs(cpu - gpu[i]) > 0.1 ? '  <-- DIVERGE' : '');
-        });
-        return rows.join(String.fromCharCode(10));
-      }
-      let worst = 0, worstAt = -1, sum = 0, shadowed = 0;
-      for (let i = 0; i < n; i++) {
-        const cpu = cardsVisibility(near, samples[i].from, samples[i].dir, 12, slope);
-        if (cpu < 0.99) shadowed++;
-        const e = Math.abs(cpu - gpu[i]);
-        sum += e;
-        if (e > worst) { worst = e; worstAt = i; }
-      }
-      const s0 = samples[worstAt];
-      return `${count} cards, ${n} rays, ${shadowed} shadowed on CPU. ` +
-             `mean |diff| ${(sum / n).toFixed(4)}, worst ${worst.toFixed(4)} ` +
-             `at (${s0.from.x.toFixed(2)}, ${s0.from.y.toFixed(2)}, ` +
-             `${s0.from.z.toFixed(2)}) cpu ${cardsVisibility(near, s0.from, s0.dir, 12, slope).toFixed(3)} ` +
-             `gpu ${gpu[worstAt].toFixed(3)}. A worst above ~0.05 means the ` +
-             `shader and the reference disagree, not that either is noisy.`;
-    }
-  },
-  cards: {
-    help: 'analytic sprite shadows - each light gets the cutout turned to face IT',
-    usage: 'bxb.cards()  toggles',
-    run: () => {
-      cardsOn = !cardsOn;
-      // Build on demand rather than waiting for a frame. The resolve normally
-      // rides the render loop, which does not run while the window is hidden -
-      // so asking about the cards from a paused tab would report them as still
-      // loading forever, which is a property of the tab and not of the cards.
-      if (cardsOn) updateCards();
-      // Whether the pass has a card loop in it at all is baked into the kernel,
-      // so this is a material rebuild rather than a uniform write - the same
-      // trade the torch makes, and for the same reason: off has to be free.
-      if (shadowsOn) { buildPerPixelShadows(); }
-      if (!cardsOn) return 'sprite cards off - nothing but terrain casts';
-      if (!cardsReady) {
-        // Say WHY, not just that it has not happened. "Still loading" covers a
-        // texture that genuinely has not arrived and one whose image is never
-        // going to be readable, and those need opposite fixes.
-        const st = pendingCards.map(p => {
-          const t = p.getTexture();
-          const im = t && t.image;
-          return `${p.key}:${p.error ? 'FAILED ' + p.error :
-                  !t ? 'no-texture' :
-                  !im ? 'no-image' :
-                  !im.width ? 'width-0' : 'ready-but-unbuilt'}`;
-        }).join(' ');
-        return `cards on - no atlas. pending ${pendingCards.length}, ` +
-               `built ${cardTypes.length}. ${st || '(nothing pending - the ' +
-               'build ran and then something after it failed)'}`;
-      }
-      const cov = cardTypes.map(t =>
-        `${t.key} ${t.card.cols}x${t.card.rows} ${(t.coverage * 100).toFixed(0)}% opaque`
-      ).join(', ');
-      return `cards on - [${cov}] in a ` +
-             `${cardAtlas.width}x${cardAtlas.height} atlas, ${lastCardCount} ` +
-             `casting this frame, cap ${MAX_CARDS} per light. Each light tests ` +
-             `the cutout turned to face IT, so a torch and the sun disagree ` +
-             `about which way Bob is side-on - which is the point, and what a ` +
-             `single baked field cannot do. Analytic, so there is no voxel size ` +
-             `and no cascade seam.`;
-    }
-  },
+  proxies: cards.commands.proxies,
+  cardparity: cards.commands.cardparity,
+  cards: cards.commands.cards,
   spikes: {
     help: 'log a CPU breakdown of every frame over 8 ms to the console',
     run: () => {
@@ -2562,126 +1269,19 @@ const bxbApi = installConsole(createConsole({
     }
   },
   torchside: lighting.commands.torchside,
-  cardface: {
-    help: 'how the sprite cutouts are turned - toward the sun, or locked to a world plane',
-    usage: 'bxb.cardface()  cycles sun -> x -> z  |  bxb.cardface("sun")',
-    run: (mode = null) => {
-      const order = { sun: 'x', x: 'z', z: 'sun' };
-      cardMode = mode && order[mode] !== undefined ? mode : order[cardMode];
-      // Nothing to invalidate by hand: the facing is part of the remembered box,
-      // so sameBox sees it change and every cutout rewrites itself next frame.
-      if (cardMode === 'sun') {
-        const f = cardFacing();
-        return `cutouts face the SUN - card normal along its azimuth ` +
-               `(${(-f.uz).toFixed(2)}, ${f.ux.toFixed(2)}). The full ` +
-               `silhouette always faces the light, so it cannot thin to a line. ` +
-               `bxb.cardface() to lock it to a world plane and see the ` +
-               `difference; move the sun with bxb.light() and the cutouts turn ` +
-               `with it.`;
-      }
-      return `cutouts LOCKED to the ${cardMode === 'x' ? 'XY' : 'ZY'} plane. ` +
-             `Swing the sun round with bxb.light() and watch the shadow thin ` +
-             `toward a line as it goes edge-on - that degeneracy is exactly what ` +
-             `the sun-facing mode exists to remove.`;
-    }
-  },
-  soften: {
-    help: 'distance-based soft sun. "cone" is one ray, a number is that many over the disc',
-    usage: 'bxb.soften("cone")  |  bxb.soften(16)  |  bxb.soften(1) for the hard reference',
-    run: async (mode = 'cone', a = sunAngular, steps = 0) => {
-      // Two techniques, one seam. Both march the same field from the same origin
-      // and both return visibility, so they can be swapped and diffed - which is
-      // the whole reason the sampled one was built first even though the cone is
-      // sixteen times cheaper.
-      if (mode === 'cone') {
-        sunCone = true;
-        sunRays = 1;
-      } else {
-        sunCone = false;
-        sunRays = Math.max(1, Math.min(64, Math.round(Number(mode) || 16)));
-      }
-      sunAngular = a;
-      ensureSunUniforms();
-      // steps = 0 means do not quantise at all, and it is the default. Passing a
-      // count opts back into the stepped-and-dithered look.
-      sunQuantise = steps > 0;
-      if (sunQuantise) sunSteps.value = steps;
-      if (shadowSun) writeSunUniforms(shadowSun, dirLight.position, sunAngular);
-
-      // The technique and the ray count are both baked into the kernel, so this
-      // is a material swap rather than a uniform write.
-      if (shadowsOn) { buildPerPixelShadows(); }
-
-      if (!sunCone && sunRays === 1) {
-        return 'hard sun - one ray down the cone axis, which is exactly what ' +
-               'bxb.shadows always cast. This is the reference every soft ' +
-               'result is judged against.';
-      }
-      // What to expect, in texels, so the result can be checked rather than
-      // admired: a penumbra that does not grow with separation means the cone
-      // basis is wrong, not that the angular size is too small.
-      const at = s => penumbraTexels(s, a).toFixed(1);
-      const expect = `Expect a penumbra of ${at(1)} texels at 1 m separation, ` +
-        `${at(4)} at 4 m, ${at(8)} at 8 m. Contact stays hard. If it does not ` +
-        `widen with separation the cone basis is wrong, not the angular size.`;
-      if (sunCone) {
-        return `soft sun by CONE TRACE - one ray, ${a} rad disc, ` +
-               `${sunQuantise ? steps + ' quantised steps' : 'smooth (no dither)'}. ` +
-               `Analytic rather than sampled, so it is smooth by construction, ` +
-               `and ~16x cheaper than sampling. What it gives up is occluder ` +
-               `SHAPE: it sees the nearest surface, not how much of the disc that ` +
-               `surface covers, so two thin occluders read as one and a shadow ` +
-               `through a narrow gap comes out slightly too dark. ` +
-               `bxb.soften(16) to diff against the sampled reference. ` + expect;
-      }
-      return `soft sun by SAMPLING - ${sunRays} rays over a ${a} rad disc, ` +
-             `${sunQuantise ? steps + ' quantised steps' : 'no quantisation'}. ` +
-             `This is the reference: it resolves ` +
-             `occluder shape, at ${sunRays}x the rays. ` + expect;
-    }
-  },
+  cardface: cards.commands.cardface,
+  soften: sun.commands.soften,
   ao: {
-    help: 'cone-traced ambient occlusion - always on. Reach in metres, or "only" to view it alone',
-    usage: 'bxb.ao(1.5)  reach  |  bxb.ao("only")',
+    help: "cone-traced ambient occlusion - always on. Reach in metres (bxb.view('ao') shows it alone)",
+    usage: 'bxb.ao(1.5)',
     run: (a = null) => {
-      if (a === 'only') {
-        aoOnly = !aoOnly;
-        if (shadowsOn) buildPerPixelShadows();   // the view is compiled in
-      } else if (a !== null) aoDistance.value = Math.max(0.1, Number(a));
-      return `AO always on - 6 cones, ${aoDistance.value.toFixed(2)} m` +
-             `${aoOnly ? ' - showing the AO term alone (white open, black occluded)' : ''}`;
+      if (a !== null) aoDistance.value = Math.max(0.1, Number(a));
+      return `AO always on - 6 cones, ${aoDistance.value.toFixed(2)} m`;
     }
   },
-  texelcache: {
-    help: 'texel-rate shading: shade the terrain in a low-res pass and reuse each texel\'s colour. ' +
-          "A number fixes the sample spacing in pixels; 'auto' (default) follows the texel's size on screen",
-    usage: "bxb.texelcache()  toggles  |  bxb.texelcache(4)  |  bxb.texelcache('auto')  |  bxb.texelcache('misses')",
-    run: (scale = null) => {
-      if (scale === 'misses') texelCache.showMisses = !texelCache.showMisses;
-      else if (scale === 'auto' || scale === 0) texelCacheSpacing = 0;
-      else if (scale !== null) texelCacheSpacing = Math.max(1, Math.min(8, Math.round(Number(scale))));
-      else texelCacheOn = !texelCacheOn;
-      if (texelCacheOn) sizeTexelCache();
-      if (shadowsOn) buildPerPixelShadows();
-      return `texel cache ${texelCacheOn ? `on, 1/${texelCacheScale} per axis` +
-             (texelCacheSpacing ? '' : ' (auto)') : 'off'}`;
-    }
-  },
-  spriteatlas: {
-    help: "sprite texel atlas: shade each sprite art texel once and read it back. Off shades every pixel, as before",
-    run: () => {
-      spriteAtlasOn = !spriteAtlasOn;
-      if (shadowsOn) buildPerPixelShadows();
-      return `sprite atlas ${spriteAtlasOn ? 'on: one shading per art texel' : 'off: every pixel shades'}`;
-    }
-  },
-  shadowcache: {
-    help: 'keep compiled shadow material sets, so toggling shadows (or a setting) back is a swap. Off: dispose on replace, as before',
-    run: () => {
-      setShadowCache(!shadowCacheOn);
-      return `shadow sets ${shadowCacheOn ? `kept (newest ${SHADOW_SETS_KEPT})` : 'disposed when replaced'}`;
-    }
-  },
+  texelcache: texel.commands.texelcache,
+  spriteatlas: spriteAtlas.commands.spriteatlas,
+  shadowcache: sets.commands.shadowcache,
   treemerge: {
     help: "each tree's four planes as one mesh (one draw); off draws the four planes",
     run: () => {
@@ -2725,17 +1325,7 @@ const bxbApi = installConsole(createConsole({
     }
   },
   glassglare: mirrors.commands.glassglare,
-  glassview: {
-    help: "glass debug view: 'thickness' (path length inside the glass, white at two blocks), " +
-          "'through' (the transmitted light alone), 'path' (how each ray ended: red opaque inside, " +
-          "green out, blue out after an internal reflection, white trapped), or no argument for normal",
-    usage: "bxb.glassview('thickness' | 'through' | 'path')  |  bxb.glassview()",
-    run: (mode = null) => {
-      glassView = ['thickness', 'through', 'path'].includes(mode) ? mode : null;
-      if (shadowsOn) buildPerPixelShadows();
-      return `glass view: ${glassView || 'normal'}`;
-    }
-  },
+  view: debugView.commands.view,
   mirrorbounce: gi.commands.mirrorbounce,
   mirrorcache: mirrors.commands.mirrorcache,
   gibatch: gi.commands.gibatch,
@@ -2753,72 +1343,14 @@ const bxbApi = installConsole(createConsole({
              `${specularOn && reflectionsOn ? 'on' : 'off'}`;
     }
   },
-  specular: {
-    help: "view the terrain's LabPBR specular map in place of the lit colour (R smoothness, G F0/metal, B porosity/SSS)",
-    run: () => {
-      specularOnly = !specularOnly;
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      buildPerPixelShadows();
-      return `specular view ${specularOnly ? 'on - red smoothness, green F0 (230+ metal), ' +
-             'blue porosity/SSS' : 'off'}`;
-    }
-  },
-  shadowonly: {
-    help: 'show the raw sun visibility term with no albedo or N.L, to judge artifacts',
-    run: async () => {
-      shadowOnly = !shadowOnly;
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      buildPerPixelShadows();
-      return shadowOnly
-        ? 'shadow term only: white is lit, black is occluded. Self-shadowing ' +
-          'shows as speckle or stripes on surfaces that should be uniformly ' +
-          'white - raise bxb.sunbias() if so.'
-        : 'back to full shading';
-    }
-  },
-  ambient: {
-    help: 'toggle the ambient floor - off means unlit surfaces are black',
-    usage: 'bxb.ambient()  |  bxb.ambient(false)  |  bxb.ambient(0.2) for a level',
-    run: (on = null) => {
-      ensureSunUniforms();
-      const v = on === null ? (sunAmbient.value > 0 ? 0 : DEFAULT_AMBIENT)
-              : (on === true ? DEFAULT_AMBIENT : (on === false ? 0 : Number(on)));
-      // A uniform, so this is a write rather than a rebuild - it changes how
-      // much light a surface gets, not whether the kernel computes one.
-      sunAmbient.value = Math.max(0, Math.min(1, v));
-      return sunAmbient.value > 0
-        ? `ambient ${sunAmbient.value.toFixed(2)}`
-        : 'ambient off - anything no light reaches is black. With bxb.daylight(false) ' +
-          'too, the torch is the only thing you can see by.';
-    }
-  },
-  daylight: {
-    help: 'turn the sun off, leaving ambient plus whatever dynamic lights are lit',
-    usage: 'bxb.daylight()  |  bxb.daylight(false)',
-    run: (on = !sunOn) => {
-      sunOn = !!on;
-      if (shadowsOn) { buildPerPixelShadows(); }
-      return sunOn
-        ? 'sun on'
-        : 'sun off - ambient only, plus any dynamic light. The sun march is ' +
-          'gone from the kernel entirely, so a torch-lit scene pays for one ' +
-          'light rather than two. bxb.torch() if it is too dark to see.';
-    }
-  },
+  ambient: sun.commands.ambient,
+  daylight: sun.commands.daylight,
   torch: lighting.commands.torch,
   lamp: lighting.commands.lamp,
   lamps: lighting.commands.lamps,
   gi: gi.commands.gi,
   shadowbudget: lighting.commands.shadowbudget,
   cardbudget: lighting.commands.cardbudget,
-  splitdebug: {
-    help: 'split shading reflections: 0 normal, 1 hit colour unlit, 2 hit distance (white 16 m, red miss), 3 none, 4 hit face normal, 5 hit block (grey by layer, magenta air, black miss)',
-    usage: 'bxb.splitdebug(1)',
-    run: (n = 0) => {
-      splitDebug.value = Math.max(0, Math.min(5, Math.round(n)));
-      return `split reflection debug ${splitDebug.value}`;
-    }
-  },
   roughreach: {
     help: 'rough reflections: shrink their reach through the blur band (on) or keep full reach (off)',
     usage: 'bxb.roughreach()',
@@ -2827,59 +1359,12 @@ const bxbApi = installConsole(createConsole({
       return `rough reflections ${roughReach.value > 0 ? 'reach less as they blur' : 'at full reach'}`;
     }
   },
-  splithalf: {
-    help: 'split shading: half or full precision for the ambient / highlights between kernels (rebuilds)',
-    usage: 'bxb.splithalf()',
-    run: () => {
-      splitHalf = !splitHalf;
-      splitShading = null;          // reallocated at the new precision
-      buildPerPixelShadows();
-      return `split shading buffers at ${splitHalf ? 'half' : 'full'} precision`;
-    }
-  },
-  splitresolve: {
-    help: 'split shading: misses shaded by the kernels (on) or by the old miss pass (off) (rebuilds)',
-    usage: 'bxb.splitresolve()',
-    run: () => {
-      splitResolveOn = !splitResolveOn;
-      buildPerPixelShadows();
-      return `misses ${splitResolveOn ? 'resolved in the kernels' : 'shaded by the miss pass'}`;
-    }
-  },
-  splitlegacy: {
-    help: "debug: split shading's kernels on A08//00a's surface path (rebuilds)",
-    usage: 'bxb.splitlegacy()',
-    run: () => {
-      splitLegacy = !splitLegacy;
-      buildPerPixelShadows();
-      return `split kernels on the ${splitLegacy ? 'A08//00a' : 'current'} surface path`;
-    }
-  },
+  splithalf: texel.commands.splithalf,
+  splitresolve: texel.commands.splitresolve,
+  splitlegacy: texel.commands.splitlegacy,
   gistats: gi.commands.gistats,
-  splitstats: {
-    help: "split shading: last frame's misses against the list's room",
-    usage: 'await bxb.splitstats()',
-    run: async () => {
-      if (!splitShading) return 'split shading is off';
-      let misses;
-      try {
-        misses = new Uint32Array(await renderer.getArrayBufferAsync(splitShading.missCount.attr))[0];
-      } catch { return 'no misses resolved yet (resolve off, or the kernels have not run)'; }
-      const s = splitShading;
-      return `${misses} misses (room ${s.missCap}${misses > s.missCap ? ' - OVERFLOWING' : ''}), ` +
-             `${s.count.value} low-res samples, ${s.fullCount.value} pixels`;
-    }
-  },
-  splitshading: {
-    help: 'light the low-res samples in compute, a feature per kernel (rebuilds)',
-    usage: 'bxb.splitshading()',
-    run: () => {
-      splitOn = !splitOn;
-      splitFailed = false;
-      buildPerPixelShadows();
-      return `split shading ${splitOn ? 'on' : 'off - one shader shades each low-res sample'}`;
-    }
-  },
+  splitstats: texel.commands.splitstats,
+  splitshading: texel.commands.splitshading,
   hitcache: {
     help: 'reflections reuse the light the terrain worked out on screen last frame (rebuilds)',
     usage: 'bxb.hitcache()',
@@ -2892,94 +1377,14 @@ const bxbApi = installConsole(createConsole({
   hitshadowbudget: lighting.commands.hitshadowbudget,
   mirrorlightbudget: lighting.commands.mirrorlightbudget,
   lightcutoff: lighting.commands.lightcutoff,
-  gridbias: {
-    help: 'how far the shading footprint leans toward the sun, in blocks',
-    usage: 'bxb.gridbias(blocks)  |  bxb.gridbias(0) to centre it on the player',
-    run: (blocks = SUN_BIAS_BLOCKS) => {
-      sunGridBias = blocks;
-      // Takes effect on the next re-origin, which dropping the remembered origin
-      // forces on the next frame.
-      shadowOrigins = [];
-      const half = Math.floor(CHUNK_SIZE / 2);
-      const up = (half + blocks) * 1.5, down = (half - blocks) * 1.5;
-      return `footprint leans ${blocks} blocks up-sun: ${up.toFixed(1)} m of ` +
-             `caster range toward the sun, ${down.toFixed(1)} m away from it. ` +
-             `Shadow rays travel TOWARD the sun, so range up-sun is what stops a ` +
-             `long shadow being cut off; range down-sun holds nothing that can ` +
-             `cast onto anything visible. The cost is that ground down-sun of you ` +
-             `falls out of the job list and keeps its last shaded value instead ` +
-             `of updating. bxb.gridbias(0) restores the centred footprint.`;
-    }
-  },
-  shade: {
-    help: 'how N.L is applied, and the ambient floor - both paths share one formula',
-    usage: "bxb.shade('ground'|'lambert'|'flat', ambient?)",
-    run: async (mode = 'lambert', ambient = DEFAULT_AMBIENT) => {
-      const modes = ['ground', 'lambert', 'flat'];
-      if (!modes.includes(mode)) return `mode must be one of ${modes.join(', ')}`;
-      shadeMode = mode;
-      ensureSunUniforms();
-      sunAmbient.value = ambient;
-      // Ambient is a uniform, the mode is a kernel branch - so only the latter
-      // costs a rebuild.
-      if (shadowsOn) { buildPerPixelShadows(); }
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      const el = Math.asin(Math.max(-1, Math.min(1,
-        dirLight.position.clone().normalize().y))) * 180 / Math.PI;
-      const explain = {
-        ground: 'flat ground under open sky reads FULLY LIT at any sun angle, ' +
-                'because N.L is normalised against what a horizontal surface ' +
-                'receives. The sun angle then sets shadow direction and length ' +
-                'rather than overall brightness. Faces turned away still fall to ' +
-                'ambient, so nothing goes flat.',
-        lambert: 'raw N.L - physically right and DIM at a low sun, because every ' +
-                 `up-facing surface is multiplied by sin(${el.toFixed(0)}) = ` +
-                 `${Math.sin(el * Math.PI / 180).toFixed(2)}. This is what made ` +
-                 'the shaded world look like it was in permanent partial shade.',
-        flat: 'no N.L at all - what bxb.shadows() always did. Bright, but an ' +
-              'unshadowed wall facing away from the sun reads exactly as bright ' +
-              'as one facing it.'
-      }[mode];
-      return `shade mode '${mode}', ambient ${ambient}. ${explain}`;
-    }
-  },
-  fade: {
-    help: 'how a shadow dissolves where its ray runs out of reach, instead of stopping',
-    usage: 'bxb.fade(startFraction, edgeVoxels)  |  bxb.fade(1, 0) to see the hard cut',
-    run: async (start = SHADOW_FADE_START, edge = EDGE_FADE_VOXELS) => {
-      ensureSunUniforms();
-      sunFadeStart.value = start;
-      sunEdgeFade.value = edge;
-      // Both are uniforms, so a sweep is a re-shade rather than a rebuild.
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      return `shadows fade over the last ${((1 - start) * 100).toFixed(0)}% of the ` +
-             `12 m march, and within ${edge} voxels (${(edge * 0.125).toFixed(2)} m) ` +
-             `of the grid boundary. This is what stops a long shadow ending on a ` +
-             `straight line: past those limits the ray does not know what is out ` +
-             `there, and fading is the honest way to say so. bxb.fade(1, 0) turns ` +
-             `it off and puts the hard cut back, to confirm that is what you were ` +
-             `seeing. Lower start = longer, softer dissolve.`;
-    }
-  },
-  sunbias: {
-    help: 'how far a shadow ray starts off the surface, along the face normal, in voxels',
-    usage: 'bxb.sunbias(voxels)',
-    run: async (v = SURFACE_BIAS_VOXELS) => {
-      ensureSunUniforms();
-      sunBias.value = v;
-      // A uniform, not a rebuild: this is the one knob that has to be found by
-      // eye, so a sweep costs a re-shade.
-      if (!shadowsOn) return 'run bxb.shadows() first';
-      return `ray origin lifted ${v} voxels (${(v * 0.125 * 100).toFixed(1)} cm) ` +
-             `along the face normal. Raise until speckle clears, then stop - too ` +
-             `much detaches contact shadows from their casters. Along the NORMAL ` +
-             `and not the ray, so this is independent of sun angle.`;
-    }
-  },
+  gridbias: sun.commands.gridbias,
+  shade: sun.commands.shade,
+  fade: sun.commands.fade,
+  sunbias: sun.commands.sunbias,
   internals: {
     help: 'live references for profiling from the console: card bindings, trees, scene. ' +
           'enemyAI.isPaused = true holds Evil Bob still, for image A/Bs',
-    run: () => ({ scene, renderer, sunCards, lightCards, viewCards, treeMeshes,
+    run: () => ({ scene, renderer, ...cards.bindings(), treeMeshes,
                   playerSprite, enemySprite, perf, enemyAI })
   },
   gpu: {
@@ -3008,12 +1413,13 @@ const bxbApi = installConsole(createConsole({
     run: async (frames = 90) => {
       if (!shadowsOn) return 'run bxb.shadows() first';
       const measure = async rebuilt => {
-        if (rebuilt) await shadowBuildDone;
+        if (rebuilt) await sets.done;
         return bxbApi.gpu(true, frames);
       };
       const glass = glassInstancedMesh;
       const glare = mirrors.glare, caustic = glassCaustics.value, layers = glassLayers;
       const rebuild = () => buildPerPixelShadows();
+      const flag = set => [() => { set(false); rebuild(); }, () => { set(true); rebuild(); }];
       let shown = [];
       // [name, applies, off, back on, rebuilds]. A case already off is skipped.
       const cases = [
@@ -3029,17 +1435,15 @@ const bxbApi = installConsole(createConsole({
         ['sprites (not drawn)', true,
          () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
          () => shown.forEach(m => { m.visible = true; }), false],
-        ['shadow rays tinting through glass', !!glass,
-         () => { glassShadows = false; rebuild(); }, () => { glassShadows = true; rebuild(); }, true],
+        ['sun shadow march', true, ...flag(v => { sun.march = v; }), true],
+        [engine.options().gi ? 'AO (cones kept for the LPV)' : 'AO cones', true, ...flag(v => { aoOn = v; }), true],
+        ['shadow rays tinting through glass', !!glass, ...flag(v => { glassShadows = v; }), true],
         ['second glass layer', !!glass && layers > 1,
          () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
         ['mirror light', mirrors.on, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
-        ['split shading', splitOn,
-         () => { splitOn = false; rebuild(); }, () => { splitOn = true; rebuild(); }, true],
-        ['hit lighting cache', hitCacheOn,
-         () => { hitCacheOn = false; rebuild(); }, () => { hitCacheOn = true; rebuild(); }, true],
-        ['model lookup in reflection hits', !!terrainTextures.modelHits,
-         () => { modelHitsOn = false; rebuild(); }, () => { modelHitsOn = true; rebuild(); }, true],
+        ['split shading', texel.splitOn, ...flag(v => { texel.splitOn = v; }), true],
+        ['hit lighting cache', hitCacheOn, ...flag(v => { hitCacheOn = v; }), true],
+        ['model lookup in reflection hits', !!terrainTextures.modelHits, ...flag(v => { modelHitsOn = v; }), true],
         ['reflections (and glass shading)', reflectionsOn,
          () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
       ];
@@ -3052,7 +1456,7 @@ const bxbApi = installConsole(createConsole({
         off();
         const m = await measure(rebuilds);
         on();
-        if (rebuilds) await shadowBuildDone;
+        if (rebuilds) await sets.done;
         rows.push({ case: `${name} off`, render: m.render, compute: m.compute });
         console.log(`[gpuprofile] ${name} off: render ${m.render} + compute ${m.compute} ms`);
       }
@@ -3081,12 +1485,12 @@ const bxbApi = installConsole(createConsole({
         m.instanceColor = src.instanceColor;
         return m;
       };
-      const set = activeShadowSet;
+      const set = sets.active;
       const objects = [['terrain', worldInstancedMesh],
-                       ['terrain miss', terrainTwins.miss],
+                       ['terrain miss', texel.twins.miss],
                        ['terrain low-res', set && set.lowMat && stand(worldInstancedMesh, set.lowMat)],
                        ['glass', glassInstancedMesh],
-                       ['glass miss', terrainTwins.glassMiss],
+                       ['glass miss', texel.twins.glassMiss],
                        ['glass low-res', set && set.glassLow && glassInstancedMesh &&
                                          stand(glassInstancedMesh, set.glassLow)],
                        ...spriteMeshes().map(m => ['sprite', m]),
@@ -3144,13 +1548,13 @@ const bxbApi = installConsole(createConsole({
     help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+G)',
     run: () => toggleBoxGridDebug(
       scene, player.gridPos, worldInstancedMesh, game.mode,
-      { sunDirection: dirLight.position, bias: sunGridBias }
+      { sunDirection: dirLight.position, bias: sun.gridBias }
     ) || 'boxGrid overlay off'
   },
   stats: {
     help: 'print world, grid and frame statistics',
     run: () => {
-      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sunGridBias);
+      const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
       const grid = createBoxGridAt(origin.x, origin.z);
       const s = perf.stats();
       const out = {
@@ -3196,24 +1600,9 @@ const bxbApi = installConsole(createConsole({
       return 'teleported to ' + x + ',' + top + ',' + z;
     }
   },
-  light: {
-    help: 'set the sun direction (a vector pointing toward the sun)',
-    usage: 'bxb.light(x, y, z)',
-    // Goes through bxbLight so the cone basis is rewritten with the direction -
-    // see there for why writing the direction alone is not enough now.
-    run: (x, y, z) => bxbLight(x, y, z) +
-      (shadowsOn ? '' : ' (run bxb.shadows() to see it)')
-  },
+  light: sun.commands.light,
   ...sky.commands,
-  sun: {
-    help: 'set the sun by angle - elevation 15-25 gives long readable shadows',
-    usage: 'bxb.sun(azimuthDeg, elevationDeg)',
-    run: (az = 45, el = 20) => {
-      const a = az * Math.PI / 180, e = el * Math.PI / 180;
-      const x = Math.cos(e) * Math.sin(a), y = Math.sin(e), z = Math.cos(e) * Math.cos(a);
-      return bxbLight(x, y, z);
-    }
-  }
+  sun: sun.commands.sun
 }));
 
 // --- The settings panel (Alt+V) ---
@@ -3221,25 +1610,21 @@ const bxbApi = installConsole(createConsole({
 // Every setting routes through the same bxb command the console uses, so the
 // two cannot drift - the panel is a front end, not a second owner of the state.
 // Ranges marked live:false rebuild the material, so they apply on release.
-function sunAngles() {
-  const d = dirLight.position.clone().normalize();
-  const az = (Math.atan2(d.x, d.z) * 180 / Math.PI + 360) % 360;
-  const el = Math.asin(Math.max(-1, Math.min(1, d.y))) * 180 / Math.PI;
-  return { az, el };
-}
-const softSteps = () => (sunQuantise && sunSteps ? sunSteps.value : 0);
-
 settingsPanel = createSettingsPanel({ groups: [
+  // The render debugger: every display that replaces or overlays the frame.
+  { title: 'Debug views', settings: [
+    debugView.setting,
+    { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
+      get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) },
+    texel.missesSetting,
+    gi.missingSetting,
+    { key: 'grid', label: 'boxGrid overlay (Alt+G)', type: 'toggle',
+      get: () => isBoxGridDebugVisible(),
+      set: v => flip(isBoxGridDebugVisible(), v, () => bxbApi.grid()) }
+  ]},
   { title: 'Perf', settings: [
-    { key: 'texelcache', label: 'Texel-rate shading', type: 'toggle',
-      help: 'terrain shaded once per texel in a low-res pass, reused at full res',
-      get: () => texelCacheOn, set: v => flip(texelCacheOn, v, () => bxbApi.texelcache()) },
-    { key: 'texelscale', label: 'Texel cache spacing (px, 0 auto)', type: 'range', min: 0, max: 8, step: 1,
-      help: 'low-res sample spacing; texels smaller than this shade themselves. 0 follows the texel size on screen',
-      get: () => texelCacheSpacing, set: v => bxbApi.texelcache(v) },
-    { key: 'shadowcache', label: 'Keep shadow materials', type: 'toggle',
-      help: 'compiled shadow sets are kept, so toggling back is a swap',
-      get: () => shadowCacheOn, set: v => flip(shadowCacheOn, v, () => bxbApi.shadowcache()) },
+    ...texel.settings,
+    sets.setting,
     { key: 'treemerge', label: 'Merged tree planes', type: 'toggle',
       help: "each tree's four planes drawn as one mesh",
       get: () => treeMerge, set: v => flip(treeMerge, v, () => bxbApi.treemerge()) },
@@ -3268,52 +1653,13 @@ settingsPanel = createSettingsPanel({ groups: [
   { title: 'Shadows', settings: [
     { key: 'shadows', label: 'Marched shadows', type: 'toggle',
       get: () => shadowsOn, set: v => flip(shadowsOn, v, () => bxbApi.shadows()) },
-    { key: 'daylight', label: 'Daylight (sun)', type: 'toggle',
-      get: () => sunOn, set: v => bxbApi.daylight(v) },
-    { key: 'soften', label: 'Soft sun', type: 'select',
-      options: [{ value: 'cone', label: 'cone trace' }, { value: 1, label: 'hard (1 ray)' },
-                { value: 4, label: '4 rays' }, { value: 16, label: '16 rays' },
-                { value: 32, label: '32 rays' }],
-      help: 'cone is one analytic ray; a count samples that many over the disc',
-      get: () => (sunCone ? 'cone' : sunRays),
-      set: v => bxbApi.soften(v, sunAngular, softSteps()) },
-    { key: 'disc', label: 'Sun disc (rad)', type: 'range', min: 0, max: 0.2, step: 0.005,
-      live: false, get: () => sunAngular,
-      set: v => bxbApi.soften(sunCone ? 'cone' : sunRays, v, softSteps()) },
-    { key: 'steps', label: 'Quantise steps', type: 'range', min: 0, max: 8, step: 1,
-      live: false, format: v => (v ? String(v) : 'off'), get: softSteps,
-      set: v => bxbApi.soften(sunCone ? 'cone' : sunRays, sunAngular, v) },
-    { key: 'sunbias', label: 'Ray bias (voxels)', type: 'range', min: 0, max: 4, step: 0.05,
-      get: () => (sunBias ? sunBias.value : SURFACE_BIAS_VOXELS), set: v => bxbApi.sunbias(v) },
-    { key: 'fadestart', label: 'Fade start', type: 'range', min: 0.5, max: 1, step: 0.01,
-      get: () => (sunFadeStart ? sunFadeStart.value : SHADOW_FADE_START),
-      set: v => bxbApi.fade(v, sunEdgeFade ? sunEdgeFade.value : EDGE_FADE_VOXELS) },
-    { key: 'edgefade', label: 'Edge fade (voxels)', type: 'range', min: 0, max: 24, step: 1,
-      get: () => (sunEdgeFade ? sunEdgeFade.value : EDGE_FADE_VOXELS),
-      set: v => bxbApi.fade(sunFadeStart ? sunFadeStart.value : SHADOW_FADE_START, v) },
-    { key: 'gridbias', label: 'Grid lean (blocks)', type: 'range', min: -6, max: 6, step: 1,
-      live: false, get: () => sunGridBias, set: v => bxbApi.gridbias(v) },
-    { key: 'shadowonly', label: 'View: sun term only', type: 'toggle',
-      get: () => shadowOnly, set: v => flip(shadowOnly, v, () => bxbApi.shadowonly()) }
+    ...sun.shadowSettings
   ]},
-  { title: 'Sun', settings: [
-    { key: 'az', label: 'Azimuth', type: 'range', min: 0, max: 359, step: 1, live: false,
-      format: v => v.toFixed(0) + '°',
-      get: () => sunAngles().az, set: v => bxbApi.sun(v, sunAngles().el) },
-    { key: 'el', label: 'Elevation', type: 'range', min: 1, max: 89, step: 1, live: false,
-      format: v => v.toFixed(0) + '°',
-      get: () => sunAngles().el, set: v => bxbApi.sun(sunAngles().az, v) }
-  ]},
+  sun.settings,
   { title: 'Shading', settings: [
-    { key: 'shade', label: 'N·L mode', type: 'select', options: ['ground', 'lambert', 'flat'],
-      get: () => shadeMode,
-      set: v => bxbApi.shade(v, sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT) },
-    { key: 'ambient', label: 'Ambient', type: 'range', min: 0, max: 1, step: 0.01,
-      get: () => (sunAmbient ? sunAmbient.value : DEFAULT_AMBIENT), set: v => bxbApi.ambient(v) },
+    ...sun.shadingSettings,
     { key: 'aodist', label: 'AO reach (m)', type: 'range', min: 0.25, max: 3, step: 0.05,
       get: () => aoDistance.value, set: v => bxbApi.ao(v) },
-    { key: 'aoonly', label: 'View: AO only', type: 'toggle',
-      get: () => aoOnly, set: v => flip(aoOnly, v, () => bxbApi.ao('only')) },
     { key: 'spec', label: 'Specular highlights', type: 'toggle',
       help: 'GGX from the sun and every light, off the LabPBR _s maps',
       get: () => specularOn, set: v => bxbApi.spec(!!v) },
@@ -3325,20 +1671,8 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => reflectBouncesUniform.value,
       set: v => { reflectBouncesUniform.value = Math.max(1, Math.min(REFLECT_MAX_BOUNCES, Math.round(v))); } },
     ...mirrors.settings,
-    { key: 'specview', label: 'View: specular (LabPBR)', type: 'toggle',
-      help: 'the _s map raw: red smoothness, green F0 (230+ is metal), blue porosity/SSS',
-      get: () => specularOnly, set: v => flip(specularOnly, v, () => bxbApi.specular()) },
-    { key: 'white', label: 'Whiteworld (Alt+X)', type: 'toggle',
-      get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) }
   ]},
   { title: 'Glass', settings: [
-    { key: 'glassview', label: 'Glass view', type: 'select',
-      options: [{ value: 'normal', label: 'normal' }, { value: 'thickness', label: 'thickness' },
-                { value: 'through', label: 'transmitted only' },
-                { value: 'path', label: 'ray path (debug)' }],
-      help: 'path: red opaque inside, green out, blue out after internal reflection, white trapped',
-      get: () => glassView || 'normal',
-      set: v => bxbApi.glassview(v === 'normal' ? undefined : v) },
     { key: 'glasslayers', label: 'Glass layers', type: 'range', min: 1, max: 4, step: 1,
       help: 'panes a view ray refracts through; 2 bends through one more glass behind the first',
       get: () => glassLayers, set: v => bxbApi.glasslayers(v) },
@@ -3356,20 +1690,9 @@ settingsPanel = createSettingsPanel({ groups: [
   ]},
   sky.settings,
   gi.settings,
-  { title: 'Sprites', settings: [
-    { key: 'cards', label: 'Card shadows', type: 'toggle',
-      get: () => cardsOn, set: v => flip(cardsOn, v, () => bxbApi.cards()) },
-    { key: 'cardface', label: 'Cutout facing', type: 'select', options: ['sun', 'x', 'z'],
-      get: () => cardMode, set: v => bxbApi.cardface(v) },
-    { key: 'proxies', label: 'Baked proxies', type: 'toggle',
-      help: 'sprites voxelised into the field - off by default, kept for GI / reflections',
-      get: () => proxiesOn, set: v => flip(proxiesOn, v, () => bxbApi.proxies()) }
-  ]},
+  cards.settings,
   lighting.settings,
   { title: 'Debug', settings: [
-    { key: 'grid', label: 'boxGrid overlay (Alt+G)', type: 'toggle',
-      get: () => isBoxGridDebugVisible(),
-      set: v => flip(isBoxGridDebugVisible(), v, () => bxbApi.grid()) },
     { key: 'freecam', label: 'Free cam (Alt+C)', type: 'toggle',
       get: () => rig.freeCam, set: v => { rig.freeCam = !!v; } },
     { key: 'hud', label: 'HUD (Alt+U)', type: 'toggle',
@@ -3434,7 +1757,7 @@ syncEffectsButton();
 function enableAlwaysOnAO() {
   if (!worldInstancedMesh) return;
   const base = worldInstancedMesh.userData.originalMaterial || worldInstancedMesh.material;
-  base.aoNode = createVoxelAONode(terrainTextures, cardsReady ? sunCards : null);
+  base.aoNode = createVoxelAONode(terrainTextures, cards.ready ? cards.sunBindings : null);
   base.needsUpdate = true;
   if (!worldInstancedMesh.userData.originalMaterial) worldInstancedMesh.userData.originalMaterial = base;
 }

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
-import { buildAllShaders } from './lib/shaders.mjs';
+import { buildAllShaders, buildViewShaders, buildProfilingShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
 // moves code must leave all of them identical - this is what proves it, where
@@ -61,3 +61,18 @@ ok('none changed', changed.join(', '), '');
 ok('none gone', missing.join(', '), '');
 ok('none new', added.join(', '), '');
 if (changed.length) note('diff tools/.shaders/accepted against tools/.shaders/current');
+
+// The render debugger's views are their own sets - not held to a snapshot,
+// only proved to build: a view that throws in the builder would otherwise
+// first show as a frozen frame in the game.
+section('debug views build');
+for (const [id, set] of Object.entries(buildViewShaders())) {
+  const empty = Object.entries(set).filter(([, st]) => Object.values(st).some(w => !w || !w.length));
+  ok(`${id}: ${Object.keys(set).length} shaders`, empty.map(([k]) => k).join(', '), '');
+}
+
+section('gpuprofile flags build');
+for (const [id, set] of Object.entries(buildProfilingShaders())) {
+  const empty = Object.entries(set).filter(([, st]) => Object.values(st).some(w => !w || !w.length));
+  ok(`${id}: ${Object.keys(set).length} shaders`, empty.map(([k]) => k).join(', '), '');
+}

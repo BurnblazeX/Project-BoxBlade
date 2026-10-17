@@ -33,7 +33,7 @@ const EXCEPTIONS = new Set([]);
 // under it fails too, asking for the budget to come down to where it now is.
 const SLACK = 50;
 const FILE_BUDGETS = {
-  'main.js': 3442
+  'main.js': 1766
 };
 const FUNCTION_BUDGETS = {
   'gpu/shade.js createShadowColorNode': 1579

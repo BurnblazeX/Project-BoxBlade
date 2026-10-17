@@ -71,13 +71,18 @@ export function createSpriteShadowMaterial(base, spriteLight, normalTex = null, 
     const t = clamp(floor(uv().mul(size)), vec2(0, 0), size.sub(float(1)));
     const slot = spriteAtlasOriginTSL()
       .add(vec2(plane.mul(size.x), select(frontFacing, float(0), size.y))).add(t);
-    mat.colorNode = base4.mul(vec4(textureLoad(atlas.tex, ivec2(slot)).rgb, 1));
+    mat.colorNode = tint(base4, textureLoad(atlas.tex, ivec2(slot)).rgb, spriteLight);
     return mat;
   }
   const drawn = base4.a.greaterThanEqual(float(base.alphaTest || 0));
-  mat.colorNode = base4.mul(vec4(spriteLight(base.map, drawn, normalTex), 1));
+  mat.colorNode = tint(base4, spriteLight(base.map, drawn, normalTex), spriteLight);
   return mat;
 }
+
+// The art times its light - or, under a raw debug view (gpu/debugview.js),
+// the light alone, keeping the art's alpha for the cutout.
+const tint = (base4, light, spriteLight) =>
+  (spriteLight.raw ? vec4(light, base4.a) : base4.mul(vec4(light, 1)));
 
 // The sprite's atlas region, per object: the mesh and its atlas twin carry
 // the same Vector2 (main.js ensureSpriteAtlas). In the object's own uniform

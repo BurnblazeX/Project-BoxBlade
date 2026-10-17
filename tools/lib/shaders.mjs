@@ -2,7 +2,7 @@
 //
 // three's node builder needs no GPU to turn a material or a compute node into
 // WGSL - only a renderer object, here one over a stub canvas that is never
-// initialised. The inputs mirror main.js obtainShadowSet / shadowNodeOptions
+// initialised. The inputs mirror render/shadowsets.js obtainShadowSet and main.js shadowNodeOptions
 // with the default settings, over the test area (glass, slopes, halves,
 // stairs); they need not be realistic, only reach the same code. Used by
 // shaders.test.mjs to prove a refactor leaves every shader byte-identical.
@@ -20,6 +20,9 @@ import { createSky } from '../../js/render/features/sky.js';
 import { createLights } from '../../js/render/features/lights.js';
 import { createMirrors } from '../../js/render/features/mirrors.js';
 import { createGI } from '../../js/render/features/gi.js';
+import { createDebugView, VIEWS } from '../../js/render/features/debugview.js';
+import { createTexelCache, buildTerrainMaterials } from '../../js/render/features/texelcache.js';
+import { SPLIT_VIEWS } from '../../js/gpu/debugview.js';
 import { readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -115,9 +118,18 @@ const giFeature = createGI({
   cascades: () => cascades, lighting, sky: features[0], mirrors: mirrorFeature,
   sun: { uniforms: () => sunU, on: () => true, angular: () => SUN_ANGULAR_SIZE, light: sunLight },
   sprites: { casters: () => [], types: [] }, terrainAlbedo: () => null,
-  syncWhite() {}, shadowsOn: () => true, rebuild() {}
+  shadowsOn: () => true, rebuild() {}
 });
 features.push(giFeature);
+const debugView = createDebugView({ shadowsOn: () => true, shadows() {}, rebuild() {} });
+features.push(debugView);
+// Split shading off in its options: each set below brings its own (over.split).
+const texelFeature = createTexelCache({
+  renderer, scene, camera, rig: { distance: 20 }, shadowsOn: () => true, activeSet: () => null,
+  gi: giFeature, rebuild() {}
+});
+texelFeature.splitOn = false;
+features.push(texelFeature);
 const rt = (w, h) => {
   const t = new THREE.RenderTarget(w, h, { type: THREE.FloatType, depthBuffer: true });
   t.texture.minFilter = t.texture.magFilter = THREE.NearestFilter;
@@ -135,17 +147,16 @@ function options(over = {}) {
   return {
     cascades, sunDirection,
     rays: 1, angular: SUN_ANGULAR_SIZE, cone: true, quantise: false, ...sunU,
-    shadeMode: 'lambert', shadowOnly: false, sun: true,
-    cards: sunCards, lightCards, terrain: terrainTextures, specularOnly: false,
+    shadeMode: 'lambert', sun: true,
+    cards: sunCards, lightCards, terrain: terrainTextures,
     albedo: (st, surf = null) => mix(terrainTexelTSL(terrainTextures.albedo, st, surf).rgb,
                                      vec3(1, 1, 1), terrainWhite),
     specular: true, reflections: true,
     viewCards,
-    ao: true, aoDistanceUniform: uniform(G.AO_DISTANCE), aoOnly: false,
-    glassView: null, glassBounces: G.GLASS_MAX_BOUNCES, glassLayers: G.GLASS_LAYERS,
-    glassDispersion: 0, glassShadows: true,
-    modelHits: true, hitCache: null, split: null,
-    splitResolve: true, splitLegacy: false, glass: !!R.glassInstancedMesh,
+    ao: true, aoDistanceUniform: uniform(G.AO_DISTANCE),
+    glassBounces: G.GLASS_MAX_BOUNCES, glassLayers: G.GLASS_LAYERS,
+    glassDispersion: 0, glassShadows: true, sunMarch: true,
+    modelHits: true, hitCache: null, glass: !!R.glassInstancedMesh,
     ...Object.assign({}, ...features.map(f => f.options())),
     ...over
   };
@@ -157,39 +168,11 @@ function shaderSet(name, over) {
   const opts = options(over);
   if (opts.split) { opts.split.rt = texelCache.tex; opts.split.idRT = texelCache.idRT.texture; }
   const built = G.createShadowColorNode(opts);
-  const node = G.terrainEmissiveTSL(built.node, terrainTextures);
   const world = R.worldInstancedMesh, glass = R.glassInstancedMesh;
-  const glassNode = glass ? built.glassNode : null;
-  const mats = {};
-  const split = built.splitKernels ? opts.split : null;
-  if (opts.split || over.texelCache) {
-    mats.low = new THREE.MeshBasicNodeMaterial();
-    mats.low.outputNode = split ? G.createTexelGBufferNode(false, opts.splitLegacy)
-      : G.createTexelCacheWriteNode(G.terrainEmissiveTSL(built.nodeCaching, terrainTextures));
-    const resolved = split && opts.splitResolve && !opts.splitLegacy && (built.splitGlass || !glassNode);
-    if (resolved) {
-      mats.terrain = G.createShadowMaterial(world, G.createSplitReadNode(texelCache, split));
-    } else {
-      mats.terrain = G.createShadowMaterial(world, G.createTexelCacheLookupNode(texelCache, split));
-      mats.miss = G.createShadowMaterial(world, G.createTexelMissNode(texelCache, node));
-    }
-    if (glassNode && resolved) {
-      mats.glassLow = new THREE.MeshBasicNodeMaterial();
-      mats.glassLow.outputNode = G.createTexelGBufferNode(true, opts.splitLegacy);
-      mats.glass = G.createShadowMaterial(glass, G.createSplitReadNode(texelCache, split));
-    } else if (glassNode) {
-      mats.glassLow = new THREE.MeshBasicNodeMaterial();
-      mats.glassLow.outputNode = built.splitGlass ? G.createTexelGBufferNode(true)
-        : G.createTexelCacheWriteNode(glassNode, !!split);
-      mats.glass = G.createShadowMaterial(glass, G.createTexelCacheLookupNode(texelCache, split));
-      mats.glassMiss = G.createShadowMaterial(glass, G.createTexelMissNode(texelCache, glassNode));
-    }
-  } else {
-    mats.terrain = G.createShadowMaterial(world, node);
-    if (glassNode) mats.glass = G.createShadowMaterial(glass, glassNode);
-  }
-  for (const k of ['terrain', 'low', 'miss']) if (mats[k]) mats[k].positionNode = terrainKeepTSL(false);
-  for (const k of ['glass', 'glassLow', 'glassMiss']) if (mats[k]) mats[k].positionNode = terrainKeepTSL(true);
+  const m = buildTerrainMaterials({ built, opts, cache: texelCache, cached: !!(opts.split || over.texelCache) });
+  const mats = { low: m.lowMat, terrain: m.terrainMat, miss: m.missMat,
+                 glassLow: m.glassLow, glass: m.glassMat, glassMiss: m.glassMiss };
+  for (const k of Object.keys(mats)) if (!mats[k]) delete mats[k];
   for (const [k, m] of Object.entries(mats)) {
     out[`${name}/${k}`] = wgslOf(k.startsWith('glass') ? glass : world, m);
   }
@@ -254,4 +237,34 @@ export async function buildAllShaders() {
   });
   Object.assign(sets, await diagnosticKernels());
   return sets;
+}
+
+// Every render debug view's set (render/features/debugview.js), built as
+// main.js builds it - not snapshotted, only proved to build. The bounce views
+// with texel GI under split shading, which is where they are traced; the rest
+// per fragment, with the LPV.
+export function buildViewShaders() {
+  const giSet = mode => giFeature.settings.settings.find(x => x.key === 'gimode').set(mode);
+  const out = {};
+  for (const v of VIEWS.filter(x => x.view || x.glassView)) {
+    debugView.commands.view.run(v.id);
+    giSet('lpv');
+    out[v.id] = shaderSet(`view-${v.id}`, {});
+    if (SPLIT_VIEWS.has(v.view)) {
+      giSet('texel');
+      const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+      split.resolve = G.createSplitResolve(split, texelCache);
+      Object.assign(out[v.id], shaderSet(`view-${v.id}-split`, { split }));
+    }
+  }
+  debugView.commands.view.run('final');
+  giSet('lpv');
+  return out;
+}
+
+// bxb.gpuprofile's kernel flags turned off, each alone - built, not snapshotted,
+// so a profiling run never meets a shader that fails to compile.
+export function buildProfilingShaders() {
+  return { 'sun march off': shaderSet('profile-sunmarch', { sunMarch: false }),
+           'AO off': shaderSet('profile-ao', { ao: false }) };
 }

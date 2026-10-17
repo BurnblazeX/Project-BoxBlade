@@ -27,7 +27,6 @@ import { flip } from '../engine.js';
 
 export function createMirrors({ sunLight, sunOn, lighting, focus, footprint, rebuild }) {
   let mirrorsOn = true;
-  let mirrorOnly = false;   // the view: mirror light alone
   let mirrorRects = null;
   // The mirror texel cache (mirrors.js): each mirror texel's own terms, worked
   // out once a frame by a compute pass instead of by every receiver. Off
@@ -107,14 +106,9 @@ export function createMirrors({ sunLight, sunOn, lighting, focus, footprint, reb
       }
     },
     mirrors: {
-      help: 'reflected sunlight: polished surfaces throw the sun onto what faces them. ' +
-            '"only" views it alone',
-      usage: "bxb.mirrors()  toggles  |  bxb.mirrors('only')",
-      run: (a = null) => {
-        if (a === 'only') {
-          mirrorOnly = !mirrorOnly;
-          if (mirrorOnly) mirrorsOn = true;
-        } else mirrorsOn = !mirrorsOn;
+      help: "reflected sunlight: polished surfaces throw the sun onto what faces them (bxb.view('mirror') shows it alone)",
+      run: () => {
+        mirrorsOn = !mirrorsOn;
         rebuild();
         return `mirror light ${mirrorsOn ? 'on' : 'off'}` +
                (mirrorRects ? ` - ${mirrorRects.length} mirror rectangles` : ' - textures still loading');
@@ -124,7 +118,7 @@ export function createMirrors({ sunLight, sunOn, lighting, focus, footprint, reb
 
   return {
     name: 'mirrors',
-    options: () => ({ mirrors: mirrorsOn ? bindings : null, mirrorOnly, mirrorCache: mirrorCacheOn }),
+    options: () => ({ mirrors: mirrorsOn ? bindings : null, mirrorCache: mirrorCacheOn }),
     bindings,
     update,
     get on() { return mirrorsOn; },
@@ -140,10 +134,7 @@ export function createMirrors({ sunLight, sunOn, lighting, focus, footprint, reb
     settings: [
       { key: 'mirrors', label: 'Mirror light', type: 'toggle',
         help: 'polished surfaces throw reflected sunlight onto what faces them',
-        get: () => mirrorsOn, set: v => flip(mirrorsOn, v, () => commands.mirrors.run()) },
-      { key: 'mirroronly', label: 'View: mirror light only', type: 'toggle',
-        help: 'the reflected sunlight alone, raw - not part of the GI bounce view',
-        get: () => mirrorOnly, set: v => flip(mirrorOnly, v, () => commands.mirrors.run('only')) }
+        get: () => mirrorsOn, set: v => flip(mirrorsOn, v, () => commands.mirrors.run()) }
     ],
     // For the Glass section.
     glareSetting: { key: 'glassglare', label: 'Glare', type: 'range', min: 0, max: 2, step: 1,

@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { texelPixels, texelCacheSpacingFor, TEXEL_METRES, TEXEL_SPACING_MIN,
-         TEXEL_SPACING_MAX } from '../js/core/texelcache.js';
+         TEXEL_SPACING_MAX, splitCapacityFor } from '../js/core/texelcache.js';
 
 file('texelcache.test.mjs - the texel cache follows the texel size on screen');
 
@@ -24,3 +24,9 @@ ok('moves once clearly past it', texelCacheSpacingFor(2 * 5.7, 5), 6);
 ok('and back down the same way', texelCacheSpacingFor(2 * 4.3, 5), 4);
 truthy('always a whole number of pixels', [3.1, 7.7, 9.9, 13.2].every(t =>
   Number.isInteger(texelCacheSpacingFor(t))));
+
+section('split buffers cover the rendered viewport');
+ok('4K includes every pixel even on a smaller reported screen', splitCapacityFor(3840, 2160).full, 8294400);
+truthy('odd dimensions include the final low-res row and column', splitCapacityFor(1921, 1081).low >= 961 * 541);
+ok('allocation retains its bounded full-pixel capacity', splitCapacityFor(10000, 10000).full, 1 << 24);
+ok('allocation retains its bounded low-res capacity', splitCapacityFor(10000, 10000).low, 1 << 22);
