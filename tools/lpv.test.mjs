@@ -152,3 +152,49 @@ section('specular share in the bounce (specularAlbedo)');
   propagateStep(L, E, solid, 0.5, plain, dim);
   near('without trans nothing changes', plain[mid * 4], out[mid * 4], 1e-9);
 }
+
+section('sky visibility (propagateSkyStep)');
+{
+  const { propagateSkyStep, DEFAULT_LPV_SKY_SPREAD } = await import('../js/core/lpv.js');
+  // An 8^3 volume: a closed box of a room (walls x 2..6, y 0..4, z 2..6,
+  // air 3..5 x 1..3 x 3..5) under open sky, with a door in its +x wall.
+  const dim = 8, at = (x, y, z) => x + y * dim + z * dim * dim;
+  const settle = (solid, skyOpen) => {
+    let a = new Float32Array(dim ** 3), b = new Float32Array(dim ** 3);
+    for (let i = 0; i < 200; i++) {
+      propagateSkyStep(a, skyOpen, solid, DEFAULT_LPV_SKY_SPREAD, b, dim); [a, b] = [b, a];
+    }
+    return a;
+  };
+  const room = door => {
+    const solid = new Float32Array(dim ** 3), skyOpen = new Float32Array(dim ** 3);
+    for (let z = 0; z < dim; z++) for (let y = 0; y < dim; y++) for (let x = 0; x < dim; x++) {
+      const shell = x >= 2 && x <= 6 && y <= 4 && z >= 2 && z <= 6;
+      const air = x >= 3 && x <= 5 && y >= 1 && y <= 3 && z >= 3 && z <= 5;
+      if (shell && !air) solid[at(x, y, z)] = 1;
+      // Open: outside the room's footprint, or above its roof.
+      if (!(x >= 2 && x <= 6 && z >= 2 && z <= 6) || y > 4) skyOpen[at(x, y, z)] = 1;
+    }
+    if (door) for (const y of [1, 2]) solid[at(6, y, 4)] = 0;
+    return settle(solid, skyOpen);
+  };
+  const shut = room(false), open = room(true);
+  ok('open air sees the whole sky', shut[at(0, 2, 0)], 1);
+  ok('beside a wall, outdoors, still the whole sky', shut[at(7, 1, 4)], 1);
+  ok('a sealed room sees none', shut[at(4, 2, 4)], 0);
+  ok('solid holds none', shut[at(2, 2, 4)], 0);
+  const doorway = open[at(6, 1, 4)], middle = open[at(4, 1, 4)], far = open[at(3, 1, 4)];
+  ok('through a door: the doorway sees about half of it', doorway > 0.3 && doorway < 0.8, true);
+  ok('... the room less, further in', middle < doorway && far < middle && far > 0, true);
+}
+
+section('the volumes: 2 x 2 a block over C1, 1 x 1 over C2');
+{
+  const { LPV_VOLUMES, lpvVolumeRes } = await import('../js/core/lpv.js');
+  const { cascadeVoxelMetres } = await import('../js/core/boxgrid.js');
+  const cell = v => LPV_CELL_VOXELS * cascadeVoxelMetres(v.level) / lpvVolumeRes(v);
+  ok('two volumes, over C1 and C2', LPV_VOLUMES.map(v => v.level).join(','), '1,2');
+  near('C1: 0.75 m cells', cell(LPV_VOLUMES[0]), 0.75, 1e-12);
+  near('C2: 1.5 m cells', cell(LPV_VOLUMES[1]), 1.5, 1e-12);
+  ok('each a whole number of cells a side', LPV_VOLUMES.every(v => Number.isInteger(LPV_DIM * lpvVolumeRes(v))), true);
+}

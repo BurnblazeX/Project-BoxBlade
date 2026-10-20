@@ -13,7 +13,7 @@ import { uniform } from 'three/tsl';
 import { SUN_BIAS_BLOCKS } from '../../core/boxgrid.js';
 import { CHUNK_SIZE } from '../../core/world.js';
 import { SUN_ANGULAR_SIZE, penumbraTexels } from '../../core/sun.js';
-import { createBayerTexture, writeSunUniforms, DEFAULT_AMBIENT } from '../../gpu/sun.js';
+import { createBayerTexture, writeSunUniforms, DEFAULT_AMBIENT, sunRoofUniform, sunFarUniform } from '../../gpu/sun.js';
 import { SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS } from '../../gpu/field.js';
 
 export function createSun({ sunLight, shadowsOn, rebuild, reorigin }) {
@@ -340,7 +340,15 @@ export function createSun({ sunLight, shadowsOn, rebuild, reorigin }) {
         get: () => (sunEdgeFade ? sunEdgeFade.value : EDGE_FADE_VOXELS),
         set: v => commands.fade.run(sunFadeStart ? sunFadeStart.value : SHADOW_FADE_START, v) },
       { key: 'gridbias', label: 'Grid lean (blocks)', type: 'range', min: -6, max: 6, step: 1,
-        live: false, get: () => sunGridBias, set: v => commands.gridbias.run(v) }
+        live: false, get: () => sunGridBias, set: v => commands.gridbias.run(v) },
+      { key: 'sunroof', label: 'A/B: sun ray ending under a roof is shadowed', type: 'toggle',
+        help: 'a sun ray that meets nothing within its reach but ends under a roof (a low sun in a ' +
+              'tall hall) is shadowed - off: lit, as before',
+        get: () => sunRoofUniform.value === 1, set: v => { sunRoofUniform.value = v ? 1 : 0; } },
+      { key: 'sunfar', label: 'Sun reach under roofs (m)', type: 'range', min: 12, max: 72, step: 1,
+        help: 'a sun ray still lit at its 12 m cap but under a roof marches on, hard, this far in all - ' +
+              'so light through a window (tinted by stained glass) reaches further into a hall. 36 is all of C1',
+        get: () => sunFarUniform.value, set: v => { sunFarUniform.value = v; } }
     ],
     settings: { title: 'Sun', settings: [
       { key: 'az', label: 'Azimuth', type: 'range', min: 0, max: 359, step: 1, live: false,

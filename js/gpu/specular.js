@@ -35,6 +35,11 @@ export const DEFAULT_REFLECT_BOUNCES = 2;
 
 export const reflectBouncesUniform = uniform(int(DEFAULT_REFLECT_BOUNCES));
 
+// A/B: a reflection ray that met nothing sees the sky only if it ended above
+// its column's roof (gpu/shade.js skyMiss) - 0 shows the sky indoors too.
+// A uniform: no rebuild.
+export const reflectEscapeUniform = uniform(int(1));
+
 // Rough surfaces fall back from the ray to the ambient estimate over this
 // band of alpha (LabPBR roughness, (1 - smoothness)^2). Grass, at alpha 1,
 // never marches.

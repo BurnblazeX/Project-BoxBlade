@@ -1,4 +1,4 @@
-import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, abs, vec2, min, normalize, cross, clamp, cos, sin, smoothstep, length, int, select, mix } from 'three/tsl';
+import { Fn, If, Loop, Break, float, vec3, vec4, uniform, texture3D, max, abs, vec2, min, normalize, cross, clamp, cos, sin, smoothstep, length, int, select, mix } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP } from '../core/boxgrid.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { LPV_DIM, LPV_CELL_METRES } from '../core/lpv.js';
@@ -84,8 +84,10 @@ export const lpvHalfCell = gi => (gi.levels[0].cellMetres ?? LPV_CELL_METRES) * 
 
 // level0: read at an explicit level 0 - in a branch only some fragments take
 // (gpu/shade.js revealedLight), where an implicit-derivative read is not allowed.
-export function lpvSampleTSL(gi, p, level0 = false) {
-  let out = null;
+// withSky: vec4 - the light, and the sky visibility (gpu/gi.js, the texture's
+// a), which past the volumes is the whole sky (1), as it was before them.
+export function lpvSampleTSL(gi, p, level0 = false, withSky = false) {
+  let out = null, vis = null;
   for (let i = gi.levels.length - 1; i >= 0; i--) {
     const lv = gi.levels[i];
     const uvw = p.sub(lv.origin).div(float(lv.extent)).toVar();
@@ -93,11 +95,20 @@ export function lpvSampleTSL(gi, p, level0 = false) {
     const edge = min(min(min(uvw.x, uvw.y), uvw.z),
                      min(min(float(1).sub(uvw.x), float(1).sub(uvw.y)), float(1).sub(uvw.z)))
                    .mul(float(lv.dim ?? LPV_DIM));
-    const w = smoothstep(float(0.5), float(0.5 + LPV_EDGE_CELLS), edge);
-    const s = (level0 ? texture3D(lv.tex, uvw).level(float(0)) : texture3D(lv.tex, uvw)).rgb;
-    out = out ? mix(out, s, w) : s.mul(w);
+    const w = smoothstep(float(0.5), float(0.5 + LPV_EDGE_CELLS), edge).toVar();
+    const t = (level0 ? texture3D(lv.tex, uvw).level(float(0)) : texture3D(lv.tex, uvw)).toVar();
+    out = out ? mix(out, t.rgb, w) : t.rgb.mul(w);
+    if (withSky) vis = mix(vis || float(1), t.a, w);
   }
-  return out;
+  return withSky ? vec4(out, vis) : out;
+}
+
+// The LPV at q as the shading takes it: { light, the bounce times the
+// strength; keep, what is left of the sky ambient - the sky visibility under
+// gi.sky (an int uniform, the A/B), else 1 }.
+export function lpvAtTSL(gi, q, level0 = false) {
+  const s = lpvSampleTSL(gi, q, level0, true).toVar();
+  return { light: s.xyz.mul(gi.strength), keep: mix(float(1), s.w, float(gi.sky)) };
 }
 
 // The light a revealed face is drawn with (gpu/terrain.js terrainRevealedTSL:
@@ -113,18 +124,31 @@ export function lpvSampleTSL(gi, p, level0 = false) {
 // normal, one answer a texel. Every read at an explicit level - it runs in a
 // branch only the revealed pixels take.
 export const REVEALED_FORM = { top: 1, side: 0.8, bottom: 0.6 };
-export function createRevealedLightTSL(skyIrradiance, gi) {
+// room: split shading's room meter (gpu/roommeter.js), or null - where it
+// has a mean and is on, that is the light instead: one value for the room.
+export function createRevealedLightTSL(skyIrradiance, gi, room = null) {
   return (p, n) => {
     let light = skyIrradiance(n);
     if (gi) {
+      // The room's sky visibility too: the most any inside sample sees -
+      // the whole sky where none is inside.
       const below = vec3(0, -lpvHalfCell(gi), 0);
-      let bounce = null;
+      let bounce = null, seen = null, inside = null;
       for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
         const q = p.add(vec3(dx * BLOCK_METRES, 0, dz * BLOCK_METRES)).add(below);
-        const s = lpvSampleTSL(gi, q, true).mul(insideAtTSL(q.xz));
-        bounce = bounce ? max(bounce, s) : s;
+        const m = insideAtTSL(q.xz).toVar();
+        const s = lpvSampleTSL(gi, q, true, true).toVar();
+        const b = s.xyz.mul(m), v = s.w.mul(m);
+        bounce = bounce ? max(bounce, b) : b;
+        seen = seen ? max(seen, v) : v;
+        inside = inside ? max(inside, m) : m;
       }
-      light = light.add(bounce.mul(gi.strength));
+      const vis = select(inside.greaterThan(float(0)), seen, float(1));
+      light = light.mul(mix(float(1), vis, float(gi.sky))).add(bounce.mul(gi.strength));
+    }
+    if (room) {
+      const m = room.meanRead.element(int(0));
+      light = select(room.on.equal(int(1)).and(m.w.greaterThan(float(0.5))), m.xyz, light);
     }
     const form = select(n.y.greaterThan(float(0.5)), float(REVEALED_FORM.top),
       select(n.y.lessThan(float(-0.5)), float(REVEALED_FORM.bottom), float(REVEALED_FORM.side)));
@@ -166,6 +190,7 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
     const B = cross(n, T).toVar();
     const vis = float(1).toVar();
     const gi = vec3(0, 0, 0).toVar();
+    const sky = lpv ? float(0).toVar() : null;
     const bent = vec3(0, 0, 0).toVar();
     // single === true compiles the one-cone case in; a node selects at runtime.
     const count = single === true ? int(1)
@@ -187,13 +212,17 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
       if (lpv) {
         const back = select(r.z.greaterThan(float(0)),
                             max(r.y.sub(float(lpvHalfCell(lpv))), float(0)), r.y);
-        gi.addAssign(lpvSampleTSL(lpv, origin.add(dir.mul(back))).mul(w));
+        const s = lpvSampleTSL(lpv, origin.add(dir.mul(back)), false, true).toVar();
+        gi.addAssign(s.xyz.mul(w));
+        sky.addAssign(s.w.mul(w));
       }
     });
     const v = clamp(vis, float(0), float(1));
     // Fully enclosed: no open direction, and the ambient is zero anyway.
     const b = select(length(bent).greaterThan(float(1e-4)), normalize(bent), n);
-    return { vis: v, gi: lpv ? gi : null, bent: b.toVar() };
+    // sky: the LPV's sky visibility where the cones ended, weighted as the
+    // occlusion is - the large-scale share the 1 m cones cannot see.
+    return { vis: v, gi: lpv ? gi : null, sky: lpv ? sky : null, bent: b.toVar() };
   };
 }
 

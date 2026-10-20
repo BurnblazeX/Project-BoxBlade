@@ -1,4 +1,5 @@
-import { GRID_DIM } from './boxgrid.js';
+import { GRID_DIM, cascadeVoxelMetres } from './boxgrid.js';
+import { BLOCK_METRES } from './world.js';
 import { DEFAULT_SPECULAR, decodeSpecular } from './materials.js';
 
 // --- The light propagation volume: GI's long band (doc §6.2) ---
@@ -36,9 +37,18 @@ export const LPV_DIM = GRID_DIM / LPV_CELL_VOXELS;              // 24
 export const LPV_CELLS = LPV_DIM * LPV_DIM * LPV_DIM;           // 13 824
 export const LPV_CELL_METRES = LPV_CELL_VOXELS * 0.125;         // 0.75 m
 export const LPV_EXTENT_METRES = LPV_DIM * LPV_CELL_METRES;     // 18 m, = C0
-// Which cascades carry a volume: C0 at half-block cells, C1 at full-block cells
-// (36 m). Past C1 there is no bounce - it fades out over C1's last cells.
-export const LPV_LEVELS = 2;
+// Which cascades carry a volume, at how many cells a block a side: all of C1
+// at 2 (0.75 m cells, 36 m - C0 lies inside it) and C2 at 1 (1.5 m cells,
+// 72 m), finest first. Past C2 there is no bounce - it fades out over C2's
+// last cells. (Until 2026-10-21: C0 at 0.75 m over 18 m, C1 at 1.5 m.)
+export const LPV_VOLUMES = [{ level: 1, blockCells: 2 }, { level: 2, blockCells: 1 }];
+
+// A volume's res for gpu/gi.js createLPV: its cells a side over the 24 its
+// cascade has at LPV_CELL_VOXELS voxels a cell - 2 for both of the above
+// (48^3 cells each).
+export function lpvVolumeRes({ level, blockCells }) {
+  return blockCells * LPV_CELL_VOXELS * cascadeVoxelMetres(level) / BLOCK_METRES;
+}
 
 // How much of a neighbour's light each iteration carries on. The steady state
 // in open air is E / (1 - alpha), so the output is multiplied back by
@@ -121,6 +131,50 @@ export function propagateStep(L, E, solid, alpha, out, dim = LPV_DIM, trans = nu
         out[c * 4 + 1] = open * (E[c * 4 + 1] + k * g) * tg;
         out[c * 4 + 2] = open * (E[c * 4 + 2] + k * b) * tb;
         out[c * 4 + 3] = 0;
+      }
+    }
+  }
+  return out;
+}
+
+// --- Sky visibility: the fourth channel ---
+//
+// The light is RGB; the cell's fourth float carries how much of the sky it
+// can see, V in [0, 1], for the sky ambient (gpu/shade.js) - so a roofed room
+// is not lit by the sky through its roof, the LPV-mode answer to texel GI's
+// escaping rays. Not light propagated by the same rule: that one loses what
+// flows into solids, and an open cell beside a wall would read dim. Instead:
+//
+//   V'(c) = open(c) * trans(c) * ( 1                          sky-open cell
+//                                  skySpread * mean_f V(n_f)   roofed cell )
+//
+// A sky-open cell (air above its column's roof - core/skytop.js) sees the
+// sky. A roofed one sees what its air neighbours see, less a share a cell:
+// the mean over its open neighbours (weighted by how open each is), not the
+// sum over six - so an alcove off the open air is nearly as bright as the
+// air, and a room through a door darkens a cell at a time. Off the volume a
+// neighbour is the cell itself, as for the light.
+// V, skyOpen (0/1 a cell), solid: Float32Array; trans: as propagateStep's
+// (4 floats a cell, its rgb averaged) or null. Writes into out, returns it.
+export const DEFAULT_LPV_SKY_SPREAD = 0.9;
+export function propagateSkyStep(V, skyOpen, solid, skySpread, out, dim = LPV_DIM, trans = null) {
+  const at = (x, y, z) => x + y * dim + z * dim * dim;
+  for (let z = 0; z < dim; z++) {
+    for (let y = 0; y < dim; y++) {
+      for (let x = 0; x < dim; x++) {
+        const c = at(x, y, z);
+        const open = 1 - solid[c];
+        let sum = 0, wsum = 0;
+        for (const [dx, dy, dz] of FACE_DIRS) {
+          const nx = x + dx, ny = y + dy, nz = z + dz;
+          const inside = nx >= 0 && ny >= 0 && nz >= 0 && nx < dim && ny < dim && nz < dim;
+          const n = inside ? at(nx, ny, nz) : c;
+          const w = inside ? 1 - solid[n] : open;
+          sum += w * V[n]; wsum += w;
+        }
+        const t = trans ? (trans[c * 4] + trans[c * 4 + 1] + trans[c * 4 + 2]) / 3 : 1;
+        const seen = skyOpen[c] > 0.5 ? 1 : skySpread * sum / Math.max(wsum, 1e-4);
+        out[c] = open * t * seen;
       }
     }
   }

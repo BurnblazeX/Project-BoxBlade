@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
-import { If, Loop, Break, float, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
+import { If, Loop, Break, float, vec2, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/boxgrid.js';
-import { BLOCK_METRES } from '../core/world.js';
+import { BLOCK_METRES, Y_MIN } from '../core/world.js';
+import { SKY_TOP_STEPS } from '../core/skytop.js';
 import { terrainWhite, blockFaceTSL as boxFaceTSL, texelLockTSL, modelTexelCoreTSL } from './terrain.js';
 import { MODEL_HIT_RECORD } from '../core/bbmodel.js';
 import { MATERIALS } from '../core/materials.js';
@@ -35,6 +36,22 @@ export function setHitBounds(box = null) {
 export const inHitBoundsTSL = p => p.x.greaterThanEqual(hitBounds.min.x).and(p.x.lessThanEqual(hitBounds.max.x))
   .and(p.y.greaterThanEqual(hitBounds.min.y)).and(p.y.lessThanEqual(hitBounds.max.y))
   .and(p.z.greaterThanEqual(hitBounds.min.z)).and(p.z.lessThanEqual(hitBounds.max.z));
+
+// --- Open sky: whether a point is above its column's roof (core/skytop.js) ---
+//
+// 1 where p is over the highest non-glass block in its block column, or its
+// column has none (or lies outside the block volume); 0 under a roof. Where
+// a ray that missed everything ended: past the roof, it reached the sky.
+export function skyOpenTSL(terrain, p) {
+  const vol = terrain.blocks;
+  const col = round(vec2(p.x, p.z).div(float(BLOCK_METRES))).sub(vec2(vol.origin.x, vol.origin.z));
+  const uv = col.add(float(0.5)).div(vec2(vol.size.x, vol.size.z)).toVar();
+  const code = round(texture(terrain.skyTop, uv).level(int(0)).r.mul(float(255))).toVar();
+  const top = code.sub(float(1)).div(float(SKY_TOP_STEPS)).add(float(Y_MIN - 0.5)).mul(float(BLOCK_METRES));
+  const outside = uv.x.lessThan(float(0)).or(uv.y.lessThan(float(0)))
+    .or(uv.x.greaterThan(float(1))).or(uv.y.greaterThan(float(1)));
+  return select(outside.or(code.lessThan(float(0.5))).or(p.y.greaterThan(top)), float(1), float(0));
+}
 
 export function axisFaceTSL(g) {
   const ag = abs(g).toVar();

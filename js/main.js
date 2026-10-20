@@ -1415,6 +1415,7 @@ const bxbApi = installConsole(createConsole({
       };
       const glass = glassInstancedMesh;
       const glare = mirrors.glare, caustic = glassCaustics.value, layers = glassLayers;
+      const texelGI = engine.options().texelGI;
       const rebuild = () => buildPerPixelShadows();
       const flag = set => [() => { set(false); rebuild(); }, () => { set(true); rebuild(); }];
       let shown = [];
@@ -1438,6 +1439,15 @@ const bxbApi = installConsole(createConsole({
         ['second glass layer', !!glass && layers > 1,
          () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
         ['mirror light', mirrors.on, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
+        // GI, whichever method: all of it - then, for texel GI, only the
+        // lamps' shadow marches at its ray hits.
+        [texelGI ? 'texel GI' : 'LPV GI', !!(texelGI || engine.options().gi),
+         () => bxbApi.gi(false), () => bxbApi.gi(true), true],
+        ['lamp shadows at texel GI hits', !!texelGI && texelGI.ab.hitShadows.value === 1,
+         () => { texelGI.ab.hitShadows.value = 0; }, () => { texelGI.ab.hitShadows.value = 1; }, false],
+        // Off costs MORE: every GI ray hit runs the light loop again.
+        ['patch direct-light cache (GI hits)', !!texelGI && texelGI.ab.direct.value === 1,
+         () => { texelGI.ab.direct.value = 0; }, () => { texelGI.ab.direct.value = 1; }, false],
         ['split shading', texel.splitOn, ...flag(v => { texel.splitOn = v; }), true],
         ['hit lighting cache', hitCacheOn, ...flag(v => { hitCacheOn = v; }), true],
         ['model lookup in reflection hits', !!terrainTextures.modelHits, ...flag(v => { modelHitsOn = v; }), true],

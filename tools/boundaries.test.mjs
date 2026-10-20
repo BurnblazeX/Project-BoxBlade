@@ -32,11 +32,10 @@ const EXCEPTIONS = new Set([]);
 // Line budgets: a ratchet. A file or function over its budget fails; one well
 // under it fails too, asking for the budget to come down to where it now is.
 const SLACK = 50;
-const FILE_BUDGETS = {
-  'main.js': 1764
-};
+// main.js has none: the user dropped it (2026-10-21).
+const FILE_BUDGETS = {};
 const FUNCTION_BUDGETS = {
-  'gpu/shade.js createShadowColorNode': 1579
+  'gpu/shade.js createShadowColorNode': 1389
 };
 
 const here = dirname(fileURLToPath(import.meta.url));

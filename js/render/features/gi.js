@@ -4,11 +4,11 @@
 // debugger's: render/features/debugview.js).
 // Strength and spread are uniforms; iterations and injection slices are CPU
 // numbers read each frame. The volume is built once, on the first shadows-on
-// frame that has cascades and a light list, and follows C0 from then on.
+// frame that has cascades and a light list, and follows its cascade from then on.
 //
 // ctx:
 //   renderer
-//   cascades()     the shadow cascades' bindings (the volumes follow C0, C1)
+//   cascades()     the shadow cascades' bindings (the volumes follow C1, C2)
 //   sun            { uniforms() the sun's march uniforms, made if need be:
 //                    { biasUniform, fadeStartUniform, edgeFadeUniform,
 //                    ambientUniform }; on(); angular(); light (its position
@@ -19,15 +19,17 @@
 //   terrainAlbedo() the terrain's mean albedo, once its textures are in
 //   shadowsOn()    whether the marched shading is on
 //   rebuild()      the shading rebuilt, when a kernel flag changed
-import { uniform } from 'three/tsl';
+import { uniform, int } from 'three/tsl';
 import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL, averageAlbedo, lpvShift,
          DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
-         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_LEVELS, LPV_RES_OPTIONS } from '../../core/lpv.js';
+         DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_VOLUMES, lpvVolumeRes, LPV_RES_OPTIONS,
+         DEFAULT_LPV_SKY_SPREAD } from '../../core/lpv.js';
 import { MATERIALS } from '../../core/materials.js';
 import { MODELS } from '../../core/models.js';
 import { createLPV } from '../../gpu/gi.js';
 import { createTexelGI, GI_LIST_CAP } from '../../gpu/texelgi.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
+import { reflectEscapeUniform } from '../../gpu/specular.js';
 import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
@@ -50,7 +52,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     }
     return texelGI;
   }
-  // One volume per level, finest first: C0 at 0.75 m cells, C1 at 1.5 m. They
+  // One volume per lpv.js LPV_VOLUMES, finest first: C1 at 0.75 m cells, C2 at 1.5 m. They
   // share every setting; the shading pass blends them (lpvSampleTSL).
   let lpvs = null;
   let lpvOrigins = [];        // cascade origin each volume was last laid over
@@ -62,12 +64,18 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
   // power, the iterations res times - so only the detail changes, and the cost.
   let lpvRes = 1;
   let lpvSlices = DEFAULT_LPV_SLICES;
+  // The LPV's sky visibility (lpv.js propagateSkyStep): 1 the sky ambient is
+  // multiplied by it, so roofs shade it as texel GI's rays do - and it stands
+  // in for the injection's sky cone; 0 the sky everywhere, as before. A
+  // uniform, read by the volumes and the shading alike.
+  const lpvSky = uniform(int(1));
+  let lpvSkySpread = DEFAULT_LPV_SKY_SPREAD;
   const giStrength = uniform(DEFAULT_GI_STRENGTH);
   let lastGIms = 0;
 
   // --- Performance ---
   //
-  // giFarHalf: the C1 GI volume (1.5 m cells, the far bounce) updates every
+  // giFarHalf: the far GI volume (C2, 1.5 m cells) updates every
   // other frame. Its contents are coarse and slow-changing; the lag is two
   // frames instead of one, which nothing that far away shows.
   let giFarHalf = true;
@@ -84,14 +92,15 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
 
   function ensureLPV() {
     const c = cascades();
-    if (lpvs || c.length < LPV_LEVELS) return lpvs;
+    if (lpvs || LPV_VOLUMES.some(v => v.level >= c.length)) return lpvs;
     const u = sun.uniforms();
     lpvs = [];
-    for (let level = 0; level < LPV_LEVELS; level++) {
-      // Every bounce order fits at res 1 (~3.5 MB each); finer, only the ones
-      // asked for - 16 orders of 8 x 8 would be gigabytes.
-      lpvs.push(createLPV({ cascades: c, lights: lighting.bindings(), level, res: lpvRes,
-                            orders: lpvRes === 1 ? GI_MAX_BOUNCES : lpvBounces,
+    for (const spec of LPV_VOLUMES) {
+      const res = lpvVolumeRes(spec) * lpvRes;
+      // Every bounce order fits in a 24^3 volume (~3.5 MB each); a bigger one
+      // holds only the ones asked for - 16 orders of 48^3 are 113 MB.
+      lpvs.push(createLPV({ cascades: c, lights: lighting.bindings(), level: spec.level, res,
+                            orders: res === 1 ? GI_MAX_BOUNCES : lpvBounces,
                             biasUniform: u.biasUniform, fadeStartUniform: u.fadeStartUniform,
                             edgeFadeUniform: u.edgeFadeUniform,
                             sky: sky.bindings, ambientUniform: u.ambientUniform,
@@ -99,7 +108,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
                             glass: glassInstancedMesh ? terrainTextures : false,
                             // The mirror light at each probe hit, so what the
                             // mirrors throw bounces from where it lands.
-                            terrain: terrainTextures, mirrors: mirrors.bindings }));
+                            terrain: terrainTextures, mirrors: mirrors.bindings, skyAB: lpvSky }));
     }
     return lpvs;
   }
@@ -115,7 +124,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
   }
 
   function giBinding() {
-    return { levels: lpvs.map(v => v.binding), strength: giStrength };
+    return { levels: lpvs.map(v => v.binding), strength: giStrength, sky: lpvSky };
   }
 
   // Each material's diffuse albedo, once its textures are in (lpv.js
@@ -174,7 +183,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     for (const v of lpvs) {
       // lpvOrigins is only written when a volume updates, so a skipped frame
       // cannot lose a re-origin: the next update sees the move.
-      if (giFarHalf && v.level > 0 && (giFrame & 1)) continue;
+      if (giFarHalf && v !== lpvs[0] && (giFrame & 1)) continue;
       const o = c[v.level].origin.value;
       const at = { x: o.x, y: o.y, z: o.z };
       const was = lpvOrigins[v.level];
@@ -198,6 +207,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       packGISprites(u);
       u.sunGain.value = sun.on() ? 1 : 0;
       u.spread.value = Math.pow(lpvSpread, 1 / v.res);
+      u.skySpread.value = Math.pow(lpvSkySpread, 1 / v.res);
       u.bounces.value = Math.min(lpvBounces, v.orders);
       v.slices = lpvSlices;
       writeSunUniforms(v.sun, sun.light.position, sun.angular());
@@ -213,7 +223,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     const dt = giLastT ? Math.min((now - giLastT) / 1000, 0.25) : 1 / 60;
     giLastT = now;
     texelGI.blend.value = giResponse > 0 ? 1 - Math.exp(-dt / giResponse) : 1;
-    list.push(kernels.patches, kernels.sums);
+    list.push(kernels.patches, kernels.sums, kernels.filter, kernels.direct);
     texelGI.frame.value = (texelGI.frame.value + 1) >>> 0;
   }
 
@@ -233,7 +243,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       }
     },
     gifar: {
-      help: 'update the far (C1) GI volume every other frame',
+      help: 'update the far (C2) GI volume every other frame',
       run: () => {
         giFarHalf = !giFarHalf;
         return `far GI volume ${giFarHalf ? 'every other frame' : 'every frame'}`;
@@ -250,7 +260,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
         if (was !== giOn) rebuild();
         if (!shadowsOn()) return 'run bxb.shadows() first';
         if (!giOn) return 'GI off';
-        return `GI on - two 24^3 volumes, over C0 (0.75 m cells) and C1 (1.5 m), ` +
+        return `GI on - ${lpvs ? lpvs.map(v => `${v.dim}^3 over C${v.level} (${v.cellMetres} m cells)`).join(' and ') : 'no volumes yet'}, ` +
                `strength ${giStrength.value.toFixed(2)}, spread ${lpvSpread.toFixed(2)}, ` +
                `${lpvIterations} iterations, 1/${lpvSlices} injected a frame, ` +
                `${lastGIms.toFixed(2)} ms CPU to encode`;
@@ -293,7 +303,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
         help: 'one compute pass and submit per GI volume instead of one per kernel',
         get: () => giBatch, set: v => flip(giBatch, v, () => commands.gibatch.run()) },
       { key: 'gifar', label: 'Far GI every 2nd frame', type: 'toggle',
-        help: 'the C1 LPV volume updates at half rate',
+        help: 'the C2 LPV volume updates at half rate',
         get: () => giFarHalf, set: v => flip(giFarHalf, v, () => commands.gifar.run()) }
     ],
     settings: { title: 'GI', settings: [
@@ -311,17 +321,35 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       ab('giabphys', 'A/B: physical bounce (Fresnel, metal)', 'physical'),
       ab('giabfresh', 'A/B: shading reads fresh patches only', 'fresh'),
       ab('giabanchor', 'A/B: rays from anchor texel', 'anchor'),
+      ab('giabsky', 'A/B: sky from GI rays (roofs block it)', 'sky'),
+      ab('giabdirect', 'A/B: GI hits read the patch direct-light cache', 'direct'),
+      ab('giabrotate', 'A/B: each patch turns its GI directions', 'rotate'),
+      ab('giabfilter', 'A/B: patches blurred with their neighbours (3x3)', 'filter'),
+      { key: 'gidirectevery', label: 'Texel GI direct refresh (frames)', type: 'range', min: 1, max: 16, step: 1,
+        help: 'how often a patch works out its sun and lamp light for the GI rays that land on it - ' +
+              'higher is cheaper, and a moving torch shows in the bounce later',
+        get: () => ensureTexelGI().directEvery.value,
+        set: v => { ensureTexelGI().directEvery.value = Math.max(1, Math.round(v)); } },
+      { key: 'giabreflsky', label: 'A/B: reflection misses: sky outdoors only', type: 'toggle',
+        help: 'a reflection ray that met nothing shows the sky only if it ended above the roof of its column',
+        get: () => reflectEscapeUniform.value === 1, set: v => { reflectEscapeUniform.value = v ? 1 : 0; } },
       { key: 'giresponse', label: 'Texel GI response (s)', type: 'range', min: 0, max: 1, step: 0.01,
         help: 'time the bounce takes to follow a change - smooths flicker from anything that moves. 0: none',
         get: () => giResponse, set: v => { giResponse = v; } },
       { key: 'gireach', label: 'Texel GI reach (m)', type: 'range', min: 1, max: 24, step: 0.5,
-        help: 'how far a GI ray marches before it gives up (a miss bounces nothing)',
+        help: 'how far a GI ray marches before it gives up (a miss brings the sky only if it ends outdoors)',
         get: () => ensureTexelGI().reach.value, set: v => { ensureTexelGI().reach.value = v; } },
       { key: 'gistrength', label: 'Strength', type: 'range', min: 0, max: 8, step: 0.05,
         get: () => giStrength.value, set: v => commands.gi.run(true, v) },
       { key: 'gispread', label: 'Spread', type: 'range', min: 0.5, max: 0.98, step: 0.01,
         help: 'how far light carries cell to cell - brightness is normalised, only reach changes',
         get: () => lpvSpread, set: v => { lpvSpread = v; } },
+      { key: 'giabskylpv', label: 'A/B: LPV sky visibility (roofs block the sky)', type: 'toggle',
+        help: 'the sky ambient times how much sky the LPV says each place sees - off: the sky everywhere',
+        get: () => lpvSky.value === 1, set: v => { lpvSky.value = v ? 1 : 0; } },
+      { key: 'giskyspread', label: 'LPV sky reach indoors', type: 'range', min: 0.5, max: 0.98, step: 0.01,
+        help: 'how much of its neighbours\' sky a roofed cell keeps - higher lets daylight further in through doors and windows',
+        get: () => lpvSkySpread, set: v => { lpvSkySpread = v; } },
       { key: 'gibounces', label: 'Bounces', type: 'range', min: 1, max: GI_MAX_BOUNCES, step: 1,
         help: 'orders of bounce light: 1 is light off a surface once, each more lands and leaves again',
         get: () => lpvBounces,

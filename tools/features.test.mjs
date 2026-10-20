@@ -194,12 +194,15 @@ section('gi');
   });
   ok('no cascades yet: no volumes, no GI binding', gi.options().gi, null);
 
-  // Two cascades, as the field makes them (only their origins are read here).
+  // Three cascades, as the field makes them (only their origins are read here).
   const { createBoxGridAt } = await import('../js/core/boxgrid.js');
   const { createDistanceTexture, cascadeBindings } = await import('../js/gpu/field.js');
   cascades = [0, 1].map(l => { const g = createBoxGridAt(0, 0, null, l); return cascadeBindings(createDistanceTexture(g), g); });
+  ok('two cascades: no volumes yet (the far one lies over C2)', gi.options().gi, null);
+  { const g = createBoxGridAt(0, 0, null, 2); cascades.push(cascadeBindings(createDistanceTexture(g), g)); }
   const binding = gi.options().gi;
   ok('then the LPV: one level per volume', binding.levels.length, 2);
+  ok('2 x 2 a block over C1, 1 x 1 over C2', binding.levels.map(l => l.cellMetres).join(','), '0.75,1.5');
   ok('texel GI is off in LPV mode', gi.options().texelGI, null);
 
   gi.update();
@@ -383,7 +386,7 @@ section('sun');
   ok('daylight off rebuilds', `${sun.on}/${rebuilds}`, 'false/1');
   ok('ambient is a uniform write', (sun.commands.ambient.run(0.3), rebuilds), 1);
   ok('the profiler flag', (sun.march = false, sun.options().sunMarch), false);
-  ok('the settings', [...sun.shadowSettings, ...sun.settings.settings, ...sun.shadingSettings].length, 12);
+  ok('the settings', [...sun.shadowSettings, ...sun.settings.settings, ...sun.shadingSettings].length, 14);
 }
 
 section('shadow sets');

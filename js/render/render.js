@@ -11,6 +11,7 @@ import { VOXEL_METRES } from '../core/boxgrid.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';
+import { buildSkyTops } from '../core/skytop.js';
 
 // Every block texture, by URL, so Vite bundles them - albedo, _n and _s alike.
 // Only under Vite; in node (the shader snapshot test) there are none.
@@ -75,6 +76,9 @@ export const terrainTextures = {
   // Placed models' cubes, by cell, for the rays (buildBlockVolume): a
   // read-only storage buffer of vec4. { attr, node }.
   modelHits: null,
+  // Each block column's roof height (core/skytop.js), over the block volume's
+  // x and z: a 2D texture, one byte a column (buildBlockVolume).
+  skyTop: null,
   ready: false
 };
 
@@ -310,6 +314,12 @@ function buildBlockVolume() {
       size: uniform(new THREE.Vector3(...size)),
       dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * 2))   // the texture's own
     };
+    const top = new THREE.DataTexture(new Uint8Array(size[0] * size[2]), size[0], size[2],
+                                      THREE.RedFormat, THREE.UnsignedByteType);
+    top.minFilter = top.magFilter = THREE.NearestFilter;
+    top.generateMipmaps = false;
+    top.unpackAlignment = 1;
+    terrainTextures.skyTop = top;
     const attr = new THREE.StorageBufferAttribute(new Float32Array(MODEL_HIT_VEC4S * 4), 4);
     terrainTextures.modelHits = {
       attr, node: storage(attr, 'vec4', MODEL_HIT_VEC4S).toReadOnly().setName('bxbModelHits')
@@ -347,6 +357,8 @@ function buildBlockVolume() {
     data[o + 2] = header >> 8;
     data[o + 3] = giIndex + 1;
   }
+  terrainTextures.skyTop.image.data.set(buildSkyTops(World, [lo[0], lo[2]], [size[0], size[2]]));
+  terrainTextures.skyTop.needsUpdate = true;
   const mh = terrainTextures.modelHits;
   mh.attr.array.set(hits.data);
   mh.attr.needsUpdate = true;

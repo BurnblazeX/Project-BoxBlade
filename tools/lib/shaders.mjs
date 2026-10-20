@@ -184,7 +184,8 @@ function shaderSet(name, over) {
   out[`${name}/sprite`] = wgslOf(sprite, G.createSpriteShadowMaterial(base, built.spriteLight, null, null));
   // The compute kernels the set carries.
   for (const [k, c] of computeNodes({ split: built.splitKernels, gi: built.giKernels,
-                                      mirror: built.mirrorCache })) {
+                                      mirror: built.mirrorCache,
+                                      room: built.splitKernels ? opts.split.room.ease : null })) {
     out[`${name}/${k}`] = wgslOf(c);
   }
   return out;

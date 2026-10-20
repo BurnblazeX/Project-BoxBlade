@@ -4,6 +4,7 @@ import { VOXEL_METRES } from '../core/boxgrid.js';
 import { terrainSurfaceTSL } from './terrain.js';
 import { outsideShadeTSL } from './occlusion.js';
 import { MATERIAL_LAYERS } from '../core/materials.js';
+import { createRoomMeter } from './roommeter.js';
 
 // ---------------------------------------------------------------------------
 // Texel-rate shading: the terrain shaded once per texel, not once per pixel
@@ -107,6 +108,8 @@ export function createSplitShading(lowCap, missCap, fullCap, half = true) {
   return {
     capacity, lowCap, missCap, fullCap,
     result: buffer('bxbSplitResult'),   // colour so far, texel id (0: none)
+    // The light on the inside's surfaces, for revealed faces (gpu/roommeter.js).
+    room: createRoomMeter(),
     // Between kernels: the ambient a reflection blends with, and highlights
     // so far (clamped at the end) - six half floats in one uvec4. fp16 is
     // ~0.05%, a tenth of an 8-bit step before Fresnel scales it down; texel-

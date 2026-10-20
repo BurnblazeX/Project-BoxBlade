@@ -13,12 +13,13 @@ import { Fn, If, Loop, Break, float, vec3, vec4, floor, fract, sin, max, mix, se
 import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/boxgrid.js';
 import { layout, memoCascades } from './layout.js';
 import { decodeFieldTSL, ringUV } from './field.js';
+import { skyOpenTSL } from './volume.js';
 
 // The views that show light alone, not times the surface's colour - a sprite
 // then draws the term itself instead of tinting its art with it.
 export const RAW_VIEWS = new Set(['normal', 'facenormal', 'labpbr', 'texels', 'cascades', 'sdf',
                                   'shadow', 'direct', 'indirect', 'ao', 'gi', 'mirror',
-                                  'reflection', 'highlights']);
+                                  'reflection', 'highlights', 'skyopen']);
 // The views split shading can show itself (the base kernel writes them): the
 // bounce, which only the split kernels trace with texel GI. Any other view
 // shades per fragment, as the old views did.
@@ -124,6 +125,13 @@ export function surfaceViewTSL(view, s, cascades) {
     }
     case 'cascades': return cascadeView(cascades, s.p, s.n, s.base);
     case 'sdf': return sdfView(cascades, s.p);
+    case 'skyopen': {
+      // The sky-top map (volume.js skyOpenTSL) at the texel, half a texel out
+      // from its face: green open to the sky, red under a roof.
+      if (!s.terrain || !s.terrain.skyTop) return vec3(0, 0, 0);
+      const open = skyOpenTSL(s.terrain, s.p.add(s.n.mul(float(VOXEL_METRES * 0.5))));
+      return mix(vec3(0.8, 0.15, 0.1), vec3(0.2, 0.8, 0.3), open).mul(float(0.4).add(luma(s.base).mul(float(0.6))));
+    }
     default: return null;
   }
 }

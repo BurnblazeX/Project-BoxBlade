@@ -1,13 +1,68 @@
 import * as THREE from 'three/webgpu';
-import { Fn, float, vec3, uniform, max, texture, vec2, normalize, clamp, cos, sin } from 'three/tsl';
+import { Fn, If, float, vec3, vec4, uniform, max, texture, vec2, normalize, clamp, cos, sin, int, mix } from 'three/tsl';
 import { VOXEL_METRES } from '../core/boxgrid.js';
 import { BAYER4, SUN_ANGULAR_SIZE, coneOffsets, coneRadius, sunBasis } from '../core/sun.js';
 import { CARD_SUN_REACH } from '../core/cards.js';
 import { layout } from './layout.js';
 import { EDGE_FADE_VOXELS, SHADOW_FADE_START, SURFACE_BIAS_VOXELS } from './field.js';
 import { glassRayTransmitTSL } from './glass.js';
-import { createConeTraceSunTSL, createShadowTraceTSL } from './trace.js';
+import { createConeTraceSunTSL, createShadowTraceTSL, createReflectTraceTSL } from './trace.js';
 import { createCardsTSL } from './cards.js';
+import { skyOpenTSL } from './volume.js';
+
+// --- The sun's march, past its reach ---
+//
+// The march stops at its cap (12 m) and fades out before it, and a ray that
+// met nothing by then counts as lit. Under a low sun, a ray from a hall's floor
+// travels further than that before it reaches the roof - so the sun lit the
+// floor through the roof from sunrise until it climbed high enough. Where the
+// ray stopped tells: still under a roof (core/skytop.js, volume.js
+// skyOpenTSL), it has not reached the sun, and the sun is shadowed. A ray
+// that left through a window or a door ends outside and stays lit; a shaft
+// through a window further than the cap is lost (dark, not a leak).
+// sunRoofUniform: the A/B - 0, the cap alone, as before. A uniform: no rebuild.
+export const sunRoofUniform = uniform(int(1));
+
+// 1, or 0 where a sun ray from origin along dir, reach long, ends under a
+// roof. terrain: the terrain textures (their sky-top map), or null: always 1.
+// What the LPV's sun marches take; the shading's go further (createSunFarTSL).
+export function sunRoofTSL(terrain, origin, dir, reach) {
+  if (!terrain || !terrain.skyTop) return float(1);
+  return mix(float(1), skyOpenTSL(terrain, origin.add(dir.mul(reach))), float(sunRoofUniform));
+}
+
+// --- Past the cap, under a roof: the hard march on ---
+//
+// A ray still lit at the cap but under a roof is not given up on: it marches
+// on, hard (no cone - past ~17 m the cone's field saturates and would shadow
+// open air), to sunFarUniform metres in all - all of C1 by default. It finds
+// the wall or the roof that shadows it, or leaves through a window, tinted by
+// the glass it crossed - a stained window's light on a floor 30 m away. Ending
+// that far out still under a roof, it is shadowed (sunRoofTSL). Only those
+// rays march: a ray lit at the cap in the open is lit, as it always was.
+export const DEFAULT_SUN_FAR = 36;
+export const sunFarUniform = uniform(float(DEFAULT_SUN_FAR));
+
+// Returns (origin, dir, reach) -> what the visibility from the soft march is
+// multiplied by: 1 where it was not under a roof at the cap, else 0 or the
+// glass's tint (a colour, with glass). null without the sky-top map.
+function createSunFarTSL(cascades, terrain, glass) {
+  if (!terrain || !terrain.skyTop) return null;
+  const trace = createReflectTraceTSL(cascades, false, !!glass);
+  return (origin, dir, reach) => {
+    const out = (glass ? vec3(1, 1, 1) : float(1)).toVar();
+    const end = origin.add(dir.mul(reach)).toVar();
+    If(sunRoofUniform.equal(int(1)).and(skyOpenTSL(terrain, end).lessThan(float(0.5))), () => {
+      const more = max(sunFarUniform.sub(reach), float(0)).toVar();
+      const r = trace(end, dir, more).toVar();
+      const t = glass ? r.y : r.w;
+      const roofed = skyOpenTSL(terrain, end.add(dir.mul(more))).lessThan(float(0.5));
+      If(t.greaterThanEqual(float(0)).or(roofed), () => { out.assign(glass ? vec3(0, 0, 0) : float(0)); })
+        .Else(() => { if (glass) out.assign(glassRayTransmitTSL(glass, vec4(0, 0, r.z, r.w), end, dir)); });
+    });
+    return out;
+  };
+}
 
 // ---------------------------------------------------------------------------
 // The sun: a marched cone
@@ -111,7 +166,8 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
                                   stepsUniform = null, biasUniform = null,
                                   cone = false, quantise = true,
                                   fadeStartUniform = null, edgeFadeUniform = null,
-                                  cards = null, glass = false }) {
+                                  cards = null, glass = false, terrain = null }) {
+  // terrain: the terrain textures, for the sky-top map (sunRoofTSL); null: none.
   // glass: a world with glass - the terrain textures (for the tint of the
   // texel a ray enters glass through), or false. The visibility is then a
   // COLOUR (vec3), the light tinted by the glass it crossed.
@@ -124,6 +180,9 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
   // the level walk is unrolled into the kernel.
   const coneTrace = createConeTraceSunTSL(cascades, !!glass);
   const shadowTrace = createShadowTraceTSL(cascades);
+  // The march on past the cap (createSunFarTSL): the cone path's sees glass;
+  // the sampled disc's does not, as its own march does not.
+  const far = createSunFarTSL(cascades, terrain, cone && glass);
   const outType = glass ? 'vec3' : 'float';
   const asOut = v => (glass ? vec3(v, v, v) : v);
 
@@ -143,7 +202,11 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       const traced = coneTrace(origin, sunDir, maxDist, coneRadiusUniform,
                                fadeStart, edgeFade).toVar();
       const visible = traced.x.toVar();
-      const through = glass ? glassRayTransmitTSL(glass, traced, origin, sunDir) : null;
+      const through = glass ? glassRayTransmitTSL(glass, traced, origin, sunDir).toVar() : null;
+      if (far) {
+        const f = far(origin, sunDir, maxDist);
+        if (glass) through.mulAssign(f); else visible.mulAssign(f);
+      }
       // Sprites left the distance field so that each light could have them
       // facing IT - see createCardsTSL. Same ray, same cap, same cone radius, so
       // a character's penumbra and a wall's come out of one formula.
@@ -198,6 +261,7 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       lit.addAssign(float(1).sub(shadowTrace(origin, dir, maxDist, fadeStart, edgeFade).x));
     }
     const visible = lit.div(float(offsets.length)).toVar();
+    if (far) visible.mulAssign(far(origin, sunDir, maxDist));
     // The sampled path takes the cards once rather than per disc sample: the
     // card test is already analytic, so sampling it N times would return the
     // same answer N times and pay for it each one.

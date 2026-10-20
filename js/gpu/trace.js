@@ -154,13 +154,23 @@ export function createShadowTraceTSL(cascades) {
 // further than the nearer surface of either kind, and stops at glass as it
 // does at rock - reporting it as w = -2 - t, the normal left zero (the caller
 // takes the face from the block grid). Otherwise it is the same trace.
-export function createReflectTraceTSL(cascades, stopAtGlass = false) {
-  return memoCascades(cascades, stopAtGlass ? 'reflectGlass' : 'reflect', () => Fn(([origin0, dir0, maxDist]) => {
+// sumGlass: the variant for texel GI's rays in a world with glass. It walks
+// through glass as the plain trace does, but steps no further than the
+// nearer surface of either kind and adds up the metres spent inside glass,
+// for the tint of whatever it brings back (glass.js glassRayTransmitTSL).
+// It returns vec4(face code, t, metres in glass, t where it first met glass
+// (-1 never)): the face packed as x + 2y + 4z (giTraceHitTSL unpacks it).
+export function createReflectTraceTSL(cascades, stopAtGlass = false, sumGlass = false) {
+  const readG = stopAtGlass || sumGlass;
+  const key = sumGlass ? 'reflectGlassSum' : stopAtGlass ? 'reflectGlass' : 'reflect';
+  return memoCascades(cascades, key, () => Fn(([origin0, dir0, maxDist]) => {
     const origin = origin0.toVar(), dir = dir0.toVar();
     const dim = float(GRID_DIM);
     const t = float(0).toVar();
     const done = float(0).toVar();
     const out = vec4(0, 0, 0, -1).toVar();
+    const inGlass = sumGlass ? float(0).toVar() : null;
+    const entered = sumGlass ? float(-1).toVar() : null;
     for (const { c } of eachCascade(cascades, float(0))) {
       If(done.equal(float(0)), () => {
         Loop({ start: 0, end: MAX_TRACE_STEPS, type: 'int', condition: '<' }, () => {
@@ -169,9 +179,9 @@ export function createReflectTraceTSL(cascades, stopAtGlass = false) {
              .or(vp.x.greaterThanEqual(dim)).or(vp.y.greaterThanEqual(dim))
              .or(vp.z.greaterThanEqual(dim)), () => { Break(); });
           const at = q => decodeFieldTSL(texture3D(c.tex, ringUV(q, c.ring)).r, c.range);
-          const sample = stopAtGlass ? texture3D(c.tex, ringUV(vp, c.ring)).toVar() : null;
-          const d = (stopAtGlass ? decodeFieldTSL(sample.r, c.range) : at(vp)).toVar();
-          const dG = stopAtGlass ? decodeFieldTSL(sample.g, c.range).toVar() : null;
+          const sample = readG ? texture3D(c.tex, ringUV(vp, c.ring)).toVar() : null;
+          const d = (readG ? decodeFieldTSL(sample.r, c.range) : at(vp)).toVar();
+          const dG = readG ? decodeFieldTSL(sample.g, c.range).toVar() : null;
           if (stopAtGlass) {
             // Only glass the view can show: in battle, glass outside the arena
             // is hidden, as the rock there is (hitBounds) - it is stepped
@@ -203,14 +213,31 @@ export function createReflectTraceTSL(cascades, stopAtGlass = false) {
           });
           // Glass is never a wall to step on: outside it, it is dG away; inside
           // (hidden glass being crossed), its far side is -dG away.
-          const reach = stopAtGlass ? min(d, abs(dG)) : d;
-          t.addAssign(max(reach, float(MIN_STEP)).mul(c.voxel));
+          const reach = readG ? min(d, abs(dG)) : d;
+          const stepM = max(reach, float(MIN_STEP)).mul(c.voxel).toVar();
+          if (sumGlass) {
+            If(dG.lessThan(float(0)), () => {
+              If(entered.lessThan(float(0)), () => { entered.assign(t); });
+              inGlass.addAssign(stepM);
+            });
+          }
+          t.addAssign(stepM);
           If(t.greaterThan(maxDist), () => { done.assign(float(1)); Break(); });
         });
       });
     }
+    if (sumGlass) return vec4(out.x.add(out.y.mul(float(2))).add(out.z.mul(float(4))), out.w, inGlass, entered);
     return out;
-  }).setLayout(layout(stopAtGlass ? 'reflectTraceGlass' : 'reflectTrace', 'vec4', [
+  }).setLayout(layout(sumGlass ? 'giTraceGlass' : stopAtGlass ? 'reflectTraceGlass' : 'reflectTrace', 'vec4', [
     { name: 'origin0', type: 'vec3' }, { name: 'dir0', type: 'vec3' },
     { name: 'maxDist', type: 'float' }])));
+}
+
+// A sumGlass trace's answer as the plain trace gives it - { hit: vec4(face
+// normal, t), glass: vec4(0, 0, metres in glass, entry t) for
+// glassRayTransmitTSL }.
+export function giTraceHitTSL(r) {
+  const code = r.x.toVar();
+  const ax = k => select(abs(code).equal(float(k)), sign(code), float(0));
+  return { hit: vec4(ax(1), ax(2), ax(4), r.y), glass: vec4(0, 0, r.z, r.w) };
 }

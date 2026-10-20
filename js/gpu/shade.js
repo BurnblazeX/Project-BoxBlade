@@ -1,4 +1,4 @@
-import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, cross, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, shiftRight, bitAnd, bitOr, shiftLeft, atomicMax, atomicMin, atomicLoad, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
+import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/boxgrid.js';
 import { SUN_ANGULAR_SIZE } from '../core/sun.js';
 import { BLOCK_METRES } from '../core/world.js';
@@ -7,16 +7,16 @@ import { layout } from './layout.js';
 import { SURFACE_BIAS_VOXELS } from './field.js';
 import { GLASS_LAYERS, GLASS_MAX_BOUNCES, GLASS_WALK_STEPS } from './glass.js';
 import { createReflectTraceTSL } from './trace.js';
-import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, isGlassCodeTSL, partAtTSL } from './volume.js';
+import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, isGlassCodeTSL, partAtTSL, skyOpenTSL } from './volume.js';
 import { boxBumpedNormalTSL, labNormalTSL } from './normals.js';
 import { NO_SKIP, createCardHitTSL } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
-import { AO_DISTANCE, createAOTSL, createSpriteAOTSL, createRevealedLightTSL, lpvHalfCell, lpvSampleTSL } from './ambient.js';
+import { AO_DISTANCE, createAOTSL, createSpriteAOTSL, createRevealedLightTSL, lpvAtTSL, lpvHalfCell } from './ambient.js';
 import { spriteShadeNormalTSL, spriteTexelLockTSL } from './sprite.js';
-import { REFLECT_MAX_DISTANCE, REFLECT_ROUGH_END, REFLECT_ROUGH_START, ROUGH_SPEC, SPEC_MAX, decodeSpecularTSL, fresnelRoughTSL, reflectBouncesUniform, specularTSL } from './specular.js';
+import { REFLECT_MAX_DISTANCE, REFLECT_ROUGH_END, REFLECT_ROUGH_START, ROUGH_SPEC, SPEC_MAX, decodeSpecularTSL, fresnelRoughTSL, reflectBouncesUniform, reflectEscapeUniform, specularTSL } from './specular.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { HIT_FAR_METRES, hitCacheReadTSL, hitCacheWriteTSL } from './hitcache.js';
-import { GI_ANCHORS, GI_CHECK, GI_CLAIMS, GI_DIRS, GI_FILLED, GI_FRESH, GI_LAST, GI_LIST_CAP, GI_SLICES, GI_SLICE_MASK, GI_SLOTS, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, GI_SUM, GI_WORDS, GI_WORD_INDEX, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchLightTSL, patchSideTSL, shPackTSL, shUnpackTSL, texelGILevelTSL } from './texelgi.js';
+import { GI_ANCHORS, GI_CHECK, GI_LAST, GI_LIST_CAP, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchLightTSL, patchSideTSL, texelGILevelTSL, createTexelGIKernels, createPatchRegisterTSL } from './texelgi.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { RAW_VIEWS, SPLIT_VIEWS, surfaceViewTSL } from './debugview.js';
 import { TEXEL_ID_OFFSET, slopeLayerTable } from './texel.js';
@@ -131,7 +131,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     cascades, sunDir: sun.dir, sunTangent: sun.tangent,
     sunBitangent: sun.bitangent, maxDist, coneRadiusUniform: sun.coneRadius,
     rayCount: rays, bayerTex, stepsUniform, biasUniform, cone, quantise,
-    fadeStartUniform, edgeFadeUniform, cards, glass: glassT
+    fadeStartUniform, edgeFadeUniform, cards, glass: glassT, terrain
   }) : () => asColour(float(1));
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
@@ -155,16 +155,30 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // The bounce at a texel, blended across a level step.
   // buf: the read-only table (shading: fresh patches only), or the patch
   // kernel's read-write one (a ray's hit: any).
-  const giRead = texelGI ? (p, n, nS, buf = texelGI.dataRead, fresh = buf === texelGI.dataRead) => {
+  // { light, cov }: cov how much of it the table answered (0 where no patch,
+  // fading out past C2), for the sky ambient to fill the rest.
+  const giRead = texelGI ? (p, n, nS, buf = texelGI.dataRead, fresh = buf === texelGI.dataRead, offFace = false) => {
     const L = giLevel(p);
-    const out = patchLightTSL(texelGI, p, n, nS, L.lvl, buf, fresh).toVar();
+    const a = patchLightTSL(texelGI, p, n, nS, L.lvl, buf, fresh, offFace);
+    const out = a.light.toVar(), cov = a.found.toVar();
     If(L.blend.greaterThan(float(0)), () => {
-      out.assign(mix(out, patchLightTSL(texelGI, p, n, nS, L.next, buf, fresh), L.blend));
+      const b = patchLightTSL(texelGI, p, n, nS, L.next, buf, fresh, offFace);
+      out.assign(mix(out, b.light, L.blend));
+      cov.assign(mix(cov, b.found, L.blend));
     });
-    return out.mul(L.fade);
+    return { light: out.mul(L.fade), cov: cov.mul(L.fade) };
   } : null;
-  const texelBounce = texelGI
-    ? (p, n, nS = n, fresh = true) => giRead(p, n, nS, texelGI.dataRead, fresh).mul(texelGI.strength) : null;
+  // With ab.sky the patches hold the sky (gpu/texelgi.js): the texel GI's
+  // light, and keep - what is left of the sky ambient where it reads them.
+  const abSky = texelGI ? float(texelGI.ab.sky) : null;
+  const texelAmbient = texelGI ? (p, n, nS = n, fresh = true, offFace = false) => {
+    const r = giRead(p, n, nS, texelGI.dataRead, fresh, offFace);
+    return { light: r.light, keep: float(1).sub(abSky.mul(r.cov)) };
+  } : null;
+  // At a hit (p, n its face): the bounce and what is left of the sky ambient -
+  // texel GI's patches, the LPV's light and sky visibility, or neither (null).
+  const hitGI = (p, n) => (texelAmbient ? texelAmbient(p, n)
+    : gi ? lpvAtTSL(gi, p.add(n.mul(float(lpvHalfCell(gi))))) : null);
   // Set inside the split kernels' builds to list the patches their rays land
   // on (reflections, the view through glass) - surfaces never seen directly
   // would have none. null in every other build, as cacheMode is set per build.
@@ -175,16 +189,22 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const occlusion = (p, n, lift, skip, texAO, single = false, nS = null, giAt = null) => {
     // giAt reads any patch, not only fresh ones: the ground under a sprite is
     // often hidden behind the sprite itself, and so not traced.
-    const tg = texelBounce
-      ? texelBounce(giAt ? giAt.p : p, giAt ? giAt.n : n, nS || n, !giAt).mul(texAO).toVar() : null;
-    if (!cones) return { ao: texAO, gi: tg, bent: n };
+    // sky: what is left of the sky ambient (ambientLight's keep).
+    const t = texelAmbient
+      ? texelAmbient(giAt ? giAt.p : p, giAt ? giAt.n : n, nS || n, !giAt, !!giAt) : null;
+    const tg = t ? t.light.mul(texAO).toVar() : null;
+    const sky = t ? t.keep.toVar() : null;
+    if (!cones) return { ao: texAO, gi: tg, bent: n, sky };
     const r = cones(p, n, lift, skip, single || null);
     let vis = aoOn ? r.vis : float(1);
     if (spriteAO) vis = vis.mul(spriteAO(p, skip));
     return {
       ao: vis.mul(texAO).toVar(),
-      gi: tg || (gi ? r.gi.mul(gi.strength).mul(texAO).toVar() : null),
-      bent: aoOn ? r.bent : n
+      // Holding the sky, the patch light takes the cones as its near occlusion.
+      gi: tg ? tg.mul(mix(float(1), vis, abSky)).toVar() : (gi ? r.gi.mul(gi.strength).mul(texAO).toVar() : null),
+      bent: aoOn ? r.bent : n,
+      // The LPV's sky visibility, gathered where the cones ended.
+      sky: sky || (gi ? mix(float(1), r.sky, float(gi.sky)).toVar() : null)
     };
   };
 
@@ -203,10 +223,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const skyIrradiance = d => (sky
     ? skyShTSL(sky, d, true).mul(ambient).mul(sky.gain)
     : vec3(ambient, ambient, ambient));
-  const ambientLight = (bent, ao) => skyIrradiance(bent).mul(ao);
+  const ambientLight = (bent, ao, keep = null) => skyIrradiance(bent).mul(keep ? ao.mul(keep) : ao);
 
   // A revealed face's light: the room's (gpu/ambient.js createRevealedLightTSL).
-  const revealedLight = createRevealedLightTSL(skyIrradiance, gi);
+  const revealedLight = createRevealedLightTSL(skyIrradiance, gi, split && split.room);
   // The sun's DIRECT term alone - sunShadeTSL with its ambient zeroed, so the
   // ambient can come from the sky instead. Scalar.
   const sunDirect = (visible, n, mode) =>
@@ -227,6 +247,15 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // Normal maps on hits reach this far (hitSurfaceTSL): C1's footprint.
   const nearCascade = cascades.length > 1 ? cascades[1] : null;
   const reflectMax = float(REFLECT_MAX_DISTANCE);
+  // What a reflection ray that met nothing sees: the sky - with
+  // reflectEscapeUniform, only if it ended (at its full reach) above its
+  // column's roof (volume.js skyOpenTSL). Indoors, it ran out of reach.
+  const skyMiss = (o, d) => {
+    if (!sky) return vec3(0, 0, 0);
+    if (!terrain || !terrain.skyTop) return skyShTSL(sky, d);
+    const open = skyOpenTSL(terrain, o.add(d.mul(reflectMax)));
+    return skyShTSL(sky, d).mul(mix(float(1), open, float(reflectEscapeUniform)));
+  };
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
   // The sun's light, in the units the diffuse term uses. sunShadeTSL's 'ground'
   // mode divides N.L by a horizontal surface's so the ground reads fully lit
@@ -258,8 +287,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // lambert: a flag node that picks 'lambert' over `mode` at run time, so one
   // call can light either a block or a sprite (shadeTraced).
   const hitLight = (p, n, lift, skip, mode, nS = n, ao = null, lambert = null) => {
+    const tb = hitGI(p, n);
     const light = skyIrradiance(nS).toVar();
     if (ao) light.mulAssign(ao);
+    if (tb) light.mulAssign(tb.keep);
     if (sunOn) {
       const vis = sunVisZero();
       If(n.dot(sun.dir).greaterThan(float(0)), () => {
@@ -272,10 +303,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     }
     // Lifted along `lift` as the sun's ray is; N.L against the hit's normal.
     if (pointLight) light.addAssign(pointLight(p, lift, skip, nS));
-    if (gi) {
-      light.addAssign(lpvSampleTSL(gi, p.add(n.mul(float(lpvHalfCell(gi)))))
-                        .mul(gi.strength));
-    } else if (texelBounce) light.addAssign(texelBounce(p, n));
+    if (tb) light.addAssign(tb.light);
     return light;
   };
 
@@ -321,7 +349,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   let cacheMode = 'none';
   const traceRecord = (origin, dir, hit, direct = null, rec = newHitRecord()) => {
     // A miss sees the sky - the same SH the background draws.
-    rec.col.assign(sky ? skyShTSL(sky, dir) : vec3(0, 0, 0));
+    rec.col.assign(skyMiss(origin, dir));
     const sp = spriteHit
       ? spriteHit(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, reflectMax))
       : null;
@@ -402,7 +430,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const hit = reflectTrace(origin, r, reflectMax).toVar();
       const hitAt = origin.add(r.mul(max(hit.w, float(0)))).toVar();
       // A miss, until a block says otherwise: the sky, and nothing further.
-      base.assign(sky ? skyShTSL(sky, r) : vec3(0, 0, 0));
+      base.assign(skyMiss(origin, r));
       spec.assign(vec4(...ROUGH_SPEC));
       d.assign(r);
       If(hit.w.greaterThanEqual(float(0)).and(inHitBoundsTSL(hitAt.sub(hit.xyz.mul(float(VOXEL_METRES * 0.5))))), () => {
@@ -411,14 +439,15 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         const hs = hitSurfaceTSL(terrain, hp, nh, nearCascade);
         p.assign(hp); n.assign(nh); nS.assign(hs.n); alb.assign(hs.albedo); spec.assign(hs.spec);
         const lightIt = () => {
+          const tb = hitGI(hp, nh);
           const light = skyIrradiance(hs.n).mul(hs.ao).toVar();
+          if (tb) light.mulAssign(tb.keep);
           if (sunOn) {
             const vis = sunVisZero();
             If(nh.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(hp, nh, NO_SKIP)); });
             light.addAssign(sunColourUniform.mul(sunDirect(vis, hs.n, shadeMode)));
           }
-          if (gi) light.addAssign(lpvSampleTSL(gi, hp.add(nh.mul(float(lpvHalfCell(gi))))).mul(gi.strength));
-          else if (texelBounce) light.addAssign(texelBounce(hp, nh));
+          if (tb) light.addAssign(tb.light);
           base.assign(hs.albedo.mul(light));
         };
         lightIt();
@@ -439,17 +468,15 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const composeHit = (rec, vis, diff) => {
     const out = rec.col.toVar();
     If(rec.met.greaterThan(float(0.5)), () => {
+      const tb = hitGI(rec.P, rec.N);
       const light = skyIrradiance(rec.nS).toVar();
-      light.mulAssign(rec.ao);
+      light.mulAssign(tb ? rec.ao.mul(tb.keep) : rec.ao);
       if (sunOn) {
         light.addAssign(sunColourUniform.mul(select(rec.lambert.greaterThan(float(0.5)),
           sunDirect(vis, rec.nS, 'lambert'), sunDirect(vis, rec.nS, shadeMode))));
       }
       if (pointLight) light.addAssign(diff);
-      if (gi) {
-        light.addAssign(lpvSampleTSL(gi, rec.P.add(rec.N.mul(float(lpvHalfCell(gi)))))
-                          .mul(gi.strength));
-      } else if (texelBounce) light.addAssign(texelBounce(rec.P, rec.N));
+      if (tb) light.addAssign(tb.light);
       out.assign(rec.alb.mul(light));
     });
     if (!nestedReflect) return out;
@@ -553,7 +580,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // too rough to see through shows, and where a ray's budget ran out.
   const ambientAt = (q, dirq) => {
     const a = skyIrradiance(dirq).toVar();
-    if (gi) a.addAssign(lpvSampleTSL(gi, q).mul(gi.strength));
+    if (gi) {
+      const l = lpvAtTSL(gi, q);
+      a.assign(a.mul(l.keep).add(l.light));
+    }
     return a;
   };
 
@@ -770,8 +800,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         // radiance - that is a bright light the ray never reached - but the
         // ambient around it: sky irradiance along the last direction, plus the
         // bounce where it stopped.
-        pre.assign(skyIrradiance(outD));
-        if (gi) pre.addAssign(lpvSampleTSL(gi, outO).mul(gi.strength));
+        pre.assign(ambientAt(outO, outD));
       });
     return { rec, need, pre, sO, sD, exitW, smoothW, absorb };
   } : null;
@@ -907,7 +936,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const base = albedo && st ? albedo(st, face).toVar() : vec3(1, 1, 1);
     // The debug views that need no light; the light-term views below show the
     // term raw, not times the albedo.
-    const shown = view && surfaceViewTSL(view, { p, n, nS, base,
+    const shown = view && surfaceViewTSL(view, { p, n, nS, base, terrain,
       specular: terrain && (() => sample(terrain.specular).rgb) }, cascades);
     if (shown) return shown;
     // Traced AO times the texture's own. The hemisphere is the geometric face,
@@ -920,7 +949,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
     // The sky ambient, along the bent normal - bent further by the normal
     // map, so the bumps catch the sky as they catch the sun.
-    const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao).toVar();
+    const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao, occ.sky).toVar();
 
     // The mirror light alone - not in the GI view, as it never goes through the LPV.
     if (view === 'mirror') return mirrorTrace ? mirrorLight(p, n, nS, n) : vec3(0, 0, 0);
@@ -1159,65 +1188,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const l = readLight(idx);
       writeLight(idx, l.env, l.spec.add(c));
     };
-    // Texel GI: list this sample's patch for the patch kernel (createTexelGI).
-    // p locked on a box face, n its axis normal.
-    const registerLevel = (p, n, lvl) => {
-      const { t, ax, e1, e2 } = faceFrameTSL(p, n);
-      const side = patchSideTSL(lvl);
-      const pmin = t.add(floor(t.div(side)).mul(side).sub(t).mul(vec3(1, 1, 1).sub(ax))).toVar();
-      // This texel within the patch, and how far from its centre (doubled, squared).
-      const ta = t.sub(pmin).dot(e1), tb = t.sub(pmin).dot(e2);
-      const da = ta.mul(float(2)).sub(side.sub(float(1))), db = tb.mul(float(2)).sub(side.sub(float(1)));
-      const anchor = bitOr(shiftLeft(uint(da.mul(da).add(db.mul(db))), uint(8)),
-                           uint(ta.mul(float(16)).add(tb))).toVar();
-      const face = faceIndexTSL(n).toVar();
-      const key = patchKeyTSL(pmin, face, lvl);
-      const mine = key.check;
-      const done = int(0).toVar();
-      const q = texelGI.queue, R = texelGI.dataRead;
-      // The slot to stamp first: the one this patch holds; else a free or
-      // stale one; else the first. Owners keep their slots, so two patches on
-      // one slot no longer race for it (and lose their light) every frame.
-      const [s1, s2] = key.slots;
-      const own = k => R.element(k.mul(int(GI_STRIDE)).add(int(GI_CHECK)));
-      const open = k => own(k).equal(uint(0)).or(
-        texelGI.frame.sub(R.element(k.mul(int(GI_STRIDE)).add(int(GI_LAST)))).greaterThan(uint(GI_STALE_FRAMES)));
-      const secondFirst = own(s2).equal(mine).or(own(s1).notEqual(mine).and(open(s1).not()).and(open(s2)));
-      const first = select(secondFirst, s2, s1).toVar(), other = select(secondFirst, s1, s2).toVar();
-      for (const slot of [first, other]) {
-        If(done.equal(int(0)), () => {
-          // Through int(), as the miss list's atomicAdd: uint() of a uint is
-          // no conversion at all, and the atomic's old value was lost - every
-          // sample listed its patch again (108k a frame, the list overflowed).
-          const old = uint(int(atomicMax(q.element(int(GI_STAMPS).add(slot)), mine))).toVar();
-          // Listed already (by this patch): done. Free, or held by a lower
-          // check: list it. Held by a higher one: the next probe.
-          If(old.equal(mine), () => {
-            atomicMin(q.element(int(GI_ANCHORS).add(slot)), anchor);
-            done.assign(int(1));
-          })
-            .ElseIf(old.lessThan(mine), () => {
-              atomicMin(q.element(int(GI_ANCHORS).add(slot)), anchor);
-              const at = int(atomicAdd(q.element(int(0)), uint(1))).toVar();
-              If(at.lessThan(int(GI_LIST_CAP)), () => {
-                const e = int(1).add(at.mul(int(4)));
-                atomicStore(q.element(e), bitOr(bitOr(uint(slot), shiftLeft(face, uint(20))), shiftLeft(lvl, uint(24))));
-                atomicStore(q.element(e.add(int(1))), uint(int(pmin.x)));
-                atomicStore(q.element(e.add(int(2))), uint(int(pmin.y)));
-                atomicStore(q.element(e.add(int(3))), uint(int(pmin.z)));
-              });
-              done.assign(int(1));
-            });
-        });
-      }
-    };
-    // p's patch, and in a blend band the next level's as well.
-    const registerPatch = (p, n) => {
-      const L = giLevel(p);
-      registerLevel(p, n, L.lvl);
-      If(L.blend.greaterThan(float(0)), () => registerLevel(p, n, L.next));
-    };
+    // Texel GI: list this sample's patch for the patch kernel (gpu/texelgi.js
+    // createPatchRegisterTSL) - p locked on a box face, n its axis normal.
+    const registerPatch = texelGI ? createPatchRegisterTSL(texelGI, giLevel) : null;
     splitKernels = [];
+    // The room meter's tap (gpu/roommeter.js): each kernel's diffuse light.
+    const roomTap = split.room ? split.room.tap(terrain) : null;
     // Glowing cubes are a kernel case unless legacy (then they are misses).
     const unlessGlowing = (S, fn) => (splitLegacy ? fn() : If(S.emissive.lessThan(float(0.5)), fn));
     splitKernels.push(kernel('splitBase', (idx, s, geo) => {
@@ -1234,7 +1210,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         else registerPatch(p, n);
       }
       const occ = occlusion(p, n, n, NO_SKIP, S.texAO, false, S.nS);
-      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao);
+      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao, occ.sky);
       if (view) {
         // The bounce views: the split kernels stay on for them, so it is traced.
         const bounce = occ.gi || vec3(0, 0, 0);
@@ -1254,6 +1230,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       }
       split.result.rw.element(idx).assign(vec4(S.base.mul(light).mul(S.kd), s.w));
       writeLight(idx, env, sunSpec);
+      if (roomTap) roomTap(idx, p, n, light, true);
       });
     }, (idx, s, terrainSample) => {
       // Glass (negative id): its own kernels below, or - without them - its
@@ -1269,11 +1246,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         const { p, n } = geo;
         const S = surfaceAt(geo);
         unlessGlowing(S, () => {
-        if (spec) {
-          const pl = pointLight.withSpecular(p, n, NO_SKIP, S.nS, S.brdf);
-          addResult(idx, S.base.mul(pl.diffuse).mul(S.kd));
-          addSpec(idx, pl.spec);
-        } else addResult(idx, S.base.mul(pointLight(p, n, NO_SKIP, S.nS)));
+        const pl = spec ? pointLight.withSpecular(p, n, NO_SKIP, S.nS, S.brdf)
+                        : { diffuse: pointLight(p, n, NO_SKIP, S.nS).toVar(), spec: null };
+        addResult(idx, spec ? S.base.mul(pl.diffuse).mul(S.kd) : S.base.mul(pl.diffuse));
+        if (pl.spec) addSpec(idx, pl.spec);
+        if (roomTap) roomTap(idx, p, n, pl.diffuse);
         });
       }));
     }
@@ -1282,7 +1259,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         const { p, n } = geo;
         const S = surfaceAt(geo);
         unlessGlowing(S, () => {
-          addResult(idx, S.base.mul(mirrorLight(p, n, S.nS, n)).mul(S.kd));
+          const m = mirrorLight(p, n, S.nS, n).toVar();
+          addResult(idx, S.base.mul(m).mul(S.kd));
+          if (roomTap) roomTap(idx, p, n, m);
         });
       }));
     }
@@ -1439,7 +1418,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const texAO = shade.ao.toVar();
     const out = vec3(0, 0, 0).toVar();
     If(drawn, () => {
-      const shown = view && surfaceViewTSL(view, { p, n, nS, base: vec3(1, 1, 1), specular: null }, cascades);
+      const shown = view && surfaceViewTSL(view, { p, n, nS, base: vec3(1, 1, 1), specular: null, terrain }, cascades);
       if (shown) { out.assign(shown); return; }
       if (view === 'reflection' || view === 'highlights') return;   // a sprite has no specular
       // Over the shading normal's hemisphere - a billboard has no geometric
@@ -1458,7 +1437,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       // A sprite by a mirror catches its glare too, sun or lamp. Lifted
       // straight up, as the sprite's own rays are.
       const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n, skip) : null;
-      const amb0 = ambientLight(occ.bent, ao);
+      const amb0 = ambientLight(occ.bent, ao, occ.sky);
       const amb = mirrored ? amb0.add(mirrored) : amb0;
       if (view === 'indirect') { out.assign(plusGI(amb)); return; }
       if (!sunOn) {
@@ -1482,176 +1461,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // Under a debug view glass is shaded as any block is: the view shows that
   // term at its surface, not glass's own look. glassView is glass's own views.
   const terrainView = !!view;
-  // --- Texel GI's patch kernel: each listed patch traces this frame's slice ---
-  // (createTexelGI). reset empties the list before the split kernels fill it;
-  // patches runs after them. Reads and writes the table through its
-  // read-write binding only - a dispatch may not bind one buffer both ways.
-  let giKernels = null;
-  if (texelGI && splitKernels) {
-    const giTrace = reflectTrace || createReflectTraceTSL(cascades);
-    const q = texelGI.queue, D = texelGI.data;
-    const reset = Fn(() => {
-      const i = int(instanceIndex);
-      atomicStore(q.element(int(GI_STAMPS).add(i)), uint(0));
-      atomicStore(q.element(int(GI_ANCHORS).add(i)), uint(0xffffffff));
-      If(i.equal(int(0)), () => {
-        atomicStore(q.element(int(0)), uint(0));
-        atomicStore(q.element(int(GI_CLAIMS)), uint(0));
-      });
-    })().compute(GI_SLOTS).setName('giPatchReset');
-    // A listed patch: { slot, face, pmin, key, mine } - mine only where the
-    // slot's stamp is this patch's (a higher check took it otherwise).
-    const listed = i => {
-      const e = int(1).add(i.mul(int(4))).toVar();
-      const w0 = atomicLoad(q.element(e)).toVar();
-      const slot = int(bitAnd(w0, uint(0xfffff))).toVar();
-      const face = bitAnd(shiftRight(w0, uint(20)), uint(15)).toVar();
-      const lvl = bitAnd(shiftRight(w0, uint(24)), uint(3)).toVar();
-      const pmin = vec3(float(int(atomicLoad(q.element(e.add(int(1)))))),
-                        float(int(atomicLoad(q.element(e.add(int(2)))))),
-                        float(int(atomicLoad(q.element(e.add(int(3))))))).toVar();
-      const key = patchKeyTSL(pmin, face, lvl);
-      const mine = atomicLoad(q.element(int(GI_STAMPS).add(slot))).equal(key.check);
-      return { slot, face, lvl, pmin, key, mine };
-    };
-    const patches = Fn(() => {
-      const i = int(instanceIndex).toVar();
-      const count = min(int(atomicLoad(q.element(int(0)))), int(GI_LIST_CAP));
-      If(i.lessThan(count), () => {
-        const { slot, face, lvl, pmin, key, mine } = listed(i);
-        If(mine, () => {
-          const fi = int(face), axis = fi.div(int(2));
-          const sgn = select(fi.mod(int(2)).equal(int(0)), float(1), float(-1));
-          const n = vec3(select(axis.equal(int(0)), sgn, float(0)), select(axis.equal(int(1)), sgn, float(0)),
-                         select(axis.equal(int(2)), sgn, float(0))).toVar();
-          const ax = abs(n).toVar();
-          const qm = float(VOXEL_METRES);
-          // The anchor texel's centre on the face (GI_ANCHORS) - the patch's
-          // own centre only if no texel offered one.
-          const e1 = vec3(float(1).sub(ax.x), ax.x, float(0)), e2 = vec3(float(0), ax.z, float(1).sub(ax.z));
-          const anc = atomicLoad(q.element(int(GI_ANCHORS).add(slot))).toVar();
-          const half = patchSideTSL(lvl).mul(float(0.5)).sub(float(0.5));
-          const noAnchor = anc.equal(uint(0xffffffff)).or(texelGI.ab.anchor.equal(int(0)));
-          const ta = select(noAnchor, half, float(bitAnd(shiftRight(anc, uint(4)), uint(15))));
-          const tb = select(noAnchor, half, float(bitAnd(anc, uint(15))));
-          const pc = pmin.add(ax.mul(float(0.5))).add(e1.mul(ta.add(float(0.5)))).add(e2.mul(tb.add(float(0.5))))
-                       .mul(qm).add(n.mul(qm.mul(float(0.5)))).toVar();
-          const helper = select(ax.y.lessThan(float(0.5)), vec3(0, 1, 0), vec3(1, 0, 0));
-          const T = normalize(cross(helper, n)).toVar();
-          const B = cross(n, T).toVar();
-          const origin = pc.add(n.mul(bias.mul(qm))).toVar();
-          const base = slot.mul(int(GI_STRIDE)).toVar();
-          // A slot newly this patch's: no slices yet (the sum kernel rewrites
-          // the sum this frame, so nothing needs clearing).
-          If(D.element(base.add(int(GI_CHECK))).notEqual(key.check), () => {
-            D.element(base.add(int(GI_CHECK))).assign(key.check);
-            D.element(base.add(int(GI_FILLED))).assign(uint(GI_FRESH));
-            atomicAdd(q.element(int(GI_CLAIMS)), uint(1));
-          });
-          D.element(base.add(int(GI_LAST))).assign(texelGI.frame);
-          const state = D.element(base.add(int(GI_FILLED))).toVar();
-          const have = bitAnd(state, uint(GI_SLICE_MASK)).toVar();
-          const next = int(bitAnd(shiftRight(state, uint(16)), uint(GI_SLICES - 1))).toVar();
-          // The next slice in turn - and, for a patch new to the table, every
-          // slice it lacks: it starts at the full GI_DIRS-ray answer instead of
-          // one slice scaled up (8 rays: a rough guess that refined over the
-          // next frames, and shimmered wherever patches were new).
-          Loop({ start: int(0), end: int(GI_SLICES), type: 'int', condition: '<', name: 'gsl' }, ({ gsl }) => {
-          If(gsl.equal(next).or(bitAnd(have, shiftLeft(uint(1), uint(gsl))).equal(uint(0))), () => {
-          const sl = gsl;
-          const c = [0, 1, 2].map(() => vec3(0, 0, 0).toVar());
-          Loop({ start: int(0), end: int(GI_DIRS / GI_SLICES), type: 'int', condition: '<', name: 'gk' }, ({ gk }) => {
-            const d = texelGI.dirs.element(sl.add(gk.mul(int(GI_SLICES))));
-            const dir = normalize(T.mul(d.x).add(B.mul(d.y)).add(n.mul(d.z))).toVar();
-            const hit = giTrace(origin, dir, texelGI.reach).toVar();
-            const hitAt = origin.add(dir.mul(max(hit.w, float(0)))).toVar();
-            const L = vec3(0, 0, 0).toVar();
-            If(hit.w.greaterThanEqual(float(0)).and(inHitBoundsTSL(hitAt.sub(hit.xyz.mul(float(VOXEL_METRES * 0.5))))), () => {
-              const ht = hitTexelTSL(terrain, hitAt, hit.xyz, dir);
-              const hp = ht.p.toVar(), nh = ht.n.toVar();
-              const hs = hitSurfaceTSL(terrain, hp, nh, null);
-              If(hs.emissive.greaterThan(float(0.5)), () => { L.assign(hs.raw); }).Else(() => {
-                const light = skyIrradiance(nh).toVar();
-                if (sunOn) {
-                  const vis = sunVisZero();
-                  If(nh.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(hp, nh, NO_SKIP)); });
-                  light.addAssign(sunColourUniform.mul(sunDirect(vis, nh, shadeMode)));
-                }
-                // The light list WITH its shadows, as the surface itself is lit
-                // on screen (the shadow budget). Unshadowed, a lamp behind a
-                // wall lit the ground in front of it at the hit, and that
-                // bounced onto every face round the wall: light through walls.
-                if (pointLight) {
-                  const mode = select(texelGI.ab.hitShadows.equal(int(1)), float(0), float(2));
-                  light.addAssign(pointLight.withSpecular(hp, nh, NO_SKIP, nh, null, mode));
-                }
-                light.addAssign(giRead(hp, nh, nh, D));
-                // What it bounces: its diffuse share, (1 - F)(1 - metal) of its
-                // albedo - none for a metal, whose albedo is its F0 - plus the
-                // specular share F, but only the part too rough for the mirror
-                // light when that is on (it throws the smooth part itself, and
-                // counting it here too was double). As the LPV's blockBounce.
-                const sd = decodeSpecularTSL(hs.spec, hs.raw);
-                const F = fresnelRoughTSL(sd.f0, max(nh.dot(dir.negate()), float(1e-4)), sd.alpha).toVar();
-                const kd = vec3(1, 1, 1).sub(F).mul(float(1).sub(sd.metal));
-                const specShare = mirrorTrace
-                  ? F.mul(smoothstep(float(REFLECT_ROUGH_START), float(REFLECT_ROUGH_END), sd.alpha)) : F;
-                L.assign(light.mul(select(texelGI.ab.physical.equal(int(1)), hs.raw.mul(kd).add(specShare), hs.raw)));
-              });
-            });
-            c[0].addAssign(L.mul(dir.x));
-            c[1].addAssign(L.mul(dir.y));
-            c[2].addAssign(L.mul(dir.z));
-          });
-          // Uniform over the hemisphere: each ray stands for 2 pi / GI_DIRS sr.
-          const wq = float(2 * Math.PI / GI_DIRS);
-          const packed = shPackTSL(c.map(x => x.mul(wq)));
-          const sb = base.add(sl.mul(int(GI_WORDS))).toVar();
-          packed.forEach((w, k) => D.element(sb.add(int(k))).assign(w));
-          });
-          });
-          D.element(base.add(int(GI_FILLED))).assign(bitOr(bitOr(uint(GI_SLICE_MASK), bitAnd(state, uint(GI_FRESH))),
-            shiftLeft(bitAnd(uint(next.add(int(1))), uint(GI_SLICES - 1)), uint(16))));
-        });
-      });
-    })().compute(GI_LIST_CAP).setName('giPatches');
-    // Each listed patch's slices summed - after the patch kernel, so its rays
-    // read only sums no thread is writing.
-    const sums = Fn(() => {
-      const i = int(instanceIndex).toVar();
-      const count = min(int(atomicLoad(q.element(int(0)))), int(GI_LIST_CAP));
-      If(i.lessThan(count), () => {
-        const { slot, key, mine } = listed(i);
-        If(mine.and(D.element(slot.mul(int(GI_STRIDE)).add(int(GI_CHECK))).equal(key.check)), () => {
-          const base = slot.mul(int(GI_STRIDE)).toVar();
-          const filled = bitAnd(D.element(base.add(int(GI_FILLED))), uint(GI_SLICE_MASK)).toVar();
-          // The sum of every slice traced so far, scaled up while some are
-          // still missing (a patch new to the table).
-          const sum = [0, 1, 2].map(() => vec3(0, 0, 0).toVar());
-          const have = float(0).toVar();
-          Loop({ start: int(0), end: int(GI_SLICES), type: 'int', condition: '<', name: 'gs' }, ({ gs }) => {
-            If(bitAnd(filled, shiftLeft(uint(1), uint(gs))).notEqual(uint(0)), () => {
-              const o = base.add(gs.mul(int(GI_WORDS))).toVar();
-              const v = shUnpackTSL(GI_WORD_INDEX.map(k => D.element(o.add(int(k)))));
-              for (let k = 0; k < 3; k++) sum[k].addAssign(v[k]);
-              have.addAssign(float(1));
-            });
-          });
-          const scale = float(GI_SLICES).div(max(have, float(1)));
-          // Shown: smoothed toward the new sum by blend (the response time) -
-          // or the new sum itself while the patch is fresh.
-          const state = D.element(base.add(int(GI_FILLED))).toVar();
-          const fresh = bitAnd(state, uint(GI_FRESH)).notEqual(uint(0));
-          const a = select(fresh, float(1), texelGI.blend).toVar();
-          const old = shUnpackTSL(GI_WORD_INDEX.map(k => D.element(base.add(int(GI_SUM + k)))));
-          const out = shPackTSL(sum.map((x, k) => mix(old[k], x.mul(scale), a)));
-          out.forEach((w, k) => D.element(base.add(int(GI_SUM + k))).assign(w));
-          D.element(base.add(int(GI_FILLED))).assign(bitAnd(state, uint(~GI_FRESH >>> 0)));
-        });
-      });
-    })().compute(GI_LIST_CAP).setName('giSums');
-    giKernels = { reset, patches, sums };
-  }
+  // Texel GI's patch kernels (gpu/texelgi.js createTexelGIKernels), lit as
+  // the shading lights a reflection hit.
+  const giKernels = texelGI && splitKernels ? createTexelGIKernels({
+    texelGI, cascades, terrain, trace: reflectTrace, glass: glassT, bias, sky, ambient, shadeMode, sun,
+    sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead }) : null;
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
            glassNode: terrainView ? node : glassNode, sun, cascades, lights,

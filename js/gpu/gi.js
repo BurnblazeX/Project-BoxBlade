@@ -10,16 +10,17 @@ import { glassRayTransmitTSL } from './glass.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { sunColourUniform, skyShTSL } from './sky.js';
-import { createSunUniforms } from './sun.js';
+import { createSunUniforms, sunRoofTSL } from './sun.js';
 import { createConeTraceSunTSL } from './trace.js';
-import { volumeAtTSL } from './volume.js';
+import { volumeAtTSL, skyOpenTSL } from './volume.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { GI_LAYERS } from '../core/models.js';
 // One entry per material, then per model (models.js giIndex).
 const GI_TABLE = Array.from({ length: GI_LAYERS });
 import {
   LPV_DIM, LPV_CELL_VOXELS, FACE_DIRS, SOLID_THRESHOLD,
-  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES
+  DEFAULT_LPV_SPREAD, DEFAULT_LPV_SLICES, MAX_GI_SPRITES, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
+  DEFAULT_LPV_SKY_SPREAD
 } from '../core/lpv.js';
 
 // --- The LPV on the GPU: solid, inject, propagate, resolve ---
@@ -28,11 +29,15 @@ import {
 // buffers and one 3D texture:
 //
 //   solid   float   how much of each cell is geometry        every frame
-//   E       vec4    injected light (rgb)                     one slice a frame
+//   E       vec4    injected light (rgb); w 1 if the cell is  one slice a frame
+//                   air open to the sky (core/skytop.js)
 //   W       vec4    what a cell's surfaces bounce (albedo)   one slice a frame
 //   A, B    vec4    propagated light, ping-ponged            N iterations a frame
-//                   - GI_MAX_BOUNCES orders of it, order k at k * CELLS
+//                   - GI_MAX_BOUNCES orders of it, order k at k * CELLS;
+//                   order 0's w the cell's sky visibility (lpv.js
+//                   propagateSkyStep)
 //   tex     RGBA16F what the shading pass samples, trilinear  every frame
+//                   - rgb the light, a the sky visibility
 //
 // The texture is written by a resolve pass that DILATES into solid cells: a
 // solid cell takes the mean of its air neighbours. The surfaces the shading pass
@@ -58,9 +63,10 @@ function neighbour(c, dx, dy, dz, D) {
   return { inside, index: select(inside, n, c.i) };
 }
 
-// level: which cascade the volume lies over. C0 gives 0.75 m cells over 18 m,
-// C1 1.5 m cells over 36 m - the same 24^3 and six voxels a cell either way,
-// because each cascade is the same 144^3 at a doubled voxel size.
+// level: which cascade the volume lies over. At res 1, 24^3 cells of six of
+// its voxels: C0 0.75 m cells over 18 m, C1 1.5 m over 36 m, C2 3 m over 72 m
+// - each cascade is the same 144^3 at a doubled voxel size. lpv.js
+// LPV_VOLUMES picks the levels and res (C1 and C2, at res 2).
 // sky: the sky SH bindings (sky.js createSkyBindings), with ambientUniform its
 // scale. blocks: render.js's block-material volume, so a probe hit bounces its
 // own block's albedo. Either may be null, and the old behaviour stands.
@@ -73,7 +79,11 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
                             orders: orderCount = GI_MAX_BOUNCES,
                             fadeStartUniform = null, edgeFadeUniform = null,
                             sky = null, ambientUniform = null, blocks = null,
-                            glass = false, terrain = null, mirrors = null }) {
+                            glass = false, terrain = null, mirrors = null, skyAB = null }) {
+  // skyAB: an int uniform - 1, the sky visibility (lpv.js propagateSkyStep)
+  // also stands in for the injection's sky cone; 0, the cone as before. The
+  // visibility itself is always propagated: it is a lane of math the kernels
+  // run anyway, and the shading decides whether to use it.
   // terrain: the terrain textures, for the mirror light's texels (with mirrors,
   // the mirror bindings) - see the injection below. Either null: no mirror bounce.
   const cascade = cascades[level];
@@ -171,8 +181,13 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     spriteFill: uniformArray(new Array(MAX_GI_SPRITES).fill(0), 'float')
       .setName(`bxbLpvSpriteFill`),
     spriteCount: uniform(int(0)),
-    skyGain: uniform(float(1))
+    skyGain: uniform(float(1)),
+    // The share of its neighbours' sky a roofed cell keeps (propagateSkyStep).
+    skySpread: uniform(float(DEFAULT_LPV_SKY_SPREAD))
   };
+  const skyOn = skyAB ? skyAB.equal(int(1)) : null;
+  // Air open to the sky - every air cell without the sky-top map.
+  const skyOpenAt = p => (terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1));
   const ambient = ambientUniform || uniform(float(0.17));
   const sun = createSunUniforms(new THREE.Vector3(0, 1, 0));
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
@@ -295,7 +310,8 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   const giSunShadow = (p, n) => {
     const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
     const traced = coneTrace(origin, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
-    return glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir).mul(traced.x) : traced.x;
+    const vis = traced.x.mul(sunRoofTSL(terrain, origin, sun.dir, sunReach));
+    return glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir).mul(vis) : vis;
   };
   const mirrorLight = terrain && mirrors
     ? createMirrorLightTSL({ cascades, terrain, mirrors, lights, sun, sunShadow: giSunShadow,
@@ -343,18 +359,26 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
                                        fadeStart, edgeFade).toVar();
               const through = glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir)
                                     : vec3(1, 1, 1);
-              sunLit.assign(through.mul(traced.x.mul(ndotl).mul(u.sunGain)));
+              sunLit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, origin, sun.dir, sunReach))
+                                               .mul(ndotl).mul(u.sunGain)));
             });
             const lit = sunColourUniform.mul(sunLit).add(pointLights(p, n, NO_SKIP, n)).toVar();
             // Sky light the surface reflects: its sky irradiance, as the
             // shading pass computes it, times how much sky it can see. Not the
             // sky itself - that is the per-fragment ambient already, and
             // injecting it would count it twice.
+            // With skyAB, the visibility is this cell's own (last frame's),
+            // and no cone is marched.
             if (sky) {
               If(n.y.greaterThan(float(-0.5)), () => {
-                const origin = p.add(n.mul(bias.mul(c0.voxel))).toVar();
-                const up = normalize(n.add(vec3(0, 1, 0)));
-                const vis = coneTrace(origin, up, SKY_REACH, SKY_CONE, fadeStart, edgeFade).x;
+                const vis = float(0).toVar();
+                const cone = () => {
+                  const origin = p.add(n.mul(bias.mul(c0.voxel))).toVar();
+                  const up = normalize(n.add(vec3(0, 1, 0)));
+                  vis.assign(coneTrace(origin, up, SKY_REACH, SKY_CONE, fadeStart, edgeFade).x);
+                };
+                if (skyOn) If(skyOn, () => { vis.assign(A.element(c.i).w); }).Else(cone);
+                else cone();
                 lit.addAssign(skyShTSL(sky, n, true).mul(ambient).mul(u.skyGain).mul(vis));
               });
             }
@@ -384,14 +408,15 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
           // as the sun's horizontal share - bright at a low sun, dim overhead.
           const facing = length(vec2(sun.dir.x, sun.dir.z));
           const vis = coneTrace(A.xyz, sun.dir, sunReach, sun.coneRadius,
-                                fadeStart, edgeFade).x;
+                                fadeStart, edgeFade).x.mul(sunRoofTSL(terrain, A.xyz, sun.dir, sunReach));
           const light = sunColourUniform.mul(vis.mul(facing).mul(u.sunGain)).toVar();
           if (sky) light.addAssign(skyShTSL(sky, vec3(0, 1, 0), true).mul(ambient)
                                      .mul(u.skyGain).mul(float(0.5)));
           spriteE.addAssign(B.xyz.mul(light).mul(w));
         });
       });
-      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE), 0));
+      const open = select(air, skyOpenAt(centre), float(0));
+      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE), open));
       W.element(c.i).assign(vec4(bounceW.div(float(6)), 0));
     });
   })().compute(CELLS).setName(`LPV.Inject`);
@@ -413,13 +438,22 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
                w: select(nb.inside, float(1).sub(solid.element(nb.index)), open).toVar() };
     });
     const rebounce = W.element(c.i).xyz.mul(float(1).sub(u.spread)).toVar();
+    // Sky visibility, order 0's w (lpv.js propagateSkyStep): 1 open to the
+    // sky, else the mean of its air neighbours' less a share; glass passes
+    // its tint's mean.
+    const vsum = float(0).toVar(), vw = float(0).toVar();
+    for (const nb of nbs) { vsum.addAssign(src.element(nb.index).w.mul(nb.w)); vw.addAssign(nb.w); }
+    const seen = select(E.element(c.i).w.greaterThan(float(0.5)), float(1),
+                        u.skySpread.mul(vsum).div(max(vw, float(1e-4))));
+    const vis = seen.mul(T ? keep.dot(vec3(1 / 3, 1 / 3, 1 / 3)) : open).toVar();
     Loop({ start: int(0), end: u.bounces, type: 'int', condition: '<', name: 'order' }, ({ order }) => {
       const base = order.mul(int(CELLS)).toVar();
       const sum = vec3(0, 0, 0).toVar();
       for (const nb of nbs) sum.addAssign(src.element(base.add(nb.index)).xyz.mul(nb.w));
       const prev = max(base.sub(int(CELLS)), int(0)).add(c.i);
       const emit = select(order.equal(int(0)), E.element(c.i).xyz, src.element(prev).xyz.mul(rebounce));
-      dst.element(base.add(c.i)).assign(vec4(emit.add(sum.mul(u.spread.div(float(6)))).mul(keep), 0));
+      dst.element(base.add(c.i)).assign(vec4(emit.add(sum.mul(u.spread.div(float(6)))).mul(keep),
+                                             select(order.equal(int(0)), vis, float(0))));
     });
   })().compute(CELLS).setName(`LPV.Propagate`);
   const aToB = propagate(A, B), bToA = propagate(B, A);
@@ -438,20 +472,27 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     const own = totalAt(c.i).toVar();
     const isSolid = solid.element(c.i).greaterThanEqual(float(SOLID_THRESHOLD));
     const outc = own.toVar();
+    const outv = A.element(c.i).w.toVar();
     If(isSolid, () => {
       const sum = vec3(0, 0, 0).toVar();
+      const vsum = float(0).toVar();
       const wsum = float(0).toVar();
       for (const [dx, dy, dz] of FACE_DIRS) {
         const nb = neighbour(c, dx, dy, dz, D);
         const w = select(nb.inside, float(1).sub(solid.element(nb.index)), float(0));
-        If(w.greaterThan(float(0)), () => { sum.addAssign(totalAt(nb.index).mul(w)); });
+        If(w.greaterThan(float(0)), () => {
+          sum.addAssign(totalAt(nb.index).mul(w));
+          vsum.addAssign(A.element(nb.index).w.mul(w));
+        });
         wsum.addAssign(w);
       }
       outc.assign(select(wsum.greaterThan(float(0)), sum.div(max(wsum, float(1e-6))), own));
+      outv.assign(select(wsum.greaterThan(float(0)), vsum.div(max(wsum, float(1e-6))), outv));
     });
     // (1 - spread): see DEFAULT_LPV_SPREAD - brightness independent of reach.
+    // The sky visibility as it is: it is a share, not light.
     textureStore(tex, uvec3(c.x, c.y, c.z),
-                 vec4(outc.mul(float(1).sub(u.spread)), 1));
+                 vec4(outc.mul(float(1).sub(u.spread)), outv));
   })().compute(CELLS).setName(`LPV.Resolve`);
 
   // --- shift: when C0 re-origins, move A by whole cells (lpv.js shiftVolume) ---

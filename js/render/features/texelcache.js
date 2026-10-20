@@ -142,6 +142,9 @@ function litWhereRevealed(mat, revealedLight) {
   })();
 }
 
+
+// Seconds the revealed faces' room light takes to follow a change.
+const ROOM_RESPONSE = 0.5;
 export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, activeSet, gi, rebuild }) {
   let texelCacheOn = true;
   // The sample spacing in pixels: 0 follows the texel's size on screen
@@ -270,6 +273,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
   }
 
   // Split shading's kernels over this frame's low-res samples, in one submit.
+  let roomLastT = 0;
   function runSplitShading(resolved) {
     const set = activeSet();
     const ks = set && set.splitKernels;
@@ -292,6 +296,13 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     // This frame's low-res samples, then (resolved) up to missCap misses.
     const n = s.count.value + (resolved ? s.missCap : 0);
     for (const k of ks) { k.count = n; list.push(k); }
+    // The room meter's mean (gpu/roommeter.js), eased over ROOM_RESPONSE s
+    // of real time, so the frame rate does not change how fast it follows.
+    const now = performance.now();
+    const dt = roomLastT ? Math.min((now - roomLastT) / 1000, 0.25) : 1 / 60;
+    roomLastT = now;
+    s.room.blend.value = 1 - Math.exp(-dt / ROOM_RESPONSE);
+    list.push(s.room.ease);
     // Texel GI: each listed patch traces this frame's slice of its directions.
     if (gk) gi.stepTexel(gk, list);
     renderer.compute(list);
@@ -508,6 +519,11 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
       { key: 'texelcache', label: 'Texel-rate shading', type: 'toggle',
         help: 'terrain shaded once per texel in a low-res pass, reused at full res',
         get: () => texelCacheOn, set: v => flip(texelCacheOn, v, () => commands.texelcache.run()) },
+      { key: 'roomlight', label: 'A/B: revealed faces take the room light', type: 'toggle',
+        help: 'a cut wall top under a lifted roof is lit by the mean light on the surfaces inside ' +
+              '(off: its own estimate - the LPV beside it, or the sky). Needs split shading',
+        get: () => ensureSplitShading().room.on.value === 1,
+        set: v => { ensureSplitShading().room.on.value = v ? 1 : 0; } },
       { key: 'texelscale', label: 'Texel cache spacing (px, 0 auto)', type: 'range', min: 0, max: 8, step: 1,
         help: 'low-res sample spacing; texels smaller than this shade themselves. 0 follows the texel size on screen',
         get: () => texelCacheSpacing, set: v => commands.texelcache.run(v) }
