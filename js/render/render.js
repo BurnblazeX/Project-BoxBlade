@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, mix, vec3, vec4, uniform, select, Fn, floor, normalize, cameraViewMatrix, storage } from 'three/tsl';
-import { terrainWhite, terrainKeepTSL, terrainShapeTSL, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL } from '../gpu/terrain.js';
-import { applyOcclusionMask } from '../gpu/occlusion.js';
+import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL } from '../gpu/terrain.js';
+import { applyOcclusionMask, outsideShadeTSL } from '../gpu/occlusion.js';
 import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey, shapeCode,
          isDual, blockParts,
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
@@ -64,6 +64,10 @@ export const terrainTextures = {
   // data, filled only at flatLayers; flatRgba as rgba, per material with one.
   // setShadedAlbedo swaps them in.
   flat: null, flatLayers: new Set(), flatRgba: [],
+  // The main textures, always - never an _a: every write to albedo, mirrored
+  // (writeLayer, writeSplit), but not the swap. What a face drawn without its
+  // normals and specular reads - one a lifted roof reveals (texelcache.js).
+  plain: null,
   // What each BLOCK is, as a 3D texture over a fixed box of blocks: what a
   // ray that hit something reads to find its texture (buildBlockVolume).
   // { tex, origin, size } - origin and size in blocks, as vec3 uniforms.
@@ -169,6 +173,15 @@ function writeLayer(tex, layer, topDown, rows = BLOCK_TEXELS) {
     tex.image.data.set(topDown.subarray(y * row, (y + 1) * row), base + (rows - 1 - y) * row);
   }
   tex.needsUpdate = true;
+  mirrorPlain(tex, base, rows * row);
+}
+
+// A write to the albedo array, copied into the main-textures one (plain).
+function mirrorPlain(tex, from, length) {
+  const p = terrainTextures.plain;
+  if (tex !== terrainTextures.albedo || !p) return;
+  p.image.data.set(tex.image.data.subarray(from, from + length), from);
+  p.needsUpdate = true;
 }
 
 // Top-down image pixels (12 wide, `rows` tall) flipped to bottom-up.
@@ -197,6 +210,7 @@ function writeSplit(tex, first, data, rows) {
   for (let y = 0; y < rows; y++) {
     const to = (first + Math.floor(y / BLOCK_TEXELS)) * layerBytes + (y % BLOCK_TEXELS) * row;
     tex.image.data.set(data.subarray(y * row, (y + 1) * row), to);
+    mirrorPlain(tex, to, row);
   }
   tex.needsUpdate = true;
 }
@@ -342,6 +356,7 @@ function buildBlockVolume() {
 function initTerrainTextures() {
   if (terrainTextures.albedo) return;
   terrainTextures.albedo = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
+  terrainTextures.plain = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
   terrainTextures.normal = makeArray([128, 128, 255, 255], THREE.NoColorSpace);
   terrainTextures.specular = makeArray(DEFAULT_SPECULAR, THREE.NoColorSpace);
   // CPU only, never bound: the writers above need just image.data and height.
@@ -487,9 +502,8 @@ function instanceCount() {
   return n;
 }
 
-// The plain terrain's look on a fresh material: also the interiors' fade
-// (render/features/occlusion.js), which must match it. params: the
-// material's own (transparent, depthWrite...).
+// The plain terrain's look on a fresh material. params: the material's own
+// (transparent, depthWrite...).
 export function plainTerrainMaterial(params = {}) {
   const material = new THREE.MeshStandardNodeMaterial({ roughness: 0.9, metalness: 0.0, ...params });
   // At the surface's texel (terrainSurfaceTSL): the face uv from the world
@@ -497,16 +511,20 @@ export function plainTerrainMaterial(params = {}) {
   // a surface of its OWN, built inside its own Fn: the normal is built in a
   // separate pass (three's NORMAL sub-build), and a surface shared with it
   // left the colour reading variables declared there - zero, so every
-  // fragment sampled texel (0, 0).
+  // fragment sampled texel (0, 0). Both darkened outside a building the
+  // player is in (gpu/occlusion.js outsideShadeTSL).
   material.colorNode = Fn(() => {
     const surf = terrainSurfaceTSL();
     const c = mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
-    return select(surf.emissive, vec3(0, 0, 0), c);
+    return select(surf.emissive, vec3(0, 0, 0), c).mul(outsideShadeTSL());
   })();
-  // A lightSource cube is unlit: all of its colour is emission.
+  // A lightSource cube is unlit: all of its colour is emission. (A face a
+  // lifted roof reveals keeps this lighting: the shadow map still holds the
+  // roof, so it gets the ambient the room under it gets.)
   material.emissiveNode = Fn(() => {
     const surf = terrainSurfaceTSL();
-    return select(surf.emissive, terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(0, 0, 0));
+    return select(surf.emissive, terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(0, 0, 0))
+      .mul(outsideShadeTSL());
   })();
   // Lit by the plane's own normal: the mesh's is still the box top's.
   material.normalNode = Fn(() =>
@@ -548,8 +566,9 @@ export function initWorldRender(scene) {
   // The unshadowed path. Standard lighting, but the colour is the block's own
   // layer - a plain `map` would put layer 0 on everything.
   const material = plainTerrainMaterial();
-  material.positionNode = terrainKeepTSL(false);
-  applyOcclusionMask(material);      // the occlusion cut-out (gpu/occlusion.js)
+  applyTerrainVertex(material);      // its shape, and a lifted roof shrinking away
+  material.castShadowPositionNode = terrainKeepTSL(false, true, false);   // a lifted roof still casts
+  applyOcclusionMask(material);      // the interiors' mask (gpu/occlusion.js)
 
   worldInstancedMesh = new THREE.InstancedMesh(geometry, material, capacity);
   worldInstancedMesh.receiveShadow = true;
@@ -576,6 +595,7 @@ export function initWorldRender(scene) {
       return mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
     })();
     glassMat.positionNode = terrainKeepTSL(true);
+    glassMat.vertexNode = terrainClipTSL();
     const g = new THREE.InstancedMesh(geometry, glassMat, capacity);
     g.instanceMatrix = worldInstancedMesh.instanceMatrix;
     g.instanceColor = worldInstancedMesh.instanceColor;

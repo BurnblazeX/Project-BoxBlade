@@ -40,16 +40,46 @@ const walls = new Map(room.walls.map(w => [w.i, w]));
 ok('the room\'s walls above the stub are walls', walls.has(at(room, 0, 2, 3)) && walls.has(at(room, 0, 3, -3)), true);
 ok('the stub row is not', walls.has(at(room, 0, 1, 3)), false);
 
-section('which walls fade');
-const t = interiorTargets(room, feet, ahead);
+section('the inside');
+const insideOf = r => new Set(r.inside.map(c => `${c.x},${c.z}`));
+const inside = insideOf(room);
+ok('the room and its walls', ['0,0', '2,-2', '3,0', '-3,3'].every(k => inside.has(k)), true);
+ok('not the eaves past the walls', inside.has('4,0') || inside.has('0,-4'), false);
+World.delete('0,1,3'); World.delete('0,2,3');
+const door = insideOf(buildInterior(cell));
+ok('a door: the step under the eaves outside it', door.has('0,4'), true);
+ok('... but not the eaves elsewhere', door.has('4,0'), false);
+ok('on the step: inside, through the door', insideOf(buildInterior({ x: 0, y: 1, z: 4 })).has('0,0'), true);
+const inDoor = buildInterior({ x: 0, y: 1, z: 3 });
+ok("in the doorway: the roof is the building's, not the door's top", inDoor.roofY, 4);
+ok('... the walls beside the door stay walls', new Set(inDoor.roof).has(at(inDoor, 1, 3, 3)), false);
+ok("... the door's top lifts with its wall", interiorTargets(inDoor, ahead).has(at(inDoor, 0, 3, 3)), true);
+ok('under the eaves by a wall: not under a roof', buildInterior({ x: 4, y: 1, z: 0 }), null);
+house();
+
+section('which walls lift');
+const t = interiorTargets(room, ahead);
 ok('the roof', t.get(at(room, 0, 4, 0)), 1);
-ok('the wall toward the camera', t.get(at(room, 0, 2, 3)), 1);
+ok('the wall facing the camera', t.get(at(room, 0, 2, 3)), 1);
+ok('... to its corners', t.has(at(room, 3, 2, 3)) && t.has(at(room, -3, 2, 3)), true);
 ok('not the wall behind', t.has(at(room, 0, 2, -3)), false);
+ok('not the side walls, even their near ends', t.has(at(room, 3, 2, 0)) || t.has(at(room, 3, 2, 2)), false);
 ok('not the stub', t.has(at(room, 0, 1, 3)), false);
-const turned = interiorTargets(room, feet, { x: -1, z: 0 });
-ok('a quarter turn: the next wall fades instead', [turned.has(at(room, 3, 2, 0)), turned.has(at(room, 0, 2, 3))].join(),
+const turned = interiorTargets(room, { x: -1, z: 0 });
+ok('a quarter turn: the next wall lifts instead', [turned.has(at(room, 3, 2, 0)), turned.has(at(room, 0, 2, 3))].join(),
    'true,false');
-ok('no interior: nothing', interiorTargets(null, feet, ahead).size, 0);
+const corner = interiorTargets(room, { x: -Math.SQRT1_2, z: -Math.SQRT1_2 });
+ok('from a corner (battle): both walls facing it',
+   [corner.has(at(room, 0, 2, 3)), corner.has(at(room, 3, 2, 0)), corner.has(at(room, 3, 2, 3))].join(), 'true,true,true');
+ok('... not the two behind', corner.has(at(room, 0, 2, -3)) || corner.has(at(room, -3, 2, 0)), false);
+ok('the walls kept: only the roof', interiorTargets(room, ahead, false).has(at(room, 0, 2, 3)), false);
+World.delete('3,2,0');   // a window in the side wall, over its sill
+const windowed = buildInterior(cell), w = interiorTargets(windowed, ahead);
+ok('a window in a side wall: the wall beside it stays', w.has(at(windowed, 3, 2, 1)) || w.has(at(windowed, 3, 3, 1)), false);
+ok('... and over it', w.has(at(windowed, 3, 3, 0)), false);
+ok('... the front wall still lifts', w.has(at(windowed, 0, 2, 3)), true);
+house();
+ok('no interior: nothing', interiorTargets(null, ahead).size, 0);
 
 section('easing');
 {

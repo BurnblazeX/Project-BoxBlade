@@ -5,6 +5,7 @@ import { LPV_DIM, LPV_CELL_METRES } from '../core/lpv.js';
 import { terrainSurfaceTSL, terrainTexelTSL } from './terrain.js';
 import { VOXEL_AO_MIN } from '../core/voxelao.js';
 import { layout, memoCascades } from './layout.js';
+import { insideAtTSL } from './occlusion.js';
 import { SURFACE_BIAS_VOXELS, decodeFieldTSL, eachCascade, ringUV } from './field.js';
 
 // --- AO: cone-traced ambient occlusion (doc §6.2, the short band) ---
@@ -81,7 +82,9 @@ const LPV_EDGE_CELLS = 2;
 // read is in the air cell before it rather than straddling the face.
 export const lpvHalfCell = gi => (gi.levels[0].cellMetres ?? LPV_CELL_METRES) * 0.5;
 
-export function lpvSampleTSL(gi, p) {
+// level0: read at an explicit level 0 - in a branch only some fragments take
+// (gpu/shade.js revealedLight), where an implicit-derivative read is not allowed.
+export function lpvSampleTSL(gi, p, level0 = false) {
   let out = null;
   for (let i = gi.levels.length - 1; i >= 0; i--) {
     const lv = gi.levels[i];
@@ -91,10 +94,42 @@ export function lpvSampleTSL(gi, p) {
                      min(min(float(1).sub(uvw.x), float(1).sub(uvw.y)), float(1).sub(uvw.z)))
                    .mul(float(lv.dim ?? LPV_DIM));
     const w = smoothstep(float(0.5), float(0.5 + LPV_EDGE_CELLS), edge);
-    const s = texture3D(lv.tex, uvw).rgb;
+    const s = (level0 ? texture3D(lv.tex, uvw).level(float(0)) : texture3D(lv.tex, uvw)).rgb;
     out = out ? mix(out, s, w) : s.mul(w);
   }
   return out;
+}
+
+// The light a revealed face is drawn with (gpu/terrain.js terrainRevealedTSL:
+// a wall's top under a lifted roof). Its own would come from inside the
+// solid the lifted roof still is to the lighting - black - so it takes the
+// room's: the ambient a face there gets (skyIrradiance, the shading's own)
+// and the bounce in the room's air beside it - the LPV (gi; none: the ambient
+// alone) one block out on each side, just below the face, the room's side kept
+// by the interiors' inside mask (outside the walls it is 0). Times a fixed
+// form shading, so a block shrinking away still reads as a cube. No direct
+// light: the sun and the lamps would need a march, from inside the same solid.
+// Returns (p, n) -> rgb: p, n the texel's locked position and its face
+// normal, one answer a texel. Every read at an explicit level - it runs in a
+// branch only the revealed pixels take.
+export const REVEALED_FORM = { top: 1, side: 0.8, bottom: 0.6 };
+export function createRevealedLightTSL(skyIrradiance, gi) {
+  return (p, n) => {
+    let light = skyIrradiance(n);
+    if (gi) {
+      const below = vec3(0, -lpvHalfCell(gi), 0);
+      let bounce = null;
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const q = p.add(vec3(dx * BLOCK_METRES, 0, dz * BLOCK_METRES)).add(below);
+        const s = lpvSampleTSL(gi, q, true).mul(insideAtTSL(q.xz));
+        bounce = bounce ? max(bounce, s) : s;
+      }
+      light = light.add(bounce.mul(gi.strength));
+    }
+    const form = select(n.y.greaterThan(float(0.5)), float(REVEALED_FORM.top),
+      select(n.y.lessThan(float(-0.5)), float(REVEALED_FORM.bottom), float(REVEALED_FORM.side)));
+    return light.mul(form);
+  };
 }
 
 // Returns Fn([p, n, lift, skip]) -> visibility in [0, 1]: n is the hemisphere,

@@ -26,6 +26,9 @@ export function createPicker(camera) {
   };
 
   return {
+    // Whether an instance is out of the view (a lifted roof: main.js wires
+    // the occlusion feature's hiddenAt) - the cursor passes through it.
+    hidden: null,
     // The grid cell whose top face is under the cursor, as { gx, gy, gz }.
     // This raycasts the terrain mesh rather than a single horizontal plane - with
     // real elevation there is no one ground height, and only a block's TOP face is
@@ -34,10 +37,11 @@ export function createPicker(camera) {
     // The nearest top face along the ray wins; side faces are passed through.
     // A grid walk, not three's raycast, which tests every instance.
     tileAt(clientX, clientY) {
+      const hidden = this.hidden;
       if (!worldInstancedMesh) return null;
       aim(clientX, clientY);
       const { origin: o, direction: d } = raycaster.ray;
-      const id = pickTop(terrainGrid(), [o.x, o.y, o.z], [d.x, d.y, d.z]);
+      const id = pickTop(terrainGrid(), [o.x, o.y, o.z], [d.x, d.y, d.z], hidden);
       const key = id >= 0 ? keyForInstance(id) : null;
       if (!key) return null;
       const [gx, gy, gz] = key.split(',').map(Number);

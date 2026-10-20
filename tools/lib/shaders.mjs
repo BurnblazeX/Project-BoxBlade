@@ -15,7 +15,7 @@ import { SUN_CARD_LOD_SHIFT, SUN_CARD_LOD_MAX } from '../../js/core/cards.js';
 import { SUN_ANGULAR_SIZE } from '../../js/core/sun.js';
 import { terrainTextures, initWorldRender } from '../../js/render/render.js';
 import * as R from '../../js/render/render.js';
-import { terrainKeepTSL, terrainTexelTSL, terrainWhite } from '../../js/gpu/terrain.js';
+import { terrainTexelTSL, terrainWhite } from '../../js/gpu/terrain.js';
 import { createSky } from '../../js/render/features/sky.js';
 import { createLights } from '../../js/render/features/lights.js';
 import { createMirrors } from '../../js/render/features/mirrors.js';
@@ -74,6 +74,7 @@ const layers = () => new THREE.DataArrayTexture(new Uint8Array(12 * 12 * 4 * 4),
 terrainTextures.albedo = layers();
 terrainTextures.normal = layers();
 terrainTextures.specular = layers();
+terrainTextures.plain = layers();
 createTestArea(40, 40);
 initWorldRender(scene);
 
@@ -170,7 +171,7 @@ function shaderSet(name, over) {
   const built = G.createShadowColorNode(opts);
   const world = R.worldInstancedMesh, glass = R.glassInstancedMesh;
   const m = buildTerrainMaterials({ built, opts, cache: texelCache, cached: !!(opts.split || over.texelCache) });
-  const mats = { low: m.lowMat, terrain: m.terrainMat, miss: m.missMat, fade: m.fadeMat,
+  const mats = { low: m.lowMat, terrain: m.terrainMat, miss: m.missMat,
                  glassLow: m.glassLow, glass: m.glassMat, glassMiss: m.glassMiss };
   for (const k of Object.keys(mats)) if (!mats[k]) delete mats[k];
   for (const [k, m] of Object.entries(mats)) {
@@ -269,26 +270,14 @@ export function buildProfilingShaders() {
            'AO off': shaderSet('profile-ao', { ao: false }) };
 }
 
-// The exposure meter's kernels (gpu/exposure.js), over each source it reads -
-// built, not snapshotted.
-// The interiors' translucent fade twin (render/features/occlusion.js): its
-// depth and colour materials, as the feature makes them - built, not held to
-// the snapshot.
-export function buildFadeShaders() {
-  const depth = new THREE.MeshBasicNodeMaterial({ colorWrite: false, transparent: true, depthWrite: true });
-  depth.maskNode = G.interiorFadeTSL().mask;
-  const colour = R.plainTerrainMaterial({ transparent: true, depthWrite: false });
-  const f = G.interiorFadeTSL();
-  colour.maskNode = f.mask;
-  colour.opacityNode = f.opacity;
-  const out = {};
-  for (const [k, mat] of [['depth', depth], ['colour', colour]]) {
-    mat.positionNode = terrainKeepTSL(false, false);
-    out[`fade/${k}`] = wgslOf(R.worldInstancedMesh, mat);
-  }
-  return out;
+// The basic mode's terrain (render.js plainTerrainMaterial, as initWorldRender
+// dresses it) - built, not snapshotted.
+export function buildPlainShaders() {
+  return { 'plain terrain': wgslOf(R.worldInstancedMesh, R.worldInstancedMesh.material) };
 }
 
+// The exposure meter's kernels (gpu/exposure.js), over each source it reads -
+// built, not snapshotted.
 export function buildExposureShaders() {
   const meter = G.createExposureMeter();
   const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);

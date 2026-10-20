@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
 import { buildAllShaders, buildViewShaders, buildProfilingShaders, buildExposureShaders,
-         buildFadeShaders } from './lib/shaders.mjs';
+         buildPlainShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
 // moves code must leave all of them identical - this is what proves it, where
@@ -78,8 +78,8 @@ for (const [id, set] of Object.entries(buildProfilingShaders())) {
   ok(`${id}: ${Object.keys(set).length} shaders`, empty.map(([k]) => k).join(', '), '');
 }
 
-section('interior fade builds');
-for (const [id, set] of Object.entries(buildFadeShaders())) {
+section('basic mode builds');
+for (const [id, set] of Object.entries(buildPlainShaders())) {
   ok(`${id}: vertex and fragment`, !!(set.vertex && set.vertex.length && set.fragment && set.fragment.length), true);
 }
 

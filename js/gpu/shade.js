@@ -11,7 +11,7 @@ import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, hitSurfaceTSL, hitTexelTSL
 import { boxBumpedNormalTSL, labNormalTSL } from './normals.js';
 import { NO_SKIP, createCardHitTSL } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
-import { AO_DISTANCE, createAOTSL, createSpriteAOTSL, lpvHalfCell, lpvSampleTSL } from './ambient.js';
+import { AO_DISTANCE, createAOTSL, createSpriteAOTSL, createRevealedLightTSL, lpvHalfCell, lpvSampleTSL } from './ambient.js';
 import { spriteShadeNormalTSL, spriteTexelLockTSL } from './sprite.js';
 import { REFLECT_MAX_DISTANCE, REFLECT_ROUGH_END, REFLECT_ROUGH_START, ROUGH_SPEC, SPEC_MAX, decodeSpecularTSL, fresnelRoughTSL, reflectBouncesUniform, specularTSL } from './specular.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
@@ -204,6 +204,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     ? skyShTSL(sky, d, true).mul(ambient).mul(sky.gain)
     : vec3(ambient, ambient, ambient));
   const ambientLight = (bent, ao) => skyIrradiance(bent).mul(ao);
+
+  // A revealed face's light: the room's (gpu/ambient.js createRevealedLightTSL).
+  const revealedLight = createRevealedLightTSL(skyIrradiance, gi);
   // The sun's DIRECT term alone - sunShadeTSL with its ambient zeroed, so the
   // ambient can come from the sky instead. Scalar.
   const sunDirect = (visible, n, mode) =>
@@ -1655,7 +1658,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
            // A raw view: the sprite draws the term itself, not times its art (gpu/sprite.js).
            spriteLight: Object.assign(spriteLight, { raw: RAW_VIEWS.has(view) }),
            mirrorCache: (mirrorLight && mirrorLight.cacheKernel) || null,
-           maxDistUniform: maxDist, ambientUniform: ambient };
+           maxDistUniform: maxDist, ambientUniform: ambient, revealedLight };
 }
 
 // How far through the rough band a reflection's reach shrinks: 0.75 = to a

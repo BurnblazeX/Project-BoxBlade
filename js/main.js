@@ -846,7 +846,7 @@ function animate(time) {
   if (shadowsOn) gi.update();
 
   const tRender = performance.now();
-  occlusion.update();   // the cut-out's circle, before the first terrain pass
+  occlusion.update();   // the interiors' lifted blocks, before the first terrain pass
   texel.render();
   spriteAtlas.render();
   tonemap.update();   // meters this frame's terrain, before the main render
@@ -1058,7 +1058,7 @@ const texel = engine.add(createTexelCache({
 }));
 // The shader sets: built from every feature's options, kept compiled.
 const tonemap = engine.add(createToneMap({ renderer, effectsOn: () => shadowsOn, meterSource: () => texel.meterSource() }));
-const occlusion = engine.add(createOcclusion({ renderer, scene, camera, feet: () => playerSprite.position, fadeMat: () => shadowsOn && sets.active?.fadeMat }));
+const occlusion = engine.add(createOcclusion({ camera, picker, feet: () => playerSprite.position }));
 const sets = createShadowSets({
   renderer, scene, camera, options: () => shadowNodeOptions(), texel, spriteAtlas, sun,
   sprites: { meshes: () => spriteMeshes(), clipping: () => [playerSprite, enemySprite],

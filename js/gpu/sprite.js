@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { Fn, float, uniform, floor, texture, uv, abs, attribute, varying, vec2, vec4, ivec2, normalize, clamp, int, select, dFdx, dFdy, textureSize, modelWorldMatrix, materialColor, frontFacing, sign, textureLoad } from 'three/tsl';
 import { labNormalTSL } from './normals.js';
+import { outsideShadeTSL } from './occlusion.js';
 
 // --- Sprite shading: the texel lock, the normal, the lit materials ---
 
@@ -80,9 +81,10 @@ export function createSpriteShadowMaterial(base, spriteLight, normalTex = null, 
 }
 
 // The art times its light - or, under a raw debug view (gpu/debugview.js),
-// the light alone, keeping the art's alpha for the cutout.
+// the light alone, keeping the art's alpha for the cutout. Darkened outside a
+// building the player is in, as the terrain is (gpu/occlusion.js).
 const tint = (base4, light, spriteLight) =>
-  (spriteLight.raw ? vec4(light, base4.a) : base4.mul(vec4(light, 1)));
+  (spriteLight.raw ? vec4(light, base4.a) : base4.mul(vec4(light.mul(outsideShadeTSL()), 1)));
 
 // The sprite's atlas region, per object: the mesh and its atlas twin carry
 // the same Vector2 (main.js ensureSpriteAtlas). In the object's own uniform

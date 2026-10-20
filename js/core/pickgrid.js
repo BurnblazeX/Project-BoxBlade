@@ -66,7 +66,8 @@ function enterBox(boxes, i, o, d) {
 
 // The instance whose top face the ray (origin o, direction d, both [x, y, z])
 // meets first, past any side or bottom faces in the way; -1 for none.
-export function pickTop(grid, o, d) {
+// skip(i): an instance not shown (a lifted roof), passed through.
+export function pickTop(grid, o, d, skip = null) {
   const { boxes, cells, size, lo, hi } = grid;
   // The ray within the instances' bounds.
   let tMin = 0, tMax = Infinity;
@@ -109,7 +110,7 @@ export function pickTop(grid, o, d) {
         if (h && h.t >= tEnter - EPS && h.t < tExit + EPS) hits.push([h.t, i, h.top]);
       }
       hits.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
-      for (const [, i, top] of hits) if (top) return i;
+      for (const [, i, top] of hits) if (top && !(skip && skip(i))) return i;
     }
     const a = next[0] === tExit ? 0 : next[1] === tExit ? 1 : 2;
     cell[a] += step[a];

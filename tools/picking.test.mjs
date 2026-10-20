@@ -88,6 +88,10 @@ ok('a ray that misses the world', pickTop(grid, [-100, 5, -100], [-1, 0, 0]), -1
 ok('pointing up from above', pickTop(grid, [3 * S, 50, 3 * S], [0, 1, 0]), -1);
 const hidden = buildPickGrid(new Float32Array(16), 1, S);
 ok('a hidden instance (scale 0) is never hit', pickTop(hidden, [0, 5, 0], [0, -1, 0]), -1);
+const roofOver = new THREE.Matrix4().makeTranslation(0, 3 * S, 0), floorUnder = new THREE.Matrix4();
+const stack = buildPickGrid(new Float32Array([...roofOver.elements, ...floorUnder.elements]), 2, S);
+ok('a roof over a floor: the roof', pickTop(stack, [0, 50, 0], [0, -1, 0]), 0);
+ok('the roof lifted: through to the floor', pickTop(stack, [0, 50, 0], [0, -1, 0], i => i === 0), 1);
 
 section('cost');
 const t0 = performance.now();

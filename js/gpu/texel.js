@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec3, uniform, instanceIndex, storage, floor, abs, vec2, vec4, ivec2, clamp, uniformArray, int, select, textureLoad, screenCoordinate, Discard, uint, atomicStore, atomicAdd } from 'three/tsl';
 import { VOXEL_METRES } from '../core/boxgrid.js';
 import { terrainSurfaceTSL } from './terrain.js';
+import { outsideShadeTSL } from './occlusion.js';
 import { MATERIAL_LAYERS } from '../core/materials.js';
 
 // ---------------------------------------------------------------------------
@@ -281,7 +282,9 @@ export function createShadowMaterial(mesh, shadowNode, albedo = null) {
   // .rgb, because the shadow node is a vec3 now that a coloured light adds to it.
   // Per-instance tint (arena greying) lives in instanceColor, so it has to be
   // carried across or battle mode loses its reachable-tile shading.
-  mat.colorNode = (albedo || vec3(1, 1, 1)).mul(shadowNode);
+  // Darkened outside a building the player is in - the view only, after the
+  // shading (gpu/occlusion.js outsideShadeTSL).
+  mat.colorNode = (albedo || vec3(1, 1, 1)).mul(shadowNode).mul(outsideShadeTSL());
   return mat;
 }
 

@@ -201,20 +201,20 @@ export function createShadowSets({ renderer, scene, camera, options, texel, spri
     const built = createShadowColorNode(opts);
     const { spriteLight, sun: sunUniforms } = built;
     // The terrain's and glass's materials: the texel cache's passes, or the shading itself.
-    const { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss, fadeMat } = texel.materials(built, opts);
+    const { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss } = texel.materials(built, opts);
     const atlas = spriteAtlas.ready();
     if (atlas) spriteAtlas.ensure();
     const spriteSet = buildSpriteShadows(spriteLight, atlas);
-    const pairs = [[worldInstancedMesh, terrainMat], [worldInstancedMesh, fadeMat], ...spriteSet.pairs,
+    const pairs = [[worldInstancedMesh, terrainMat], ...spriteSet.pairs,
                    ...texel.compilePairs({ lowMat, missMat, glassMat, glassLow, glassMiss })];
     const set = {
-      key, parts, sun: sunUniforms, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss, fadeMat,
+      key, parts, sun: sunUniforms, terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss,
       made: spriteSet.made, variants: spriteSet.variants, atlasMats: spriteSet.atlasMats,
       mirrorCache: built.mirrorCache,
       splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
       giKernels: lowMat && built.giKernels ? built.giKernels : null,
       resolved: !!(lowMat && built.splitKernels && !missMat),
-      mats: [terrainMat, fadeMat, ...[lowMat, missMat].filter(Boolean),
+      mats: [terrainMat, ...[lowMat, missMat].filter(Boolean),
              ...[glassMat, glassLow, glassMiss].filter(Boolean), ...spriteSet.mats],
       compiled: false
     };

@@ -4,10 +4,11 @@
 // the texel lock, the face uv, a model cube's tile - the node functions the
 // terrain materials (render/render.js) and the shading (the rest of gpu/) share. Moved
 // out of render.js (2026-10-17) so the shader side never imports the meshes.
-import { attribute, texture, uv, int, vec3, vec4, uniform, select, positionLocal, Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize, clamp, exp2 } from 'three/tsl';
+import { attribute, texture, uv, int, vec3, vec4, uniform, select, positionLocal, Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize, clamp, exp2,
+         cameraProjectionMatrix, cameraViewMatrix, modelWorldMatrix } from 'three/tsl';
 import { BLOCK_METRES } from '../core/world.js';
 import { VOXEL_METRES } from '../core/boxgrid.js';
-import { occlusionRevealTSL } from './occlusion.js';
+import { occlusionRevealTSL, occlusionHiddenTSL, occlusionShrinkTSL } from './occlusion.js';
 
 // 1 draws the terrain plain white (whiteworld) - a uniform, so both the plain
 // and the shadowed materials follow it with no rebuild.
@@ -23,10 +24,25 @@ export const terrainLayerTSL = () => int(attribute('blockLayer', 'float').add(0.
 // already the placed block.
 // blockGlass also carries the instance's drawn faces: glass + 2 * mask
 // (world.js exposedFaceMask), read by terrainShapeTSL.
-export const terrainKeepTSL = (glass, reveal = true) => {
+export const terrainKeepTSL = (glass, reveal = true, hide = !glass) => {
   const isGlass = attribute('blockGlass', 'float').mod(float(2)).greaterThan(0.5);
-  return select(glass ? isGlass : isGlass.not(), terrainShapeTSL(reveal), vec3(0, 0, 0));
+  return select(glass ? isGlass : isGlass.not(), terrainShapeTSL(reveal, hide), vec3(0, 0, 0));
 };
+
+// Every non-glass terrain material's vertexNode: the clip position of the
+// shaped vertex (positionNode's), a lifted roof's block shrunk toward its
+// cell (gpu/occlusion.js occlusionShrinkTSL). Only the clip position:
+// positionWorld - the shading, the texel - is still positionNode's, on the
+// block's own surface. Identical in every pass, so their depths agree.
+export const terrainClipTSL = () =>
+  cameraProjectionMatrix.mul(cameraViewMatrix.mul(modelWorldMatrix
+    .mul(vec4(occlusionShrinkTSL(positionLocal, attribute('position', 'vec3')), 1))));
+// Both, on a material drawing the terrain's non-glass blocks.
+export function applyTerrainVertex(material, reveal = true) {
+  material.positionNode = terrainKeepTSL(false, reveal);
+  material.vertexNode = terrainClipTSL();
+  return material;
+}
 
 // --- Slopes, as drawn ---
 //
@@ -64,21 +80,42 @@ export function slopeFromCodeTSL(code) {
 // (gpu/occlusion.js occlusionRevealTSL), when it is the surface the cut opens on.
 // reveal false: the buried faces stay buried (the interiors' translucent fade,
 // which draws a faded block's outside only).
-export const terrainShapeTSL = (reveal = true) => {
+// hide: a block whose roof has fully faded collapses too (occlusionHiddenTSL)
+// - every view pass; false for the shadow maps (castShadowPositionNode), where
+// a lifted roof still casts.
+export const terrainShapeTSL = (reveal = true, hide = true) => {
   const s = slopeTSL();
   const raw = attribute('position', 'vec3');
   const low = s.on.and(raw.y.greaterThan(float(0)))
     .and(raw.x.mul(s.f.x).add(raw.z.mul(s.f.y)).lessThan(float(0)));
   const shaped = positionLocal.sub(vec3(0, select(low, s.grad.mul(float(BLOCK_METRES)), float(0)), 0));
-  const mask = floor(attribute('blockGlass', 'float').mul(float(0.5)));
+  const nr = attribute('normal', 'vec3');
+  const exposed = terrainFaceExposedTSL();
+  const open = reveal ? exposed.or(occlusionRevealTSL(positionLocal, raw, nr)) : exposed;
+  const shown = hide ? open.and(occlusionHiddenTSL(positionLocal, raw).not()) : open;
+  return select(shown, shaped, vec3(0, 0, 0));
+};
+
+// Whether this box face is one of its block's drawn faces (world.js
+// exposedFaceMask: bits in blockGlass / 2), by the geometry's own normal - in
+// the vertex, or the fragment, where both attributes arrive as varyings.
+// Rounded first: interpolated, the whole number blockGlass is off by a hair
+// (126 reads 125.99998), and floor would drop a bit - a face lost at random
+// pixels along the triangles.
+export const terrainFaceExposedTSL = () => {
+  const mask = floor(round(attribute('blockGlass', 'float')).mul(float(0.5)));
   const nr = attribute('normal', 'vec3');
   const d = select(abs(nr.x).greaterThan(float(0.5)), select(nr.x.greaterThan(float(0)), float(0), float(1)),
             select(abs(nr.y).greaterThan(float(0.5)), select(nr.y.greaterThan(float(0)), float(2), float(3)),
                    select(nr.z.greaterThan(float(0)), float(4), float(5))));
-  const exposed = floor(mask.div(exp2(d))).mod(float(2)).greaterThan(float(0.5));
-  const shown = reveal ? exposed.or(occlusionRevealTSL(positionLocal, raw, nr)) : exposed;
-  return select(shown, shaped, vec3(0, 0, 0));
+  return floor(mask.div(exp2(d))).mod(float(2)).greaterThan(float(0.5));
 };
+// A drawn face that is not one of its block's: buried, and shown only because
+// the block across it lifted (the reveal) - a wall's top under a lifted roof,
+// the stub under a lifted wall. Its lighting would be from inside a solid
+// the lighting still sees, so it is drawn its albedo, unlit
+// (render/features/texelcache.js).
+export const terrainRevealedTSL = () => terrainFaceExposedTSL().not();
 
 // A terrain array sampled at this fragment's own layer - at st when given
 // (the shaded path passes its texel's centre), else the mesh uv.

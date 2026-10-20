@@ -17,14 +17,15 @@
 //   gi           the GI feature: stepTexel, inside the split shading's submit
 //   rebuild()    the shading rebuilt, when a kernel flag changed
 import * as THREE from 'three/webgpu';
-import { uniform } from 'three/tsl';
+import { uniform, Fn, If, mix, vec3 } from 'three/tsl';
 import { texelPixels, texelCacheSpacingFor, splitCapacityFor } from '../../core/texelcache.js';
 import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissNode,
          createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode,
          createShadowMaterial } from '../../gpu/texel.js';
-import { terrainKeepTSL, terrainShapeTSL } from '../../gpu/terrain.js';
+import { terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, terrainRevealedTSL,
+         terrainSurfaceTSL, terrainTexelTSL, terrainWhite } from '../../gpu/terrain.js';
 import { terrainEmissiveTSL } from '../../gpu/shade.js';
-import { applyOcclusionMask, interiorFadeTSL } from '../../gpu/occlusion.js';
+import { applyOcclusionMask, outsideShadeTSL } from '../../gpu/occlusion.js';
 import { worldInstancedMesh, glassInstancedMesh, terrainTextures } from '../render.js';
 import { flip } from '../engine.js';
 
@@ -98,25 +99,47 @@ export function buildTerrainMaterials({ built, opts, cache, cached }) {
     if (glassNode) glassMat = createShadowMaterial(glassInstancedMesh, glassNode);
   }
   // Each draws only its own blocks - terrainKeepTSL in render.js.
-  for (const m of [terrainMat, lowMat, missMat]) if (m) m.positionNode = terrainKeepTSL(false);
-  for (const m of [glassMat, glassLow, glassMiss]) if (m) m.positionNode = terrainKeepTSL(true);
-  // The occlusion cut-out, in every opaque pass alike (gpu/occlusion.js) -
+  // All with the same clip position (terrainClipTSL: a lifted roof shrinks
+  // away), so every pass agrees on depth - glass too, which the prepass draws.
+  for (const m of [terrainMat, lowMat, missMat]) if (m) applyTerrainVertex(m);
+  // A lifted roof is not drawn (gpu/occlusion.js occlusionHiddenTSL), but
+  // still casts into any shadow map.
+  if (terrainMat) terrainMat.castShadowPositionNode = terrainKeepTSL(false, true, false);
+  for (const m of [glassMat, glassLow, glassMiss]) if (m) {
+    m.positionNode = terrainKeepTSL(true);
+    m.vertexNode = terrainClipTSL();
+  }
+  // The interiors' mask, in every opaque pass alike (gpu/occlusion.js) -
   // never glass. The miss pass writes no depth - the prepass already holds
   // it - so its discard leaves the stencil test early, before the heavy
   // shader starts.
   for (const m of [terrainMat, lowMat, missMat]) if (m) applyOcclusionMask(m);
   if (missMat) missMat.depthWrite = false;
-  // The occlusion fade's colour (render/features/occlusion.js): what the
-  // opaque passes left out, drawn again translucent with this set's full
-  // shading - so a block fading looks exactly as it did solid, and never pops.
-  const fadeMat = createShadowMaterial(worldInstancedMesh, node);
-  fadeMat.transparent = true;
-  fadeMat.depthWrite = false;
-  fadeMat.positionNode = terrainKeepTSL(false, false);
-  const fade = interiorFadeTSL();
-  fadeMat.maskNode = fade.mask;
-  fadeMat.opacityNode = fade.opacity;
-  return { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss, fadeMat };
+  // Not under a debug view: it shows a term alone, and should show it there too.
+  if (!opts.view) for (const m of [terrainMat, missMat]) if (m) litWhereRevealed(m, built.revealedLight);
+  return { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss };
+}
+
+// A revealed face (gpu/terrain.js terrainRevealedTSL) - a wall's top under a
+// lifted roof - is buried in what the lighting sees, so its own shading comes
+// from inside a solid: black. Drawn its main texture (terrainTextures.plain -
+// never the _a, which is made for the normals and specular this light has
+// none of) in the room's light instead
+// (gpu/shade.js revealedLight), whiteworld and the darkening outside a
+// building still applied. The light only in the branch the revealed pixels
+// take - every read in it at an explicit level; the albedo before it, where
+// the texel lock's derivatives are defined.
+function litWhereRevealed(mat, revealedLight) {
+  const shaded = mat.colorNode;
+  mat.colorNode = Fn(() => {
+    const c = vec3(shaded).toVar();
+    const surf = terrainSurfaceTSL();
+    const albedo = mix(terrainTexelTSL(terrainTextures.plain, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite).toVar();
+    If(terrainRevealedTSL(), () => {
+      c.assign(albedo.mul(revealedLight(surf.p, surf.n)).mul(outsideShadeTSL()));
+    });
+    return c;
+  })();
 }
 
 export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, activeSet, gi, rebuild }) {
@@ -169,6 +192,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     const depthOnly = new THREE.MeshBasicNodeMaterial({ colorWrite: false });
     // The same vertex code as the shaded draws: a slope's plane, not its box.
     depthOnly.positionNode = terrainShapeTSL();
+    depthOnly.vertexNode = terrainClipTSL();
     applyOcclusionMask(depthOnly, true);   // its glass instances never cut
     // The prepass keeps every block, glass included: glass is the front surface
     // wherever it is, so the terrain behind it fails the depth test and is never
