@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
-import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ, WINDOW_MS, worstPerColumn } from "../js/tools/perf.js";
+import { createFrameStats, nextRedraw, DEFAULT_DRAW_HZ, WINDOW_MS, worstPerColumn, frameBound } from "../js/tools/perf.js";
 import { createConsole, installConsole } from '../js/tools/console.js';
 
 file('perf.test.mjs - frame stats ring buffer and bxb console');
@@ -133,3 +133,10 @@ ok('n caps the count', gs.stats(100).count, 100);
 near('and the average covers only those', gs.stats(100).avg, 2);
 ok('fewer samples than n: all of them', createFrameStats(8192).stats(120).count, 0);
 ok('no n: everything held', gs.stats().count, 1000);
+
+section('frame bound');
+ok('GPU larger: gpu-bound', frameBound(3, 4, 4.1, 4.1), 'gpu-bound');
+ok('CPU larger: cpu-bound', frameBound(5, 4, 5.2, 5.2), 'cpu-bound');
+ok('made well under the interval: paced', frameBound(3, 4, 6, 16.7), 'paced');
+ok('unseen browser work counts: not paced', frameBound(0.3, 0.5, 0.88, 0.9), 'gpu-bound');
+ok('no made time yet: never paced', frameBound(3, 4, 0, 16.7), 'gpu-bound');

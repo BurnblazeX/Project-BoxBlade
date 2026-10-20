@@ -151,6 +151,15 @@ export function worstPerColumn(v, t, end, windowMs, columns) {
   return out;
 }
 
+// What limits the frame. made is what it took to make, interval how long it was
+// apart from the last: well under it, the frame waited on vsync or the pacer.
+// Otherwise the larger side - the CPU encodes frame N+1 while the GPU draws N.
+const PACED_SLACK = 0.85;
+export function frameBound(cpu, gpu, made, interval) {
+  if (made > 0 && made < interval * PACED_SLACK) return 'paced';
+  return gpu > cpu ? 'gpu-bound' : 'cpu-bound';
+}
+
 const BREAK_TOP = 30 + GRAPH_H + 10;
 const HEIGHT = BREAK_TOP + GRAPH_H + 57;
 
@@ -198,6 +207,7 @@ export function createPerfOverlay(doc = document) {
   // update's own time, sampling and drawing. It cannot report itself before it
   // returns, so each frame's 'other' is the previous frame's.
   let tail = 0;
+  let uncapped = false;
 
   function draw() {
     const s = stats.stats();
@@ -237,9 +247,18 @@ export function createPerfOverlay(doc = document) {
     }
     for (const [colour, path] of bars) { ctx.fillStyle = colour; ctx.fill(path); }
 
+    // The window's averages, shared with the legend below.
+    const sides = averages(end);
     ctx.fillStyle = '#e5e7eb';
     ctx.font = '11px monospace';
-    ctx.fillText(`${s.fps.toFixed(0)} fps   ${s.last.toFixed(1)}ms`, 6, 13);
+    // The ms is what a frame takes to make, averaged - not how long it stays on
+    // screen, which a cap pads out to the refresh interval. Uncapped nothing
+    // waits, so the interval is exact. Capped, a page cannot see when the GPU
+    // finished (the browser reports it at its next tick, near the next refresh),
+    // so it is the measured CPU and GPU time added - the browser's own submission
+    // work is not in it.
+    const made = uncapped ? s.avg : sides.cpu + sides.gpu;
+    ctx.fillText(`${s.fps.toFixed(0)} fps   ${made.toFixed(2)}ms`, 6, 13);
     ctx.fillText(`1% low ${s.low1.toFixed(0)}   max ${s.max.toFixed(1)}ms`, 6, 25);
 
     // The resolution actually rendered: the canvas's backing size, which is CSS
@@ -255,7 +274,28 @@ export function createPerfOverlay(doc = document) {
       ctx.textAlign = 'left';
     }
 
-    drawBreakdown(s, cols, end);
+    drawBreakdown(s, made, sides, cols, end);
+  }
+
+  // The GPU series cut to the window.
+  function recent(series, end) {
+    const all = series.series();
+    const keep = end === null ? [] : all.t.map((t, i) => i).filter(i => all.t[i] >= end - WINDOW_MS);
+    return { v: keep.map(i => all.v[i]), t: keep.map(i => all.t[i]) };
+  }
+  const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+
+  // Averages over the window, so a stage that spikes once does not read as its
+  // steady cost. Render and compute share the one queue, so the GPU side is
+  // their sum.
+  function averages(end) {
+    const cols = SECTIONS.map(([k]) => parts[k].toArray());
+    const g = recent(gpu, end), gc = recent(gpuCompute, end).v;
+    return {
+      cols, g, gc,
+      cpu: cols.reduce((sum, c) => sum + avg(c), 0),
+      gpu: avg(g.v) + avg(gc)
+    };
   }
 
   // Scaled to the frame's own time rather than to the 30 fps budget above:
@@ -263,16 +303,8 @@ export function createPerfOverlay(doc = document) {
   // scale the stages would be slivers.
   // Each column stacks the sections of the frame the graph above shows there -
   // the worst one - so the two graphs describe the same frame.
-  function drawBreakdown(s, frameCols, end) {
-    const cols = SECTIONS.map(([k]) => parts[k].toArray());
-    // The GPU series cut to the window.
-    const recent = series => {
-      const all = series.series();
-      const keep = end === null ? [] : all.t.map((t, i) => i).filter(i => all.t[i] >= end - WINDOW_MS);
-      return { v: keep.map(i => all.v[i]), t: keep.map(i => all.t[i]) };
-    };
-    const { v: g, t: gt } = recent(gpu);
-    const gc = recent(gpuCompute).v;
+  function drawBreakdown(s, made, sides, frameCols, end) {
+    const { cols, g: { v: g, t: gt }, gc, cpu } = sides;
     const scale = Math.max(1, s.p95 || 0, ...g) * 1.1;
     const y0 = BREAK_TOP + GRAPH_H;
     const paths = SECTIONS.map(() => new Path2D());
@@ -306,12 +338,11 @@ export function createPerfOverlay(doc = document) {
     ctx.fillStyle = '#9ca3af';
     ctx.fillText(`scale ${scale.toFixed(1)}ms`, WIDTH - 84, BREAK_TOP + 9);
 
-    // Legend: averages over the window, so a stage that spikes once does not
-    // read as its steady cost.
-    const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+    // Legend: the window's averages.
     ctx.font = '10px monospace';
     // Three to a row: the CPU stages, then the GPU's render and compute passes
-    // and the sum of everything - the frame's cost if none of it overlapped.
+    // and the CPU's sum. CPU and GPU overlap, so the larger side - not the two
+    // added - is what the fps above is made of.
     const COL = 78;
     let y = y0 + 13;
     SECTIONS.forEach(([k, colour], i) => {
@@ -319,18 +350,23 @@ export function createPerfOverlay(doc = document) {
       ctx.fillText(`${k} ${avg(cols[i]).toFixed(2)}`, 6 + (i % 3) * COL, y + Math.floor(i / 3) * 13);
     });
     y += Math.ceil(SECTIONS.length / 3) * 13;
-    const total = cols.reduce((sum, c) => sum + avg(c), 0) + avg(g) + avg(gc);
     ctx.fillStyle = GPU_COLOUR;
     ctx.fillText(g.length ? `gpu ${avg(g).toFixed(2)}` : 'gpu n/a', 6, y);
     ctx.fillStyle = COMPUTE_COLOUR;
     ctx.fillText(gc.length ? `compute ${avg(gc).toFixed(2)}` : 'compute n/a', 6 + COL, y);
     ctx.fillStyle = '#e5e7eb';
-    ctx.fillText(`total ${total.toFixed(2)}`, 6 + 2 * COL, y);
+    ctx.fillText(`cpu ${cpu.toFixed(2)}`, 6 + 2 * COL, y);
     if (renderer && renderer.info && renderer.info.render) {
       const r = renderer.info.render;
       ctx.fillStyle = '#9ca3af';
       ctx.fillText(`draws ${r.drawCalls ?? '-'}  tris ${(r.triangles ?? 0).toLocaleString()}`,
                    6, y + 13);
+    }
+    if (g.length) {
+      ctx.fillStyle = '#e5e7eb';
+      ctx.textAlign = 'right';
+      ctx.fillText(frameBound(cpu, sides.gpu, made, s.avg), WIDTH - 6, y + 13);
+      ctx.textAlign = 'left';
     }
     ctx.font = '11px monospace';
   }
@@ -338,12 +374,14 @@ export function createPerfOverlay(doc = document) {
   return {
     // dt arrives in seconds from the existing clock.
     // sections: ms per SECTIONS key for this frame's CPU work.
-    update(dt, sections = null) {
+    // uncapped: the pacer is not waiting on a refresh, so dt is the frame's cost.
+    update(dt, sections = null, uncappedNow = false) {
       if (!visible) return;
       // The frame that turns the graph on also contains the work that turned it
       // on (a console call, a chunk rebuild), so its dt is not a real frame time
       // and would sit in the buffer skewing the average for seconds.
       if (skipNext) { skipNext = false; return; }
+      uncapped = uncappedNow;
       const now = performance.now();
       stats.push(dt * 1000, now);
       for (const [k] of SECTIONS) parts[k].push(k === 'other' ? tail : sections ? sections[k] || 0 : 0, now);

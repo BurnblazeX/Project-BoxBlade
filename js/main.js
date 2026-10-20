@@ -855,11 +855,11 @@ function animate(time) {
   const tEnd = performance.now();
   logSpike(tGrid, tCards, tRender, tEnd, moved);
   perf.update(dt, { logic: tGrid - tStart, grids: tCards - tGrid,
-                    cards: tRender - tCards, submit: tEnd - tRender });
+                    cards: tRender - tCards, submit: tEnd - tRender }, pacer.mode === 'uncapped');
 }
 
-// One resolve in flight at a time: each returns the GPU time of everything
-// rendered since the last, so overlapping them would split frames in two.
+// One resolve in flight at a time: each reads every query since the last and
+// returns the newest frame's GPU time; overlapping them would split frames.
 // Resolved every frame even with the graph hidden - unresolved queries fill
 // three's query pool.
 let gpuTimePending = false;
