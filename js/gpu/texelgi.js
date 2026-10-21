@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin } from 'three/tsl';
+import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/boxgrid.js';
 import { mix32TSL } from './hitcache.js';
 import { createReflectTraceTSL, giTraceHitTSL } from './trace.js';
@@ -85,11 +85,12 @@ export const GI_SLICE_MASK = (1 << GI_SLICES) - 1;
 // A patch's light: the first moment of what arrives, sum L w dw - three vec3
 // (x, y, z) - its total, sum L dw, and the near band's irradiance at the face
 // normal, sum a L cos dw (a ray hitting at t within the AO reach counts
-// a = 1 - t / reach of its light as near, as the cones weigh blocking): five
-// vec3, eight u32 of half floats, one half spare (patchLightTSL reads it).
+// a = 1 - t / reach of its light as near, as the cones weigh blocking), then
+// the rays' own near occlusion, sum a cos dw (a scalar, in a vec3's x): six
+// parts, eight u32 of half floats (patchLightTSL reads them).
 export const GI_WORDS = 8;
 
-export const GI_VEC3 = 5;
+export const GI_VEC3 = 6;
 
 export const GI_WORD_INDEX = [0, 1, 2, 3, 4, 5, 6, 7];
 
@@ -205,25 +206,27 @@ export function faceFrameTSL(p, n) {
   return { t, ax, e1, e2 };
 }
 
-// The first moment, the total and the near band (GI_VEC3 vec3: the x, y and
-// z parts, then L0, then near, each rgb) to and from GI_WORDS u32 of half floats.
+// The first moment, the total, the near band and the near occlusion (GI_VEC3
+// parts: the x, y and z parts, then L0, then near, each rgb, then the
+// occlusion in x) to and from GI_WORDS u32 of half floats.
 export const shPackTSL = c => [
   packHalf2x16(vec2(c[0].x, c[0].y)), packHalf2x16(vec2(c[0].z, c[1].x)), packHalf2x16(vec2(c[1].y, c[1].z)),
   packHalf2x16(vec2(c[2].x, c[2].y)), packHalf2x16(vec2(c[2].z, c[3].x)), packHalf2x16(vec2(c[3].y, c[3].z)),
-  packHalf2x16(vec2(c[4].x, c[4].y)), packHalf2x16(vec2(c[4].z, float(0)))];
+  packHalf2x16(vec2(c[4].x, c[4].y)), packHalf2x16(vec2(c[4].z, c[5].x))];
 
 export const shUnpackTSL = w => {
   const a = w.map(x => unpackHalf2x16(x));
   return [vec3(a[0].x, a[0].y, a[1].x), vec3(a[1].y, a[2].x, a[2].y), vec3(a[3].x, a[3].y, a[4].x),
-          vec3(a[4].y, a[5].x, a[5].y), vec3(a[6].x, a[6].y, a[7].x)];
+          vec3(a[4].y, a[5].x, a[5].y), vec3(a[6].x, a[6].y, a[7].x), vec3(a[7].y, 0, 0)];
 };
 
-// The near/far split's ratios clamp at NEAR_RATIO_MAX, and V_p and 1 - V_p
-// are floored at NEAR_FLOOR: an anchor open all round holds next to no near
-// light, and a texel a little less open must not scale it without bound.
+// The near/far split's ratios clamp at NEAR_RATIO_MAX, and the open and
+// occluded shares are floored at NEAR_FLOOR / NEAR_OCC_FLOOR.
 export const NEAR_RATIO_MAX = 2;
 
 export const NEAR_FLOOR = 0.05;
+
+export const NEAR_OCC_FLOOR = 1e-3;
 
 // The bounce light at a texel (p on its face, n its axis normal), seen by
 // shading normal nS: the four nearest patches on the face, bilinear, those
@@ -237,14 +240,20 @@ export const NEAR_FLOOR = 0.05;
 // offFace: nS may lean far off the face (a sprite reading the ground under
 // it) - with ab.sky, read the L0 + L1 irradiance instead of the first moment.
 // near: { vis } - the texel's own cone visibility V_t (null: none). With
-// ab.near and ab.sky each patch's light is split by its near band: far x
-// V_t / V_p + near x (1 - V_t) / (1 - V_p), V_p the cones' visibility at the
-// patch's anchor (giDirect). Where the texel sees what its anchor sees that
-// is the patch's light itself - the near occluders its rays met are not
-// darkened a second time by the cones - and a texel more boxed in than its
-// anchor trades far light for the near walls' (ratios clamped; a patch whose
-// V_p is not worked out yet counts as V_p = V_t). The near part is read at
-// the face normal, the far one (the first moment) at nS.
+// ab.near and ab.sky each patch's light is split by its near band. The rays
+// give the band's share k of the light and their own near occlusion O_p, so
+// the near light per unit of occlusion is k / O_p and the far light per unit
+// of openness (1 - k) / (1 - O_p) - one measure, the rays'. The cones only
+// say how much more the texel is boxed in than its anchor: O_t = O_p + V_p -
+// V_t, V_p the cones at the anchor (giDirect). The light is scaled by
+// (1 - k)(1 - O_t) / (1 - O_p) + k O_t / O_p, ratios clamped: where the
+// texel sees what its anchor sees, the patch's light itself - the near
+// occluders its rays met are not darkened a second time by the cones. A
+// share, not a difference (total(nS) - near(n) went below zero on bumps), and
+// never V_p against the rays' near light: the cones' 1 - V_p could be ~0.05
+// where the rays had met a bright wall, and dividing by it turned texel-to-
+// texel differences into a grid. A patch whose V_p is not worked out yet
+// counts as V_p = V_t.
 // Returns { light, found } - found 1 where any of the four is in the table.
 export function patchLightTSL(tg, p, n, nS, lvl, buf = tg.dataRead, fresh = true, offFace = false, near = null) {
   const { t, ax, e1, e2 } = faceFrameTSL(p, n);
@@ -256,8 +265,6 @@ export function patchLightTSL(tg, p, n, nS, lvl, buf = tg.dataRead, fresh = true
   const keepT = t.mul(ax).toVar(), tang = vec3(1, 1, 1).sub(ax).toVar();
   const sum = [0, 1, 2, 3].map(() => vec3(0, 0, 0).toVar());
   const wsum = float(0).toVar();
-  // The split's correction to the total: sum of near x (rn - rf) x w.
-  const extra = near ? vec3(0, 0, 0).toVar() : null;
   const nearOn = near ? tg.ab.near.equal(int(1)).and(tg.ab.sky.equal(int(1))) : null;
   for (const [da, db] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
     const pmin = keepT.add(i0.add(e1.mul(float(da))).add(e2.mul(float(db))).mul(side).mul(tang));
@@ -276,17 +283,21 @@ export function patchLightTSL(tg, p, n, nS, lvl, buf = tg.dataRead, fresh = true
       const base = found.mul(int(GI_STRIDE)).add(int(GI_FILT)).toVar();
       const c = shUnpackTSL(GI_WORD_INDEX.map(k => buf.element(base.add(int(k)))));
       if (near) {
-        // far x rf + near x rn = total x rf + near x (rn - rf): the total
-        // takes rf in its weight, the near band the rest.
+        // k: the near band's share of the light at the face normal (0..1 a
+        // colour); op: the rays' near occlusion (their cosine weights sum to pi).
         const sb = found.mul(int(GI_STRIDE)).toVar();
         const vpOk = bitAnd(buf.element(sb.add(int(GI_FILLED))), uint(GI_DIRECT_OK)).notEqual(uint(0));
         const vt = near.vis;
         const vp = select(vpOk, unpackHalf2x16(buf.element(sb.add(int(GI_DIRECT + 1)))).y, vt).toVar();
-        const rf = min(vt.div(max(vp, float(NEAR_FLOOR))), float(NEAR_RATIO_MAX)).toVar();
-        const rn = min(float(1).sub(vt).div(max(float(1).sub(vp), float(NEAR_FLOOR))), float(NEAR_RATIO_MAX));
-        const wf = select(nearOn, rf, float(1)).mul(w).toVar();
-        for (let k = 0; k < 4; k++) sum[k].addAssign(c[k].mul(wf));
-        extra.addAssign(c[4].mul(select(nearOn, rn.sub(rf), float(0)).mul(w)));
+        const op = clamp(c[5].x.div(float(Math.PI)), float(0), float(1)).toVar();
+        const ot = clamp(op.add(vp).sub(vt), float(0), float(1)).toVar();
+        const rf = min(float(1).sub(ot).div(max(float(1).sub(op), float(NEAR_FLOOR))), float(NEAR_RATIO_MAX)).toVar();
+        const rn = min(ot.div(max(op, float(NEAR_OCC_FLOOR))), float(NEAR_RATIO_MAX)).toVar();
+        const atN = c[0].mul(n.x).add(c[1].mul(n.y)).add(c[2].mul(n.z));
+        const k = clamp(c[4].div(max(atN, vec3(1e-6, 1e-6, 1e-6))), vec3(0, 0, 0), vec3(1, 1, 1));
+        const split = mix(vec3(rf, rf, rf), vec3(rn, rn, rn), k);
+        const wf = select(nearOn, split, vec3(1, 1, 1)).mul(w).toVar();
+        for (let k2 = 0; k2 < 4; k2++) sum[k2].addAssign(c[k2].mul(wf));
       } else {
         for (let k = 0; k < 4; k++) sum[k].addAssign(c[k].mul(w));
       }
@@ -301,8 +312,7 @@ export function patchLightTSL(tg, p, n, nS, lvl, buf = tg.dataRead, fresh = true
   // gave a ray along the face a third of a head-on one's weight instead of
   // none - and rays skimming the floor, landing on whatever the torch lit,
   // made the bounce a field of bright patch-sized squares.
-  const m1d = sum[0].mul(nS.x).add(sum[1].mul(nS.y)).add(sum[2].mul(nS.z));
-  const m1 = (extra ? m1d.add(extra) : m1d).toVar();
+  const m1 = sum[0].mul(nS.x).add(sum[1].mul(nS.y)).add(sum[2].mul(nS.z)).toVar();
   // Off the face: the L0 + L1 SH irradiance, E = L0 / 4 + (L1 . n) / 2 -
   // a sprite facing sideways under open sky sees half of it, not none.
   const light = (offFace
@@ -563,6 +573,7 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
             const a = select(hit.w.greaterThanEqual(float(0)),
               max(float(1).sub(hit.w.div(nearReach)), float(0)), float(0));
             c[4].addAssign(L.mul(a.mul(d.z)));
+            c[5].addAssign(vec3(a.mul(d.z), 0, 0));
           }
         });
         // Uniform over the hemisphere: each ray stands for 2 pi / GI_DIRS sr.

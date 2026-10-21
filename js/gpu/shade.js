@@ -171,7 +171,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // sky: what is left of the sky ambient (ambientLight's keep).
     // The cones first: a texel's own visibility splits its patch light.
     const r = cones ? cones(p, n, lift, skip, single || null) : null;
-    const coneVis = r && aoOn ? r.vis : float(1);
+    const coneVis = r && aoOn ? (texelAmbient ? r.vis.toVar() : r.vis) : float(1);   // a var: an expression first used in the patch read's If read 0 outside it
     const near = r && aoOn && !giAt ? { vis: coneVis } : null;
     const t = texelAmbient
       ? texelAmbient(giAt ? giAt.p : p, giAt ? giAt.n : n, nS || n, !giAt, !!giAt, near) : null;

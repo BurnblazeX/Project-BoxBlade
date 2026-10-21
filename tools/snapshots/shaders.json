@@ -67,10 +67,10 @@
  },
  "texelgi/sprite": {
   "vertex": "8005a253b56fa77a",
-  "fragment": "e5e45708fe5faacc"
+  "fragment": "c95d1024f25343ae"
  },
  "texelgi/split.0:splitBase": {
-  "compute": "3bd73be1d4ec8a41"
+  "compute": "18d54adb9ad6b73b"
  },
  "texelgi/split.1:splitPoints": {
   "compute": "7eb5eb25c5fee824"
@@ -97,13 +97,13 @@
   "compute": "2e2d602bc54595e2"
  },
  "texelgi/gi.patches:giPatches": {
-  "compute": "8aa1a714060810d6"
+  "compute": "06ad58d4b026c7b8"
  },
  "texelgi/gi.sums:giSums": {
-  "compute": "f1f9de458943c389"
+  "compute": "c24ede7f35ca7a4d"
  },
  "texelgi/gi.filter:giFilter": {
-  "compute": "25782d25c47e26db"
+  "compute": "058a3535456835cd"
  },
  "texelgi/gi.direct:giDirect": {
   "compute": "a416945b8842d375"
