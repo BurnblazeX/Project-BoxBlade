@@ -16,7 +16,7 @@ import { spriteShadeNormalTSL, spriteTexelLockTSL } from './sprite.js';
 import { REFLECT_MAX_DISTANCE, REFLECT_ROUGH_END, REFLECT_ROUGH_START, ROUGH_SPEC, SPEC_MAX, decodeSpecularTSL, fresnelRoughTSL, reflectBouncesUniform, reflectEscapeUniform, specularTSL } from './specular.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { HIT_FAR_METRES, hitCacheReadTSL, hitCacheWriteTSL } from './hitcache.js';
-import { GI_ANCHORS, GI_CHECK, GI_LAST, GI_LIST_CAP, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchLightTSL, patchSideTSL, texelGILevelTSL, createTexelGIKernels, createPatchRegisterTSL } from './texelgi.js';
+import { GI_ANCHORS, GI_CHECK, GI_LAST, GI_LIST_CAP, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchSideTSL, texelGILevelTSL, createTexelGIKernels, createTexelGIReadTSL, createPatchRegisterTSL } from './texelgi.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { RAW_VIEWS, SPLIT_VIEWS, surfaceViewTSL } from './debugview.js';
 import { TEXEL_ID_OFFSET, slopeLayerTable } from './texel.js';
@@ -152,29 +152,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // (A cascade LOD - cheaper shading past C0 - was tried and removed: it was
   // no faster, and it dropped reflections at distance.)
   const giLevel = texelGI ? texelGILevelTSL(cascades) : null;
-  // The bounce at a texel, blended across a level step.
-  // buf: the read-only table (shading: fresh patches only), or the patch
-  // kernel's read-write one (a ray's hit: any).
-  // { light, cov }: cov how much of it the table answered (0 where no patch,
-  // fading out past C2), for the sky ambient to fill the rest.
-  const giRead = texelGI ? (p, n, nS, buf = texelGI.dataRead, fresh = buf === texelGI.dataRead, offFace = false) => {
-    const L = giLevel(p);
-    const a = patchLightTSL(texelGI, p, n, nS, L.lvl, buf, fresh, offFace);
-    const out = a.light.toVar(), cov = a.found.toVar();
-    If(L.blend.greaterThan(float(0)), () => {
-      const b = patchLightTSL(texelGI, p, n, nS, L.next, buf, fresh, offFace);
-      out.assign(mix(out, b.light, L.blend));
-      cov.assign(mix(cov, b.found, L.blend));
-    });
-    return { light: out.mul(L.fade), cov: cov.mul(L.fade) };
-  } : null;
-  // With ab.sky the patches hold the sky (gpu/texelgi.js): the texel GI's
-  // light, and keep - what is left of the sky ambient where it reads them.
-  const abSky = texelGI ? float(texelGI.ab.sky) : null;
-  const texelAmbient = texelGI ? (p, n, nS = n, fresh = true, offFace = false) => {
-    const r = giRead(p, n, nS, texelGI.dataRead, fresh, offFace);
-    return { light: r.light, keep: float(1).sub(abSky.mul(r.cov)) };
-  } : null;
+  // The texel GI reads (gpu/texelgi.js createTexelGIReadTSL).
+  const { giRead, texelAmbient, abSky, abNear } = texelGI ? createTexelGIReadTSL(texelGI, giLevel) : {};
   // At a hit (p, n its face): the bounce and what is left of the sky ambient -
   // texel GI's patches, the LPV's light and sky visibility, or neither (null).
   const hitGI = (p, n) => (texelAmbient ? texelAmbient(p, n)
@@ -190,18 +169,24 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // giAt reads any patch, not only fresh ones: the ground under a sprite is
     // often hidden behind the sprite itself, and so not traced.
     // sky: what is left of the sky ambient (ambientLight's keep).
+    // The cones first: a texel's own visibility splits its patch light.
+    const r = cones ? cones(p, n, lift, skip, single || null) : null;
+    const coneVis = r && aoOn ? r.vis : float(1);
+    const near = r && aoOn && !giAt ? { vis: coneVis } : null;
     const t = texelAmbient
-      ? texelAmbient(giAt ? giAt.p : p, giAt ? giAt.n : n, nS || n, !giAt, !!giAt) : null;
+      ? texelAmbient(giAt ? giAt.p : p, giAt ? giAt.n : n, nS || n, !giAt, !!giAt, near) : null;
     const tg = t ? t.light.mul(texAO).toVar() : null;
     const sky = t ? t.keep.toVar() : null;
     if (!cones) return { ao: texAO, gi: tg, bent: n, sky };
-    const r = cones(p, n, lift, skip, single || null);
-    let vis = aoOn ? r.vis : float(1);
-    if (spriteAO) vis = vis.mul(spriteAO(p, skip));
+    const sprite = spriteAO ? spriteAO(p, skip).toVar() : null;
+    const vis = sprite ? coneVis.mul(sprite) : coneVis;
+    // Holding the sky, the patch light takes the cones as its near
+    // occlusion: split by them (ab.near, where the read had them), else
+    // times them. The sprites' contact discs darken it either way.
+    const giVis = near ? mix(mix(float(1), vis, abSky), sprite || float(1), abNear) : mix(float(1), vis, abSky);
     return {
       ao: vis.mul(texAO).toVar(),
-      // Holding the sky, the patch light takes the cones as its near occlusion.
-      gi: tg ? tg.mul(mix(float(1), vis, abSky)).toVar() : (gi ? r.gi.mul(gi.strength).mul(texAO).toVar() : null),
+      gi: tg ? tg.mul(giVis).toVar() : (gi ? r.gi.mul(gi.strength).mul(texAO).toVar() : null),
       bent: aoOn ? r.bent : n,
       // The LPV's sky visibility, gathered where the cones ended.
       sky: sky || (gi ? mix(float(1), r.sky, float(gi.sky)).toVar() : null)
@@ -1465,7 +1450,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // the shading lights a reflection hit.
   const giKernels = texelGI && splitKernels ? createTexelGIKernels({
     texelGI, cascades, terrain, trace: reflectTrace, glass: glassT, bias, sky, ambient, shadeMode, sun,
-    sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead }) : null;
+    sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead,
+    // The near band and V_p need the cones' AO.
+    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null }) : null;
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
            glassNode: terrainView ? node : glassNode, sun, cascades, lights,

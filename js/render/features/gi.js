@@ -325,6 +325,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       ab('giabdirect', 'A/B: GI hits read the patch direct-light cache', 'direct'),
       ab('giabrotate', 'A/B: each patch turns its GI directions', 'rotate'),
       ab('giabfilter', 'A/B: patches blurred with their neighbours (3x3)', 'filter'),
+      ab('giabnear', 'A/B: AO cones split the patch light near/far (with sky)', 'near'),
       { key: 'gidirectevery', label: 'Texel GI direct refresh (frames)', type: 'range', min: 1, max: 16, step: 1,
         help: 'how often a patch works out its sun and lamp light for the GI rays that land on it - ' +
               'higher is cheaper, and a moving torch shows in the bounce later',
