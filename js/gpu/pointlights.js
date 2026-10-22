@@ -1,6 +1,7 @@
+import { smokeTransmitTSL } from './smokeshadow.js';
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, uniform, max, abs, vec4, min, clamp, length, log2, uniformArray, int, select, mix } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { MAX_LIGHT_LEVEL, MAX_LIGHTS, LIGHT_VEC4S, DEFAULT_LIGHT_CUTOFF } from '../core/lights.js';
 import { layout } from './layout.js';
 import { EDGE_FADE_VOXELS, SHADOW_FADE_START, SURFACE_BIAS_VOXELS } from './field.js';
@@ -57,8 +58,12 @@ export function writeLightBindings(b, packed, count) {
 
 // Returns Fn([p, n, skip, shadeN]) -> the summed colour of every live light.
 // The body is the single torch's, unchanged, run once per row of the list.
+// smoke: gpu/smokeshadow.js smokeShared, or null - every light is dimmed by
+// the cloud spells between it and the point (smokeSoft: through their soft
+// copy - the smoke lighting itself).
 export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
-                                edgeFadeUniform, cards = null, glass = false }) {
+                                edgeFadeUniform, cards = null, glass = false, smoke = null,
+                                smokeSoft = false }) {
   // Ranged: the point lights share one card buffer and each walks only the
   // slice that was turned to face it.
   const cardsFn = createCardsTSL(cards, { ranged: true });
@@ -121,7 +126,8 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
       // far brighter than a square across the middle, which is what a torch
       // looks like.
       const falloff = log2(float(1).add(u)).mul(level.div(float(MAX_LIGHT_LEVEL))).toVar();
-      const ndotl = max(shadeN.dot(dir), float(0));
+      // shadeN null: a point in the air (gpu/gi.js fog light), lit from every side.
+      const ndotl = shadeN ? max(shadeN.dot(dir), float(0)) : float(1);
 
       // lights.js coneSlope(): the cone from this fragment to the emitter opens
       // to sourceRadius at the light, so its slope is sourceRadius / D. Unlike
@@ -177,6 +183,7 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
           }
           else visible.assign(mix(float(1), v, weight));
         });
+        if (smoke) visible.mulAssign(smokeTransmitTSL(smoke, origin, dir, reach, smokeSoft));
         sum.addAssign(B.xyz.mul(amount).mul(visible));
         // The highlight takes the light's falloff, not the cut-remapped
         // diffuse amount - brdf carries its own N.L.

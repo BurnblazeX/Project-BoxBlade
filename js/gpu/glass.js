@@ -1,5 +1,5 @@
 import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, vec4, min, clamp, length, int, select, pow } from 'three/tsl';
-import { GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/boxgrid.js';
+import { GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { blockFaceTSL as boxFaceTSL, texelLockTSL } from './terrain.js';
 import { BLOCK_TEXELS } from '../core/materials.js';

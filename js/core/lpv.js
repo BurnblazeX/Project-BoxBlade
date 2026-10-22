@@ -1,4 +1,4 @@
-import { GRID_DIM, cascadeVoxelMetres } from './boxgrid.js';
+import { GRID_DIM, cascadeVoxelMetres } from './field.js';
 import { BLOCK_METRES } from './world.js';
 import { DEFAULT_SPECULAR, decodeSpecular } from './materials.js';
 
@@ -40,7 +40,10 @@ export const LPV_EXTENT_METRES = LPV_DIM * LPV_CELL_METRES;     // 18 m, = C0
 // Which cascades carry a volume, at how many cells a block a side: all of C1
 // at 2 (0.75 m cells, 36 m - C0 lies inside it) and C2 at 1 (1.5 m cells,
 // 72 m), finest first. Past C2 there is no bounce - it fades out over C2's
-// last cells. (Until 2026-10-21: C0 at 0.75 m over 18 m, C1 at 1.5 m.)
+// last cells. A finer volume keeps its reach in metres by itself: gi.js runs
+// res x the iterations and spreads spread^(1/res) a cell. (Until 2026-10-21:
+// C0 at 0.75 m over 18 m, C1 at 1.5 m. On 2026-10-22 C1 at 3 a block - the
+// BoxGrid, 0.5 m, 72^3 - was tried and dropped: steep for next to no gain.)
 export const LPV_VOLUMES = [{ level: 1, blockCells: 2 }, { level: 2, blockCells: 1 }];
 
 // A volume's res for gpu/gi.js createLPV: its cells a side over the 24 its

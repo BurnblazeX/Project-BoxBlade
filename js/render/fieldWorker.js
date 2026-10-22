@@ -1,5 +1,5 @@
 import { loadWorldMirror, loadModelBoxes } from '../core/world.js';
-import { createBoxGridAt, scrollForHandoff } from '../core/boxgrid.js';
+import { createFieldAt, scrollForHandoff } from '../core/field.js';
 
 // --- The field worker ---
 //
@@ -17,7 +17,7 @@ self.onmessage = ({ data: m }) => {
     loadWorldMirror(m.blocks);
     loadModelBoxes(m.models || []);
   } else if (m.type === 'reset') {
-    grids[m.level] = createBoxGridAt(m.x, m.z, null, m.level);
+    grids[m.level] = createFieldAt(m.x, m.z, null, m.level);
   } else if (m.type === 'scroll') {
     const out = scrollForHandoff(grids[m.level], m.x, m.z);
     self.postMessage({ ...out, level: m.level, gen: m.gen }, [out.data.buffer]);

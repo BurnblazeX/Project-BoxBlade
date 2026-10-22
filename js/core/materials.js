@@ -12,7 +12,7 @@
 // LabPBR companions beside it: <texture>_n.png (normal) and <texture>_s.png
 // (specular). A missing _n is generated from the albedo (normals.js); a missing
 // _s is DEFAULT_SPECULAR. Every block texture is BLOCK_TEXELS square - one
-// texel per boxGrid voxel, the §4 lock.
+// texel per field voxel, the §4 lock.
 //
 // <texture>_a.png (and _top_a, _bottom_a, _slope_a, _halfSlope_a): the albedo
 // with shadows on. The main texture has its shading baked in for the plain
@@ -120,7 +120,7 @@ export function glassSurfaceTransmit(f0, cosI) {
 }
 
 // Glass: a material with glass: true. Baked into the field's glass distance
-// instead of its opaque one (boxgrid.js FIELD_CHANNELS).
+// instead of its opaque one (core/field.js FIELD_CHANNELS).
 export function isGlassMaterial(id) {
   const i = id == null ? -1 : layerById.get(id);
   return i != null && i >= 0 && MATERIALS[i].glass === true;

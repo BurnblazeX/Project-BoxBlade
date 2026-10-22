@@ -4,6 +4,7 @@ import { createEngine } from '../js/render/engine.js';
 import { createSky } from '../js/render/features/sky.js';
 import { sunForHour, DEFAULT_SKY_HOUR } from '../js/core/sky.js';
 import { sunColourUniform } from '../js/gpu/sky.js';
+import { createWorldClock, HOUR_TICKS } from '../js/core/clock.js';
 
 file('features.test.mjs - render features, each on its own');
 
@@ -54,6 +55,31 @@ section('sky');
 
   sky.settings.settings[0].set(6);
   ok('the setting runs the command', sky.settings.settings[0].get(), 6);
+}
+
+section('sky on a running world clock');
+{
+  const scene = new THREE.Scene();
+  const light = new THREE.DirectionalLight();
+  const clock = createWorldClock(9);
+  const moved = [];
+  const sky = createSky({ scene, sunLight: light, clock,
+                          moveSun: (x, y, z) => { moved.push([x, y, z]); light.position.set(x, y, z); } });
+  ok('reads the clock\'s hour', sky.hour, 9);
+  for (let i = 0; i < HOUR_TICKS; i++) clock.tick();
+  sky.update();
+  ok('an hour of ticks later, an hour later', sky.hour, 10);
+  ok('the sun followed it', JSON.stringify(moved.at(-1)), JSON.stringify(sunForHour(10)));
+  const n = moved.length;
+  clock.tick();
+  sky.update();
+  ok('a tick is below the hour\'s resolution: the sun stays', moved.length, n);
+  ok('bxb.daycycle stops it', sky.commands.daycycle.run(false), 'day cycle off, 10.00h');
+  for (let i = 0; i < HOUR_TICKS; i++) clock.tick();
+  sky.update();
+  ok('stopped: the hour holds', sky.hour.toFixed(3), '10.000');
+  sky.commands.time.run(15);
+  ok('bxb.time sets the world clock', clock.hour(), 15);
 }
 
 section('lights');
@@ -195,11 +221,11 @@ section('gi');
   ok('no cascades yet: no volumes, no GI binding', gi.options().gi, null);
 
   // Three cascades, as the field makes them (only their origins are read here).
-  const { createBoxGridAt } = await import('../js/core/boxgrid.js');
+  const { createFieldAt } = await import('../js/core/field.js');
   const { createDistanceTexture, cascadeBindings } = await import('../js/gpu/field.js');
-  cascades = [0, 1].map(l => { const g = createBoxGridAt(0, 0, null, l); return cascadeBindings(createDistanceTexture(g), g); });
+  cascades = [0, 1].map(l => { const g = createFieldAt(0, 0, null, l); return cascadeBindings(createDistanceTexture(g), g); });
   ok('two cascades: no volumes yet (the far one lies over C2)', gi.options().gi, null);
-  { const g = createBoxGridAt(0, 0, null, 2); cascades.push(cascadeBindings(createDistanceTexture(g), g)); }
+  { const g = createFieldAt(0, 0, null, 2); cascades.push(cascadeBindings(createDistanceTexture(g), g)); }
   const binding = gi.options().gi;
   ok('then the LPV: one level per volume', binding.levels.length, 2);
   ok('2 x 2 a block over C1, 1 x 1 over C2', binding.levels.map(l => l.cellMetres).join(','), '0.75,1.5');

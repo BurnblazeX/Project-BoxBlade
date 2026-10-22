@@ -7,14 +7,19 @@
 //   exitArena()                show everything again
 //   clearHover()               no hover border, no path dots
 //   refreshTints()             the terrain's reach tint (none, at present)
+// ticks: the tick clock, for the pauses between turns. worldClock: game time,
+// which in battle stands still but for the rounds: 6 s each, counted as each
+// begins (core/clock.js).
 import { World, getVoxelKey, enterBattle, exitBattle, getReachableVoxels, isStandable, BLOCK_METRES } from '../core/world.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity,
-         nextTurn, addParticipant } from './battle.js';
+         nextTurn, addParticipant, roundNumber } from './battle.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
 import { getSpriteWorldPos, vacate } from './movement.js';
 import * as UI from './ui.js';
+import { ROUND_TICKS, TICK_RATE } from '../core/clock.js';
 
-export function createEncounter({ game, player, enemy, playerSprite, enemySprite, enemyAI, view }) {
+export function createEncounter({ game, player, enemy, playerSprite, enemySprite, enemyAI, view,
+                                  ticks, worldClock }) {
 
   // Battle: the tiles this turn's remaining movement reaches.
   function refreshReachableTiles() {
@@ -41,13 +46,20 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     }
   }
 
-  // Runs fn after ms - unless the battle it was scheduled in has ended (or
-  // been replaced by a new one) by then.
+  // Runs fn after ms, in ticks - unless the battle it was scheduled in has
+  // ended (or been replaced by a new one) by then.
   function later(ms, fn) {
     const session = game.battleSession;
-    setTimeout(() => {
+    ticks.after(ms / 1000 * TICK_RATE, () => {
       if (game.mode === 'battle' && game.battleSession === session) fn();
-    }, ms);
+    });
+  }
+
+  // The next turn; a new round is 6 s more of game time.
+  function advanceTurn() {
+    const round = roundNumber;
+    nextTurn(game.participants, onTurnStart);
+    if (game.mode === 'battle' && roundNumber > round) worldClock.advance(ROUND_TICKS);
   }
 
   function processEnemyAI() {
@@ -70,9 +82,9 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
       } else {
         console.log(`[Combat] ${enemy.name} misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
       }
-      later(1000, () => nextTurn(game.participants, onTurnStart));
+      later(1000, advanceTurn);
     } else if (aiDecision.action === 'end') {
-      later(500, () => nextTurn(game.participants, onTurnStart));
+      later(500, advanceTurn);
     }
   }
 
@@ -140,6 +152,9 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
 
     game.mode = 'battle';
     game.battleSession++;
+    // Game time moves by rounds now, the first beginning.
+    worldClock.live = false;
+    worldClock.advance(ROUND_TICKS);
     UI.setModeText(game.mode);
     game.path = [];
     view.clearHover();
@@ -180,6 +195,7 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     if (message) console.log(`[Combat] ${message}`);
     game.mode = 'explore';
     game.battleSession++;
+    worldClock.live = true;
     UI.setModeText(game.mode);
     game.path = [];
     view.clearHover();
@@ -251,7 +267,7 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     if (getCurrentEntity(game.participants)?.id !== player.id) return;
 
     UI.logDiceRoll(`<i>${player.name} ends their turn.</i>`, 'system');
-    nextTurn(game.participants, onTurnStart);
+    advanceTurn();
   }
 
   return { startBattle, endBattle, attack, endTurn, processEnemyAI, refreshReachableTiles };

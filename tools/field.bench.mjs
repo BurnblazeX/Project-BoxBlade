@@ -5,10 +5,10 @@
 //
 //   node tools/field.bench.mjs
 import { World, getVoxelKey } from '../js/core/world.js';
-import { createBoxGridAt, populateDistanceField, sphereTrace, decodeDistance,
+import { createFieldAt, populateDistanceField, sphereTrace, decodeDistance,
          GRID_DIM, VOXEL_METRES, DISTANCE_RANGE, CASCADE_COUNT,
          cascadeVoxelMetres, cascadeBlocks, cascadeExtentMetres,
-         cascadeRangeVoxels } from '../js/core/boxgrid.js';
+         cascadeRangeVoxels } from '../js/core/field.js';
 
 function groundWorld(n = 12) {
   World.clear();
@@ -24,7 +24,7 @@ function groundWorld(n = 12) {
 const blocks = groundWorld(24);   // wide enough to fill C1's footprint too
 
 function measure(level) {
-  const grid = createBoxGridAt(0, 0, null, level);
+  const grid = createFieldAt(0, 0, null, level);
   for (let i = 0; i < 5; i++) populateDistanceField(grid);
   const N = 20;
   const t0 = performance.now();
@@ -33,7 +33,7 @@ function measure(level) {
     populateDistanceField(grid);
   }
   const ms = (performance.now() - t0) / N;
-  createBoxGridAt(0, 0, grid, level);
+  createFieldAt(0, 0, grid, level);
 
   let saturated = 0, graded = 0, solid = 0;
   const range = grid.range;
@@ -65,7 +65,7 @@ function measure(level) {
 
 const levels = [];
 for (let l = 0; l < CASCADE_COUNT; l++) levels.push(measure(l));
-const grid = createBoxGridAt(0, 0, null, 0);
+const grid = createFieldAt(0, 0, null, 0);
 
 // Steps to cross the footprint diagonally through open air, which is what a sun
 // ray does. At the old +-1 voxel clamp every step was one voxel.

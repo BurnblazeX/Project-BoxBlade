@@ -39,7 +39,7 @@ import * as THREE from 'three/webgpu';
 import { uniform, float, int, vec2, vec3, abs, round, bool, attribute, dot, select,
          texture, texture3D, positionWorld } from 'three/tsl';
 import { BLOCK_METRES } from '../core/world.js';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { INTERIOR_DIMS } from '../core/interior.js';
 
 // The cell mask: one byte a cell, nearest, read at cell centres. Its
@@ -82,8 +82,9 @@ const B = BLOCK_METRES;
 const cellOf = p => round(p.div(float(B))).mul(float(B));
 const fragmentCell = () => cellOf(positionWorld.sub(round(attribute('normal', 'vec3')).mul(float(VOXEL_METRES * 0.5))));
 
-// A cell's lift, 0..1 (centre c, metres).
-function liftAtTSL(c) {
+// A cell's lift, 0..1 (centre c, metres). (gpu/smoke.js too: a cloud's cubes
+// against a lifted block show.)
+export function liftAtTSL(c) {
   const u = cellMask;
   const uvw = round(c.div(float(B))).sub(u.origin).add(float(0.5)).div(vec3(IW, IH, ID));
   return texture3D(u.tex, uvw).level(int(0)).r;

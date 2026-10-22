@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, uniform, instanceIndex, storage, floor, max, texture, abs, vec4, clamp, smoothstep, length, log2, uniformArray, int, select, mix, sqrt, exp2, pow, round, reflect, refract } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { MAX_LIGHT_LEVEL, LIGHT_VEC4S } from '../core/lights.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { blockFaceTSL as boxFaceTSL, texelLockTSL } from './terrain.js';

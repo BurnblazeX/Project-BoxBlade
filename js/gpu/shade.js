@@ -1,5 +1,6 @@
+import { withSmokeTSL } from './smokeshadow.js';
 import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/field.js';
 import { SUN_ANGULAR_SIZE } from '../core/sun.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { terrainSampleTSL, terrainWhite, axisNormalTSL, blockFaceTSL as boxFaceTSL, texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL, terrainTexelTSL, slopeFromCodeTSL, slopePlaneTSL } from './terrain.js';
@@ -97,7 +98,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   terrain = null,
                                   albedo = null, specular: specOn = true,
                                   reflections: reflectOn = true, sky = null,
-                                  mirrors = null,
+                                  mirrors = null, smoke = null,
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   gi = null,
@@ -127,12 +128,12 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const ambient = ambientUniform || uniform(float(DEFAULT_AMBIENT));
   // sunMarch false (profiling only): the sun is unshadowed everywhere - to
   // measure what its march costs. The GI's own sun march is left alone.
-  const sunShadow = sunMarch ? createSoftSunTSL({
+  const sunShadow = withSmokeTSL(smoke, sun.dir, sunMarch ? createSoftSunTSL({
     cascades, sunDir: sun.dir, sunTangent: sun.tangent,
     sunBitangent: sun.bitangent, maxDist, coneRadiusUniform: sun.coneRadius,
     rayCount: rays, bayerTex, stepsUniform, biasUniform, cone, quantise,
     fadeStartUniform, edgeFadeUniform, cards, glass: glassT, terrain
-  }) : () => asColour(float(1));
+  }) : () => asColour(float(1)));
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
   // The cones are built for AO, for GI, or both - GI gathers along them - so
@@ -170,7 +171,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // often hidden behind the sprite itself, and so not traced.
     // sky: what is left of the sky ambient (ambientLight's keep).
     // The cones first: a texel's own visibility splits its patch light.
-    const r = cones ? cones(p, n, lift, skip, single || null) : null;
+    const r = cones ? cones(p, n, lift, skip, single || null, nS) : null;
     const coneVis = r && aoOn ? (texelAmbient ? r.vis.toVar() : r.vis) : float(1);   // a var: an expression first used in the patch read's If read 0 outside it
     const near = r && aoOn && !giAt ? { vis: coneVis } : null;
     const t = texelAmbient
@@ -222,7 +223,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // on and off is a uniform write rather than a rebuild.
   const pointLight = lights
     ? createPointLightsTSL({ cascades, lights, biasUniform,
-                             fadeStartUniform, edgeFadeUniform, cards: lightCards, glass: glassT })
+                             fadeStartUniform, edgeFadeUniform, cards: lightCards, glass: glassT, smoke })
     : null;
 
   // The specular path needs the terrain's arrays (its _s texels) and its albedo,
@@ -541,7 +542,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // Glass is not blended over what is behind it. It is shaded like any other
   // texel - locked, one answer per texel - and its answer includes what it
   // shows: the Fresnel share of a reflection ray, and the rest of a ray sent on
-  // THROUGH it. Glass is only in the field's glass channel (boxgrid.js), and the
+  // THROUGH it. Glass is only in the field's glass channel (core/field.js), and the
   // trace reads the opaque one, so that ray walks straight through the glass -
   // and any other glass - to the first opaque surface, and shades it with the
   // same hit shading reflections use: its texture, the sun with its shadow, the
@@ -636,7 +637,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const dir = dIn.toVar();
     // The glass box the ray is in (partAtTSL): a whole block's is its cell,
     // a half's or a pane's its own. Faces are crossed a nudge deep to ask
-    // what is past them (boxgrid.js GLASS_WALK_NUDGE).
+    // what is past them (core/field.js GLASS_WALK_NUDGE).
     const nudge = float(GLASS_WALK_NUDGE);
     const part0 = partAtTSL(terrain, p.sub(n.mul(nudge)));
     const boxLo = part0.lo.toVar(), boxHi = part0.hi.toVar();
@@ -1452,7 +1453,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     texelGI, cascades, terrain, trace: reflectTrace, glass: glassT, bias, sky, ambient, shadeMode, sun,
     sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead,
     // The near band and V_p need the cones' AO.
-    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null }) : null;
+    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null, smoke }) : null;
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
            glassNode: terrainView ? node : glassNode, sun, cascades, lights,

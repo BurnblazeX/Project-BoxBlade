@@ -2,16 +2,16 @@ import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/har
 import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE } from '../js/core/world.js';
 import { CASCADE_COUNT, cascadeVoxelsPerBlock, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, cascadeRangeVoxels, DISTANCE_RANGE_METRES,
-         createBoxGrid, createBoxGridAt, gridOriginFor, GRID_DIM, VOXEL_METRES, TEXELS_PER_BLOCK, worldToVoxel,
-         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow } from '../js/core/boxgrid.js';
+         createField, createFieldAt, gridOriginFor, GRID_DIM, VOXEL_METRES, TEXELS_PER_BLOCK, worldToVoxel,
+         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow } from '../js/core/field.js';
 
-file('boxgrid.test.mjs - occupancy grid and DDA traversal');
+file('field.test.mjs - occupancy grid and DDA traversal');
 
 const solid = () => ({ solid: true, walkable: true, materialId: null, occupant: null, triggerId: null });
 createTestArea(36, 36);
 // A wall inside chunk (0,0) so the shadow tests have an occluder nearby.
 for (let y = 1; y <= 2; y++) World.set(getVoxelKey(6, y, 6), solid());
-const g = createBoxGrid(0, 0);
+const g = createField(0, 0);
 
 section('frozen constants - the 1:1 texel/voxel lock');
 ok('12 texels per block', TEXELS_PER_BLOCK, 12);
@@ -38,7 +38,7 @@ truthy('wall block (6,2,6) lands at vy 60..71', isOccupied(g, 72, 60, 72) && isO
 falsy('out of bounds reads as empty', isOccupied(g, -1, 0, 0));
 falsy('inBounds rejects the far edge', inBounds(144, 0, 0));
 ok('a neighbouring chunk picks up only its slice of the x=20 wall',
-   createBoxGrid(1, 0).occupiedCount, 144 * HALF + 8 * FULL);
+   createField(1, 0).occupiedCount, 144 * HALF + 8 * FULL);
 
 section('grid origin follows the mode');
 ok('battle snaps to the chunk', JSON.stringify(gridOriginFor('battle', { x: 20, z: 10 })), '{"x":12,"z":0}');
@@ -117,16 +117,16 @@ ok('explore centres on the player when no sun is given',
 }
 
 ok('an explore-centred grid holds the same block count as a chunk-aligned one',
-   createBoxGridAt(0, 0).occupiedCount, createBoxGrid(0, 0).occupiedCount);
+   createFieldAt(0, 0).occupiedCount, createField(0, 0).occupiedCount);
 truthy('a player-centred grid puts the player near the middle',
-   (() => { const g = createBoxGridAt(...Object.values(gridOriginFor('explore', { x: 20, z: 10 })));
+   (() => { const g = createFieldAt(...Object.values(gridOriginFor('explore', { x: 20, z: 10 })));
             const v = worldToVoxel(g, 20 * BLOCK_METRES, 0.75, 10 * BLOCK_METRES);
             return v.vx > 60 && v.vx < 84 && v.vz > 60 && v.vz < 84; })());
 
 section('repopulating in place matches a fresh build');
-const fresh = createBoxGridAt(12, 0);
-const reused = createBoxGridAt(0, 0);
-createBoxGridAt(12, 0, reused); // re-origin the existing buffer
+const fresh = createFieldAt(12, 0);
+const reused = createFieldAt(0, 0);
+createFieldAt(12, 0, reused); // re-origin the existing buffer
 ok('same occupied count', reused.occupiedCount, fresh.occupiedCount);
 truthy('and byte-identical occupancy - the scoped clear leaves no stale voxels',
        reused.data.every((v, i) => v === fresh.data[i]));
@@ -293,8 +293,8 @@ ok('and 4 at C1', cascadeRangeVoxels(1), 4);
 // voxels per block, so roughly an eighth the occupied voxel count.
 {
   createTestArea(12, 12);
-  const g0 = createBoxGridAt(0, 0, null, 0);
-  const g1 = createBoxGridAt(0, 0, null, 1);
+  const g0 = createFieldAt(0, 0, null, 0);
+  const g1 = createFieldAt(0, 0, null, 1);
   ok('C0 records its level', g0.level, 0);
   ok('C1 records its level', g1.level, 1);
   near('C1 voxels are twice the size', g1.voxelSize, g0.voxelSize * 2, 1e-12);
@@ -313,7 +313,7 @@ section('half blocks bake over their own span');
   put(5, 1, 3, 'halfTop');
   put(7, 1, 3, 'halfBottom');
   put(7, 2, 3, undefined);          // a full block over a half-bottom's gap
-  const h = createBoxGrid(0, 0);
+  const h = createField(0, 0);
   // Block y 1 is vy 48..59; x 3 is vx 36..47, x 5 60..71, x 7 84..95; z 3 is 36..47.
   truthy('a half-bottom fills its lower six voxels', isOccupied(h, 40, 48, 40) && isOccupied(h, 40, 53, 40));
   falsy('and not its upper six', isOccupied(h, 40, 54, 40) || isOccupied(h, 40, 59, 40));
@@ -329,7 +329,7 @@ section('vertical halves and panes bake across x and z');
   createTestArea(12, 12);
   World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfVertical', facing: 'E' });
   World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'middleVertical', facing: 'S' });
-  const h = createBoxGrid(0, 0);
+  const h = createField(0, 0);
   // x 3 is vx 36..47, x 5 60..71; y 1 is vy 48..59; z 3 is vz 36..47.
   truthy('a vertical half facing E fills its east six voxels, full height',
          isOccupied(h, 42, 48, 40) && isOccupied(h, 47, 59, 40));
@@ -340,10 +340,10 @@ section('vertical halves and panes bake across x and z');
 
 section('dual blocks bake each half in its own channel');
 {
-  const { glassDistanceAt } = await import('../js/core/boxgrid.js');
+  const { glassDistanceAt } = await import('../js/core/field.js');
   createTestArea(12, 12);
   World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfBottom', second: 'glass' });
-  const h = createBoxGrid(0, 0);
+  const h = createField(0, 0);
   truthy('the low half is opaque', isOccupied(h, 40, 50, 40));
   falsy('the high half is not', isOccupied(h, 40, 57, 40));
   truthy('it is glass', glassDistanceAt(h, 40, 57, 40) < 0);
@@ -354,7 +354,7 @@ section('slopes bake as staircases under their plane');
   createTestArea(12, 12);
   World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'slope', facing: 'E' });
   World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'halfSlopeHigh', facing: 'W' });
-  const h = createBoxGrid(0, 0);
+  const h = createField(0, 0);
   // x 3 is vx 36..47, y 1 is vy 48..59, z 3 is 36..47. Facing E: column k
   // (vx 36 + k) is solid up to the plane at its downhill edge, k voxels.
   falsy('the first column is empty (the plane starts at the floor)', isOccupied(h, 36, 48, 40));
@@ -383,7 +383,7 @@ section('placed models bake as their cubes');
     { name: 'post', from: [-2, 0, -2], to: [-1, 9, -1], faces },
     { name: 'bounds', type: 'bounding_box', from: [-2, 0, -2], to: [2, 4, 2] }] });
   addWorldModel(chair, 5, 0, 5, 0);
-  const h = createBoxGrid(0, 0);
+  const h = createField(0, 0);
   // Cell (5, 0, 5): its top face is vy 48 (ground y 0 is vy 36..47), its
   // centre vx 66, vz 66. The seat is x -2..2, y 3..4 over it: vy 51.
   truthy('the seat is solid', isOccupied(h, 66, 51, 66));

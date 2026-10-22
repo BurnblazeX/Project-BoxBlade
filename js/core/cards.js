@@ -1,5 +1,5 @@
 import { signedDistanceTransform, facingToward } from './silhouette.js';
-import { encodeDistance } from './boxgrid.js';
+import { encodeDistance } from './field.js';
 
 // --- Sprite shadows as analytic cards, one facing per light ---
 //
@@ -124,7 +124,7 @@ export const CARD_SUN_REACH = 64;
 // the next. Past C0 the hit point snaps to that level's voxel grid; across the
 // band the two resolutions mix; past the outermost level the card fades out.
 // C0's voxel size and the level count are copies, so this module stays free of
-// the grid; cards.test.mjs asserts they match boxgrid.js.
+// the grid; cards.test.mjs asserts they match core/field.js.
 export const CARD_LOD_C0_METRES = 0.125;
 export const CARD_LOD_LEVELS = 3;
 // Per light: lodShift draws its cards that many levels finer than their
@@ -169,7 +169,7 @@ export function cardVisibility({ card, centre, facing, from, dir, maxDist,
   // and wrong the moment it is not: at a 64 m reach the sun's cone is nearly
   // four metres across, so d/(R*t) came out below one EVERYWHERE and every card
   // dimmed the whole map. The distance field had exactly this failure at +-1
-  // voxel; see DISTANCE_RANGE in boxgrid.js.
+  // voxel; see DISTANCE_RANGE in core/field.js.
   //
   // The silhouette is inside its own rectangle, so the distance to that
   // rectangle is a valid floor for the distance to the shape - exact far away,
@@ -243,7 +243,7 @@ export function cardsVisibility(cards, from, dir, maxDist, coneSlope = 0, lodShi
 // loop over cards is the whole point. An atlas turns "which texture" into "which
 // rectangle", which is just arithmetic on a uniform.
 //
-// Stored R8 with the SAME squared encoding the boxGrid uses, so decodeFieldTSL
+// Stored R8 with the SAME squared encoding the field uses, so decodeFieldTSL
 // reads it unchanged and there is one distance encoding in the renderer rather
 // than two that could drift. Range is CARD_PAD pixels: past that the falloff has
 // already reached 1, so nothing is lost by saturating there.

@@ -10,7 +10,7 @@
 //   rebuild()    the shading rebuilt, when a kernel flag changed
 //   reorigin()   the cascades re-originate next frame (the footprint's lean moved)
 import { uniform } from 'three/tsl';
-import { SUN_BIAS_BLOCKS } from '../../core/boxgrid.js';
+import { SUN_BIAS_BLOCKS } from '../../core/field.js';
 import { CHUNK_SIZE } from '../../core/world.js';
 import { SUN_ANGULAR_SIZE, penumbraTexels } from '../../core/sun.js';
 import { createBayerTexture, writeSunUniforms, DEFAULT_AMBIENT, sunRoofUniform, sunFarUniform } from '../../gpu/sun.js';

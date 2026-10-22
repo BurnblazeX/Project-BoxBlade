@@ -23,6 +23,8 @@ import { createSky } from './render/features/sky.js';
 import { createLights } from './render/features/lights.js';
 import { createMirrors } from './render/features/mirrors.js';
 import { createGI } from './render/features/gi.js';
+import { createFog } from './render/features/fog.js';
+import { createSmoke } from './render/features/smoke.js';
 import { createDebugView } from './render/features/debugview.js';
 import { createTexelCache } from './render/features/texelcache.js';
 import { createSpriteAtlas } from './render/features/spriteatlas.js';
@@ -32,9 +34,9 @@ import { createShadowSets, nextFrame } from './render/shadowsets.js';
 import { createToneMap } from './render/features/tonemap.js';
 import { createOcclusion } from './render/features/occlusion.js';
 import { getSpriteWorldPos, followPath, walk, WALK_SPEED, ENEMY_SPEED } from './game/movement.js';
-import { toggleBoxGridDebug, refreshBoxGridDebug, isBoxGridDebugVisible } from './tools/debug.js';
-import { createBoxGridAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
-         CASCADE_COUNT, applyHandoff } from './core/boxgrid.js';
+import { toggleFieldDebug, refreshFieldDebug, isFieldDebugVisible } from './tools/debug.js';
+import { createFieldAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
+         CASCADE_COUNT, applyHandoff } from './core/field.js';
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent, crossedPlanesGeometry } from './render/sprites.js';
 import { createPerfOverlay } from './tools/perf.js';
 import { createFramePacer, describePacing } from './tools/pacing.js';
@@ -50,6 +52,7 @@ import { roughReach } from './gpu/shade.js';
 import { reflectBouncesUniform, REFLECT_MAX_BOUNCES } from './gpu/specular.js';
 import { setHitBounds } from './gpu/volume.js';
 import { sunForHour, DEFAULT_SKY_HOUR } from './core/sky.js';
+import { createTickClock, createWorldClock, createTickSmoothing } from './core/clock.js';
 import { lightRadiusMetres } from './core/lights.js';
 import { createConsole, installConsole } from './tools/console.js';
 import { createSettingsPanel } from './tools/settings.js';
@@ -494,6 +497,16 @@ const pivot = rig.pivot;
 
 const timer = new THREE.Timer();
 
+// --- Game time (core/clock.js) ---
+// The game steps in 60 Hz ticks; the frame draws the characters between their
+// last two (smoothing). Game time - the hour, a battle's rounds - is the world
+// clock. Its day cycle starts stopped (bxb.daycycle): the sky re-projects as the
+// hour moves, which the time-of-day work is to make cheap first.
+const ticks = createTickClock();
+const worldClock = createWorldClock(DEFAULT_SKY_HOUR);
+worldClock.running = false;
+const smoothing = createTickSmoothing([playerSprite, enemySprite]);
+
 // --- What is under the cursor (render/picking.js) ---
 const picker = createPicker(camera);
 
@@ -510,7 +523,7 @@ function applyWorldEdit() {
   mirrors.invalidate();
   lighting.syncModelLights();
   if (shadowsOn) {
-    // No prior footprint: a full bake, not a scroll (boxgrid.js createBoxGridAt).
+    // No prior footprint: a full bake, not a scroll (core/field.js createFieldAt).
     for (const g of shadowGrids) if (g) g.filledBlocks = null;
     ensureShadowGrids();
   }
@@ -534,7 +547,7 @@ const editor = createEditor({
 //
 // The rules live there; what they look like is this view.
 const encounter = createEncounter({
-  game, player, enemy, playerSprite, enemySprite, enemyAI,
+  game, player, enemy, playerSprite, enemySprite, enemyAI, ticks, worldClock,
   view: {
     enterArena(arena, bounds) {
       const centerX = (bounds.minX + bounds.maxX) / 2;
@@ -638,6 +651,10 @@ async function toggleAdvancedEffects() {
 
 let settingsPanel = null;   // built after the console, below
 
+// Where the pointer last was, for keys that act on what is under it (Alt+F).
+const lastPointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+window.addEventListener('pointermove', (e) => { lastPointer.x = e.clientX; lastPointer.y = e.clientY; });
+
 window.addEventListener('keydown', (e) => {
   const key = e.key.toLowerCase();
 
@@ -696,13 +713,22 @@ window.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Debug: Alt+G toggles the boxGrid occupancy overlay.
+  // Alt+F: a Fog Cloud on the block under the pointer. Alt+Shift+F clears them.
+  if (e.altKey && e.code === 'KeyF') {
+    e.preventDefault();
+    if (e.shiftKey) { console.log(smoke.clear()); return; }
+    const tile = picker.tileAt(lastPointer.x, lastPointer.y);
+    console.log(tile ? smoke.summonAt(tile) : 'no block under the pointer');
+    return;
+  }
+
+  // Debug: Alt+G toggles the field occupancy overlay.
   if (e.altKey && e.code === 'KeyG') {
     e.preventDefault();
-    const msg = toggleBoxGridDebug(scene, player.gridPos, worldInstancedMesh,
+    const msg = toggleFieldDebug(scene, player.gridPos, worldInstancedMesh,
                                    game.mode, { sunDirection: dirLight.position,
                                                   bias: sun.gridBias });
-    console.log(msg || '[boxGrid debug] off');
+    console.log(msg || '[field debug] off');
     return;
   }
 
@@ -741,25 +767,14 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- RENDER & GAME LOOP ---
-function animate(time) {
-  const tStart = performance.now();
-  // Clamped: after a stall (a tab switch, a compile) one huge step would carry
-  // movement through walls and snap every ease to its target.
-  timer.update(time);
-  const dt = Math.min(timer.getDelta(), 0.1);
-
+// --- GAME TICK ---
+// One 1/60 s step of the game: AI and movement. dt is always TICK_SECONDS. Reads
+// the camera's heading as the last frame left it.
+function gameTick(dt) {
   if (game.mode === 'explore' && !editor.active) {
     enemyAI.update(dt, rig.heading);
   }
 
-  // The newest pointer move since the last frame (game/input.js).
-  input.flush();
-
-  // The click pop; once it ends the hover is looked at afresh.
-  if (markers.update(dt)) input.forgetHover();
-
-  // 1. Process Movement Logic
   const isWalkingManual = (game.keys.w || game.keys.a || game.keys.s || game.keys.d);
 
   if (isWalkingManual && !rig.freeCam && game.mode === 'explore' && game.path.length > 0) {
@@ -794,6 +809,34 @@ function animate(time) {
   // (world.js followGround).
   followGround(playerSprite, player.gridPos, dt);
   followGround(enemySprite, enemy.gridPos, dt);
+}
+// In order each tick: the characters' starting points for the smoothing, game
+// time, then the game.
+ticks.every(1, () => smoothing.capture());
+ticks.every(1, () => worldClock.tick());
+ticks.every(1, gameTick);
+
+// --- RENDER & GAME LOOP ---
+function animate(time) {
+  const tStart = performance.now();
+  timer.update(time);
+  const realDt = timer.getDelta();
+  // The per-frame eases (camera, markers) are clamped: after a stall (a tab
+  // switch, a compile) one huge step would snap every ease to its target. The
+  // ticks cap themselves the same way.
+  const dt = Math.min(realDt, 0.1);
+
+  // The newest pointer move since the last frame (game/input.js).
+  input.flush();
+
+  // The click pop; once it ends the hover is looked at afresh.
+  if (markers.update(dt)) input.forgetHover();
+
+  // 1. The game's ticks for the time that passed; the characters are then
+  // drawn between their last two tick positions.
+  smoothing.restore();
+  ticks.advance(realDt);
+  smoothing.show(ticks.alpha);
 
   // The panel closes once Bob walks out of look-range of its target;
   // otherwise its action buttons' enabled state stays live.
@@ -817,7 +860,7 @@ function animate(time) {
 
   // Rebuilds the overlay if the player has walked into a different chunk.
   // No-op when the overlay is off or the chunk is unchanged.
-  refreshBoxGridDebug(scene, player.gridPos, game.mode,
+  refreshFieldDebug(scene, player.gridPos, game.mode,
                       { sunDirection: dirLight.position, bias: sun.gridBias });
 
   // The cascades follow the player so shading works wherever they are, not only
@@ -832,7 +875,7 @@ function animate(time) {
   // Always: with shadows off the sprites' contact AO still reads the sun's cards.
   resolveTerrainAlbedo();
   cards.update();
-  sky.update();
+  sky.update(ticks.alpha);
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
   // remembered boxes into the new coordinates - so running this first would
@@ -850,6 +893,8 @@ function animate(time) {
   texel.render();
   spriteAtlas.render();
   tonemap.update();   // meters this frame's terrain, before the main render
+  fog.update();   // after the texel cache drew this frame's G-buffer
+  smoke.update();
   renderer.render(scene, camera);
   resolveGPUTime();
   const tEnd = performance.now();
@@ -899,7 +944,7 @@ function fieldFocus() {
 }
 // One entry per cascade. C0 is the fine 18 m field the texel lock is aligned to;
 // C1 is half resolution over 36 m and exists so a long shadow's ray still finds
-// its caster after C0 has run out. See boxgrid.js for the level table.
+// its caster after C0 has run out. See core/field.js for the level table.
 let shadowGrids = [];
 let shadowTexes = [];
 let shadowCascades = [];   // the GPU bindings for each level
@@ -910,7 +955,7 @@ let shadowOrigins = [];     // block origin each level is currently built at
 function ensureShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const o = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sun.gridBias, l);
-    shadowGrids[l] = createBoxGridAt(o.x, o.z, shadowGrids[l] || null, l);
+    shadowGrids[l] = createFieldAt(o.x, o.z, shadowGrids[l] || null, l);
     if (!shadowTexes[l]) shadowTexes[l] = createDistanceTexture(shadowGrids[l]);
     updateDistanceTexture(shadowTexes[l]);
     shadowCascades[l] = shadowCascades[l]
@@ -1021,7 +1066,8 @@ const cards = engine.add(createCards({
   grids: () => shadowGrids, textures: () => shadowTexes, shadowsOn: () => shadowsOn,
   rebuild: () => buildPerPixelShadows(), onReady: () => enableAlwaysOnAO()
 }));
-const sky = engine.add(createSky({ scene, sunLight: dirLight, moveSun: (x, y, z) => sun.move(x, y, z) }));
+const sky = engine.add(createSky({ scene, sunLight: dirLight, clock: worldClock,
+                                   moveSun: (x, y, z) => sun.move(x, y, z) }));
 const lighting = engine.add(createLights({
   scene, shadowsOn: () => shadowsOn, mirrorRects: () => mirrors.rects,
   holder: { sprite: playerSprite, facingRight: () => mirrored(playerSprite) },
@@ -1043,7 +1089,17 @@ const gi = engine.add(createGI({
   sprites: { casters: () => cards.casters(), types: cards.types },
   terrainAlbedo: () => terrainAlbedo,
   shadowsOn: () => shadowsOn,
-  rebuild: () => { if (shadowsOn) buildPerPixelShadows(); }
+  rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
+  fogOn: () => fog.on()
+}));
+const fog = engine.add(createFog({
+  renderer, scene, camera, texel: { gbuffer: () => texel.gbuffer() }, gi, sky, shadowsOn: () => shadowsOn,
+  sun: { light: dirLight, on: () => sun.on, uniforms: () => sun.uniforms() }
+}));
+const smoke = engine.add(createSmoke({
+  renderer, scene, cascades: () => shadowCascades,
+  lighting, sky, shadowsOn: () => shadowsOn, rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
+  sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
 }));
 const debugView = engine.add(createDebugView({
   shadowsOn: () => shadowsOn, shadows: () => bxbApi.shadows(), rebuild: () => buildPerPixelShadows()
@@ -1188,7 +1244,7 @@ const bxbApi = installConsole(createConsole({
     help: 'march the same rays on CPU and GPU and diff them',
     run: async (n = 256) => {
       const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
-      const grid = createBoxGridAt(origin.x, origin.z);
+      const grid = createFieldAt(origin.x, origin.z);
       const tex = createDistanceTexture(grid);
 
       // Spread over the grid in random directions, so the comparison covers
@@ -1552,17 +1608,17 @@ const bxbApi = installConsole(createConsole({
     }
   },
   grid: {
-    help: 'toggle the boxGrid overlay - both cascades, C1 with C0 subtracted (Alt+G)',
-    run: () => toggleBoxGridDebug(
+    help: 'toggle the field overlay - both cascades, C1 with C0 subtracted (Alt+G)',
+    run: () => toggleFieldDebug(
       scene, player.gridPos, worldInstancedMesh, game.mode,
       { sunDirection: dirLight.position, bias: sun.gridBias }
-    ) || 'boxGrid overlay off'
+    ) || 'field overlay off'
   },
   stats: {
     help: 'print world, grid and frame statistics',
     run: () => {
       const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
-      const grid = createBoxGridAt(origin.x, origin.z);
+      const grid = createFieldAt(origin.x, origin.z);
       const s = perf.stats();
       const out = {
         blocks: World.size,
@@ -1608,7 +1664,7 @@ const bxbApi = installConsole(createConsole({
     }
   },
   light: sun.commands.light,
-  ...sky.commands, ...tonemap.commands, ...occlusion.commands,
+  ...sky.commands, ...tonemap.commands, ...occlusion.commands, ...fog.commands, ...smoke.commands,
   sun: sun.commands.sun
 }));
 
@@ -1625,9 +1681,9 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => whiteWorld, set: v => flip(whiteWorld, v, toggleWhiteWorld) },
     texel.missesSetting,
     gi.missingSetting,
-    { key: 'grid', label: 'boxGrid overlay (Alt+G)', type: 'toggle',
-      get: () => isBoxGridDebugVisible(),
-      set: v => flip(isBoxGridDebugVisible(), v, () => bxbApi.grid()) }
+    { key: 'grid', label: 'field overlay (Alt+G)', type: 'toggle',
+      get: () => isFieldDebugVisible(),
+      set: v => flip(isFieldDebugVisible(), v, () => bxbApi.grid()) }
   ]},
   { title: 'Perf', settings: [
     ...texel.settings,
@@ -1698,6 +1754,8 @@ settingsPanel = createSettingsPanel({ groups: [
   ]},
   sky.settings,
   gi.settings,
+  fog.settings,
+  smoke.settings,
   cards.settings,
   lighting.settings,
   { title: 'Debug', settings: [

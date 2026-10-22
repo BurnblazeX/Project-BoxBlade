@@ -44,7 +44,7 @@ export function createCameraRig(scene) {
     distance: CAMERA_CONFIGS.explore.distance,
     // Free cam (Alt+C, debug): detaches the camera from Bob - WASD flies the
     // pivot instead of walking him, Q/E still turn it. Only the CAMERA moves -
-    // the cascades, the boxGrid overlay and everything else that follows the
+    // the cascades, the field overlay and everything else that follows the
     // player keep following player.gridPos, so flying away shows the field's
     // footprint staying put around Bob.
     freeCam: false,

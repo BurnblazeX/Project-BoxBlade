@@ -1,5 +1,5 @@
 import { Fn, If, Loop, Break, float, vec3, texture3D, max, abs, vec2, vec4, min, clamp, length, select, step, sign } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 import { layout, memoCascades } from './layout.js';
 import { decodeFieldTSL, eachCascade, fadeWeightTSL, levelLive, ringUV, seamBlend } from './field.js';
 import { inHitBoundsTSL } from './volume.js';

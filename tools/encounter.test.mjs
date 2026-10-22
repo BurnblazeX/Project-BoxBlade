@@ -15,6 +15,7 @@ const { createTestArea, createEntity, World, getVoxelKey, GROUND_Y, CHUNK_SIZE }
 const { createGameState } = await import('../js/game/state.js');
 const { createEncounter } = await import('../js/game/encounter.js');
 const { getSpriteWorldPos, occupy } = await import('../js/game/movement.js');
+const { createTickClock, createWorldClock, ROUND_TICKS } = await import('../js/core/clock.js');
 
 file('encounter.test.mjs - into battle and out, by B and by Fight');
 
@@ -34,8 +35,10 @@ function setup(enemyAt) {
     clearHover: () => calls.push(['clearHover']),
     refreshTints: () => {}
   };
-  const encounter = createEncounter({ game, player, enemy, playerSprite, enemySprite, enemyAI, view });
-  return { game, player, enemy, enemySprite, enemyAI, calls, encounter };
+  const ticks = createTickClock(), worldClock = createWorldClock(9);
+  const encounter = createEncounter({ game, player, enemy, playerSprite, enemySprite, enemyAI, view,
+                                      ticks, worldClock });
+  return { game, player, enemy, enemySprite, enemyAI, calls, encounter, ticks, worldClock };
 }
 const inChunk = (p, b) => p.x >= b.minX && p.x <= b.maxX && p.z >= b.minZ && p.z <= b.maxZ;
 
@@ -93,5 +96,19 @@ section('Fight: the enemy pulled into the arena');
   ok('explore again', t.game.mode, 'explore');
   ok('the panels stay up', el('battle-ui-layer').style.display, 'block');
 }
+section('game time in battle: 6 s a round');
+{
+  const t = setup({ x: 25, z: 25 });
+  const start = t.worldClock.ticks;
+  t.encounter.startBattle(false);
+  ok('the first round begins: 6 s', t.worldClock.ticks - start, ROUND_TICKS);
+  ok('ticks no longer move it', (t.worldClock.tick(), t.worldClock.ticks - start), ROUND_TICKS);
+  t.encounter.endTurn();
+  ok('alone, ending the turn begins round 2', t.worldClock.ticks - start, 2 * ROUND_TICKS);
+  t.encounter.endBattle();
+  t.worldClock.tick();
+  ok('explore: the ticks move it again', t.worldClock.ticks - start, 2 * ROUND_TICKS + 1);
+}
+
 World.clear();
 globalThis.document = savedDocument;

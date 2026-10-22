@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec3, vec4, uniform, max, texture, vec2, normalize, clamp, cos, sin, int, mix } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { BAYER4, SUN_ANGULAR_SIZE, coneOffsets, coneRadius, sunBasis } from '../core/sun.js';
 import { CARD_SUN_REACH } from '../core/cards.js';
 import { layout } from './layout.js';

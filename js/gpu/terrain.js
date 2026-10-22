@@ -7,7 +7,7 @@
 import { attribute, texture, uv, int, vec3, vec4, uniform, select, positionLocal, Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize, clamp, exp2,
          cameraProjectionMatrix, cameraViewMatrix, modelWorldMatrix } from 'three/tsl';
 import { BLOCK_METRES } from '../core/world.js';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { occlusionRevealTSL, occlusionHiddenTSL, occlusionShrinkTSL } from './occlusion.js';
 
 // 1 draws the terrain plain white (whiteworld) - a uniform, so both the plain

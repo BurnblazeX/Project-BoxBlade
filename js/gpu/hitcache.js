@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, float, vec3, uniform, instanceIndex, storage, floor, abs, clamp, int, select, sqrt, uint, ivec3, bitXor, shiftRight, bitAnd, bitOr, shiftLeft, atomicMax, atomicLoad, atomicStore } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 
 // --- The hit lighting cache ---
 //

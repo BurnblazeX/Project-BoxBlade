@@ -1,7 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec2, vec3, vec4, int, uint, uniform, storage, min, mix, select, round,
          atomicAdd, atomicLoad, atomicStore } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { insideAtTSL } from './occlusion.js';
 import { blockVolumeTSL } from './volume.js';

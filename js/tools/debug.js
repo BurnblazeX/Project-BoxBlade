@@ -1,9 +1,9 @@
 import * as THREE from 'three/webgpu';
-import { createBoxGridAt, gridOriginFor, isOccupied, isGlassVoxel, GRID_DIM,
+import { createFieldAt, gridOriginFor, isOccupied, isGlassVoxel, GRID_DIM,
          voxelCentreToWorld, CASCADE_COUNT, cascadeVoxelMetres, cascadeBlocks,
-         cascadeExtentMetres, SUN_BIAS_BLOCKS } from '../core/boxgrid.js';
+         cascadeExtentMetres, SUN_BIAS_BLOCKS } from '../core/field.js';
 
-// --- boxGrid debug visualisation (Alt+G) ---
+// --- field debug visualisation (Alt+G) ---
 //
 // Draws the occupancy grid as it actually exists in memory: one cube per
 // occupied voxel at 12.5 cm, with a checkerboard tint so individual voxels stay
@@ -175,7 +175,7 @@ let pendingOrigin = null;
 let pendingMode = null;
 let pendingPlayer = null;
 
-// One cached grid PER LEVEL. createBoxGridAt() only initialises voxelSize,
+// One cached grid PER LEVEL. createFieldAt() only initialises voxelSize,
 // range and voxelsPerBlock when it allocates, so handing it a C0 buffer and
 // asking for C1 would repopulate at the coarse stride while the grid still
 // claimed to be fine - a field that is wrong by a factor of two in a way that
@@ -186,7 +186,7 @@ const cachedGrids = [];
 function beginRebuild(scene, origin, mode, sunDirection, bias) {
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const o = l === 0 ? origin : gridOriginFor(mode, pendingPlayer, sunDirection, bias, l);
-    cachedGrids[l] = createBoxGridAt(o.x, o.z, cachedGrids[l] || null, l);
+    cachedGrids[l] = createFieldAt(o.x, o.z, cachedGrids[l] || null, l);
   }
   cachedGrid = cachedGrids[0];
   // Each level is clipped by the one finer than it, so the ladder subtracts all
@@ -215,7 +215,7 @@ function finishRebuild() {
   const counts = cachedGrids.map((g, l) => fill(meshes[l], g, l === 0 ? null : clipBoxes[l - 1]));
   const count = counts[0];
   console.log(
-    `[boxGrid debug] ${pendingMode} | origin (${pendingOrigin.x},${pendingOrigin.z}) | ` +
+    `[field debug] ${pendingMode} | origin (${pendingOrigin.x},${pendingOrigin.z}) | ` +
     counts.map((c, l) =>
       `C${l} ${(cascadeVoxelMetres(l) * 100).toFixed(1)}cm to ` +
       `${cascadeExtentMetres(l)}m: ${c.toLocaleString()}`).join(' | ')
@@ -232,7 +232,7 @@ function rebuild(scene, origin, mode, sunDirection, bias) {
   return finishRebuild();
 }
 
-export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh,
+export function toggleFieldDebug(scene, playerGridPos, terrainMesh,
                                    mode = 'explore', opts = {}) {
   const { sunDirection = null, bias = SUN_BIAS_BLOCKS } = opts;
   isVisible = !isVisible;
@@ -243,7 +243,7 @@ export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh,
     pendingOrigin = null;
     pendingMode = null;
     if (terrainMesh) terrainMesh.visible = true;
-    console.log('[boxGrid debug] off');
+    console.log('[field debug] off');
     return false;
   }
 
@@ -256,7 +256,7 @@ export function toggleBoxGridDebug(scene, playerGridPos, terrainMesh,
   // the whole ground plane; substituting the view also makes it unambiguous
   // that what is on screen is grid data, not the world.
   if (terrainMesh) terrainMesh.visible = false;
-  return `boxGrid overlay on - C0 at ${(cascadeVoxelMetres(0) * 100).toFixed(1)} cm ` +
+  return `field overlay on - C0 at ${(cascadeVoxelMetres(0) * 100).toFixed(1)} cm ` +
          `over ${cascadeExtentMetres(0)} m, C1 at ` +
          `${(cascadeVoxelMetres(1) * 100).toFixed(1)} cm filling out to ` +
          `${cascadeExtentMetres(1)} m around it. C1 is drawn with C0 subtracted, ` +
@@ -278,7 +278,7 @@ function originFor(mode, playerGridPos, sunDirection, bias) {
 // the grid origin actually moved, or a split rebuild is half done. In explore
 // that is once per block stepped (the footprint follows the player); in battle
 // it is chunk-aligned and static for the whole fight.
-export function refreshBoxGridDebug(scene, playerGridPos, mode = 'explore',
+export function refreshFieldDebug(scene, playerGridPos, mode = 'explore',
                                     opts = {}) {
   if (!isVisible) return false;
 
@@ -294,10 +294,10 @@ export function refreshBoxGridDebug(scene, playerGridPos, mode = 'explore',
   return true;
 }
 
-export function isBoxGridDebugVisible() {
+export function isFieldDebugVisible() {
   return isVisible;
 }
 
-export function getBoxGridDebugOrigin() {
+export function getFieldDebugOrigin() {
   return currentOrigin;
 }

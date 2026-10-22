@@ -19,7 +19,7 @@
 //   rebuild()    the shading rebuilt (a kernel flag changed, or the atlas arrived)
 //   onReady()    the cards' atlas has arrived (the plain AO takes their discs)
 import { VOXEL_SIZE } from '../render.js';
-import { CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres } from '../../core/boxgrid.js';
+import { CASCADE_COUNT, cascadeExtentMetres, cascadeVoxelMetres } from '../../core/field.js';
 import { createCardBindings, createCardAtlasTexture, createCardColourTexture, writeCardBindings,
          MAX_CARDS } from '../../gpu/cards.js';
 import { runGPUCards } from '../../gpu/diagnostics.js';

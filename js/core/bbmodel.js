@@ -5,7 +5,7 @@
 // form, and places a model in the world as axis-aligned boxes - the form every
 // system here already understands: the renderer draws each cube as one more
 // instance of the terrain box (render.js), the field bakes it as a box
-// (boxgrid.js), so shadows, AO, GI, reflections and the texel cache take a
+// (core/field.js), so shadows, AO, GI, reflections and the texel cache take a
 // model with no path of their own.
 //
 // The conventions it holds a model to (doc §0):

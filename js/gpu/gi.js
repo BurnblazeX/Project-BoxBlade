@@ -2,13 +2,14 @@ import * as THREE from 'three/webgpu';
 import {
   Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec3, uniform, instanceIndex,
   storage, texture3D, textureStore, max, min, select, normalize, round, uniformArray,
-  length, pow, mix
+  length, pow, mix, exp
 } from 'three/tsl';
-import { HIT_EPS, MIN_STEP, cascadeVoxelMetres, VOXEL_METRES } from '../core/boxgrid.js';
+import { HIT_EPS, MIN_STEP, cascadeVoxelMetres, VOXEL_METRES } from '../core/field.js';
 import { decodeFieldTSL, ringUV, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FADE_VOXELS } from './field.js';
 import { glassRayTransmitTSL } from './glass.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { createPointLightsTSL } from './pointlights.js';
+import { smokeShared, smokeSampleTSL, smokeTransmitTSL, SMOKE_REACH } from './smokeshadow.js';
 import { sunColourUniform, skyShTSL } from './sky.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
 import { createConeTraceSunTSL } from './trace.js';
@@ -120,6 +121,11 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   const buf = (itemSize) => new THREE.StorageBufferAttribute(CELLS, itemSize);
   const ORDERS = CELLS * orderCount;
   const solidBuf = buf(1), eBuf = buf(4), wBuf = buf(4);
+  // Per cell, what the cloud spells' smoke in it lets through: exp(-sigma x
+  // cell) (gpu/smokeshadow.js) - 1 with no smoke. The bounce and the sky
+  // visibility are both cut by it in propagate.
+  const smokeBuf = buf(1);
+  const smokeK = storage(smokeBuf, 'float', CELLS).setName(`bxbLpvSmoke`);
   const aBuf = new THREE.StorageBufferAttribute(ORDERS, 4), bBuf = new THREE.StorageBufferAttribute(ORDERS, 4);
   // Named: an unnamed buffer is NodeBuffer_<global node id> in the WGSL, and
   // that id depends on how many nodes existed before - so the shader text, and
@@ -144,6 +150,21 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   tex.generateMipmaps = false;
   tex.minFilter = tex.magFilter = THREE.LinearFilter;
   tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
+
+  // The fog's light in this volume's air (gpu/fog.js reads it): per cell, the
+  // sun's transmittance to the cell centre (rgb - stained glass tints it), and
+  // the light list's light there, shadowed, from every side. Written by the
+  // fog kernel only while there is fog.
+  const fogTex = (() => {
+    const t = new THREE.Storage3DTexture(D, D, D);
+    t.type = THREE.HalfFloatType;
+    t.format = THREE.RGBAFormat;
+    t.generateMipmaps = false;
+    t.minFilter = t.magFilter = THREE.LinearFilter;
+    t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping;
+    return t;
+  });
+  const fogSunTex = fogTex(), fogLampTex = fogTex();
 
   const u = {
     // World-space min corner of the volume: C0's origin, tracked by the CPU.
@@ -260,6 +281,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
       sprite.addAssign(spriteOverlap(base, A, B).mul(u.spriteFill.element(sp)));
     });
     solid.element(c.i).assign(min(count.div(float(27)).add(sprite), float(1)));
+    smokeK.element(c.i).assign(exp(smokeSampleTSL(smokeShared, base.add(cellU.mul(float(0.5)))).w.mul(cellU).negate()));
   })().compute(CELLS).setName(`LPV.Solid`);
 
   // --- inject: light leaving the surfaces around each air cell ---
@@ -416,10 +438,51 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
         });
       });
       const open = select(air, skyOpenAt(centre), float(0));
-      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE), open));
+      // Cloud spells' smoke in this cell gives back the light it is lit by -
+      // the sun, through the world and through the smoke toward it, and the
+      // sky - times its colour and the share of light it scatters here.
+      const smokeE = vec3(0, 0, 0).toVar();
+      const smk = smokeSampleTSL(smokeShared, centre).toVar();
+      If(smk.w.greaterThan(float(1e-4)), () => {
+        const lit = vec3(0, 0, 0).toVar();
+        If(u.sunGain.greaterThan(float(0)), () => {
+          const traced = coneTrace(centre, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
+          const through = glass ? glassRayTransmitTSL(glass, traced, centre, sun.dir) : vec3(1, 1, 1);
+          lit.assign(sunColourUniform.mul(through).mul(traced.x.mul(sunRoofTSL(terrain, centre, sun.dir, sunReach)))
+            .mul(u.sunGain).mul(smokeTransmitTSL(smokeShared, centre, sun.dir, float(SMOKE_REACH), true)));
+        });
+        if (sky) lit.addAssign(skyShTSL(sky, vec3(0, 1, 0), true).mul(ambient).mul(u.skyGain).mul(skyOpenAt(centre)));
+        const colour = smk.xyz.div(smk.w);
+        smokeE.assign(lit.mul(colour).mul(float(1).sub(exp(smk.w.mul(cellU).negate()))));
+      });
+      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE).add(smokeE), open));
       W.element(c.i).assign(vec4(bounceW.div(float(6)), 0));
     });
   })().compute(CELLS).setName(`LPV.Inject`);
+
+  // --- fog: the light at each air cell's centre, for the froxels ---
+  //
+  // The same sun march and light loop the injection runs at its probe hits,
+  // but at the cell centre and with no surface: the sun's visibility with its
+  // glass tint and the roof test, and every light shadowed with no N.L (a
+  // point in the air is lit from all sides). Sliced as the injection is.
+  const fogKernel = Fn(() => {
+    const c = cellOf(instanceIndex, D);
+    If(c.i.mod(u.slices).equal(u.slice), () => {
+      const centre = centreOf(c).toVar();
+      const sunT = vec3(0, 0, 0).toVar(), lamp = vec3(0, 0, 0).toVar();
+      If(fieldAt(centre).greaterThan(float(0)), () => {
+        If(u.sunGain.greaterThan(float(0)), () => {
+          const traced = coneTrace(centre, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
+          const through = glass ? glassRayTransmitTSL(glass, traced, centre, sun.dir) : vec3(1, 1, 1);
+          sunT.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, centre, sun.dir, sunReach)).mul(u.sunGain)));
+        });
+        lamp.assign(pointLights.withSpecular(centre, vec3(0, 0, 0), NO_SKIP, null));
+      });
+      textureStore(fogSunTex, uvec3(c.x, c.y, c.z), vec4(sunT, 0));
+      textureStore(fogLampTex, uvec3(c.x, c.y, c.z), vec4(lamp, 0));
+    });
+  })().compute(CELLS).setName(`LPV.Fog`);
 
   // --- propagate: one iteration, src -> dst (lpv.js propagateStep) ---
   // Every order in one loop. Order 0 is lit by the injection (E); order k by
@@ -429,7 +492,8 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   // frames as the propagation itself does.
   const propagate = (src, dst) => Fn(() => {
     const c = cellOf(instanceIndex, D);
-    const open = float(1).sub(solid.element(c.i)).toVar();
+    // Smoke in the cell holds the light back as glass tints it.
+    const open = float(1).sub(solid.element(c.i)).mul(smokeK.element(c.i)).toVar();
     // Glass tints the light in its cells (lpv.js propagateStep's trans).
     const keep = (T ? T.element(c.i).xyz.mul(open) : vec3(open, open, open)).toVar();
     const nbs = FACE_DIRS.map(([dx, dy, dz]) => {
@@ -533,12 +597,13 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   // and none changes partway through it, so batching cannot change a value.
   // Cached, not rebuilt per frame: three keys the pass's state on the array.
   const lists = new Map();
-  const kernelList = (prefix, iterations) => {
-    const key = `${prefix}:${iterations}`;
+  const kernelList = (prefix, iterations, fog) => {
+    const key = `${prefix}:${iterations}:${fog}`;
     let list = lists.get(key);
     if (!list) {
       list = prefix === 'reset' ? [clearA] : prefix === 'shift' ? [shiftKernel, copyBA] : [];
       list.push(solidKernel, injectKernel);
+      if (fog) list.push(fogKernel);
       for (let k = 0; k < iterations; k += 2) list.push(aToB, bToA);
       list.push(resolveKernel);
       lists.set(key, list);
@@ -549,7 +614,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   return {
     tex, uniforms: u, sun, level, cellMetres, dim: D, res, orders: orderCount,
     // What the shading pass needs to sample it: see lpvSampleTSL in ambient.js.
-    binding: { tex, origin: u.origin, extent: D * cellMetres, dim: D, cellMetres },
+    binding: { tex, origin: u.origin, extent: D * cellMetres, dim: D, cellMetres, fogSunTex, fogLampTex },
 
     // Injection slices: 1/N of the cells re-injected each frame.
     get slices() { return sliceCount; },
@@ -559,7 +624,8 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     // volume cannot follow, or null when C0 did not move.
     // batch false submits each kernel on its own, as before - the same list in
     // the same order, so the two can be A/B'd (bxb.gibatch()).
-    update(renderer, { shift = null, iterations = 8, fullInject = false, batch = true } = {}) {
+    // fog: also light the air for the froxels (the fog kernel).
+    update(renderer, { shift = null, iterations = 8, fullInject = false, batch = true, fog = false } = {}) {
       let prefix = '';
       if (shift === 'reset') {
         prefix = 'reset';
@@ -577,7 +643,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
       frame++;
       // Even, so the answer always ends in A, where resolve reads it.
       const n = Math.max(2, iterations + (iterations % 2));
-      const list = kernelList(prefix, n);
+      const list = kernelList(prefix, n, fog);
       if (batch) renderer.compute(list);
       else for (const k of list) renderer.compute(k);
     },
@@ -586,8 +652,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     // a hundred MB.
     dispose(renderer = null) {
       tex.dispose();
+      fogSunTex.dispose();
+      fogLampTex.dispose();
       const attrs = renderer && renderer._attributes;
-      if (attrs) for (const b of [solidBuf, eBuf, wBuf, aBuf, bBuf, tBuf]) if (b) attrs.delete(b);
+      if (attrs) for (const b of [solidBuf, smokeBuf, eBuf, wBuf, aBuf, bBuf, tBuf]) if (b) attrs.delete(b);
     }
   };
 }

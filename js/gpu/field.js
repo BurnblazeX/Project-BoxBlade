@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, min, clamp, smoothstep, int, select } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE, FIELD_CHANNELS, gridIndex, ringSegments, ringSegmentsZ, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES, createFieldAt, DISTANCE_RANGE, FIELD_CHANNELS, gridIndex, ringSegments, ringSegmentsZ, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
 
 // The step ceiling, the hit epsilon and the minimum step all come from
-// boxgrid.js rather than being restated here. They are the difference between
+// core/field.js rather than being restated here. They are the difference between
 // the CPU reference and the shader agreeing and not, and bxb.parity() exists to
 // catch exactly that - so there must be one definition, not two.
 
@@ -17,7 +17,7 @@ import { GRID_DIM, VOXEL_METRES, createBoxGridAt, DISTANCE_RANGE, FIELD_CHANNELS
 // at integer cells.
 // ---------------------------------------------------------------------------
 // Two channels, interleaved exactly as grid.data holds them: R the opaque
-// distance, G the glass distance (boxgrid.js FIELD_CHANNELS). Every existing read
+// distance, G the glass distance (core/field.js FIELD_CHANNELS). Every existing read
 // samples .r, so it sees the opaque field and nothing else changes.
 export function createDistanceTexture(grid) {
   const tex = new THREE.Data3DTexture(grid.data, GRID_DIM, GRID_DIM, GRID_DIM);
@@ -32,7 +32,7 @@ export function createDistanceTexture(grid) {
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
   // X and Z repeat because the field is a ring in those axes (see gridIndex in
-  // boxgrid.js): filtering across the physical seam then reads the logical
+  // core/field.js): filtering across the physical seam then reads the logical
   // neighbour. Y is not ringed and clamps as before.
   tex.wrapS = tex.wrapR = THREE.RepeatWrapping;
   tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -48,10 +48,10 @@ export function updateDistanceTexture(tex) {
 // ---------------------------------------------------------------------------
 // Sphere tracing in TSL
 //
-// The port of sphereTrace() in boxgrid.js, and the technique the design doc
+// The port of sphereTrace() in core/field.js, and the technique the design doc
 // specifies: step by the distance stored at the current point, which is the
 // radius of a sphere guaranteed to be empty, so the step can never overshoot a
-// surface. The binary Amanatides-Woo DDA it replaced is still in boxgrid.js as
+// surface. The binary Amanatides-Woo DDA it replaced is still in core/field.js as
 // an independent cross-check - two unrelated traversals agreeing on the same
 // geometry is worth more than either one being carefully reviewed.
 //
@@ -65,12 +65,12 @@ export function updateDistanceTexture(tex) {
 // ---------------------------------------------------------------------------
 
 // The decode, and it MUST stay the exact mirror of decodeDistance() in
-// boxgrid.js - the CPU reference and this shader are only worth having as a pair
+// core/field.js - the CPU reference and this shader are only worth having as a pair
 // if they read the same bytes the same way, which is what bxb.parity() checks.
 //
 // An R8 texture samples normalised to [0,1], the field stores c over [-1,+1], and
 // the mapping is squared so that precision concentrates at the surface: distance
-// = c * |c| * DISTANCE_RANGE, in voxels. See boxgrid.js for the precision table
+// = c * |c| * DISTANCE_RANGE, in voxels. See core/field.js for the precision table
 // and for why a linear map over the same range would have been a bad trade.
 //
 // The normalisation that silently broke the binary version - where an occupied
@@ -113,7 +113,7 @@ export const ringUV = Fn(([vp, ring]) => {
   return clamp(vp, vec3(0.5, 0.5, 0.5), vec3(dim.sub(0.5))).add(ring).div(dim);
 });
 
-// ring: the grid's x/z ring offset in voxels - see gridIndex in boxgrid.js.
+// ring: the grid's x/z ring offset in voxels - see gridIndex in core/field.js.
 export const traceDistanceTSL = Fn(([sdfTex, gridOrigin, origin, dir, maxDist, ring]) => {
   const dim = float(GRID_DIM);
   const vs = float(VOXEL_METRES);
@@ -299,7 +299,7 @@ export const levelLive = (i, skipC0, done) =>
 // is enough - the texture object and the material are unchanged, so nothing
 // rebuilds. The grid remembers its own level, so this works for any cascade.
 export function followShadowGrid(grid, tex, bindings, originBlock, renderer = null) {
-  createBoxGridAt(originBlock.x, originBlock.z, grid, grid.level);
+  createFieldAt(originBlock.x, originBlock.z, grid, grid.level);
   return commitShadowGrid(grid, tex, bindings, renderer);
 }
 

@@ -1,5 +1,5 @@
 import { voxelIndex, gridIndex, ringSegments, GRID_DIM, DISTANCE_RANGE, FIELD_CHANNELS,
-         CASCADE_COUNT, cascadeVoxelMetres } from './boxgrid.js';
+         CASCADE_COUNT, cascadeVoxelMetres } from './field.js';
 
 // --- Tracing against the cutout, not against a box ---
 //
@@ -8,7 +8,7 @@ import { voxelIndex, gridIndex, ringSegments, GRID_DIM, DISTANCE_RANGE, FIELD_CH
 // shadow read as a character rather than as a blob under one.
 //
 // THE REASON THIS IS CHEAP IS THE FROZEN CONSTANT. Twelve texels per 1.5 m block
-// means 12.5 cm per texel, the boxGrid is locked 1:1 to that, and the character
+// means 12.5 cm per texel, the field is locked 1:1 to that, and the character
 // sprites are authored at 12 x 24 for a 1.5 x 3.0 m quad. So one sprite pixel is
 // one voxel is one texel, exactly, with nothing to resample and no projection
 // error to carry. The alpha mask IS a voxel mask already - it just has to be
@@ -57,7 +57,7 @@ import { voxelIndex, gridIndex, ringSegments, GRID_DIM, DISTANCE_RANGE, FIELD_CH
 // What it gives up: the card is no longer axis-aligned to the voxel grid, so the
 // 1:1 pixel-to-voxel correspondence only holds when the sun happens to lie along
 // an axis. That is why the transform is sampled BILINEARLY below - the same
-// reasoning that makes the boxGrid's own 3D texture LinearFilter rather than
+// reasoning that makes the field's own 3D texture LinearFilter rather than
 // nearest. Interpolating a distance field is exact in a way that interpolating
 // occupancy never was, so a rotated card still resolves its zero-crossing
 // properly instead of stair-stepping against its own pixel grid.

@@ -1,9 +1,9 @@
 import { file, section, ok, truthy, falsy, note } from './lib/harness.mjs';
 import { World, createTestArea, getVoxelKey } from '../js/core/world.js';
 import {
-  createBoxGridAt, populateDistanceField, isOccupied, sphereTrace,
+  createFieldAt, populateDistanceField, isOccupied, sphereTrace,
   worldToVoxel, voxelIndex, gridIndex, GRID_DIM, VOXEL_METRES
-} from '../js/core/boxgrid.js';
+} from '../js/core/field.js';
 import {
   createOccluder, placeOccluder, applyOccluders,
   PROXY_WIDTH, PROXY_HEIGHT
@@ -18,7 +18,7 @@ World.clear();
 createTestArea(12, 12);
 
 function freshGrid() {
-  return createBoxGridAt(0, 0, null, 0);
+  return createFieldAt(0, 0, null, 0);
 }
 
 // A byte-for-byte snapshot. The strongest available statement about the restore
@@ -171,14 +171,14 @@ section('a re-origin carries proxies with it');
 // The two ways a scroll can go wrong, and neither shows up without moving the
 // grid: the stored box is in grid coordinates and goes stale, or the strip bake
 // wipes the imprint of a proxy standing in what slid in.
-const g2 = createBoxGridAt(0, 0, null, 0);
+const g2 = createFieldAt(0, 0, null, 0);
 const walker = placeOccluder(createOccluder('w'), 9, 0.75, 9);
 applyOccluders(g2, [walker]);
 const before = chestVoxel(g2, 9, 9);
 truthy('solid before the scroll', isOccupied(g2, before.vx, before.vy, before.vz));
 
 // Step the footprint one block. The proxy does not move in the world.
-createBoxGridAt(1, 0, g2, 0);
+createFieldAt(1, 0, g2, 0);
 const moved = chestVoxel(g2, 9, 9);
 falsy('a stationary proxy needs no rewrite after a scroll',
       applyOccluders(g2, [walker]));
@@ -188,13 +188,13 @@ truthy('and is still solid at the same WORLD position',
 // Now a proxy standing in the strip that is about to scroll in. Its imprint
 // cannot exist yet, so the strip bake cannot destroy it - place it, scroll, and
 // check the grid notices it has to be written into the freshly baked strip.
-const edge = createBoxGridAt(0, 0, null, 0);
+const edge = createFieldAt(0, 0, null, 0);
 // A world x near the far edge of the footprint, so one block of scroll brings
 // fresh ground under it.
 const ex = 16.5;
 const stander = placeOccluder(createOccluder('s'), ex, 0.75, 9);
 applyOccluders(edge, [stander]);
-createBoxGridAt(1, 0, edge, 0);
+createFieldAt(1, 0, edge, 0);
 applyOccluders(edge, [stander]);
 const ev = chestVoxel(edge, ex, 9);
 truthy('a proxy over the scrolled-in strip is still solid',
@@ -202,10 +202,10 @@ truthy('a proxy over the scrolled-in strip is still solid',
 
 section('a full re-bake drops every imprint');
 
-const g3 = createBoxGridAt(0, 0, null, 0);
+const g3 = createFieldAt(0, 0, null, 0);
 applyOccluders(g3, [placeOccluder(createOccluder('x'), 9, 0.75, 9)]);
 // A jump too far to slide is a full bake, which clears everything including the
 // proxies. The state has to be dropped with it or the next diff thinks they are
 // already written.
-createBoxGridAt(60, 60, g3, 0);
+createFieldAt(60, 60, g3, 0);
 ok('occluder state is cleared by a full bake', g3.occluderBoxes, null);

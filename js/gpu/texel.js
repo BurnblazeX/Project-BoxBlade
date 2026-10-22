@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec3, uniform, instanceIndex, storage, floor, abs, vec2, vec4, ivec2, clamp, uniformArray, int, select, textureLoad, screenCoordinate, Discard, uint, atomicStore, atomicAdd } from 'three/tsl';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { terrainSurfaceTSL } from './terrain.js';
 import { outsideShadeTSL } from './occlusion.js';
 import { MATERIAL_LAYERS } from '../core/materials.js';

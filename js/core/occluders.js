@@ -1,5 +1,5 @@
 import { GRID_DIM, DISTANCE_RANGE, minBoxVoxels, populateDistanceField,
-         voxelIndex, gridIndex, FIELD_CHANNELS } from './boxgrid.js';
+         voxelIndex, gridIndex, FIELD_CHANNELS } from './field.js';
 import { minSilhouetteVoxels, AXIS_X } from './silhouette.js';
 
 // --- Dynamic occluders: the things that move and still cast ---

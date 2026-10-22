@@ -1,5 +1,5 @@
 import { VOXEL_METRES, sphereTrace, sampleDistance, worldToVoxelFloat,
-         GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from './boxgrid.js';
+         GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from './field.js';
 
 // Defaults mirrored from gpu/field.js. See fadeWeightTSL there for why a march that
 // ends at a LIMIT rather than at geometry has to fade out instead of stopping.

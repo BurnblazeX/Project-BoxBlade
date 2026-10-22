@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, uniform, floor, max, texture, abs, vec2, clamp, smoothstep, length, uniformArray, int, select, mix, exp2 } from 'three/tsl';
-import { VOXEL_METRES, CASCADE_COUNT } from '../core/boxgrid.js';
+import { VOXEL_METRES, CASCADE_COUNT } from '../core/field.js';
 import { CARD_RANGE, CARD_PAD, CARD_FADE_START, CARD_SUN_REACH } from '../core/cards.js';
 import { layout } from './layout.js';
 import { decodeFieldTSL } from './field.js';
@@ -155,7 +155,7 @@ export function createCardsTSL(b, { ranged = false } = {}) {
               const sv = clamp(pv, float(0.5), rh.sub(float(0.5)));
               const uvp = vec2(rx.add(su).div(b.atlasSize.x),
                                ry.add(sv).div(b.atlasSize.y));
-              // Same decode as the boxGrid's, because it is the same encoding - one
+              // Same decode as the field's, because it is the same encoding - one
               // distance format in the renderer, not two that can drift.
               const dPix = decodeFieldTSL(texture(b.atlas, uvp).r, float(CARD_RANGE));
               // The transform saturates at CARD_PAD pixels, so far from the card it

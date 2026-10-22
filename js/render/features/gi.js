@@ -19,6 +19,8 @@
 //   terrainAlbedo() the terrain's mean albedo, once its textures are in
 //   shadowsOn()    whether the marched shading is on
 //   rebuild()      the shading rebuilt, when a kernel flag changed
+//   fogOn()        whether there is fog: the volumes then light their air for
+//                  it too (gpu/gi.js fog kernel; render/features/fog.js reads it)
 import { uniform, int } from 'three/tsl';
 import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL, averageAlbedo, lpvShift,
          DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
@@ -34,7 +36,7 @@ import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
 export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, sprites, terrainAlbedo,
-                           shadowsOn, rebuild }) {
+                           shadowsOn, rebuild, fogOn = () => false }) {
   let giOn = true;
   // Which bounce: 'texel' - a radiance cache on the block faces, ray-traced
   // (gpu/texelgi.js createTexelGI; needs split shading, which finds the patches) - or
@@ -211,7 +213,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       u.bounces.value = Math.min(lpvBounces, v.orders);
       v.slices = lpvSlices;
       writeSunUniforms(v.sun, sun.light.position, sun.angular());
-      v.update(renderer, { shift, iterations: Math.round(lpvIterations * v.res), batch: giBatch });
+      v.update(renderer, { shift, iterations: Math.round(lpvIterations * v.res), batch: giBatch, fog: fogOn() });
     }
     lastGIms = performance.now() - t0;
   }
@@ -296,6 +298,8 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     }),
     update,
     stepTexel,
+    // The LPV's bindings for the fog (gpu/fog.js), while the LPV is the bounce.
+    lpvBinding: () => (giOn && giMode === 'lpv' && lpvs ? giBinding() : null),
     commands,
     // For the Perf section.
     perfSettings: [
@@ -359,7 +363,11 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
           if (lpvs && lpvs[0].orders < lpvBounces) rebuildLPV();   // finer res: more orders to hold
         } },
       { key: 'gires', label: 'Resolution', type: 'select',
-        options: LPV_RES_OPTIONS.map(r => ({ value: r, label: `${2 * r}x${2 * r} a block face (${0.75 / r} m)` })),
+        // The near volume's cells a block face, by its own cells a block (LPV_VOLUMES).
+        options: LPV_RES_OPTIONS.map(r => {
+          const n = LPV_VOLUMES[0].blockCells * r;
+          return { value: r, label: `${n}x${n} a block face (${+(1.5 / n).toFixed(3)} m)` };
+        }),
         help: 'GI cells a block face. Finer is sharper bounce and dearer: ~3.4x, 8x, 27x the cells (rebuilds)',
         get: () => lpvRes,
         set: v => { const r = Number(v); if (r !== lpvRes) { lpvRes = r; rebuildLPV(); } } },

@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { If, Loop, Break, float, vec2, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
 import { BLOCK_METRES, Y_MIN } from '../core/world.js';
 import { SKY_TOP_STEPS } from '../core/skytop.js';
 import { terrainWhite, blockFaceTSL as boxFaceTSL, texelLockTSL, modelTexelCoreTSL } from './terrain.js';
@@ -69,10 +69,10 @@ export function axisFaceTSL(g) {
 // corner, where two faces meet and the gradient points between them: snapped
 // to the wrong axis, an exit bent against the wrong face and sent the ray to
 // the sky - the white rims along every glass edge. Mirrored on the CPU by
-// boxgrid.js blockFaceNormal.
+// core/field.js blockFaceNormal.
 // terrain: the block volume, so the planes of the shape in p's cell count too
 // (world.js codeBox) - a pane's or a half's faces sit mid-cell. Mirrors
-// boxgrid.js blockFaceNormal with a world.
+// core/field.js blockFaceNormal with a world.
 export function blockFaceTSL(p, dir, leaving, terrain = null) {
   const f = fract(p.div(float(BLOCK_METRES)).add(float(0.5))).toVar();
   const ad = abs(dir).toVar();

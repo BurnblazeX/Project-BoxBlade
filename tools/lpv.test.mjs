@@ -1,5 +1,5 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
-import { GRID_DIM, VOXEL_METRES } from '../js/core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES } from '../js/core/field.js';
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, LPV_CELL_METRES, LPV_EXTENT_METRES,
   cellIndex, cellCoords, propagateStep, lpvShift, shiftVolume, averageAlbedo,
@@ -191,7 +191,7 @@ section('sky visibility (propagateSkyStep)');
 section('the volumes: 2 x 2 a block over C1, 1 x 1 over C2');
 {
   const { LPV_VOLUMES, lpvVolumeRes } = await import('../js/core/lpv.js');
-  const { cascadeVoxelMetres } = await import('../js/core/boxgrid.js');
+  const { cascadeVoxelMetres } = await import('../js/core/field.js');
   const cell = v => LPV_CELL_VOXELS * cascadeVoxelMetres(v.level) / lpvVolumeRes(v);
   ok('two volumes, over C1 and C2', LPV_VOLUMES.map(v => v.level).join(','), '1,2');
   near('C1: 0.75 m cells', cell(LPV_VOLUMES[0]), 0.75, 1e-12);

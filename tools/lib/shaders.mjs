@@ -9,7 +9,7 @@
 import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3 } from 'three/tsl';
 import { createTestArea } from '../../js/core/world.js';
-import { createBoxGridAt, gridOriginFor, CASCADE_COUNT } from '../../js/core/boxgrid.js';
+import { createFieldAt, gridOriginFor, CASCADE_COUNT } from '../../js/core/field.js';
 import { POINT_CARD_CAPACITY } from '../../js/core/lights.js';
 import { SUN_CARD_LOD_SHIFT, SUN_CARD_LOD_MAX } from '../../js/core/cards.js';
 import { SUN_ANGULAR_SIZE } from '../../js/core/sun.js';
@@ -83,7 +83,7 @@ const sunDirection = new THREE.Vector3(0.4, 0.8, 0.3).normalize();
 const cascades = [];
 for (let l = 0; l < CASCADE_COUNT; l++) {
   const o = gridOriginFor('explore', { x: 20, y: 0, z: 20 }, sunDirection, 0, l);
-  const grid = createBoxGridAt(o.x, o.z, null, l);
+  const grid = createFieldAt(o.x, o.z, null, l);
   cascades.push(G.cascadeBindings(G.createDistanceTexture(grid), grid));
 }
 const sunCards = G.createCardBindings(G.MAX_CARDS, 'bxbSunCards');
@@ -114,12 +114,14 @@ const sunU = {
 };
 // GI: its compute dispatches caught from a stand-in renderer, as lists.
 const dispatched = [];
+// On only inside buildFogShaders: the LPV then lights its air for the fog.
+let fogTest = false;
 const giFeature = createGI({
   renderer: { compute: k => dispatched.push([k].flat()) },
   cascades: () => cascades, lighting, sky: features[0], mirrors: mirrorFeature,
   sun: { uniforms: () => sunU, on: () => true, angular: () => SUN_ANGULAR_SIZE, light: sunLight },
   sprites: { casters: () => [], types: [] }, terrainAlbedo: () => null,
-  shadowsOn: () => true, rebuild() {}
+  shadowsOn: () => true, rebuild() {}, fogOn: () => fogTest
 });
 features.push(giFeature);
 const debugView = createDebugView({ shadowsOn: () => true, shadows() {}, rebuild() {} });
@@ -197,7 +199,7 @@ async function diagnosticKernels() {
   const caught = [];
   const stand = { computeAsync: async k => { caught.push(k); },
                   getArrayBufferAsync: async () => new ArrayBuffer(4) };
-  const grid = createBoxGridAt(0, 0, null, 0);
+  const grid = createFieldAt(0, 0, null, 0);
   const rays = Array.from({ length: 256 }, () => ({ origin: { x: 1, y: 1, z: 1 },
                                                     dir: { x: 1, y: -1, z: 0.5 }, maxDist: 12 }));
   await G.runGPUMarch(stand, G.createDistanceTexture(grid), grid, rays);
@@ -275,6 +277,48 @@ export function buildProfilingShaders() {
 // dresses it) - built, not snapshotted.
 export function buildPlainShaders() {
   return { 'plain terrain': wgslOf(R.worldInstancedMesh, R.worldInstancedMesh.material) };
+}
+
+// The fog (gpu/fog.js): the LPV's fog kernel, the froxel kernels and the
+// quad over the frame - built, not snapshotted.
+export function buildFogShaders() {
+  fogTest = true;
+  dispatched.length = 0;
+  giFeature.update();
+  fogTest = false;
+  const out = {};
+  for (const list of dispatched) for (const k of list) if (k.name === 'LPV.Fog') out['lpv fog light'] = wgslOf(k);
+  const fog = G.createFroxelFog({ gi: giFeature.lpvBinding(), sky, ambient: sunU.ambientUniform });
+  fog.kernels.forEach(k => { out[k.name] = wgslOf(k); });
+  const rt = new THREE.RenderTarget(64, 64, { type: THREE.FloatType, depthTexture: new THREE.DepthTexture(64, 64) });
+  const quad = fog.makeQuad({ id: rt.texture, depth: rt.depthTexture });
+  out['fog quad'] = { compute: wgslOf(quad, quad.material).fragment };
+  return out;
+}
+
+// Spell smoke (gpu/smoke.js): the per-cube light kernel and the cubes -
+// built, not snapshotted.
+export function buildSmokeShaders() {
+  const smoke = G.createSmokeCubes({ cascades, lights: lighting.bindings(), biasUniform: sunU.biasUniform,
+                                     fadeStartUniform: sunU.fadeStartUniform, edgeFadeUniform: sunU.edgeFadeUniform,
+                                     ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures });
+  const out = { smokeLight: wgslOf(smoke.light), 'smoke cubes': { compute: wgslOf(smoke.mesh, smoke.mesh.material).fragment } };
+  // The shading with the smoke in its light (its sun march and light loop).
+  const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  split.resolve = G.createSplitResolve(split, texelCache);
+  for (const [k, v] of Object.entries(shaderSet('smoke-shadows', { smoke: G.smokeShared, split }))) {
+    out[`shading with smoke: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
+  }
+  // ... and with texel GI, whose rays the smoke dims.
+  const mode = giFeature.settings.settings.find(x => x.key === 'gimode');
+  mode.set('texel');
+  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  split2.resolve = G.createSplitResolve(split2, texelCache);
+  for (const [k, v] of Object.entries(shaderSet('smoke-texelgi', { smoke: G.smokeShared, split: split2 }))) {
+    if (k.includes('gi.')) out[`texel GI with smoke: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
+  }
+  mode.set('lpv');
+  return out;
 }
 
 // The exposure meter's kernels (gpu/exposure.js), over each source it reads -

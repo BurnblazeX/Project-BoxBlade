@@ -17,7 +17,7 @@ import { buildMirrors, packMirrors, isReflective, MAX_MIRRORS, mirrorCacheStride
          MIRROR_CACHE_VEC4S } from '../../core/mirrors.js';
 import { MATERIALS, isGlassMaterial } from '../../core/materials.js';
 import { World } from '../../core/world.js';
-import { cascadeExtentMetres } from '../../core/boxgrid.js';
+import { cascadeExtentMetres } from '../../core/field.js';
 import { LIGHT_VEC4S } from '../../core/lights.js';
 import { createMirrorBindings, writeMirrorBindings } from '../../gpu/mirrorlight.js';
 import { glassBackGlare } from '../../gpu/glass.js';

@@ -4,8 +4,8 @@ import { createCard, cardDistance, cardFacingFor, cardVisibility,
          cullCardsForLight, cardPixelAt, CARD_PAD, CARD_RANGE,
          CARD_LOD_C0_METRES, CARD_LOD_LEVELS, SUN_CARD_LOD_SHIFT,
          SUN_CARD_LOD_MAX } from '../js/core/cards.js';
-import { VOXEL_METRES, CASCADE_COUNT } from '../js/core/boxgrid.js';
-import { decodeDistance } from '../js/core/boxgrid.js';
+import { VOXEL_METRES, CASCADE_COUNT } from '../js/core/field.js';
+import { decodeDistance } from '../js/core/field.js';
 import { facingToward } from '../js/core/silhouette.js';
 
 file('cards.test.mjs - analytic sprite cards, one facing per light');
@@ -158,7 +158,7 @@ ok('one rect per card', atlas.rects.length, 2);
 ok('the second starts where the first ends', atlas.rects[1].x, card.w);
 
 // The bytes must decode back to the distances, through the SAME encoding the
-// boxGrid uses - one distance format in the renderer, not two that can drift.
+// field uses - one distance format in the renderer, not two that can drift.
 const probeX = atlas.rects[0].x + CARD_PAD + 1;      // inside the H's left leg
 const probeY = CARD_PAD + 1;
 near('a stored byte decodes to the distance it was built from',
@@ -228,8 +228,8 @@ note('a scene can hold any number of sprites - what is bounded is how many ' +
 
 section('cascade LOD - a card follows the level it stands in');
 {
-  ok('the LOD copy of C0 voxel size matches boxgrid', CARD_LOD_C0_METRES, VOXEL_METRES);
-  ok('the LOD copy of the level count matches boxgrid', CARD_LOD_LEVELS, CASCADE_COUNT);
+  ok('the LOD copy of C0 voxel size matches field', CARD_LOD_C0_METRES, VOXEL_METRES);
+  ok('the LOD copy of the level count matches field', CARD_LOD_LEVELS, CASCADE_COUNT);
   // A solid card straight ahead; rays aimed at a sweep of heights across its
   // top edge. Coarser levels move where the edge lands to a coarser grid.
   const solid = createCard({ mask: new Uint8Array(16 * 16).fill(1), w: 16, h: 16,

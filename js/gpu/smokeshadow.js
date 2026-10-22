@@ -1,0 +1,307 @@
+// --- The smoke as the whole renderer sees it: shadows and bounce through cloud spells ---
+//
+// smokeShared   one binding (a module singleton, as volume.js hitBounds): per
+//               cloud slot (MAX_SMOKE_CLOUDS), which BoxGrid boxes are smoke
+//               (SMOKE_BOX^3, stacked along z), and the slot's box corner,
+//               spell colour and density, cast time and roll-out. The boxes
+//               are written once, when a cloud is cast - each holding how far
+//               the smoke travelled to reach it (core/smoke.js) - and how far
+//               it has grown is worked out where it is read (smokeGrownAtTSL:
+//               a box rolls in by its travel, as its cube does), so a cloud's
+//               shadow grows with it, round corners as the smoke flows, and
+//               no frame rewrites it.
+//               Never a shader rebuild. Two copies of the boxes:
+//                 hard  as they are, read nearest - the world's shadows, so a
+//                       cube's shadow is a cube's;
+//                 soft  blurred over each box's neighbours ([1 2 1] / 4 a
+//                       side), read filtered - how the smoke shades itself and
+//                       holds back the bounce: light falls off smoothly
+//                       through a cloud instead of box by box.
+// smokeTauTSL   the optical depth along a ray through every live cloud. The
+//               shading multiplies its sun march and every light by
+//               exp(-tau x strength) (gpu/shade.js, gpu/pointlights.js); the
+//               cubes light themselves through the soft copy (gpu/smoke.js).
+// smokeSampleTSL  the smoke at a point - extinction, and its colour by it: the
+//               LPV's cells lose the bounce through it and the lit smoke in
+//               them gives its own back (gpu/gi.js).
+// smokeInscatterTSL  a ray through smoke: what it holds back, and the lit
+//               smoke's light it gathers on the way - texel GI's rays
+//               (gpu/texelgi.js), so a sunlit cloud brightens what is round it.
+// Its own module so the light loop (pointlights.js) and the cubes (smoke.js),
+// which use each other, both reach it.
+import * as THREE from 'three/webgpu';
+import { Fn, If, Loop, float, vec3, vec4, int, uniform, uniformArray, texture3D, exp, max, min, clamp,
+         smoothstep, select } from 'three/tsl';
+import { SMOKE_CUBE, SMOKE_BOX, SMOKE_GROW_IN } from '../core/smoke.js';
+import { layout } from './layout.js';
+
+// Cloud spells live at once. Each is a slot of the atlas, and every shadow
+// ray and light checks each slot's box: one more slot is one more box test a
+// ray, wherever the clouds are.
+export const MAX_SMOKE_CLOUDS = 8;
+
+// Rows of the slot table a slot (see createSmokeShared).
+const ROWS = 6;
+
+export const SMOKE_REACH = 36;      // metres a shadow ray looks for smoke: C1
+
+// Boxes along a ray through one cloud's box, at most: its diagonal.
+const STEPS = Math.ceil(SMOKE_BOX * Math.sqrt(3));
+
+// The binding the renderer shares (see above).
+function createSmokeShared() {
+  const N = MAX_SMOKE_CLOUDS, O = SMOKE_BOX, SLOT = O * O * O;
+  const texture = (data, filter) => {
+    const t = new THREE.Data3DTexture(data, O, O, O * N);
+    t.format = THREE.RedFormat;
+    t.type = THREE.UnsignedByteType;
+    t.minFilter = t.magFilter = filter;
+    t.wrapS = t.wrapT = t.wrapR = THREE.ClampToEdgeWrapping;
+    t.unpackAlignment = 1;
+    t.generateMipmaps = false;
+    t.needsUpdate = true;
+    return t;
+  };
+  const occData = new Uint8Array(SLOT * N), softData = new Uint8Array(SLOT * N);
+  const occTex = texture(occData, THREE.NearestFilter), softTex = texture(softData, THREE.LinearFilter);
+  const at = (x, y, z) => x + O * (y + O * z);
+  const a = new Float32Array(SLOT), b = new Float32Array(SLOT);
+  // [1 2 1] / 4 along axis d, src -> dst, over [lo, hi] (the cloud's boxes and a margin).
+  const blurAxis = (src, dst, d, lo, hi) => {
+    for (let z = lo[2]; z <= hi[2]; z++) for (let y = lo[1]; y <= hi[1]; y++) for (let x = lo[0]; x <= hi[0]; x++) {
+      const c = [x, y, z];
+      let sum = 2 * src[at(x, y, z)], w = 2;
+      for (const s of [-1, 1]) {
+        const n = c.slice(); n[d] += s;
+        if (n[d] < 0 || n[d] >= O) continue;
+        sum += src[at(n[0], n[1], n[2])]; w += 1;
+      }
+      dst[at(x, y, z)] = sum / w;
+    }
+  };
+  // One uniform array for all of it, four vec4 a slot - each uniformArray
+  // is a uniform buffer, and a stage may bind only 12: four arrays took the
+  // LPV's inject past it (an invalid pipeline).
+  //   0  its box's min corner (world metres), 1 while live
+  //   1  its colour (rgb) and density (/m)
+  //   2  its emitter (world metres) and the second it was cast
+  //   3  its radii across and up (metres), the farthest travel it took, the
+  //      seconds it takes to roll out
+  //   4  the min corner of what its smoke fills (world metres, a box of margin
+  //      for the soft copy's blur), 5 its max - every ray is clipped to these,
+  //      not to the slot's whole box: that is sized for a 9th-level cast (32 m),
+  //      and marching all of it from everything near a small cloud doubled
+  //      the frame
+  const slots = uniformArray(new Array(N * ROWS).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSmokeSlots');
+  return {
+    occData, occTex, softData, softTex, slots,
+    // Slot k's row r (above), as a node.
+    row: (k, r) => slots.element(int(k).mul(int(ROWS)).add(int(r))),
+    // How many slots are live: 0, and every smoke test is one branch.
+    live: uniform(int(0)).setName('bxbSmokeLive'),
+    // Seconds, on the same clock as the cast times (render/features/smoke.js).
+    time: uniform(float(0)).setName('bxbSmokeTime'),
+    // How dark the smoke is to light passing through it: a scale on the depth.
+    strength: uniform(float(1)).setName('bxbSmokeStrength'),
+    // Slot k: the cloud's boxes (core/smoke.js), its spell and its growth,
+    // cast at `castTime`; null clears it.
+    write(k, cloud, castTime = 0) {
+      const ob = k * SLOT;
+      a.fill(0);
+      occData.fill(0, ob, ob + SLOT);
+      if (cloud) {
+        const lo = [O, O, O], hi = [-1, -1, -1];
+        for (const c of cloud.cubes) {
+          const l = [c[4] - cloud.box[0], c[5] - cloud.box[1], c[6] - cloud.box[2]];
+          if (l.some(v => v < 0 || v >= O)) continue;
+          a[at(l[0], l[1], l[2])] = 1;
+          // Hard: its travel as a share of the farthest, 1..255 (0 is no smoke).
+          occData[ob + at(l[0], l[1], l[2])] = 1 + Math.round(254 * c[3] / Math.max(cloud.gMax, 1e-6));
+          for (let d = 0; d < 3; d++) { lo[d] = Math.min(lo[d], l[d]); hi[d] = Math.max(hi[d], l[d]); }
+        }
+        // The blur only where the cloud is, and a box round it.
+        const blo = lo.map(v => Math.max(0, v - 2)), bhi = hi.map(v => Math.min(O - 1, v + 2));
+        b.fill(0);
+        if (hi[0] >= 0) { blurAxis(a, b, 0, blo, bhi); a.set(b); blurAxis(a, b, 1, blo, bhi); a.set(b); blurAxis(a, b, 2, blo, bhi); }
+        for (let i = 0; i < SLOT; i++) softData[ob + i] = Math.round(255 * b[i]);
+        const { box, centre, spell, radius } = cloud;
+        const r = slots.array;
+        const R = ROWS * k;
+        r[R].set((box[0] - 0.5) * SMOKE_CUBE, (box[1] - 0.5) * SMOKE_CUBE, (box[2] - 0.5) * SMOKE_CUBE, 1);
+        r[R + 1].set(spell.colour[0], spell.colour[1], spell.colour[2], spell.density);
+        r[R + 2].set(centre[0], centre[1], centre[2], castTime);
+        r[R + 3].set(radius * SMOKE_CUBE, (radius + 0.5) * SMOKE_CUBE, cloud.gMax, cloud.growSeconds);
+        // What it fills: its boxes, and one more each way for the blur.
+        const corner = d => (box[d] + lo[d] - 1.5) * SMOKE_CUBE, far = d => (box[d] + hi[d] + 1.5) * SMOKE_CUBE;
+        r[R + 4].set(corner(0), corner(1), corner(2), 0);
+        r[R + 5].set(far(0), far(1), far(2), 0);
+      } else {
+        occData.fill(0, ob, ob + SLOT);
+        softData.fill(0, ob, ob + SLOT);
+        slots.array[ROWS * k].set(0, 0, 0, 0);
+      }
+      occTex.needsUpdate = true;
+      softTex.needsUpdate = true;
+      let live = 0;
+      for (let j = 0; j < N; j++) if (slots.array[ROWS * j].w > 0.5) live++;
+      this.live.value = live;
+    }
+  };
+}
+
+export const smokeShared = createSmokeShared();
+
+// How grown slot k's smoke is (0..1) where the smoke travelled `share` of
+// its farthest to get: it rolls in over the slot's roll-out time by travel,
+// each box over SMOKE_GROW_IN - as its cube grows in.
+export function smokeGrowthTSL(shared, k, share) {
+  const appear = share.mul(shared.row(k, 3).w);
+  return smoothstep(appear, appear.add(float(SMOKE_GROW_IN)), shared.time.sub(shared.row(k, 2).w));
+}
+
+// How grown slot k's smoke is at p (uvw its atlas place): by the travel its
+// hard box holds - and where the soft copy reaches past the boxes (its blur),
+// once the cloud is fully out.
+const grownAt = (shared, k, uvw) => {
+  const r = texture3D(shared.occTex, uvw).level(float(0)).r;
+  return smokeGrowthTSL(shared, k, select(r.greaterThan(float(0.002)), r.mul(float(255)).sub(float(1)).div(float(254)), float(1)));
+};
+
+// Where p falls in slot k's part of the atlas (z kept half a box inside it,
+// so the filter never reads the next cloud).
+const atlasUVW = (m, k, p) => {
+  const O = SMOKE_BOX, SPAN = O * SMOKE_CUBE;
+  const l = p.sub(m.xyz).div(float(SPAN)).toVar();
+  const z = clamp(l.z, float(0.5 / O), float(1 - 0.5 / O));
+  return vec3(clamp(l.x, float(0), float(1)), clamp(l.y, float(0), float(1)),
+              float(k).add(z).div(float(MAX_SMOKE_CLOUDS)));
+};
+
+// What slot k's smoke fills, against the ray: { t0, t1 } (t1 <= t0: missed).
+const boxSpan = (shared, k, origin, dir, reach) => {
+  const inv = vec3(1, 1, 1).div(dir);
+  const a = shared.row(k, 4).xyz.sub(origin).mul(inv), b = shared.row(k, 5).xyz.sub(origin).mul(inv);
+  const lo = min(a, b), hi = max(a, b);
+  return { t0: max(max(max(lo.x, lo.y), lo.z), float(0)).toVar(), t1: min(min(min(hi.x, hi.y), hi.z), reach).toVar() };
+};
+
+// Fn([origin, dir, reach]) -> the optical depth through every live cloud
+// along the ray (unscaled by strength); soft: through the blurred copy. A
+// layout function: the shading calls it at every sun march and every light.
+const tauFns = new WeakMap();
+export function smokeTauTSL(shared = smokeShared, soft = false) {
+  if (!tauFns.has(shared)) tauFns.set(shared, {});
+  const memo = tauFns.get(shared), key = soft ? 'soft' : 'hard';
+  if (memo[key]) return memo[key];
+  const step = SMOKE_CUBE, tex = soft ? shared.softTex : shared.occTex;
+  const fn = Fn(([origin, dir, reach]) => {
+    const tau = float(0).toVar();
+    If(shared.live.greaterThan(int(0)), () => Loop({ start: int(0), end: int(MAX_SMOKE_CLOUDS), type: 'int', condition: '<', name: 'smk' }, ({ smk }) => {
+      const m = shared.row(smk, 0).toVar();
+      If(m.w.greaterThan(float(0.5)), () => {
+        const { t0, t1 } = boxSpan(shared, smk, origin, dir, reach);
+        If(t1.greaterThan(t0), () => {
+          const density = shared.row(smk, 1).w.toVar();
+          const t = t0.add(float(step * 0.5)).toVar();
+          Loop({ start: int(0), end: int(STEPS), type: 'int', condition: '<', name: 'sms' }, () => {
+            If(t.lessThan(t1), () => {
+              const uvw = atlasUVW(m, smk, origin.add(dir.mul(t))).toVar();
+              const raw = texture3D(tex, uvw).level(float(0)).r;
+              // Hard: any travel is a whole box of smoke.
+              const occ = soft ? raw : select(raw.greaterThan(float(0.002)), float(1), float(0));
+              tau.addAssign(occ.mul(grownAt(shared, smk, uvw)).mul(density).mul(float(step)));
+              t.addAssign(float(step));
+            });
+          });
+        });
+      });
+    }));
+    return tau;
+  }).setLayout(layout(soft ? 'smokeTauSoft' : 'smokeTau', 'float', [
+    { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' }, { name: 'reach', type: 'float' }]));
+  memo[key] = fn;
+  return fn;
+}
+
+// The smoke's transmittance along a ray, as the shading takes it: exp(-tau x
+// strength). reach: how far to look (metres); soft: the blurred copy.
+export const smokeTransmitTSL = (shared, origin, dir, reach = float(SMOKE_REACH), soft = false) =>
+  exp(smokeTauTSL(shared, soft)(origin, dir, reach).mul(shared.strength).negate());
+
+// The smoke at p, every live cloud's (the soft copy, grown): vec4(colour x
+// extinction, extinction) - extinction /m, times strength. Inline: one call
+// site a kernel.
+export function smokeSampleTSL(shared, p) {
+  const out = vec4(0, 0, 0, 0).toVar();
+  If(shared.live.greaterThan(int(0)), () => Loop({ start: int(0), end: int(MAX_SMOKE_CLOUDS), type: 'int', condition: '<', name: 'smp' }, ({ smp }) => {
+    const m = shared.row(smp, 0).toVar();
+    const lo = shared.row(smp, 4).xyz, hi = shared.row(smp, 5).xyz;
+    const inside = m.w.greaterThan(float(0.5)).and(p.x.greaterThanEqual(lo.x)).and(p.y.greaterThanEqual(lo.y))
+      .and(p.z.greaterThanEqual(lo.z)).and(p.x.lessThan(hi.x)).and(p.y.lessThan(hi.y)).and(p.z.lessThan(hi.z));
+    If(inside, () => {
+      const par = shared.row(smp, 1);
+      const uvw = atlasUVW(m, smp, p).toVar();
+      const sigma = texture3D(shared.softTex, uvw).level(float(0)).r
+        .mul(grownAt(shared, smp, uvw)).mul(par.w).mul(shared.strength).toVar();
+      out.addAssign(vec4(par.xyz.mul(sigma), sigma));
+    });
+  }));
+  return out;
+}
+
+// Fn([origin, dir, reach, sunDir, sunLight, skyLight]) -> vec4(the light the
+// lit smoke along the ray scatters into it, the optical depth x strength).
+// Per cloud the ray crosses: its depth through the cloud (soft), the light
+// the smoke there is lit by - the sun through the rest of the smoke from
+// where it is thickest along the ray, and the sky - times its colour, and
+// what it gives the ray: that light times (1 - its transmittance), dimmed by
+// the clouds before it. The sun's world shadow is left out: this is the bounce.
+const inFns = new WeakMap();
+export function smokeInscatterTSL(shared = smokeShared) {
+  if (inFns.has(shared)) return inFns.get(shared);
+  const tauSoft = smokeTauTSL(shared, true);
+  const step = SMOKE_CUBE;
+  const fn = Fn(([origin, dir, reach, sunDir, sunLight, skyLight]) => {
+    const gathered = vec3(0, 0, 0).toVar(), tauAll = float(0).toVar();
+    If(shared.live.greaterThan(int(0)), () => Loop({ start: int(0), end: int(MAX_SMOKE_CLOUDS), type: 'int', condition: '<', name: 'sik' }, ({ sik: k }) => {
+      const m = shared.row(k, 0).toVar();
+      If(m.w.greaterThan(float(0.5)), () => {
+        const { t0, t1 } = boxSpan(shared, k, origin, dir, reach);
+        If(t1.greaterThan(t0), () => {
+          const par = shared.row(k, 1).toVar();
+          const tau = float(0).toVar(), tw = float(0).toVar();
+          const t = t0.add(float(step * 0.5)).toVar();
+          Loop({ start: int(0), end: int(STEPS), type: 'int', condition: '<', name: 'sis' }, () => {
+            If(t.lessThan(t1), () => {
+              const uvw = atlasUVW(m, k, origin.add(dir.mul(t))).toVar();
+              const s = texture3D(shared.softTex, uvw).level(float(0)).r
+                .mul(grownAt(shared, k, uvw)).mul(par.w).mul(float(step)).toVar();
+              tau.addAssign(s);
+              tw.addAssign(s.mul(t));
+              t.addAssign(float(step));
+            });
+          });
+          If(tau.greaterThan(float(1e-4)), () => {
+            const mid = origin.add(dir.mul(tw.div(tau))).toVar();
+            const toSun = exp(tauSoft(mid, sunDir, float(SMOKE_REACH)).mul(shared.strength).negate());
+            const lit = sunLight.mul(toSun).add(skyLight).mul(par.xyz);
+            const T = exp(tau.mul(shared.strength).negate());
+            gathered.addAssign(lit.mul(float(1).sub(T)).mul(exp(tauAll.negate())));
+            tauAll.addAssign(tau.mul(shared.strength));
+          });
+        });
+      });
+    }));
+    return vec4(gathered, tauAll);
+  }).setLayout(layout('smokeInscatter', 'vec4', [
+    { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' }, { name: 'reach', type: 'float' },
+    { name: 'sunDir', type: 'vec3' }, { name: 'sunLight', type: 'vec3' }, { name: 'skyLight', type: 'vec3' }]));
+  inFns.set(shared, fn);
+  return fn;
+}
+
+// A sun shadow (p, lift, skip) -> visibility, through the cloud spells too:
+// the ground under a cloud is in its shadow. smoke null: the shadow as it is.
+export const withSmokeTSL = (smoke, sunDir, shadow) => (smoke
+  ? (p, lift, skip) => shadow(p, lift, skip).mul(smokeTransmitTSL(smoke, p, sunDir))
+  : shadow);

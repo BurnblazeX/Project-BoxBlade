@@ -1,5 +1,5 @@
 import { Fn, If, Loop, Break, float, vec3, vec4, uniform, texture3D, max, abs, vec2, min, normalize, cross, clamp, cos, sin, smoothstep, length, int, select, mix } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP } from '../core/field.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { LPV_DIM, LPV_CELL_METRES } from '../core/lpv.js';
 import { terrainSurfaceTSL, terrainTexelTSL } from './terrain.js';
@@ -168,6 +168,12 @@ export function createRevealedLightTSL(skyIrradiance, gi, room = null) {
 // hit rather than at the receiver is what makes the bounce directional: the
 // cones that struck a red wall bring back red, the ones that escaped bring back
 // whatever fills the open air.
+//
+// nS (the normal-mapped normal; null: n) bends the gather: each cone's sample
+// is weighed by nS's cosine to it over n's, so a bump turned toward a lit red
+// wall takes more of its red and one turned away less. Exactly as before on a
+// flat texel (nS = n). The occlusion and the sky visibility stay n's - they
+// are the geometry's.
 export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null }) {
   const cone = createAOConeTSL(cascades);
   const bias = biasUniform || uniform(float(SURFACE_BIAS_VOXELS));
@@ -183,7 +189,8 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
   // A loop, not six unrolled copies, and its count is a node: `single` (a bool
   // node, or null) drops it to the one cone along the normal, weighted 1, for
   // shading LOD - see createShadowColorNode's lod.
-  return (p, n, lift, skip, single = null) => {
+  return (p, n, lift, skip, single = null, nS = null) => {
+    const bump = lpv && nS ? nS.toVar() : null;
     const origin = p.add(lift.mul(bias.mul(float(VOXEL_METRES)))).toVar();
     const helper = select(abs(n.y).lessThan(float(0.999)), vec3(0, 1, 0), vec3(1, 0, 0));
     const T = normalize(cross(helper, n)).toVar();
@@ -213,7 +220,9 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
         const back = select(r.z.greaterThan(float(0)),
                             max(r.y.sub(float(lpvHalfCell(lpv))), float(0)), r.y);
         const s = lpvSampleTSL(lpv, origin.add(dir.mul(back)), false, true).toVar();
-        gi.addAssign(s.xyz.mul(w));
+        // The cone's cosine to n is ct (1 up, cos AO_TILT tilted).
+        const lean = bump ? max(dir.dot(bump), float(0)).div(ct) : null;
+        gi.addAssign(s.xyz.mul(lean ? w.mul(lean) : w));
         sky.addAssign(s.w.mul(w));
       }
     });

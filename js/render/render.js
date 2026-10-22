@@ -7,7 +7,7 @@ import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockF
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
 import { MODELS, TERRAIN_LAYERS } from '../core/models.js';
 import { lightColourOf, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from '../core/bbmodel.js';
-import { VOXEL_METRES } from '../core/boxgrid.js';
+import { VOXEL_METRES } from '../core/field.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';

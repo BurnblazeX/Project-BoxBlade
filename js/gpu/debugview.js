@@ -10,7 +10,7 @@
 // createShadowColorNode, where those terms are built.
 import { Fn, If, Loop, Break, float, vec3, vec4, floor, fract, sin, max, mix, select,
          clamp, length, normalize, texture3D, cameraPosition } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/boxgrid.js';
+import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 import { layout, memoCascades } from './layout.js';
 import { decodeFieldTSL, ringUV } from './field.js';
 import { skyOpenTSL } from './volume.js';

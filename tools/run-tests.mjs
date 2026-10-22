@@ -1,7 +1,7 @@
 // Smoke-test runner. Discovers every *.test.mjs in tools/ and runs it.
 //
 //   npm test                 - run everything
-//   npm test boxgrid         - run only files whose name contains "boxgrid"
+//   npm test field         - run only files whose name contains "field"
 //
 // Tests must stay headless: no WebGPU device, no DOM. Modules that only import
 // Three.js are fine (debug.js does), but anything constructing a renderer is not

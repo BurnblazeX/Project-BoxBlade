@@ -1,6 +1,6 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
 import { World, getVoxelKey, BLOCK_METRES } from '../js/core/world.js';
-import { createBoxGridAt, VOXEL_METRES, sphereTrace, DISTANCE_RANGE } from '../js/core/boxgrid.js';
+import { createFieldAt, VOXEL_METRES, sphereTrace, DISTANCE_RANGE } from '../js/core/field.js';
 import {
   SUN_ANGULAR_SIZE, penumbraMetres, penumbraTexels, coneRadius, sunBasis,
   coneOffsets, coneDirections, coneVisibility, coneTraceVisibility,
@@ -145,7 +145,7 @@ function wallGrid(height) {
       World.set(getVoxelKey(x, y, WALL_Z), { solid: true, walkable: false, occupant: null });
     }
   }
-  return createBoxGridAt(0, 0);
+  return createFieldAt(0, 0);
 }
 
 // Ground surface height in world metres: block y = 0 spans [-0.75, +0.75], so its

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
 import { buildAllShaders, buildViewShaders, buildProfilingShaders, buildExposureShaders,
-         buildPlainShaders } from './lib/shaders.mjs';
+         buildPlainShaders, buildFogShaders, buildSmokeShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
 // moves code must leave all of them identical - this is what proves it, where
@@ -82,6 +82,19 @@ section('basic mode builds');
 for (const [id, set] of Object.entries(buildPlainShaders())) {
   ok(`${id}: vertex and fragment`, !!(set.vertex && set.vertex.length && set.fragment && set.fragment.length), true);
 }
+
+section('fog builds');
+for (const [id, set] of Object.entries(buildFogShaders())) ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
+
+section('within the default WebGPU limits');
+for (const [name, set] of Object.entries(shaders)) for (const [stage, code] of Object.entries(set)) {
+  if (typeof code !== 'string') continue;
+  const ubos = (code.match(/var<uniform>/g) || []).length;
+  if (ubos > 12) ok(`${name} ${stage}: at most 12 uniform buffers`, ubos, 12);
+}
+
+section('smoke builds');
+for (const [id, set] of Object.entries(buildSmokeShaders())) ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
 
 section('exposure meter builds');
 for (const [id, set] of Object.entries(buildExposureShaders())) {

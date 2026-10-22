@@ -1,8 +1,8 @@
 import { file, section, ok, near, truthy, falsy, note } from './lib/harness.mjs';
 import { World, createTestArea } from '../js/core/world.js';
-import { createBoxGridAt, isOccupied, worldToVoxel, sphereTrace,
+import { createFieldAt, isOccupied, worldToVoxel, sphereTrace,
          DISTANCE_RANGE, VOXEL_METRES, CASCADE_COUNT,
-         cascadeVoxelMetres } from '../js/core/boxgrid.js';
+         cascadeVoxelMetres } from '../js/core/field.js';
 import {
   maskFromRGBA, downsampleMask, signedDistanceTransform,
   createSilhouette, createSilhouetteSet, silhouetteDistance, ALPHA_THRESHOLD,
@@ -154,7 +154,7 @@ section('it bakes into the field, and the gap stays open');
 
 World.clear();
 createTestArea(12, 12);
-const grid = createBoxGridAt(0, 0, null, 0);
+const grid = createFieldAt(0, 0, null, 0);
 const clean = Uint8Array.from(grid.data);
 
 // The H, stood up on the ground at a known spot, 7 x 9 voxels.
@@ -249,7 +249,7 @@ section('a turned card still casts its cutout, gap and all');
 // orientation - the fixed-axis version thins to a line twice per revolution.
 World.clear();
 createTestArea(12, 12);
-const swept = createBoxGridAt(0, 0, null, 0);
+const swept = createFieldAt(0, 0, null, 0);
 const sweepProxy = createOccluder('sweep', { silhouettes: [hSil] });
 placeOccluder(sweepProxy, STAND.x, 0.75, STAND.z);
 
@@ -281,7 +281,7 @@ falsy('the gap never closes up', everLostGap);
 
 section('turning the sun rewrites the cutouts in place');
 
-const turned = createBoxGridAt(0, 0, null, 0);
+const turned = createFieldAt(0, 0, null, 0);
 const p = placeOccluder(createOccluder('t', { silhouettes: [hSil] }),
                         STAND.x, 0.75, STAND.z);
 truthy('first apply writes it', applyOccluders(turned, [p], AXIS_X));
@@ -298,7 +298,7 @@ section('a rotated card still restores exactly');
 // The band of a turned card is a rotated slab, so the rect that clears it is
 // sized from the rotated bounds. Sized from the axis-aligned ones instead, the
 // corners it missed would keep their old values.
-const restore = createBoxGridAt(0, 0, null, 0);
+const restore = createFieldAt(0, 0, null, 0);
 const cleanRot = Uint8Array.from(restore.data);
 const rp = placeOccluder(createOccluder('r', { silhouettes: [hSil] }),
                          STAND.x, 0.75, STAND.z);
@@ -364,7 +364,7 @@ near('...and no z component to that normal', sunEast.ux, 0, 1e-9);
 
 World.clear();
 createTestArea(12, 12);
-const mir = createBoxGridAt(0, 0, null, 0);
+const mir = createFieldAt(0, 0, null, 0);
 const barProxy = placeOccluder(createOccluder('bar', { silhouettes: [barSil] }),
                                STAND.x, 0.75, STAND.z);
 
@@ -427,7 +427,7 @@ const bobSil = createSilhouette({
 
 World.clear();
 createTestArea(12, 12);
-const lit = createBoxGridAt(0, 0, null, 0);
+const lit = createFieldAt(0, 0, null, 0);
 const holder = placeOccluder(createOccluder('holder', { silhouettes: [bobSil] }),
                              STAND.x, 0.75, STAND.z);
 
@@ -658,7 +658,7 @@ for (let l = 0; l < CASCADE_COUNT; l++) {
 // actually reads. Scanning for the solid extent rather than trusting the header.
 const widths = [];
 for (let l = 0; l < CASCADE_COUNT; l++) {
-  const g = createBoxGridAt(0, 0, null, l);
+  const g = createFieldAt(0, 0, null, l);
   const pr = placeOccluder(createOccluder('p', { silhouettes: setSil }),
                            STAND.x, 0.75, STAND.z);
   applyOccluders(g, [pr], AXIS_X);

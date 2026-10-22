@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
-import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES } from '../core/boxgrid.js';
+import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, exp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin } from 'three/tsl';
+import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
 import { mix32TSL } from './hitcache.js';
 import { createReflectTraceTSL, giTraceHitTSL } from './trace.js';
 import { hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, skyOpenTSL } from './volume.js';
@@ -8,6 +8,7 @@ import { glassRayTransmitTSL } from './glass.js';
 import { REFLECT_ROUGH_END, REFLECT_ROUGH_START, decodeSpecularTSL, fresnelRoughTSL } from './specular.js';
 import { NO_SKIP } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
+import { smokeInscatterTSL } from './smokeshadow.js';
 
 // --- Texel GI: a radiance cache on the block faces ---
 //
@@ -387,13 +388,15 @@ export const texelGILevelTSL = cascades => p => {
 //   bias, sky, ambient, shadeMode, sun, sunOn, sunShadow, sunVisZero,
 //   sunDirect, skyIrradiance, pointLight, mirrorTrace   as the shading's
 //   giRead       the shading's bounce read, { light, cov } (blended levels)
+//   smoke        gpu/smokeshadow.js smokeShared, or null: each ray's light is
+//                dimmed by the cloud spells it crossed on its way
 //   cones, nearReach   the shading's AO cones (createAOTSL) and their reach:
 //                the near band is the rays hitting within it, V_p the cones'
 //                visibility at the anchor (giDirect). null: no near band
 export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass, bias, sky, ambient,
                                        shadeMode, sun, sunOn, sunShadow, sunVisZero, sunDirect,
                                        skyIrradiance, pointLight, mirrorTrace, giRead,
-                                       cones = null, nearReach = null }) {
+                                       cones = null, nearReach = null, smoke = null }) {
   const plainTrace = glass ? null : trace || createReflectTraceTSL(cascades);
   const glassTrace = glass ? createReflectTraceTSL(cascades, false, true) : null;
   const abSky = float(texelGI.ab.sky);
@@ -402,6 +405,11 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
   // integral over a hemisphere, over pi, is skyIrradiance.
   const skyRadiance = d => (sky ? skyShTSL(sky, d).mul(ambient).mul(sky.gain) : vec3(ambient, ambient, ambient));
   const q = texelGI.queue, D = texelGI.data;
+  // What lit smoke is lit by, for the rays crossing it: the sun (its world
+  // shadow left out - this is the bounce) and the sky, evenly.
+  const smokeIn = smoke ? smokeInscatterTSL(smoke) : null;
+  const smokeSun = smoke ? sunColourUniform.mul(float(1).sub(ambient)).mul(float(sunOn ? 1 : 0)) : null;
+  const smokeSky = smoke ? skyIrradiance(vec3(0, 1, 0)).add(skyIrradiance(vec3(0, -1, 0))).mul(float(0.5)) : null;
   const reset = Fn(() => {
     const i = int(instanceIndex);
     atomicStore(q.element(int(GI_STAMPS).add(i)), uint(0));
@@ -563,6 +571,14 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
           });
           // Through glass: tinted by the metres it spent in it.
           if (traced) L.mulAssign(glassRayTransmitTSL(glass, traced.glass, origin, dir));
+          // Through cloud spells: to the hit, or the whole reach for a ray that
+          // escaped - held back by the smoke, and given the light of the lit
+          // smoke it crossed (a bounce, so times the GI strength).
+          if (smoke) {
+            const sc = smokeIn(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, texelGI.reach),
+                               sun.dir, smokeSun, smokeSky).toVar();
+            L.assign(L.mul(exp(sc.w.negate())).add(sc.xyz.mul(texelGI.strength)));
+          }
           c[0].addAssign(L.mul(dir.x));
           c[1].addAssign(L.mul(dir.y));
           c[2].addAssign(L.mul(dir.z));

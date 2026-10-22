@@ -1,11 +1,11 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
 import { createTestArea, BLOCK_METRES } from '../js/core/world.js';
 import {
-  createBoxGrid, gridIndex, scrollForHandoff, applyHandoff, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
+  createField, gridIndex, scrollForHandoff, applyHandoff, TEXELS_PER_BLOCK, GRID_DIM, VOXEL_METRES,
   DISTANCE_RANGE, FAR_BYTE, encodeDistance, decodeDistance,
   distanceAt, isOccupied, sampleDistance, boxDistance,
-  sphereTrace, marchOccupancy, voxelCentreToWorld, createBoxGridAt
-} from '../js/core/boxgrid.js';
+  sphereTrace, marchOccupancy, voxelCentreToWorld, createFieldAt
+} from '../js/core/field.js';
 
 file('sdf.test.mjs - signed distance field and sphere tracing');
 
@@ -72,7 +72,7 @@ near('the centre is the half-extent away', boxDistance(0, 0, 0, 0, 0, 0, 2, 2, 2
 
 section('the baked field');
 createTestArea(40, 40);
-const g = createBoxGrid(0, 0);
+const g = createField(0, 0);
 
 ok('two bytes per voxel (opaque, glass), 5.70 MB', (g.data.length / 1048576).toFixed(2), '5.70');
 // Ground only: createTestArea lays the slab, the wall and pillar come from
@@ -204,9 +204,9 @@ section('re-origining rebuilds the field exactly');
 // The bake clears only the ranges it wrote last time, expanded by the field's
 // one-voxel band. Getting that expansion wrong leaves a stale rim that reads as
 // a phantom occluder, so an in-place rebuild must be byte-identical to a fresh one.
-const reused = createBoxGrid(1, 1);
-createBoxGrid(0, 0, reused);
-const fresh = createBoxGrid(0, 0);
+const reused = createField(1, 1);
+createField(0, 0, reused);
+const fresh = createField(0, 0);
 ok('same occupied count', reused.occupiedCount, fresh.occupiedCount);
 truthy('and byte-for-byte identical, with no stale band left behind',
        reused.data.every((v, i) => v === fresh.data[i]));
@@ -233,9 +233,9 @@ const sameLogical = (a, b) => {
 // distances reading as an occluder that is not there, which is very hard to see
 // and very easy to blame on the shadow code. Byte-for-byte or it is wrong.
 for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -4]]) {
-  const slid = createBoxGridAt(10, 10);
-  createBoxGridAt(10 + dx, 10 + dz, slid);
-  const baked = createBoxGridAt(10 + dx, 10 + dz);
+  const slid = createFieldAt(10, 10);
+  createFieldAt(10 + dx, 10 + dz, slid);
+  const baked = createFieldAt(10 + dx, 10 + dz);
   truthy(`scrolling by (${dx}, ${dz}) matches a fresh bake byte for byte`,
          sameLogical(slid, baked));
   ok(`  and keeps the occupancy count exact`, slid.occupiedCount, baked.occupiedCount);
@@ -244,17 +244,17 @@ for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -
 // slid by the wrong number of voxels would look almost right, which is the
 // worst way for this to fail.
 {
-  const slid = createBoxGridAt(10, 10, null, 1);
-  createBoxGridAt(12, 14, slid, 1);
-  const baked = createBoxGridAt(12, 14, null, 1);
+  const slid = createFieldAt(10, 10, null, 1);
+  createFieldAt(12, 14, slid, 1);
+  const baked = createFieldAt(12, 14, null, 1);
   truthy('C1 scrolls by its own voxel size',
          sameLogical(slid, baked));
 }
 // C2 has 3 voxels per block, so half a block is 1.5 voxels. filledBlocks must
-// still be whole voxel coordinates - fractional starts had the boxGrid overlay
+// still be whole voxel coordinates - fractional starts had the field overlay
 // indexing the grid between voxels and dropping most of C2's surface.
 {
-  const c2 = createBoxGridAt(0, 0, null, 2);
+  const c2 = createFieldAt(0, 0, null, 2);
   truthy('C2 block ranges start on whole voxels', c2.filledBlocks.every(Number.isInteger));
 }
 
@@ -263,30 +263,30 @@ for (const [dx, dz] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-2, 3], [5, -
 // a fresh bake - including after the mirror is reset to a DIFFERENT ring, which
 // is what a main-thread full bake does to it.
 {
-  const main = createBoxGridAt(10, 10);
-  let mirror = createBoxGridAt(10, 10);
+  const main = createFieldAt(10, 10);
+  let mirror = createFieldAt(10, 10);
   let ok1 = true;
   const moves = [[11, 10], [11, 11], [12, 12], 'reset', [13, 12], [12, 11], [60, 60], [61, 60]];
   let at = [12, 12];
   for (const mv of moves) {
     if (mv === 'reset') {
-      createBoxGridAt(at[0] + 3, at[1], main);        // main full-bakes elsewhere...
-      createBoxGridAt(at[0], at[1], main);            // ...and back, keeping its ring
-      mirror = createBoxGridAt(at[0], at[1]);          // mirror resets to ring 0
+      createFieldAt(at[0] + 3, at[1], main);        // main full-bakes elsewhere...
+      createFieldAt(at[0], at[1], main);            // ...and back, keeping its ring
+      mirror = createFieldAt(at[0], at[1]);          // mirror resets to ring 0
       continue;
     }
     at = mv;
     applyHandoff(main, scrollForHandoff(mirror, mv[0], mv[1]));
-    if (!sameLogical(main, createBoxGridAt(mv[0], mv[1]))) ok1 = false;
+    if (!sameLogical(main, createFieldAt(mv[0], mv[1]))) ok1 = false;
   }
   truthy('worker hand-off matches a fresh bake, across rings and a jump', ok1);
 }
 // A jump too far to share anything has to fall back to a full bake rather than
 // scrolling in garbage from the far side of the buffer.
 {
-  const jumped = createBoxGridAt(10, 10);
-  createBoxGridAt(60, 60, jumped);
-  const baked = createBoxGridAt(60, 60);
+  const jumped = createFieldAt(10, 10);
+  createFieldAt(60, 60, jumped);
+  const baked = createFieldAt(60, 60);
   truthy('and a jump past the footprint rebakes instead',
          sameLogical(jumped, baked));
 }

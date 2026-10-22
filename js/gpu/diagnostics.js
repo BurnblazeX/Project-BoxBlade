@@ -45,7 +45,7 @@ export async function runComputeSmokeTest(renderer, count = 64) {
 // CPU/GPU parity
 //
 // Runs the same rays through the GPU kernel and returns the results, so they
-// can be diffed against marchOccupancy() from boxgrid.js. The whole reason the
+// can be diffed against marchOccupancy() from core/field.js. The whole reason the
 // CPU DDA was written first was to have something trustworthy to check this
 // against - a shader that silently disagrees is very hard to notice by eye.
 // ---------------------------------------------------------------------------

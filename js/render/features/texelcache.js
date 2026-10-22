@@ -225,7 +225,9 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     // The full-res G-buffer for split shading's resolve.
     const fw = Math.max(1, _drawSize.x), fh = Math.max(1, _drawSize.y);
     if (!texelCache.idRT) {
-      texelCache.idRT = new THREE.RenderTarget(fw, fh, { type: THREE.FloatType, depthBuffer: true });
+      // Its depth as a texture too: the fog reads it (render/features/fog.js).
+      texelCache.idRT = new THREE.RenderTarget(fw, fh, { type: THREE.FloatType, depthBuffer: true,
+                                                         depthTexture: new THREE.DepthTexture(fw, fh) });
       texelCache.idRT.texture.minFilter = texelCache.idRT.texture.magFilter = THREE.NearestFilter;
       texelCache.idRT.texture.generateMipmaps = false;
     } else if (texelCache.idRT.width !== fw || texelCache.idRT.height !== fh) {
@@ -308,6 +310,9 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     renderer.compute(list);
   }
 
+  // Whether this frame drew the full-res G-buffer (idRT).
+  let drewGBuffer = false;
+
   // The low-res pass, before the main render. Only while the terrain wears the
   // material this cache was built for - mid-rebuild it may not.
   function render() {
@@ -327,6 +332,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     if (terrainTwins.glassMiss) {
       terrainTwins.glassMiss.visible = !!glassActive && mesh.visible && glass.visible && !resolved;
     }
+    drewGBuffer = false;
     if (!active) return;
     sizeTexelCache();
     const mask = camera.layers.mask;
@@ -340,6 +346,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
       renderer.setRenderTarget(texelCache.idRT);
       renderer.render(scene, camera);
     }
+    drewGBuffer = resolved;
     renderer.setRenderTarget(null);
     camera.layers.mask = mask;
     runSplitShading(resolved);
@@ -433,6 +440,10 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     // (gpu/exposure.js): split shading's result buffer, or the low-res target
     // (under split shading that holds positions, not colour). null with no
     // cached set showing.
+    // This frame's full-res G-buffer - { id: (locked position, texel id),
+    // depth } - or null when it was not drawn.
+    gbuffer: () => (drewGBuffer && texelCache.idRT
+      ? { id: texelCache.idRT.texture, depth: texelCache.idRT.depthTexture } : null),
     meterSource() {
       const set = activeSet();
       if (!texelCacheOn || !shadowsOn() || !set || !set.lowMat) return null;

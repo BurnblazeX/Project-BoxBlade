@@ -9,7 +9,7 @@ export const World = new Map();
 // ground level itself, and 8 above. Ground is y = 0, so the vertical span is
 // -3 .. 8 inclusive (12 distinct levels).
 // One block is 1.5 m on a side. This is a property of the world, not of the
-// renderer, and boxgrid.js needs it without pulling Three.js in - so it lives
+// renderer, and core/field.js needs it without pulling Three.js in - so it lives
 // here and render.js aliases it as VOXEL_SIZE.
 export const BLOCK_METRES = 1.5;
 export const CHUNK_SIZE = 12;
@@ -73,7 +73,7 @@ export function isSolid(x, y, z) {
 // E and turned to the others.
 //
 // Glass takes the one-box shapes (glass: true below - halves, vertical
-// halves, panes); its walk (boxgrid.js walkThroughGlass, and the shader's)
+// halves, panes); its walk (core/field.js walkThroughGlass, and the shader's)
 // steps from box face to box face. A glass slope or stairs is whole.
 
 // Steps are one texel deep: 12 to the block. Step k's top is the plane's
@@ -433,7 +433,7 @@ export function getColumnTop(x, z) {
 export const WorldModels = [];
 const TEXEL_METRES = BLOCK_METRES / 12;
 // Every placed cube as [x0, y0, z0, x1, y1, z1] in world texels - what the
-// field bakes (boxgrid.js), and what the field worker is sent.
+// field bakes (core/field.js), and what the field worker is sent.
 export const ModelBoxes = [];
 
 export function addWorldModel(model, x, y, z, yaw = 0) {
@@ -589,7 +589,7 @@ export function createTestArea(width, depth) {
   World.clear();
 
   // A single ground layer at y = 0. No sub-surface fill: buried blocks would be
-  // invisible geometry inflating both the draw and the boxGrid's occupancy set
+  // invisible geometry inflating both the draw and the field's occupancy set
   // for nothing, since a block is only ever seen or marched against when some
   // face of it is exposed to air.
   for (let x = 0; x < width; x++) {
@@ -708,7 +708,7 @@ function addReflectionTest() {
   }
 }
 
-// Vertical test geometry, to give the boxGrid something that can actually
+// Vertical test geometry, to give the field something that can actually
 // occlude a light, which a flat single-layer world cannot. A full block's rise
 // needs Jump; the raised platform is reached by the half-tile steps of
 // addHalfTileTest.
