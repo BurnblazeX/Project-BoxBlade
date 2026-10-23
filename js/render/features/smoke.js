@@ -26,20 +26,31 @@
 //                    angular(), uniforms() - the shading's march uniforms }
 //   shadowsOn()    whether the marched shading is on
 //   rebuild()      the shading rebuilt (smoke shadows switched)
+//   boxLight()     basic mode's box light feature (render/features/boxlight.js):
+//                  with the advanced effects off the cubes light themselves
+//                  by its walks (world()), and it shadows the terrain through
+//                  the smoke - version() and growing() tell it when to look
+//                  again.
 import { createSmokeCloud, smokeRadius, CLOUD_SPELLS, MAX_CAST_LEVEL, SMOKE_GROW_IN } from '../../core/smoke.js';
 import { createSmokeCubes, MAX_SMOKE_CLOUDS, DEFAULT_SMOKE, SMOKE_ENCLOSED_DELAY, smokeShared } from '../../gpu/smoke.js';
+import { smokeView } from '../../gpu/smokeview.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
 import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
-export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, shadowsOn, rebuild = () => {} }) {
+export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, cards = null, shadowsOn,
+                              rebuild = () => {}, boxLight = () => null }) {
   const clouds = new Array(MAX_SMOKE_CLOUDS).fill(null);
   let nextSlot = 0;
   let spell = 'fogCloud';
   let castLevel = 1;         // the level Alt+F casts at - a spell's own if that is higher
   let shadows = true;        // the smoke in the world's light (a rebuild to switch)
   const params = { ...DEFAULT_SMOKE };
-  let gpu = null, gpuFor = null;
+  let gpu = null, gpuFor = null, gpuCards = null, gpuLightCards = null;
+  // Basic mode's cubes: made over the box light's walks (gpuFor is them).
+  let gpuBasic = false;
+  // Bumped whenever the clouds change (a cast, a clear, a roll-out done).
+  let version = 0;
   const t0 = performance.now();
   const now = () => (performance.now() - t0) / 1000;
 
@@ -50,20 +61,38 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, sha
     const c = clouds[k];
     smokeShared.write(k, c ? c.cloud : null, c ? c.at : 0);
     if (gpu) gpu.write(clouds);
+    version++;
   };
 
-  // Made for the cascades in use (a shadows rebuild makes new ones).
+  // Made for the cascades in use (a shadows rebuild makes new ones) - or in
+  // basic mode for the box light's walks (remade with its kernels).
   function ensure() {
+    if (!shadowsOn()) {
+      const box = boxLight();
+      const w = box && box.world();
+      if (!w) return null;
+      if (gpu && gpuBasic && gpuFor === w) return gpu;
+      if (gpu) { scene.remove(gpu.mesh); gpu.dispose(); }
+      gpu = createSmokeCubes({ terrain: terrainTextures, world: w });
+      gpuFor = w; gpuBasic = true; gpuCards = gpuLightCards = null;
+      scene.add(gpu.mesh);
+      for (const [k, v] of Object.entries(params)) gpu.uniforms[k].value = v;
+      for (let k = 0; k < MAX_SMOKE_CLOUDS; k++) write(k);
+      return gpu;
+    }
     const c = cascades();
     if (!c || !c.length || !lighting.bindings()) return null;
-    if (gpu && gpuFor === c) return gpu;
+    const cardOptions = cards ? cards.options() : {};
+    if (gpu && !gpuBasic && gpuFor === c && gpuCards === cardOptions.cards && gpuLightCards === cardOptions.lightCards) return gpu;
     if (gpu) { scene.remove(gpu.mesh); gpu.dispose(); }
+    gpuBasic = false;
     const s = sun.uniforms();
     gpu = createSmokeCubes({ cascades: c, lights: lighting.bindings(), biasUniform: s.biasUniform,
                              fadeStartUniform: s.fadeStartUniform, edgeFadeUniform: s.edgeFadeUniform,
                              ambientUniform: s.ambientUniform, sky: sky.bindings, terrain: terrainTextures,
+                             cards: cardOptions.cards, lightCards: cardOptions.lightCards,
                              glass: glassInstancedMesh ? terrainTextures : false });
-    gpuFor = c;
+    gpuFor = c; gpuCards = cardOptions.cards; gpuLightCards = cardOptions.lightCards;
     scene.add(gpu.mesh);
     for (const [k, v] of Object.entries(params)) gpu.uniforms[k].value = v;
     for (let k = 0; k < MAX_SMOKE_CLOUDS; k++) write(k);
@@ -103,14 +132,17 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, sha
         c.compact = compacted = true;
       }
     });
-    if (compacted && gpu) gpu.write(clouds);
-    const live = clouds.some(Boolean) && shadowsOn() && ensure();
+    if (compacted) { version++; if (gpu) gpu.write(clouds); }
+    const live = clouds.some(Boolean) && ensure();
     if (gpu) gpu.mesh.visible = !!live;
     if (!live) return;
     const u = gpu.uniforms;
     writeSunUniforms(gpu.sun, sun.light.position, sun.angular());
+    smokeView.sunDir.value.copy(gpu.sun.dir.value);
     const ambient = sun.uniforms().ambientUniform.value;
-    u.sunLight.value = sun.on() ? 1 - ambient : 0;
+    // Basic mode's sun is the plain light, whole; the shaded path's is what
+    // its ambient leaves.
+    u.sunLight.value = sun.on() ? (gpuBasic ? 1 : 1 - ambient) : 0;
     u.time.value = now();
     renderer.compute(gpu.light);
   }
@@ -151,10 +183,15 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, sha
   return {
     name: 'smoke',
     // The shading reads the smoke: its sun march and lights pass through it.
-    options: () => ({ smoke: shadows ? smokeShared : null }),
+    options: () => ({ smoke: shadows ? smokeShared : null, smokeView: true }),
     update,
     summonAt,
     clear,
+    // For the box light: when the clouds last changed, and whether one is
+    // still rolling out (its shadow growing - a little past, so the last look
+    // sees it whole).
+    version: () => version,
+    growing: () => clouds.some(c => c && now() - c.at < c.cloud.growSeconds + SMOKE_GROW_IN + 0.3),
     // The live clouds (core/smoke.js), for gameplay - what a line of sight crosses.
     clouds: () => clouds.filter(Boolean).map(c => c.cloud),
     commands,
@@ -168,15 +205,15 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, sha
       { key: 'smokeshadows', label: 'Shadows through smoke', type: 'toggle',
         help: 'the sun and every light pass through the smoke: the ground under a cloud is in its shadow (rebuilds)',
         get: () => shadows, set: v => flip(shadows, v, () => commands.smoke.run('shadows')) },
-      { key: 'smokestrength', label: 'Shadow strength', type: 'range', min: 0, max: 3, step: 0.05,
-        help: 'how dark the smoke is to light passing through it - its shadows, and how much it shades itself',
+      { key: 'smokestrength', label: 'Lamp / bounce density', type: 'range', min: 0, max: 3, step: 0.05,
+        help: 'density for lamp shadows and indirect light; sunlight is blocked after eight smoke boxes',
         get: () => smokeShared.strength.value, set: v => { smokeShared.strength.value = v; } },
       range('smokealbedo', 'Brightness', 'albedo', 0, 2, 0.01, 'on the spell\'s own colour'),
       range('smokewave', 'Breathing', 'wave', 0, 0.6, 0.01, 'how much larger than its cell a cube swells before shrinking back'),
       range('smokespeed', 'Breathing speed', 'speed', 0, 8, 0.1, 'how fast the wave moves through the cloud'),
       range('smokenoise', 'Noise', 'noise', 0, 1, 0.05, 'how much the soft texel noise thins and thickens the glow through'),
       range('smokedrift', 'Noise drift (m/s)', 'drift', 0, 1, 0.01, 'how fast the noise moves through the cloud'),
-      range('smokems', 'Glow through', 'ms', 0, 1, 0.05, 'light scattered inside the cloud - a lit side glowing through'),
+      range('smokems', 'Translucent glow', 'ms', 0, 1, 0.05, 'glow from transmitted sunlight; eight smoke boxes fully block sunlight'),
       range('smokesun', 'Sun', 'sun', 0, 2, 0.05, 'the sun on the smoke'),
       range('smokelamps', 'Lamps', 'lamps', 0, 4, 0.05, 'the light list on the smoke'),
       range('smokesky', 'Sky', 'sky', 0, 2, 0.05, 'the sky on the smoke')

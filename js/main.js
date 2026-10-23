@@ -25,6 +25,7 @@ import { createMirrors } from './render/features/mirrors.js';
 import { createGI } from './render/features/gi.js';
 import { createFog } from './render/features/fog.js';
 import { createSmoke } from './render/features/smoke.js';
+import { createBoxLight } from './render/features/boxlight.js';
 import { createDebugView } from './render/features/debugview.js';
 import { createTexelCache } from './render/features/texelcache.js';
 import { createSpriteAtlas } from './render/features/spriteatlas.js';
@@ -522,6 +523,7 @@ function applyWorldEdit() {
   texel.syncCount();
   mirrors.invalidate();
   lighting.syncModelLights();
+  boxLight.rebuild();
   if (shadowsOn) {
     // No prior footprint: a full bake, not a scroll (core/field.js createFieldAt).
     for (const g of shadowGrids) if (g) g.filledBlocks = null;
@@ -882,7 +884,7 @@ function animate(time) {
   // write proxies the scroll then destroys, and cost the bake twice.
   if (shadowsOn) cards.updateOccluders();
   lighting.moveTorch();
-  if (shadowsOn) lighting.update();
+  if (shadowsOn || boxLight.active()) lighting.update();
   // After the light list: the mirrors are culled against where the lights are now.
   mirrors.update();
   runMirrorCache();
@@ -890,11 +892,12 @@ function animate(time) {
 
   const tRender = performance.now();
   occlusion.update();   // the interiors' lifted blocks, before the first terrain pass
+  smoke.update();   // cube bounds and light before reflections / glass read them
   texel.render();
   spriteAtlas.render();
   tonemap.update();   // meters this frame's terrain, before the main render
   fog.update();   // after the texel cache drew this frame's G-buffer
-  smoke.update();
+  boxLight.update();
   renderer.render(scene, camera);
   resolveGPUTime();
   const tEnd = performance.now();
@@ -1069,7 +1072,9 @@ const cards = engine.add(createCards({
 const sky = engine.add(createSky({ scene, sunLight: dirLight, clock: worldClock,
                                    moveSun: (x, y, z) => sun.move(x, y, z) }));
 const lighting = engine.add(createLights({
-  scene, shadowsOn: () => shadowsOn, mirrorRects: () => mirrors.rects,
+  // For its messages: whether a light is seen - the box light shows lamps too
+  // (boxLight is made below; this runs only on a key or a command).
+  scene, shadowsOn: () => shadowsOn || boxLight.active(), mirrorRects: () => mirrors.rects,
   holder: { sprite: playerSprite, facingRight: () => mirrored(playerSprite) },
   // A light's sprite cards, in its slice of the shared point-light buffer.
   cards: {
@@ -1098,8 +1103,14 @@ const fog = engine.add(createFog({
 }));
 const smoke = engine.add(createSmoke({
   renderer, scene, cascades: () => shadowCascades,
-  lighting, sky, shadowsOn: () => shadowsOn, rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
+  lighting, sky, cards, shadowsOn: () => shadowsOn, rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
+  boxLight: () => boxLight,
   sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
+}));
+// Basic mode's light: sun shadows and lamps on the BoxGrid, with the advanced
+// effects off.
+const boxLight = engine.add(createBoxLight({
+  renderer, shadowsOn: () => shadowsOn, lighting, cards, sunLight: dirLight, ambientLight, smoke
 }));
 const debugView = engine.add(createDebugView({
   shadowsOn: () => shadowsOn, shadows: () => bxbApi.shadows(), rebuild: () => buildPerPixelShadows()
@@ -1664,7 +1675,7 @@ const bxbApi = installConsole(createConsole({
     }
   },
   light: sun.commands.light,
-  ...sky.commands, ...tonemap.commands, ...occlusion.commands, ...fog.commands, ...smoke.commands,
+  ...sky.commands, ...tonemap.commands, ...occlusion.commands, ...fog.commands, ...smoke.commands, ...boxLight.commands,
   sun: sun.commands.sun
 }));
 
@@ -1758,6 +1769,7 @@ settingsPanel = createSettingsPanel({ groups: [
   smoke.settings,
   cards.settings,
   lighting.settings,
+  boxLight.settings,
   { title: 'Debug', settings: [
     { key: 'freecam', label: 'Free cam (Alt+C)', type: 'toggle',
       get: () => rig.freeCam, set: v => { rig.freeCam = !!v; } },

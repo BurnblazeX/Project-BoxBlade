@@ -9,7 +9,7 @@ import { decodeFieldTSL, ringUV, SURFACE_BIAS_VOXELS, SHADOW_FADE_START, EDGE_FA
 import { glassRayTransmitTSL } from './glass.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { createPointLightsTSL } from './pointlights.js';
-import { smokeShared, smokeSampleTSL, smokeTransmitTSL, SMOKE_REACH } from './smokeshadow.js';
+import { smokeShared, smokeSampleTSL, smokeSunTransmitTSL } from './smokeshadow.js';
 import { sunColourUniform, skyShTSL } from './sky.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
 import { createConeTraceSunTSL } from './trace.js';
@@ -449,7 +449,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
           const traced = coneTrace(centre, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
           const through = glass ? glassRayTransmitTSL(glass, traced, centre, sun.dir) : vec3(1, 1, 1);
           lit.assign(sunColourUniform.mul(through).mul(traced.x.mul(sunRoofTSL(terrain, centre, sun.dir, sunReach)))
-            .mul(u.sunGain).mul(smokeTransmitTSL(smokeShared, centre, sun.dir, float(SMOKE_REACH), true)));
+            .mul(u.sunGain).mul(smokeSunTransmitTSL(smokeShared, centre, sun.dir)));
         });
         if (sky) lit.addAssign(skyShTSL(sky, vec3(0, 1, 0), true).mul(ambient).mul(u.skyGain).mul(skyOpenAt(centre)));
         const colour = smk.xyz.div(smk.w);

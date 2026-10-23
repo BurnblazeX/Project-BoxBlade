@@ -18,6 +18,7 @@ import * as R from '../../js/render/render.js';
 import { terrainTexelTSL, terrainWhite } from '../../js/gpu/terrain.js';
 import { createSky } from '../../js/render/features/sky.js';
 import { createLights } from '../../js/render/features/lights.js';
+import { createBoxLight } from '../../js/render/features/boxlight.js';
 import { createMirrors } from '../../js/render/features/mirrors.js';
 import { createGI } from '../../js/render/features/gi.js';
 import { createDebugView, VIEWS } from '../../js/render/features/debugview.js';
@@ -279,6 +280,27 @@ export function buildPlainShaders() {
   return { 'plain terrain': wgslOf(R.worldInstancedMesh, R.worldInstancedMesh.material) };
 }
 
+// Basic mode's box light (render/features/boxlight.js): its terrain material
+// and its three kernels over the test area - built, not snapshotted.
+export function buildBoxLightShaders() {
+  // Bindings of their own with a stand-in atlas, so the card tests compile in
+  // (the shared ones have none headlessly, and their snapshot is as accepted).
+  const atlas = G.createCardAtlasTexture({ data: new Uint8Array(4), width: 2, height: 2 });
+  const sc = G.createCardBindings(G.MAX_CARDS, 'bxbSunCards'), lc = G.createCardBindings(POINT_CARD_CAPACITY, 'bxbLightCards');
+  sc.atlas = lc.atlas = atlas;
+  const cardsFeature = { options: () => ({ cards: sc, lightCards: lc }), ready: true, sunBindings: sc };
+  const box = createBoxLight({ renderer, shadowsOn: () => false, lighting, cards: cardsFeature,
+                               sunLight: new THREE.DirectionalLight(), ambientLight: new THREE.AmbientLight() });
+  const { material, kernels } = box.shaders();
+  const out = { 'box light terrain': wgslOf(R.worldInstancedMesh, material) };
+  for (const k of kernels) out[k.name] = wgslOf(k);
+  // The cloud spells' cubes in basic mode, lit by the box light's walks.
+  const smoke = G.createSmokeCubes({ terrain: terrainTextures, world: box.world() });
+  out['basic smoke light'] = wgslOf(smoke.light);
+  out['basic smoke cubes'] = { compute: wgslOf(smoke.mesh, smoke.mesh.material).fragment };
+  return out;
+}
+
 // The fog (gpu/fog.js): the LPV's fog kernel, the froxel kernels and the
 // quad over the frame - built, not snapshotted.
 export function buildFogShaders() {
@@ -299,14 +321,17 @@ export function buildFogShaders() {
 // Spell smoke (gpu/smoke.js): the per-cube light kernel and the cubes -
 // built, not snapshotted.
 export function buildSmokeShaders() {
+  const atlas = G.createCardAtlasTexture({ data: new Uint8Array(4), width: 2, height: 2 });
+  const sc = G.createCardBindings(G.MAX_CARDS, 'bxbSmokeSunCards'), lc = G.createCardBindings(POINT_CARD_CAPACITY, 'bxbSmokeLampCards');
+  sc.atlas = lc.atlas = atlas;
   const smoke = G.createSmokeCubes({ cascades, lights: lighting.bindings(), biasUniform: sunU.biasUniform,
                                      fadeStartUniform: sunU.fadeStartUniform, edgeFadeUniform: sunU.edgeFadeUniform,
-                                     ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures });
+                                     ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures, glass: terrainTextures, cards: sc, lightCards: lc });
   const out = { smokeLight: wgslOf(smoke.light), 'smoke cubes': { compute: wgslOf(smoke.mesh, smoke.mesh.material).fragment } };
   // The shading with the smoke in its light (its sun march and light loop).
   const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
   split.resolve = G.createSplitResolve(split, texelCache);
-  for (const [k, v] of Object.entries(shaderSet('smoke-shadows', { smoke: G.smokeShared, split }))) {
+  for (const [k, v] of Object.entries(shaderSet('smoke-shadows', { smoke: G.smokeShared, smokeView: true, split }))) {
     out[`shading with smoke: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
   }
   // ... and with texel GI, whose rays the smoke dims.
@@ -314,7 +339,7 @@ export function buildSmokeShaders() {
   mode.set('texel');
   const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
   split2.resolve = G.createSplitResolve(split2, texelCache);
-  for (const [k, v] of Object.entries(shaderSet('smoke-texelgi', { smoke: G.smokeShared, split: split2 }))) {
+  for (const [k, v] of Object.entries(shaderSet('smoke-texelgi', { smoke: G.smokeShared, smokeView: true, split: split2 }))) {
     if (k.includes('gi.')) out[`texel GI with smoke: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
   }
   mode.set('lpv');

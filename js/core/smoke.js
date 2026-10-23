@@ -89,6 +89,9 @@ export const SMOKE_BOX_FROM = -32;
 export const SMOKE_GROW_SECONDS = 1.5;
 export const SMOKE_GROW_IN = 0.3;
 
+// Half-metre box equivalents along a ray that fully block sunlight.
+export const SMOKE_SUN_BOXES = 8;
+
 // The sphere's measure at cube offset (i, j, k) - centre at emitter + (i, j +
 // 0.5, k) cubes; in at <= 1.
 export const sphereMeasure = (i, j, k, rh, rv = rh + 0.5) => (i * i + k * k) / (rh * rh) + ((j + 0.5) ** 2) / (rv * rv);

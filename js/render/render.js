@@ -544,6 +544,17 @@ export function plainTerrainMaterial(params = {}) {
   return material;
 }
 
+// The plain material as the terrain mesh wears it: its shape, a lifted roof
+// shrinking away (and still casting), the interiors' mask (gpu/occlusion.js).
+// Basic mode's box light (render/features/boxlight.js) starts from one too.
+export function plainTerrainMeshMaterial() {
+  const material = plainTerrainMaterial();
+  applyTerrainVertex(material);
+  material.castShadowPositionNode = terrainKeepTSL(false, true, false);
+  applyOcclusionMask(material);
+  return material;
+}
+
 export function initWorldRender(scene) {
   const needed = instanceCount();
   if (needed === 0) return;
@@ -577,10 +588,7 @@ export function initWorldRender(scene) {
   };
   // The unshadowed path. Standard lighting, but the colour is the block's own
   // layer - a plain `map` would put layer 0 on everything.
-  const material = plainTerrainMaterial();
-  applyTerrainVertex(material);      // its shape, and a lifted roof shrinking away
-  material.castShadowPositionNode = terrainKeepTSL(false, true, false);   // a lifted roof still casts
-  applyOcclusionMask(material);      // the interiors' mask (gpu/occlusion.js)
+  const material = plainTerrainMeshMaterial();
 
   worldInstancedMesh = new THREE.InstancedMesh(geometry, material, capacity);
   worldInstancedMesh.receiveShadow = true;

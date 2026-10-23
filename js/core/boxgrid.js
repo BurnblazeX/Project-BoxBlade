@@ -5,7 +5,7 @@
 // along an axis is centred on i x BOX_METRES and block b holds boxes 3b - 1 ..
 // 3b + 1. The grid the world's finer systems share:
 //   - spell smoke's cubes (core/smoke.js)
-//   - basic mode's lighting (planned)
+//   - basic mode's lighting (core/boxlight.js)
 //   - fluid physics (planned)
 //
 // Not the field: the signed distance field the rays march (core/field.js) is

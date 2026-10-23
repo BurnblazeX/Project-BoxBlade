@@ -1,3 +1,4 @@
+import { smokeViewHitTSL } from './smokeview.js';
 import { withSmokeTSL } from './smokeshadow.js';
 import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/field.js';
@@ -98,7 +99,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   terrain = null,
                                   albedo = null, specular: specOn = true,
                                   reflections: reflectOn = true, sky = null,
-                                  mirrors = null, smoke = null,
+                                  mirrors = null, smoke = null, smokeView = false,
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   gi = null,
@@ -306,15 +307,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // sprite its own pixels, lit as the sprites are (Lambert, facing back along
   // the ray, since the card was turned to be seen). Past the field, the sky.
   //
-  // In three parts, so that everything a shader lights can go through ONE sun
-  // march and ONE light loop (lightBatch): the D3D12 shader compiler (DXC,
-  // behind both Firefox and Chrome) inlines every function at every call site,
-  // so each place that lit something was another full copy of the lighting to
-  // compile. The values are the same - the same functions, with what differed
-  // between the call sites chosen before them.
-  //
-  // traceRecord: what a ray from origin along dir met, given its trace (hit) -
-  // into the vars of `rec` (newHitRecord), so it can be filled inside a branch.
+  // Record the nearest ray hit into mutable vars for batched lighting.
   // direct: a flag node - the hit is a known surface at origin, normal hit.xyz
   // (an opaque block met inside glass): no sprite in front, no arena test,
   // as glass's own walk has already judged both.
@@ -382,6 +375,15 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         rec.lambert.assign(float(1)); rec.met.assign(float(1));
       });
     }
+    if (smokeView) {
+      // Limit the smoke query to the nearest visible surface, including sprites.
+      const reach = select(terrainWins, max(hit.w, 0), reflectMax).toVar();
+      if (sp) If(sp.t.greaterThanEqual(0), () => { reach.assign(min(reach, sp.t)); });
+      const cloud = smokeViewHitTSL(origin, dir, reach).toVar();
+      If(cloud.w.greaterThanEqual(0), () => {
+        rec.col.assign(cloud.xyz); rec.met.assign(0); rec.nest.assign(0);
+      });
+    }
     return rec;
   };
   // --- Reflections in reflections ---
@@ -390,12 +392,6 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // its own, up to reflectBouncesUniform surfaces in all. Each surface keeps
   // the diffuse share of its colour (1 - F, none for a metal) and passes on F
   // of the next one, faded out over the rough band as the first reflection is.
-  // The surfaces past the first are lit cheaply: the sky, the sun with its
-  // shadow, and the bounce - no light list (the torch reaches them only through
-  // the bounce). Not the hit lighting cache: a layout function's body is built
-  // once per shader, and which way the cache is bound (cacheMode) is not fixed
-  // then. A layout function, so the loop is compiled once a shader, however
-  // many places compose a hit.
   // base: the first surface's lit colour; p, n, nS, alb, spec: that surface;
   // d: the ray that met it. Returns the colour it shows, reflections and all.
   const nestedReflect = reflectTrace ? Fn(([base0, p0, n0, nS0, d0, alb0, spec0]) => {
@@ -438,6 +434,13 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         };
         lightIt();
       });
+      if (smokeView) {
+        const cloud = smokeViewHitTSL(origin, r, select(hit.w.greaterThanEqual(0), hit.w, reflectMax)).toVar();
+        If(cloud.w.greaterThanEqual(0), () => {
+          base.assign(cloud.xyz); spec.assign(vec4(...ROUGH_SPEC));
+          Break();
+        });
+      }
     });
     out.addAssign(thr.mul(base));
     return out;
@@ -616,23 +619,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const outO = vec3(0, 0, 0).toVar(), outD = dIn.toVar();
     const exitW = float(1).toVar();
     const bounces = int(0).toVar();          // internal reflections taken
+    const smokeSeen = vec3(0).toVar();
     const seenHit = vec4(0, 0, 0, -1).toVar();   // kind 5: the seek's hit
     const layers = int(0).toVar();           // panes entered
 
-    // --- The walk through the glass, block by block ---
-    //
-    // Glass is whole blocks, so the path inside it is walked on the block grid
-    // itself (Amanatides-Woo), not marched through the distance field: the
-    // field's resolution is the cascade's, and at C1's 25 cm voxels it could not
-    // tell an edge texel's start from the outside, while the grid is exact at
-    // any distance. Each step crosses into the next block along the ray: glass,
-    // keep going; air, the ray leaves through that face - refracting out, or
-    // past the critical angle reflecting back in and walking on; anything else,
-    // it has met an opaque block, and that face is what the glass shows.
-    //
-    // A steep ray in a slab reflects off its sides again and again on the way
-    // down, like light in a light pipe, so the budget is several reflections,
-    // not one - each is a step or two, and a block is 1.5 m.
     const pos = p.toVar();
     const dir = dIn.toVar();
     // The glass box the ray is in (partAtTSL): a whole block's is its cell,
@@ -714,6 +704,17 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         // Out of this pane. With layers left, look for more glass on the way.
         If(gl.lessThan(int(glassLayers - 1)), () => {
           const hit = seenOrGlassFn(outO, outD, reflectMax).toVar();
+          if (smokeView) {
+            const reach = select(hit.w.lessThanEqual(-2), float(-2).sub(hit.w), select(hit.w.greaterThanEqual(0), hit.w, reflectMax));
+            const cloud = smokeViewHitTSL(outO, outD, reach).toVar();
+            // Smoke between panes ends the walk before the next pane tints it.
+            if (spriteHit) {
+              const sp = spriteHit(outO, outD, reach);
+              If(cloud.w.greaterThanEqual(0).and(sp.t.lessThan(0).or(cloud.w.lessThan(sp.t))), () => {
+                smokeSeen.assign(cloud.xyz); kind.assign(6); Break();
+              });
+            } else If(cloud.w.greaterThanEqual(0), () => { smokeSeen.assign(cloud.xyz); kind.assign(6); Break(); });
+          }
           If(hit.w.lessThanEqual(float(-2)), () => {
             // Into the next pane: its face from the block grid, its tint from
             // the texel the ray enters by, less the Fresnel it reflects away.
@@ -770,11 +771,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     // batch (glassNode). The other endings need no lighting: `pre`.
     const pre = vec3(0, 0, 0).toVar();
     const isOpaque = kind.equal(int(1));
-    const need = isOpaque.or(kind.equal(int(2))).or(kind.equal(int(5)));
+    const need = isOpaque.or(kind.equal(int(2))).or(kind.equal(int(5))).or(kind.equal(int(6)));
     const rec = newHitRecord();
     const sO = select(isOpaque, hitP, outO).toVar();
     const sD = select(isOpaque, hitN, outD).toVar();
-    If(need, () => {
+    If(kind.equal(6), () => { rec.col.assign(smokeSeen); }).ElseIf(need, () => {
       const sHit = seenHit.toVar();
       If(isOpaque, () => { sHit.assign(vec4(hitN, 0)); })
         .ElseIf(kind.equal(int(2)), () => { sHit.assign(reflectTrace(outO, outD, reflectMax)); });

@@ -4,7 +4,8 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
 import { buildAllShaders, buildViewShaders, buildProfilingShaders, buildExposureShaders,
-         buildPlainShaders, buildFogShaders, buildSmokeShaders } from './lib/shaders.mjs';
+         buildPlainShaders, buildFogShaders, buildSmokeShaders,
+         buildBoxLightShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
 // moves code must leave all of them identical - this is what proves it, where
@@ -83,6 +84,18 @@ for (const [id, set] of Object.entries(buildPlainShaders())) {
   ok(`${id}: vertex and fragment`, !!(set.vertex && set.vertex.length && set.fragment && set.fragment.length), true);
 }
 
+section('box light builds');
+// WGSL folds constant expressions and rejects a division by zero it can see
+// ('1.0 / 0.0' cannot be represented as 'f32') - the basic smoke kernel's sky
+// ray, straight up, did this. A literal vector's zero component under 1.0 / abs().
+const constZeroDivision = code => /1\.0 \/ abs\( vec3<f32>\( ([-\d.e]+), ([-\d.e]+), ([-\d.e]+) \)\.([xyz]) \)/g;
+for (const [id, set] of Object.entries(buildBoxLightShaders())) {
+  const code = set.compute || set.fragment || '';
+  ok(`${id}: builds`, code.length > 0, true);
+  const zeros = [...code.matchAll(constZeroDivision())].filter(m => Number(m['xyz'.indexOf(m[4]) + 1]) === 0);
+  ok(`${id}: no constant division by zero`, zeros.length, 0);
+}
+
 section('fog builds');
 for (const [id, set] of Object.entries(buildFogShaders())) ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
 
@@ -94,7 +107,21 @@ for (const [name, set] of Object.entries(shaders)) for (const [stage, code] of O
 }
 
 section('smoke builds');
-for (const [id, set] of Object.entries(buildSmokeShaders())) ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
+const smokeShaders = buildSmokeShaders();
+for (const [id, set] of Object.entries(smokeShaders)) {
+  ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
+  for (const code of Object.values(set)) {
+    ok(`${id}: resource limits`, (code.match(/var<uniform>/g) || []).length <= 12 &&
+      (code.match(/var<storage/g) || []).length <= 8 && (code.match(/: texture_/g) || []).length <= 16, true);
+  }
+}
+for (const pass of ['splitFinal', 'splitGlassReflect', 'splitGlassThrough']) {
+  const code = Object.entries(smokeShaders).find(([id]) => id.endsWith(pass))[1].compute;
+  ok(`${pass}: traces smoke`, code.includes('bxbSmokeView') && code.includes('smokeViewHit'), true);
+  ok(`${pass}: distinct traversal loop variables`, ['smvCloud', 'smvStep', 'smvNeighbour'].every(n => code.includes(`var ${n} : i32`)), true);
+}
+ok('smoke lighting binds both sprite shadow atlases', smokeShaders.smokeLight.compute.includes('bxbSmokeSunCards') &&
+  smokeShaders.smokeLight.compute.includes('bxbSmokeLampCards'), true);
 
 section('exposure meter builds');
 for (const [id, set] of Object.entries(buildExposureShaders())) {

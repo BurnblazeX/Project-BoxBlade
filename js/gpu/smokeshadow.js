@@ -32,7 +32,7 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, vec4, int, uniform, uniformArray, texture3D, exp, max, min, clamp,
          smoothstep, select } from 'three/tsl';
-import { SMOKE_CUBE, SMOKE_BOX, SMOKE_GROW_IN } from '../core/smoke.js';
+import { SMOKE_CUBE, SMOKE_BOX, SMOKE_GROW_IN, SMOKE_SUN_BOXES } from '../core/smoke.js';
 import { layout } from './layout.js';
 
 // Cloud spells live at once. Each is a slot of the atlas, and every shadow
@@ -189,9 +189,9 @@ const boxSpan = (shared, k, origin, dir, reach) => {
 // along the ray (unscaled by strength); soft: through the blurred copy. A
 // layout function: the shading calls it at every sun march and every light.
 const tauFns = new WeakMap();
-export function smokeTauTSL(shared = smokeShared, soft = false) {
+export function smokeTauTSL(shared = smokeShared, soft = false, boxes = false) {
   if (!tauFns.has(shared)) tauFns.set(shared, {});
-  const memo = tauFns.get(shared), key = soft ? 'soft' : 'hard';
+  const memo = tauFns.get(shared), key = boxes ? 'boxes' : soft ? 'soft' : 'hard';
   if (memo[key]) return memo[key];
   const step = SMOKE_CUBE, tex = soft ? shared.softTex : shared.occTex;
   const fn = Fn(([origin, dir, reach]) => {
@@ -201,7 +201,7 @@ export function smokeTauTSL(shared = smokeShared, soft = false) {
       If(m.w.greaterThan(float(0.5)), () => {
         const { t0, t1 } = boxSpan(shared, smk, origin, dir, reach);
         If(t1.greaterThan(t0), () => {
-          const density = shared.row(smk, 1).w.toVar();
+          const density = boxes ? float(1 / SMOKE_CUBE) : shared.row(smk, 1).w.toVar();
           const t = t0.add(float(step * 0.5)).toVar();
           Loop({ start: int(0), end: int(STEPS), type: 'int', condition: '<', name: 'sms' }, () => {
             If(t.lessThan(t1), () => {
@@ -217,7 +217,7 @@ export function smokeTauTSL(shared = smokeShared, soft = false) {
       });
     }));
     return tau;
-  }).setLayout(layout(soft ? 'smokeTauSoft' : 'smokeTau', 'float', [
+  }).setLayout(layout(boxes ? 'smokeBoxes' : soft ? 'smokeTauSoft' : 'smokeTau', 'float', [
     { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' }, { name: 'reach', type: 'float' }]));
   memo[key] = fn;
   return fn;
@@ -227,6 +227,11 @@ export function smokeTauTSL(shared = smokeShared, soft = false) {
 // strength). reach: how far to look (metres); soft: the blurred copy.
 export const smokeTransmitTSL = (shared, origin, dir, reach = float(SMOKE_REACH), soft = false) =>
   exp(smokeTauTSL(shared, soft)(origin, dir, reach).mul(shared.strength).negate());
+
+// Thickness in half-metre box equivalents, independent of spell density.
+// Eight boxes block the sun fully, like an opaque occluder; ambient remains.
+export const smokeSunTransmitTSL = (shared, origin, dir) =>
+  float(1).sub(clamp(smokeTauTSL(shared, false, true)(origin, dir, float(SMOKE_REACH)).div(float(SMOKE_SUN_BOXES)), float(0), float(1)));
 
 // The smoke at p, every live cloud's (the soft copy, grown): vec4(colour x
 // extinction, extinction) - extinction /m, times strength. Inline: one call
@@ -259,7 +264,6 @@ export function smokeSampleTSL(shared, p) {
 const inFns = new WeakMap();
 export function smokeInscatterTSL(shared = smokeShared) {
   if (inFns.has(shared)) return inFns.get(shared);
-  const tauSoft = smokeTauTSL(shared, true);
   const step = SMOKE_CUBE;
   const fn = Fn(([origin, dir, reach, sunDir, sunLight, skyLight]) => {
     const gathered = vec3(0, 0, 0).toVar(), tauAll = float(0).toVar();
@@ -283,7 +287,7 @@ export function smokeInscatterTSL(shared = smokeShared) {
           });
           If(tau.greaterThan(float(1e-4)), () => {
             const mid = origin.add(dir.mul(tw.div(tau))).toVar();
-            const toSun = exp(tauSoft(mid, sunDir, float(SMOKE_REACH)).mul(shared.strength).negate());
+            const toSun = smokeSunTransmitTSL(shared, mid, sunDir);
             const lit = sunLight.mul(toSun).add(skyLight).mul(par.xyz);
             const T = exp(tau.mul(shared.strength).negate());
             gathered.addAssign(lit.mul(float(1).sub(T)).mul(exp(tauAll.negate())));
@@ -303,5 +307,5 @@ export function smokeInscatterTSL(shared = smokeShared) {
 // A sun shadow (p, lift, skip) -> visibility, through the cloud spells too:
 // the ground under a cloud is in its shadow. smoke null: the shadow as it is.
 export const withSmokeTSL = (smoke, sunDir, shadow) => (smoke
-  ? (p, lift, skip) => shadow(p, lift, skip).mul(smokeTransmitTSL(smoke, p, sunDir))
+  ? (p, lift, skip) => shadow(p, lift, skip).mul(smokeSunTransmitTSL(smoke, p, sunDir))
   : shadow);

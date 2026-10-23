@@ -243,11 +243,17 @@ export function createAOTSL({ cascades, distance, biasUniform = null, lpv = null
 // cards: the sun's card bindings, for the sprites' contact discs on the
 // ground (createSpriteAOTSL) - analytic, no marches. Null until they load.
 export function createVoxelAONode(terrain, cards = null) {
-  const vol = terrain.blocks;
   const spriteAO = createSpriteAOTSL(cards);
-  return Fn(() => {
+  return Fn(() => voxelAOAtTSL(terrain, terrainSurfaceTSL(), spriteAO))();
+}
+
+// The same at a surface the caller already has (terrainSurfaceTSL) - the box
+// light's one-pass material reads it there. spriteAO: createSpriteAOTSL's, or
+// null.
+export function voxelAOAtTSL(terrain, surf, spriteAO = null) {
+  const vol = terrain.blocks;
+  {
     // A slope's plane is taken as a top face of its own block (approximate).
-    const surf = terrainSurfaceTSL();
     const n = select(surf.on, vec3(0, 1, 0), surf.n).toVar();
     const p = surf.p;
     const block = surf.block;
@@ -277,7 +283,7 @@ export function createVoxelAONode(terrain, cards = null) {
     const texAO = terrainTexelTSL(terrain.normal, surf.st, surf).b;
     const ao = float(VOXEL_AO_MIN).add(float(1 - VOXEL_AO_MIN).mul(v)).mul(texAO);
     return spriteAO ? ao.mul(spriteAO(p, vec2(1e9, 1e9))) : ao;
-  })();
+  }
 }
 
 // --- Sprite contact AO: a soft disc under each sprite ---

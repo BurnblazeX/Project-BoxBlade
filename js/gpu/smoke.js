@@ -14,10 +14,14 @@
 //               smoke (smokeTauTSL - one cloud shades another), the light
 //               list (shadowed by the world and the smoke) and the sky (by the
 //               roof map, less the smoke above). Light scattered more than
-//               once inside the smoke - its subsurface light - is the octave
-//               approximation (Wrenninge): octave i gives a^i as much and sees
-//               b^i of the depth toward the sun. Kept apart: the sun direct,
+//               once inside the smoke shares the same eight-box cutoff.
+//               Kept apart: the sun direct,
 //               the sun scattered, the lamps and sky.
+//               In basic mode (world: the box light's walks, gpu/boxlight.js)
+//               the world's part comes from the BoxGrid instead of the field:
+//               the sun walked to (glass, sprite cards), every lamp walked to,
+//               and the sky straight up - in the basic material's units
+//               (irradiance / pi); the smoke's part is the same.
 // draw          a cube is its full grid cell at rest. It grows in when the
 //               cloud rolls out to it (as its box does in the shadows), then breathes: it swells larger and back
 //               with a wave travelling through the cloud. A soft noise on the
@@ -30,17 +34,18 @@ import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec3, vec4, int, uniform, instanceIndex, storage, select,
          exp, max, cos, fract, sin, varying, positionGeometry, normalGeometry,
          positionWorld, cameraProjectionMatrix, cameraViewMatrix } from 'three/tsl';
-import { SMOKE_CUBE, SMOKE_GROW_IN } from '../core/smoke.js';
+import { SMOKE_CUBE, SMOKE_GROW_IN, SMOKE_BOX } from '../core/smoke.js';
 import { createConeTraceSunTSL } from './trace.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
 import { glassRayTransmitTSL } from './glass.js';
-import { NO_SKIP } from './cards.js';
+import { NO_SKIP, createCardsTSL, CARD_SUN_MAX } from './cards.js';
+import { smokeView, smokeColourTSL, SMOKE_CUBE_CAPACITY } from './smokeview.js';
+export { SMOKE_CUBE_CAPACITY, DEFAULT_SMOKE } from './smokeview.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
 import { skyOpenTSL } from './volume.js';
-import { valueNoise } from './fog.js';
 import { liftAtTSL } from './occlusion.js';
-import { MAX_SMOKE_CLOUDS, SMOKE_REACH, smokeShared, smokeTauTSL, smokeGrowthTSL } from './smokeshadow.js';
+import { MAX_SMOKE_CLOUDS, smokeShared, smokeTauTSL, smokeGrowthTSL, smokeSunTransmitTSL } from './smokeshadow.js';
 
 export { MAX_SMOKE_CLOUDS, smokeShared };
 
@@ -50,7 +55,6 @@ export { MAX_SMOKE_CLOUDS, smokeShared };
 // nothing. One packed list: the mesh draws exactly the cubes there are. (Per
 // cloud slots of 12288 cut a cloud filling a room short - its smoke out of the
 // door went missing - and drew every unused slot's instances anyway.)
-export const SMOKE_CUBE_CAPACITY = 131072;
 
 // Seconds a cube stays after it is enclosed, while a cloud rolls out: the
 // front thins out a layer behind itself.
@@ -58,37 +62,20 @@ export const SMOKE_ENCLOSED_DELAY = 0.25;
 
 export const NEVER = 1e9;     // the measure of an unused cube: it never appears
 
-// The noise's finest lattice: a texel. A coarser one at NOISE_COARSE times it.
-const NOISE_TEXEL = 0.125;
-const NOISE_COARSE = 4;
-
 // Depth bias between cubes, in clip depth per unit w (see draw, above): at
 // 20 m it is a few millimetres.
 const CUBE_DEPTH_BIAS = 2e-6;
-
-export const DEFAULT_SMOKE = {
-  albedo: 1,         // brightness on the spell's colour
-  wave: 0.22,        // how much larger than its cell a cube swells
-  speed: 2.2,        // the wave's speed (radians a second)
-  noise: 0.35,       // how much the soft noise thins and thickens the glow
-  drift: 0.12,       // metres a second the noise drifts through the cloud
-  ms: 0.8,           // the glow through: 0 single scattering, 1 the full octaves
-  sun: 1,            // the sun's share
-  lamps: 1,          // the light list's share
-  sky: 0.6           // the sky's share
-};
-
-const MS_OCTAVES = 3;
-const MS = { a: 0.5, b: 0.5 };
 
 const hash = v => fract(sin(v.dot(vec3(12.9898, 78.233, 37.719))).mul(float(43758.5453)));
 
 // ctx as createLPV's: cascades, lights, biasUniform, fadeStartUniform,
 // edgeFadeUniform, ambientUniform, sky (bindings), terrain (the terrain
 // textures: the roof map), glass (the terrain textures in a world with glass);
-// shared: smokeShared.
+// shared: smokeShared. world: the box light's walks (basic mode) - then no
+// cascades, lights, sky or cards are needed.
 export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUniform, edgeFadeUniform,
-                                   ambientUniform, sky, terrain, glass = false, shared = smokeShared }) {
+                                   ambientUniform, sky, terrain, glass = false, cards = null, lightCards = null,
+                                   shared = smokeShared, world = null }) {
   const COUNT = SMOKE_CUBE_CAPACITY;
   // A cube's w: travel + AGAINST x the faces it presses on solid with (0 for
   // one open to air) + SLOT x its cloud's slot. Shown when the faces are 0, or
@@ -121,10 +108,10 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   // it rolls in: smokeGrowthTSL, as its box in the shadows).
   const cubeAttr = new THREE.StorageInstancedBufferAttribute(new Float32Array(COUNT * 4).fill(NEVER), 4);
   const cubes = storage(cubeAttr, 'vec4', COUNT).setName('bxbSmokeCubes');
-  // Per cube: the sun direct, the sun scattered, the lamps and sky.
-  const lightAttr = new THREE.StorageBufferAttribute(COUNT * 3, 4);
-  const light = storage(lightAttr, 'vec4', COUNT * 3).setName('bxbSmokeLight');
-  const lightRead = storage(lightAttr, 'vec4', COUNT * 3).toReadOnly().setName('bxbSmokeLightRead');
+  // Per cube: animated bounds, direct sun, scattered sun, then lamps and sky.
+  const lightAttr = smokeView.attr;
+  const light = storage(lightAttr, 'vec4', COUNT * 4).setName('bxbSmokeLight');
+  const lightRead = smokeView.read;
   // Per cube: when it is enclosed, a share of the cloud's farthest travel
   // (NEVER: open to air).
   const enclosedAttr = new THREE.StorageInstancedBufferAttribute(new Float32Array(COUNT).fill(NEVER), 1);
@@ -132,15 +119,15 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
 
   const u = {
     sunLight: uniform(float(1)),
-    time: uniform(float(0)),
     count: uniform(int(0)),          // cubes in the list
-    ...Object.fromEntries(Object.entries(DEFAULT_SMOKE).map(([k, v]) => [k, uniform(float(v))]))
+    ...smokeView.uniforms
   };
   const sun = createSunUniforms(new THREE.Vector3(0, 1, 0));
-  const coneTrace = createConeTraceSunTSL(cascades, !!glass);
+  const coneTrace = world ? null : createConeTraceSunTSL(cascades, !!glass);
+  const spriteShadow = world ? null : createCardsTSL(cards);
   // The lamps through the smoke too - its soft copy, as the sun.
-  const pointLights = createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
-                                             edgeFadeUniform, cards: null, glass, smoke: shared, smokeSoft: true });
+  const pointLights = world ? null : createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
+                                             edgeFadeUniform, cards: lightCards, glass, smoke: shared, smokeSoft: true });
   // Through the soft copy (gpu/smokeshadow.js): the light falls off smoothly
   // through the cloud. Through the hard one, each cube counted whole boxes
   // from where it happened to sit on the lattice, and lit cubes stood out in
@@ -149,6 +136,28 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   const sunReach = float(12);
   const skyIso = () => skyShTSL(sky, vec3(0, 1, 0), true).add(skyShTSL(sky, vec3(0, -1, 0), true))
     .mul(float(0.5)).mul(ambientUniform).mul(sky.gain);
+
+  // The world's light at p, before the smoke: the sun (times the sun on and
+  // its gain), the lamps (through the smoke's soft copy) and the sky.
+  const PI_INV = float(1 / Math.PI);
+  const worldLight = world ? {
+    sun: p => world.binding.sunColour.mul(PI_INV).mul(u.sunLight).mul(world.sun(p)).mul(u.sun),
+    lamps: p => world.lamps(p).mul(world.binding.lampGain).mul(PI_INV),
+    sky: p => world.binding.ambient.mul(PI_INV).mul(world.sky(p))
+  } : {
+    sun: p => {
+      const lit = vec3(0, 0, 0).toVar();
+      If(u.sunLight.greaterThan(float(0)), () => {
+        const traced = coneTrace(p, sun.dir, sunReach, sun.coneRadius, fadeStartUniform, edgeFadeUniform).toVar();
+        const through = glass ? glassRayTransmitTSL(glass, traced, p, sun.dir) : vec3(1, 1, 1);
+        lit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, p, sun.dir, sunReach))));
+      });
+      if (spriteShadow) lit.mulAssign(spriteShadow(p, sun.dir, float(CARD_SUN_MAX), sun.coneRadius, NO_SKIP));
+      return sunColourUniform.mul(u.sunLight).mul(lit).mul(u.sun);
+    },
+    lamps: p => pointLights.withSpecular(p, vec3(0, 0, 0), NO_SKIP, null),
+    sky: p => skyIso().mul(terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1))
+  };
 
   const lightKernel = Fn(() => {
     const i = int(instanceIndex);
@@ -159,28 +168,30 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
       const p = c.xyz.toVar();
       // Through the smoke toward the sun and up, from the cube's centre - the
       // same for every cube.
-      const tauSun = tau(p, sun.dir, float(SMOKE_REACH)).mul(shared.strength).toVar();
+      const transmission = smokeSunTransmitTSL(shared, p, sun.dir).toVar();
       const tauUp = tau(p, vec3(0, 1, 0), float(8)).mul(shared.strength).toVar();
-      const world = vec3(0, 0, 0).toVar();
-      If(u.sunLight.greaterThan(float(0)), () => {
-        const traced = coneTrace(p, sun.dir, sunReach, sun.coneRadius, fadeStartUniform, edgeFadeUniform).toVar();
-        const through = glass ? glassRayTransmitTSL(glass, traced, p, sun.dir) : vec3(1, 1, 1);
-        world.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, p, sun.dir, sunReach))));
-      });
-      const sunIn = sunColourUniform.mul(u.sunLight).mul(world).mul(u.sun).toVar();
-      direct.assign(sunIn.mul(exp(tauSun.negate())));
-      const more = float(0).toVar();
-      for (let o = 1; o < MS_OCTAVES; o++) more.addAssign(float(MS.a ** o).mul(exp(tauSun.mul(float(-(MS.b ** o))))));
-      scattered.assign(sunIn.mul(more).mul(u.ms));
-      const lamps = pointLights.withSpecular(p, vec3(0, 0, 0), NO_SKIP, null);
-      const skyL = skyIso().mul(terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1))
-        .mul(exp(tauUp.mul(float(-0.5))));
+      const sunIn = worldLight.sun(p).toVar();
+      // Sunlight falls linearly to zero after eight half-metre boxes.
+      // Glow redistributes that transmitted light; it cannot bypass the cap.
+      const glow = transmission.mul(float(1).sub(transmission)).mul(u.ms).toVar();
+      direct.assign(sunIn.mul(transmission.sub(glow)));
+      scattered.assign(sunIn.mul(glow));
+      const lamps = worldLight.lamps(p);
+      const skyL = worldLight.sky(p).mul(exp(tauUp.mul(float(-0.5))));
       iso.assign(lamps.mul(u.lamps).add(skyL.mul(u.sky)));
     });
-    const b = i.mul(int(3));
-    light.element(b).assign(vec4(direct, 0));
-    light.element(b.add(int(1))).assign(vec4(scattered, 0));
-    light.element(b.add(int(2))).assign(vec4(iso, 0));
+    const b = i.mul(int(4));
+    const halfSize = float(0).toVar();
+    If(i.lessThan(u.count), () => {
+      halfSize.assign(select(shownTSL(c.xyz, c.w, enclosed.element(i)),
+        smokeGrowthTSL(shared, k, travelOf(c.w).div(max(shared.row(k, 3).z, float(1e-6)))), float(0))
+        .mul(float(1).add(u.wave.mul(float(0.5).sub(cos(u.time.mul(u.speed).sub(c.xyz.dot(vec3(1.1, 1.7, 0.8)).mul(2))).mul(0.5)))))
+        .mul(SMOKE_CUBE * 0.5));
+    });
+    light.element(b).assign(vec4(c.xyz, halfSize));
+    light.element(b.add(int(1))).assign(vec4(direct, 0));
+    light.element(b.add(int(2))).assign(vec4(scattered, 0));
+    light.element(b.add(int(3))).assign(vec4(iso, 0));
   })().compute(COUNT).setName('smokeLight');
 
   // The cubes: their full cell at rest, swelling larger and back.
@@ -194,11 +205,11 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   const swell = float(0.5).sub(cos(u.time.mul(u.speed).sub(phase)).mul(float(0.5)));
   const scale = grown.mul(float(1).add(u.wave.mul(swell)));
   const mat = new THREE.MeshBasicNodeMaterial();
-  const world = cube.xyz.add(positionGeometry.mul(float(SMOKE_CUBE)).mul(scale));
-  mat.positionNode = world;
-  const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(world, float(1))));
+  const placed = cube.xyz.add(positionGeometry.mul(float(SMOKE_CUBE)).mul(scale));
+  mat.positionNode = placed;
+  const clip = cameraProjectionMatrix.mul(cameraViewMatrix.mul(vec4(placed, float(1))));
   mat.vertexNode = vec4(clip.xy, clip.z.sub(hash(cube.xyz).mul(float(CUBE_DEPTH_BIAS)).mul(clip.w)), clip.w);
-  const at = int(instanceIndex).mul(int(3));
+  const at = int(instanceIndex).mul(int(4)).add(int(1));
   const vDirect = varying(lightRead.element(at).xyz, 'vSmokeDirect');
   const vScattered = varying(lightRead.element(at.add(int(1))).xyz, 'vSmokeScattered');
   const vIso = varying(lightRead.element(at.add(int(2))).xyz, 'vSmokeIso');
@@ -206,17 +217,7 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   // Soft noise: value noise on the texel lattice, blended between texels,
   // under a coarser one - read in the world, so it runs on across
   // neighbouring cubes, and drifting, so it moves through the cloud as smoke.
-  mat.colorNode = Fn(() => {
-    const n = normalGeometry;
-    const q = positionWorld.add(vec3(u.drift.mul(u.time), u.drift.mul(u.time).mul(float(0.4)),
-                                     u.drift.mul(u.time).mul(float(-0.7)))).div(float(NOISE_TEXEL)).toVar();
-    const noise = valueNoise(q).mul(float(0.4)).add(valueNoise(q.div(float(NOISE_COARSE))).mul(float(0.6))).toVar();
-    const thin = u.noise.mul(noise.sub(float(0.5))).mul(float(2)).toVar();
-    const shade = vDirect.mul(float(0.45).add(float(0.55).mul(max(n.dot(sun.dir), float(0)))))
-      .add(vScattered.mul(float(1).add(thin)))
-      .add(vIso.mul(float(0.8).add(float(0.2).mul(n.y))).mul(float(1).add(thin.mul(float(0.25)))));
-    return shade.mul(vColour).mul(u.albedo);
-  })();
+  mat.colorNode = smokeColourTSL(positionWorld, normalGeometry, vDirect, vScattered, vIso, vColour, u, sun.dir);
   const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), mat, COUNT);
   mesh.frustumCulled = false;
   mesh.name = 'smokeCubes';
@@ -230,6 +231,7 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     write(clouds) {
       const arr = cubeAttr.array, enc = enclosedAttr.array;
       let n = 0;
+      smokeView.indices.fill(0);
       for (const pass of [0, 1, 2]) {
         clouds.forEach((entry, k) => {
           if (!entry || (pass === 2 && entry.compact)) return;
@@ -239,11 +241,14 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
             const kind = c[7] ? 0 : c[8] ? 1 : 2;
             if (kind !== pass) continue;
             enc[n] = c[9] === Infinity ? NEVER : c[9] / Math.max(cloud.gMax, 1e-6);
+            const x = c[4] - cloud.box[0], y = c[5] - cloud.box[1], z = c[6] - cloud.box[2];
+            smokeView.indices[x + SMOKE_BOX * (y + SMOKE_BOX * (z + SMOKE_BOX * k))] = n + 1;
             arr.set([c[0], c[1], c[2], c[3] + AGAINST * c[8] + SLOT * k], 4 * n++);
           }
         });
       }
       arr.fill(NEVER, 4 * n);
+      smokeView.grid.needsUpdate = true;
       cubeAttr.needsUpdate = true;
       enclosedAttr.needsUpdate = true;
       mesh.count = n;
