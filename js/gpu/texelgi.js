@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
-import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, exp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin } from 'three/tsl';
+import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, exp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin, uniformArray, step, length } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
+import { MAX_GI_SPRITES } from '../core/lpv.js';
 import { mix32TSL } from './hitcache.js';
 import { createReflectTraceTSL, giTraceHitTSL } from './trace.js';
 import { hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, skyOpenTSL } from './volume.js';
@@ -50,6 +51,12 @@ import { smokeInscatterTSL } from './smokeshadow.js';
 // slice; the sum kernel after it adds the slices up - in a dispatch of its
 // own, so no ray ever reads a sum while it is being written (that tore, and
 // shimmered).
+// The sprites are in it as the LPV has them (core/lpv.js, "Sprites in the
+// LPV"): a box per card caster, its quad's width square and its height tall.
+// A ray that enters one before its hit takes the sprite's light - its mean
+// albedo lit as a face turned back along the ray, by the one light evaluation
+// the hit would have had - over what lies behind, by the sprite's opaque
+// fraction. What lies behind then keeps only its cached direct light.
 // A patch's side in texels by level: 3 within C1 (C0 too), 6 within C2, 12
 // (a whole block face) past it. Each step blends over the inner cascade's
 // outer GI_BLEND_VOXELS (createShadowColorNode giLevel), where a texel reads -
@@ -169,6 +176,12 @@ export function createTexelGI() {
       filter: uniform(int(1)),       // the shading reads each patch blurred with its neighbours
       near: uniform(int(1))          // the cones split the patch light into near and far (with sky)
     },
+    // The sprites the rays meet, three vec4 each: (centre, half width),
+    // (albedo, half height), (opaque fraction, 0, 0, 0). Written each frame
+    // (render/features/gi.js stepTexel).
+    sprites: uniformArray(new Array(MAX_GI_SPRITES * 3).fill(0).map(() => new THREE.Vector4()), 'vec4')
+      .setName('bxbTexelGISprites'),
+    spriteCount: uniform(int(0)),
     strength: null,      // the GI strength uniform, set by main.js
     kernels: null        // { reset, patches }: built with the shading (createShadowColorNode)
   };
@@ -454,11 +467,12 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
     return { n, ax, pc };
   };
   // The sun and the light list at p (normal n), shadowed, added to light: a
-  // patch's direct light, or - where no patch holds it - a ray hit's.
-  const directAt = (p, n, light) => {
+  // patch's direct light, or - where no patch holds it - a ray hit's. skip:
+  // the card left out (a sprite's own).
+  const directAt = (p, n, light, skip = NO_SKIP) => {
     if (sunOn) {
       const vis = sunVisZero();
-      If(n.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(p, n, NO_SKIP)); });
+      If(n.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(p, n, skip)); });
       light.addAssign(sunColourUniform.mul(sunDirect(vis, n, shadeMode)));
     }
     // The light list WITH its shadows, as the surface itself is lit on screen
@@ -467,8 +481,26 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
     // wall: light through walls.
     if (pointLight) {
       const mode = select(texelGI.ab.hitShadows.equal(int(1)), float(0), float(2));
-      light.addAssign(pointLight.withSpecular(p, n, NO_SKIP, n, null, mode));
+      light.addAssign(pointLight.withSpecular(p, n, skip, n, null, mode));
     }
+  };
+  // The nearest sprite box the ray (o, d) enters before tMax, from outside
+  // (a patch under a sprite's feet starts in its box: the contact disc darkens
+  // it instead). { t (tMax: none), i (-1: none) }.
+  const spriteOnRay = (o, d, tMax) => {
+    const best = tMax.toVar(), found = int(-1).toVar();
+    const inv = vec3(1, 1, 1).div(mix(d, vec3(1e-7, 1e-7, 1e-7), step(abs(d), vec3(1e-7, 1e-7, 1e-7)))).toVar();
+    Loop({ start: int(0), end: texelGI.spriteCount, type: 'int', condition: '<', name: 'gsp' }, ({ gsp }) => {
+      const A = texelGI.sprites.element(gsp.mul(int(3))).toVar();
+      const half = vec3(A.w, texelGI.sprites.element(gsp.mul(int(3)).add(int(1))).w, A.w);
+      const a = A.xyz.sub(half).sub(o).mul(inv), b = A.xyz.add(half).sub(o).mul(inv);
+      const lo = min(a, b), hi = max(a, b);
+      const tIn = max(max(lo.x, lo.y), lo.z), tOut = min(min(hi.x, hi.y), hi.z);
+      If(tIn.greaterThan(float(0)).and(tIn.lessThanEqual(tOut)).and(tIn.lessThan(best)), () => {
+        best.assign(tIn); found.assign(gsp);
+      });
+    });
+    return { t: best, i: found };
   };
   // A patch's own turn of the direction set, fixed by its key: an angle round
   // the normal and a shift within each direction's band of z (both kept
@@ -528,6 +560,13 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
           const hit = (traced ? traced.hit : plainTrace(origin, dir, texelGI.reach)).toVar();
           const hitAt = origin.add(dir.mul(max(hit.w, float(0)))).toVar();
           const L = vec3(0, 0, 0).toVar();
+          // A sprite before the hit (above), and the one light evaluation of
+          // the ray: at the sprite, or at a hit with no cached direct light.
+          const sp = spriteOnRay(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, texelGI.reach));
+          const onSprite = sp.i.greaterThanEqual(int(0)).toVar();
+          const need = int(0).toVar();
+          const dp = vec3(0, 0, 0).toVar(), dn = vec3(0, 1, 0).toVar();
+          const dMul = vec3(0, 0, 0).toVar();
           If(hit.w.greaterThanEqual(float(0)).and(inHitBoundsTSL(hitAt.sub(hit.xyz.mul(float(VOXEL_METRES * 0.5))))), () => {
             const ht = hitTexelTSL(terrain, hitAt, hit.xyz, dir);
             const hp = ht.p.toVar(), nh = ht.n.toVar();
@@ -546,7 +585,7 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
               // frames, not one a ray. Else lit here, as the patch would be.
               const cached = patchDirectTSL(hp, nh, level(hp).lvl, D);
               If(cached.ok.and(texelGI.ab.direct.equal(int(1))), () => { light.addAssign(cached.light); })
-                .Else(() => directAt(hp, nh, light));
+                .ElseIf(onSprite.not(), () => { need.assign(int(1)); dp.assign(hp); dn.assign(nh); });
               light.addAssign(g.light);
               // What it bounces: its diffuse share, (1 - F)(1 - metal) of its
               // albedo - none for a metal, whose albedo is its F0 - plus the
@@ -560,8 +599,9 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
               const kd = vec3(1, 1, 1).sub(F).mul(float(1).sub(sd.metal));
               const specShare = mirrorTrace
                 ? F.mul(smoothstep(float(REFLECT_ROUGH_START), float(REFLECT_ROUGH_END), sd.alpha)) : F;
-              L.assign(light.mul(select(texelGI.ab.physical.equal(int(1)), hs.raw.mul(kd).add(specShare), hs.raw))
-                         .mul(texelGI.strength));
+              dMul.assign(select(texelGI.ab.physical.equal(int(1)), hs.raw.mul(kd).add(specShare), hs.raw)
+                            .mul(texelGI.strength));
+              L.assign(light.mul(dMul));
             });
           }).ElseIf(hit.w.lessThan(float(0)), () => {
             // A miss: the sky - if the ray truly escaped. Where it ended (out
@@ -569,13 +609,33 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
             const end = origin.add(dir.mul(texelGI.reach));
             L.assign(skyRadiance(dir).mul(abSky).mul(skyOpenTSL(terrain, end)));
           });
+          // The sprite: a face turned back along the ray, lit by the sky over
+          // it and (below) the sun and lamps, its own card left out.
+          const sA = texelGI.sprites.element(max(sp.i, int(0)).mul(int(3))).toVar();
+          const nBack = vec3(dir.x.negate(), float(0), dir.z.negate()).toVar();
+          const sn = select(length(nBack).greaterThan(float(0.1)), normalize(nBack), dir.negate()).toVar();
+          const sLight = vec3(0, 0, 0).toVar();
+          If(onSprite, () => {
+            need.assign(int(1)); dp.assign(sA.xyz); dn.assign(sn);
+            sLight.assign(skyIrradiance(sn).mul(skyOpenTSL(terrain, sA.xyz)));
+          });
+          If(need.equal(int(1)), () => {
+            const dl = vec3(0, 0, 0).toVar();
+            directAt(dp, dn, dl, select(onSprite, sA.xz, NO_SKIP));
+            If(onSprite, () => { sLight.addAssign(dl); }).Else(() => { L.addAssign(dl.mul(dMul)); });
+          });
+          If(onSprite, () => {
+            const sB = texelGI.sprites.element(sp.i.mul(int(3)).add(int(1)));
+            const cover = texelGI.sprites.element(sp.i.mul(int(3)).add(int(2))).x;
+            L.assign(mix(L, sLight.mul(sB.xyz).mul(texelGI.strength), cover));
+          });
           // Through glass: tinted by the metres it spent in it.
           if (traced) L.mulAssign(glassRayTransmitTSL(glass, traced.glass, origin, dir));
-          // Through cloud spells: to the hit, or the whole reach for a ray that
+          // Through cloud spells: to the hit (or the sprite), or the whole reach for a ray that
           // escaped - held back by the smoke, and given the light of the lit
           // smoke it crossed (a bounce, so times the GI strength).
           if (smoke) {
-            const sc = smokeIn(origin, dir, select(hit.w.greaterThanEqual(float(0)), hit.w, texelGI.reach),
+            const sc = smokeIn(origin, dir, sp.t,
                                sun.dir, smokeSun, smokeSky).toVar();
             L.assign(L.mul(exp(sc.w.negate())).add(sc.xyz.mul(texelGI.strength)));
           }

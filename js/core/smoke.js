@@ -41,7 +41,8 @@
 //
 // Headless: gameplay reads the blocks (line of sight), the renderer draws the
 // cubes (render/features/smoke.js).
-import { BLOCK_METRES, isSolidAt } from './world.js';
+import { BLOCK_METRES, isSolidAt, partAt } from './world.js';
+import { isGlassMaterial } from './materials.js';
 import { BOX_CELLS, BOX_METRES } from './boxgrid.js';
 
 // A cube is a box of the BoxGrid.
@@ -180,6 +181,8 @@ function lineOfSight(p, q, solid) {
 
 // tile: { gx, gy, gz }, the block cast at. solidAt(wx, wy, wz): whether a
 // world point is in solid (world.js isSolidAt; a test passes its own).
+// glassAt(wx, wy, wz): whether that solid is glass - seen through, so a face
+// pressed on it is open as one on air is (else the cloud shows hollow there).
 // spell: a CLOUD_SPELLS entry; level: the level it is cast at.
 // Returns { tile, spell, level, radius (cubes), centre (the emitter, world
 // metres), box (the BoxGrid index of its box's min corner), volume (cubes it
@@ -187,13 +190,20 @@ function lineOfSight(p, q, solid) {
 // 'x,y,z' -> cubes of it, gMax (the farthest travel taken), growSeconds } -
 // cubes in the order taken; travel in the ellipsoid's measure (1 at the rim
 // in the open); air 1 for a cube with a face open to air that is not smoke
-// (always seen); against, for one without, the faces (bit f of FACES) it
+// or glass (always seen); against, for one without, the faces (bit f of FACES) it
 // presses on solid with - seen only while that solid is lifted away (the
 // interiors take roofs and near walls off). A cube with neither is inside.
 // enclosed: the travel at which the last of its smoke neighbours rolls in
 // (Infinity for one open to air) - while the cloud rolls out, every cube is
 // seen from when it arrives until then, so the front grows layer by layer.
-export function createSmokeCloud(tile, solidAt = isSolidAt, spell = CLOUD_SPELLS.fogCloud, level = spell.level) {
+// Glass in the World: the part of its block at the point is a glass material.
+function glassAtWorld(wx, wy, wz) {
+  const part = partAt(wx, wy, wz);
+  return !!part && isGlassMaterial(part.materialId);
+}
+
+export function createSmokeCloud(tile, solidAt = isSolidAt, spell = CLOUD_SPELLS.fogCloud, level = spell.level,
+                                 glassAt = glassAtWorld) {
   const { gx, gy, gz } = tile;
   const rh = smokeRadius(spell, level), rv = rh + 0.5;
   const centre = [gx * BLOCK_METRES, (gy + 0.5) * BLOCK_METRES, gz * BLOCK_METRES];
@@ -260,7 +270,7 @@ export function createSmokeCloud(tile, solidAt = isSolidAt, spell = CLOUD_SPELLS
   for (const [i, j, k, travel] of order) {
     const p = pos(i, j, k);
     if (travel > gMax) gMax = travel;
-    // Its faces: open to air that is not smoke (always seen), or against
+    // Its faces: open to air that is not smoke, or to glass (always seen), or against
     // solid (seen only once that solid is lifted away by the interiors). And
     // when it is enclosed: the travel at which its last smoke neighbour rolls
     // in - while the cloud grows, a cube is seen until then (the front rolls
@@ -269,7 +279,9 @@ export function createSmokeCloud(tile, solidAt = isSolidAt, spell = CLOUD_SPELLS
     FACES.forEach(([di, dj, dk], f) => {
       const a = i + di, b = j + dj, c = k + dk;
       if (inBox(a, b, c) && taken[at(a, b, c)]) { enclosed = Math.max(enclosed, g[at(a, b, c)]); return; }
-      if (solid(a, b, c)) against |= 1 << f; else air = 1;
+      if (!solid(a, b, c)) { air = 1; return; }
+      const q = pos(a, b, c);
+      if (glassAt(q[0], q[1], q[2])) air = 1; else against |= 1 << f;
     });
     cubes.push([p[0], p[1], p[2], travel, over[0] + i, over[1] + j, over[2] + k, air, air ? 0 : against,
                 air ? Infinity : enclosed]);

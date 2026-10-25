@@ -97,7 +97,7 @@
   "compute": "2e2d602bc54595e2"
  },
  "texelgi/gi.patches:giPatches": {
-  "compute": "06ad58d4b026c7b8"
+  "compute": "dfe30911cf71787a"
  },
  "texelgi/gi.sums:giSums": {
   "compute": "c24ede7f35ca7a4d"

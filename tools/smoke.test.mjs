@@ -82,6 +82,12 @@ ok('the same volume as in the open', w.cubes.length, c.volume);
 ok('no cube inside the wall', w.cubes.every(([x]) => !(x >= 1.5 && x < 3)), true);
 ok('the smoke the wall took goes past the radius, this side', w.cubes.some(([, , , m]) => m > 1), true);
 ok('... never through the wall', w.cubes.every(([x]) => x < 1.5), true);
+// The same wall as glass: seen through, so the cubes on it are open, not hidden.
+const pressed = cs => cs.filter(([x]) => x > 1.5 - 1.5 * SMOKE_CUBE && x < 1.5);
+const glassWall = createSmokeCloud(tile, wall, fog, fog.level, (x, y) => !ground(x, y) && x >= 1.5 && x < 3);
+ok('against a stone wall the cubes inside hide', pressed(w.cubes).some(c => !c[7] && c[8]), true);
+ok('against glass they show', pressed(glassWall.cubes).length > 0 && pressed(glassWall.cubes).every(c => c[7] === 1 && c[8] === 0), true);
+ok('... and the cloud is the same', glassWall.cubes.length, w.cubes.length);
 // Under a low roof: a slab of solid at y in [2.25, 3).
 const roof = (x, y) => ground(x, y) || (y >= 2.25 && y < 3);
 const r = createSmokeCloud(tile, roof);

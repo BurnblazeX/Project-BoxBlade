@@ -174,6 +174,21 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     u.spriteCount.value = n;
   }
 
+  // The same sprites for texel GI's rays (gpu/texelgi.js createTexelGI
+  // sprites): three vec4 each, the third its opaque fraction.
+  function packTexelSprites(t) {
+    const list = sprites.casters() || [];
+    const n = Math.min(list.length, MAX_GI_SPRITES);
+    for (let i = 0; i < n; i++) {
+      const c = list[i], ty = sprites.types[c.typeIndex];
+      if (!ty.albedo) ty.albedo = ty.card.rgba ? averageAlbedo(ty.card.rgba) : { r: 0.5, g: 0.5, b: 0.5 };
+      t.sprites.array[i * 3].set(c.centre.x, c.centre.y, c.centre.z, ty.widthMetres / 2);
+      t.sprites.array[i * 3 + 1].set(ty.albedo.r, ty.albedo.g, ty.albedo.b, ty.heightMetres / 2);
+      t.sprites.array[i * 3 + 2].set(ty.coverage ?? 0.5, 0, 0, 0);
+    }
+    t.spriteCount.value = n;
+  }
+
   // One frame of GI, per volume: follow its cascade, then solid / inject /
   // propagate / resolve.
   function update() {
@@ -225,6 +240,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     const dt = giLastT ? Math.min((now - giLastT) / 1000, 0.25) : 1 / 60;
     giLastT = now;
     texelGI.blend.value = giResponse > 0 ? 1 - Math.exp(-dt / giResponse) : 1;
+    packTexelSprites(texelGI);
     list.push(kernels.patches, kernels.sums, kernels.filter, kernels.direct);
     texelGI.frame.value = (texelGI.frame.value + 1) >>> 0;
   }
