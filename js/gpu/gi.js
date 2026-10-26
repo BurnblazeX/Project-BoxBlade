@@ -1,6 +1,8 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup } from './uploads.js';
 import {
-  Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec3, uniform, instanceIndex,
+  Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec2, uvec3, uniform, instanceIndex,
+  packHalf2x16, unpackHalf2x16,
   storage, texture3D, textureStore, max, min, select, normalize, round, uniformArray,
   length, pow, mix, exp
 } from 'three/tsl';
@@ -76,6 +78,12 @@ function neighbour(c, dx, dy, dz, D) {
 // 24 * res cells a side and res^3 times the cells. orders: how many
 // bounce orders its buffers hold (at most GI_MAX_BOUNCES; the bounces uniform
 // must not exceed it).
+// The propagated light (A, B) as half floats, packed two to a u32: half the
+// bytes a cell for the propagation, which reads six neighbours an order and
+// runs ~24 times a frame - the largest kernel. The resolved texture the
+// shading reads was half float already. bxb.lpvhalf() flips it (rebuilds).
+export const lpvStorage = { half: true };
+
 export function createLPV({ cascades, lights, level = 0, biasUniform = null, res = 1,
                             orders: orderCount = GI_MAX_BOUNCES,
                             fadeStartUniform = null, edgeFadeUniform = null,
@@ -126,7 +134,10 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   // visibility are both cut by it in propagate.
   const smokeBuf = buf(1);
   const smokeK = storage(smokeBuf, 'float', CELLS).setName(`bxbLpvSmoke`);
-  const aBuf = new THREE.StorageBufferAttribute(ORDERS, 4), bBuf = new THREE.StorageBufferAttribute(ORDERS, 4);
+  const half = lpvStorage.half;
+  const lightBuf = () => (half ? new THREE.StorageBufferAttribute(new Uint32Array(ORDERS * 2), 2)
+                                : new THREE.StorageBufferAttribute(ORDERS, 4));
+  const aBuf = lightBuf(), bBuf = lightBuf();
   // Named: an unnamed buffer is NodeBuffer_<global node id> in the WGSL, and
   // that id depends on how many nodes existed before - so the shader text, and
   // with it the browser's pipeline cache key, changed from run to run.
@@ -141,8 +152,19 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   const tBuf = glass ? buf(4) : null;
   const T = glass ? storage(tBuf, 'vec4', CELLS).setName(`bxbLpvT`) : null;
   const W = storage(wBuf, 'vec4', CELLS).setName(`bxbLpvW`);
-  const A = storage(aBuf, 'vec4', ORDERS).setName(`bxbLpvA`);
-  const B = storage(bBuf, 'vec4', ORDERS).setName(`bxbLpvB`);
+  const A = storage(aBuf, half ? 'uvec2' : 'vec4', ORDERS).setName(`bxbLpvA`);
+  const B = storage(bBuf, half ? 'uvec2' : 'vec4', ORDERS).setName(`bxbLpvB`);
+  // Light at index i of A or B, as vec4 / its w alone, and a write.
+  const light = (buf, i) => {
+    if (!half) return buf.element(i);
+    const v = buf.element(i).toVar();
+    return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+  };
+  const lightW = (buf, i) => (half ? unpackHalf2x16(buf.element(i).y).y : buf.element(i).w);
+  const setLight = (buf, i, v) => (half
+    ? buf.element(i).assign(uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw)))
+    : buf.element(i).assign(v));
+  const noLight = () => (half ? uvec2(0, 0) : vec4(0));
 
   const tex = new THREE.Storage3DTexture(D, D, D);
   tex.type = THREE.HalfFloatType;
@@ -180,16 +202,16 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     shift: uniform(new THREE.Vector3()),
     // Per material layer: the DIFFUSE albedo it bounces (lpv.js diffuseAlbedo).
     layerAlbedo: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.3, 0.4, 0.2, 0)), 'vec4')
-      .setName(`bxbLpvAlbedo`),
+      .setName(`bxbLpvAlbedo`).setGroup(tableGroup),
     // ... the SPECULAR share it bounces (lpv.js specularAlbedo): all of it, and
     // only its rough part - the smooth part the mirror light carries instead.
     layerSpecAll: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
-      .setName(`bxbLpvSpecAll`),
+      .setName(`bxbLpvSpecAll`).setGroup(tableGroup),
     layerSpecRough: uniformArray(GI_TABLE.map(() => new THREE.Vector4(0.04, 0.04, 0.04, 0)), 'vec4')
-      .setName(`bxbLpvSpecRough`),
+      .setName(`bxbLpvSpecRough`).setGroup(tableGroup),
     // ... and for glass, its tint through one block (1 for everything else).
     layerTint: uniformArray(GI_TABLE.map(() => new THREE.Vector4(1, 1, 1, 0)), 'vec4')
-      .setName(`bxbLpvTint`),
+      .setName(`bxbLpvTint`).setGroup(tableGroup),
     // 1: light thrown by the mirrors bounces from where it lands (and the
     // smooth texels' own share is left to it). 0: no mirror light - every
     // texel bounces its whole specular share where it is.
@@ -198,9 +220,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     //   0  centre xyz, half width        1  albedo rgb (linear), half height
     // and a fill each (opaque fraction x lpv.js SPRITE_GI_FILL) in spriteFill.
     sprites: uniformArray(new Array(MAX_GI_SPRITES * 2).fill(0).map(() => new THREE.Vector4()), 'vec4')
-      .setName(`bxbLpvSprites`),
+      .setName(`bxbLpvSprites`).setGroup(tableGroup),
     spriteFill: uniformArray(new Array(MAX_GI_SPRITES).fill(0), 'float')
-      .setName(`bxbLpvSpriteFill`),
+      .setName(`bxbLpvSpriteFill`).setGroup(tableGroup),
     spriteCount: uniform(int(0)),
     skyGain: uniform(float(1)),
     // The share of its neighbours' sky a roofed cell keeps (propagateSkyStep).
@@ -399,7 +421,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
                   const up = normalize(n.add(vec3(0, 1, 0)));
                   vis.assign(coneTrace(origin, up, SKY_REACH, SKY_CONE, fadeStart, edgeFade).x);
                 };
-                if (skyOn) If(skyOn, () => { vis.assign(A.element(c.i).w); }).Else(cone);
+                if (skyOn) If(skyOn, () => { vis.assign(lightW(A, c.i)); }).Else(cone);
                 else cone();
                 lit.addAssign(skyShTSL(sky, n, true).mul(ambient).mul(u.skyGain).mul(vis));
               });
@@ -506,18 +528,18 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     // sky, else the mean of its air neighbours' less a share; glass passes
     // its tint's mean.
     const vsum = float(0).toVar(), vw = float(0).toVar();
-    for (const nb of nbs) { vsum.addAssign(src.element(nb.index).w.mul(nb.w)); vw.addAssign(nb.w); }
+    for (const nb of nbs) { vsum.addAssign(lightW(src, nb.index).mul(nb.w)); vw.addAssign(nb.w); }
     const seen = select(E.element(c.i).w.greaterThan(float(0.5)), float(1),
                         u.skySpread.mul(vsum).div(max(vw, float(1e-4))));
     const vis = seen.mul(T ? keep.dot(vec3(1 / 3, 1 / 3, 1 / 3)) : open).toVar();
     Loop({ start: int(0), end: u.bounces, type: 'int', condition: '<', name: 'order' }, ({ order }) => {
       const base = order.mul(int(CELLS)).toVar();
       const sum = vec3(0, 0, 0).toVar();
-      for (const nb of nbs) sum.addAssign(src.element(base.add(nb.index)).xyz.mul(nb.w));
+      for (const nb of nbs) sum.addAssign(light(src, base.add(nb.index)).xyz.mul(nb.w));
       const prev = max(base.sub(int(CELLS)), int(0)).add(c.i);
-      const emit = select(order.equal(int(0)), E.element(c.i).xyz, src.element(prev).xyz.mul(rebounce));
-      dst.element(base.add(c.i)).assign(vec4(emit.add(sum.mul(u.spread.div(float(6)))).mul(keep),
-                                             select(order.equal(int(0)), vis, float(0))));
+      const emit = select(order.equal(int(0)), E.element(c.i).xyz, light(src, prev).xyz.mul(rebounce));
+      setLight(dst, base.add(c.i), vec4(emit.add(sum.mul(u.spread.div(float(6)))).mul(keep),
+                                        select(order.equal(int(0)), vis, float(0))));
     });
   })().compute(CELLS).setName(`LPV.Propagate`);
   const aToB = propagate(A, B), bToA = propagate(B, A);
@@ -527,7 +549,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   const totalAt = i => {
     const s = vec3(0, 0, 0).toVar();
     Loop({ start: int(0), end: u.bounces, type: 'int', condition: '<', name: 'order' }, ({ order }) => {
-      s.addAssign(A.element(order.mul(int(CELLS)).add(i)).xyz);
+      s.addAssign(light(A, order.mul(int(CELLS)).add(i)).xyz);
     });
     return s;
   };
@@ -536,7 +558,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     const own = totalAt(c.i).toVar();
     const isSolid = solid.element(c.i).greaterThanEqual(float(SOLID_THRESHOLD));
     const outc = own.toVar();
-    const outv = A.element(c.i).w.toVar();
+    const outv = lightW(A, c.i).toVar();
     If(isSolid, () => {
       const sum = vec3(0, 0, 0).toVar();
       const vsum = float(0).toVar();
@@ -546,7 +568,7 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
         const w = select(nb.inside, float(1).sub(solid.element(nb.index)), float(0));
         If(w.greaterThan(float(0)), () => {
           sum.addAssign(totalAt(nb.index).mul(w));
-          vsum.addAssign(A.element(nb.index).w.mul(w));
+          vsum.addAssign(lightW(A, nb.index).mul(w));
         });
         wsum.addAssign(w);
       }
@@ -570,13 +592,13 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
       .and(sz.greaterThanEqual(int(0))).and(sx.lessThan(int(D)))
       .and(sy.lessThan(int(D))).and(sz.lessThan(int(D)));
     const s = sx.add(sy.mul(int(D))).add(sz.mul(int(D * D)));
-    B.element(at).assign(select(inside, A.element(base.add(select(inside, s, int(0)))), vec4(0)));
+    B.element(at).assign(select(inside, A.element(base.add(select(inside, s, int(0)))), noLight()));
   })().compute(ORDERS).setName(`LPV.Shift`);
   const copyBA = Fn(() => {
     A.element(instanceIndex).assign(B.element(instanceIndex));
   })().compute(ORDERS).setName(`LPV.Copy`);
   const clearA = Fn(() => {
-    A.element(instanceIndex).assign(vec4(0));
+    A.element(instanceIndex).assign(noLight());
     If(int(instanceIndex).lessThan(int(CELLS)), () => {
       E.element(instanceIndex).assign(vec4(0));
       W.element(instanceIndex).assign(vec4(0));

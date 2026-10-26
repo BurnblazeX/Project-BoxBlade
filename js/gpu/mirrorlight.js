@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup } from './uploads.js';
 import { Fn, If, Loop, float, vec3, uniform, instanceIndex, storage, floor, max, texture, abs, vec4, clamp, smoothstep, length, log2, uniformArray, int, select, mix, sqrt, exp2, pow, round, reflect, refract } from 'three/tsl';
 import { VOXEL_METRES } from '../core/field.js';
 import { MAX_LIGHT_LEVEL, LIGHT_VEC4S } from '../core/lights.js';
@@ -44,7 +45,7 @@ export function createMirrorBindings(capacity) {
   return {
     capacity,
     data: uniformArray(new Array(capacity * MIRROR_VEC4S).fill(0).map(() => new THREE.Vector4()), 'vec4')
-      .setName('bxbMirrors'),
+      .setName('bxbMirrors').setGroup(tableGroup),
     count: uniform(int(0)),
     cacheWrite: storage(cache, 'vec4', MIRROR_CACHE_VEC4S).setName('bxbMirrorCacheW'),
     cacheRead: storage(cache, 'vec4', MIRROR_CACHE_VEC4S).toReadOnly().setName('bxbMirrorCache')

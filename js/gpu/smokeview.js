@@ -1,6 +1,7 @@
 // Shared rendered cubes: secondary rays use the same animated bounds and
 // lighting as the mesh. The grid maps each cloud cell to its packed cube.
 import * as THREE from 'three/webgpu';
+import { frameValues } from './uploads.js';
 import { Fn, If, Loop, Break, float, int, vec3, vec4, uniform, storage, texture3D,
          floor, min, max, abs, sign, select, mix, step } from 'three/tsl';
 import { SMOKE_BOX, SMOKE_CUBE } from '../core/smoke.js';
@@ -25,7 +26,7 @@ const attr = new THREE.StorageBufferAttribute(SMOKE_CUBE_CAPACITY * 4, 4);
 export const smokeView = {
   grid, indices, attr,
   read: storage(attr, 'vec4', SMOKE_CUBE_CAPACITY * 4).toReadOnly().setName('bxbSmokeView'),
-  uniforms: { time: uniform(0), ...Object.fromEntries(Object.entries(DEFAULT_SMOKE).map(([k, v]) => [k, uniform(v)])) },
+  uniforms: { time: frameValues.smokeViewTime, ...Object.fromEntries(Object.entries(DEFAULT_SMOKE).map(([k, v]) => [k, uniform(v)])) },
   sunDir: uniform(new THREE.Vector3(0, 1, 0))
 };
 

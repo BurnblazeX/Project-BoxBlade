@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup } from './uploads.js';
 import { float, vec3, uniform, max, uniformArray, int } from 'three/tsl';
 
 // --- The sky, as L2 SH (sky.js) ---
@@ -14,7 +15,7 @@ export const sunColourUniform = uniform(new THREE.Color(1, 1, 1));
 
 export function createSkyBindings() {
   return {
-    sh: uniformArray(new Array(9).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSkySH'),
+    sh: uniformArray(new Array(9).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSkySH').setGroup(tableGroup),
     gain: uniform(float(1))
   };
 }

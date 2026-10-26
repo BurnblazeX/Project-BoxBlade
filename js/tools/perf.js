@@ -375,8 +375,9 @@ export function createPerfOverlay(doc = document) {
     // dt arrives in seconds from the existing clock.
     // sections: ms per SECTIONS key for this frame's CPU work.
     // uncapped: the pacer is not waiting on a refresh, so dt is the frame's cost.
+    // Hidden, it still samples (bxb.gpu reads the stats with the graph off,
+    // whose 2D canvas costs Firefox's WebGPU thread) and only skips the draw.
     update(dt, sections = null, uncappedNow = false) {
-      if (!visible) return;
       // The frame that turns the graph on also contains the work that turned it
       // on (a console call, a chunk rebuild), so its dt is not a real frame time
       // and would sit in the buffer skewing the average for seconds.
@@ -387,14 +388,14 @@ export function createPerfOverlay(doc = document) {
       for (const [k] of SECTIONS) parts[k].push(k === 'other' ? tail : sections ? sections[k] || 0 : 0, now);
       const r = nextRedraw(now, drawDue, drawHz);
       drawDue = r.due;
-      if (r.draw) draw();
+      if (r.draw && visible) draw();
       tail = performance.now() - now;
     },
     get drawHz() { return drawHz; },
     set drawHz(hz) { drawHz = Math.max(0, Number(hz) || 0); drawDue = -Infinity; },
     // GPU time for a frame, in ms, whenever a timestamp resolve lands.
-    gpu(ms) { if (visible) gpu.push(ms, performance.now()); },
-    gpuCompute(ms) { if (visible) gpuCompute.push(ms, performance.now()); },
+    gpu(ms) { gpu.push(ms, performance.now()); },
+    gpuCompute(ms) { gpuCompute.push(ms, performance.now()); },
     // Averages for scripted profiling (bxb.gpu): render and compute, ms.
     // Over the newest n resolves - the buffer itself holds far more.
     gpuStats: (n = DEFAULT_CAPACITY) => ({ render: gpu.stats(n), compute: gpuCompute.stats(n) }),
@@ -403,11 +404,11 @@ export function createPerfOverlay(doc = document) {
       visible = !visible;
       canvas.style.display = visible ? 'block' : 'none';
       if (visible) { skipNext = true; drawDue = -Infinity; }
-      else { stats.reset(); gpu.reset(); gpuCompute.reset(); for (const [k] of SECTIONS) parts[k].reset(); }
       return visible;
     },
     get visible() { return visible; },
     attachRenderer(r) { renderer = r; },
-    stats: () => stats.stats()
+    // Frame times over the newest n frames (all held, with no n).
+    stats: (n = Infinity) => stats.stats(n)
   };
 }

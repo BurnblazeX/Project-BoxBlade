@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { frameValues } from './uploads.js';
 import { Fn, float, vec3, uniform, instanceIndex, storage, floor, abs, clamp, int, select, sqrt, uint, ivec3, bitXor, shiftRight, bitAnd, bitOr, shiftLeft, atomicMax, atomicLoad, atomicStore } from 'three/tsl';
 import { VOXEL_METRES } from '../core/field.js';
 
@@ -38,7 +39,7 @@ export function createHitCache() {
   // atomic (read-write) binding counts as a side effect and costs the shader
   // its early depth and stencil tests - measured +3.7 ms on the miss pass.
   const read = storage(attr, 'uint', HIT_CACHE_HALF * 2).toReadOnly().setName('bxbHitCacheRead');
-  const writeHalf = uniform(int(0));
+  const writeHalf = frameValues.hitHalf;
   const clear = Fn(() => {
     atomicStore(node.element(int(instanceIndex).add(writeHalf.mul(int(HIT_CACHE_HALF)))), uint(0));
   })().compute(HIT_CACHE_HALF).setName('hitCacheClear');

@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup, frameValues } from './uploads.js';
 import { Fn, If, float, vec3, uniform, instanceIndex, storage, floor, abs, vec2, vec4, ivec2, clamp, uniformArray, int, select, textureLoad, screenCoordinate, Discard, uint, atomicStore, atomicAdd } from 'three/tsl';
 import { VOXEL_METRES } from '../core/field.js';
 import { terrainSurfaceTSL } from './terrain.js';
@@ -128,7 +129,7 @@ export function createSplitShading(lowCap, missCap, fullCap, half = true) {
     count: uniform(int(0)),             // low-res samples this frame
     fullWidth: uniform(int(1)),
     fullCount: uniform(int(0)),
-    viewPos: uniform(new THREE.Vector3()),
+    viewPos: frameValues.viewPos,
     rt: null,                           // the low-res target's texture, set by main.js
     idRT: null                          // the full-res one's
   };
@@ -137,7 +138,7 @@ export function createSplitShading(lowCap, missCap, fullCap, half = true) {
 // Per material, its slope planes' first layers + 1 (0: the side stretched):
 // x slope, y half slope - render.js fillInstances' modelInfo.x, as a table.
 export const slopeLayerTable = uniformArray(MATERIAL_LAYERS.faces.map(f =>
-  new THREE.Vector4(f.slope[0] + 1, f.slope[1] + 1, 0, 0)), 'vec4').setName('bxbSlopeLayers');
+  new THREE.Vector4(f.slope[0] + 1, f.slope[1] + 1, 0, 0)), 'vec4').setName('bxbSlopeLayers').setGroup(tableGroup);
 
 // The resolve, before the kernels: [clear the miss count, per pixel find
 // its sample]. cache: texelCache (scale, size).

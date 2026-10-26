@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup } from './uploads.js';
 import { Fn, If, Loop, float, vec3, uniform, floor, max, texture, abs, vec2, clamp, smoothstep, length, uniformArray, int, select, mix, exp2 } from 'three/tsl';
 import { VOXEL_METRES, CASCADE_COUNT } from '../core/field.js';
 import { CARD_RANGE, CARD_PAD, CARD_FADE_START, CARD_SUN_REACH } from '../core/cards.js';
@@ -42,7 +43,7 @@ export function createCardBindings(capacity = MAX_CARDS, name = 'bxbCards') {
     // 64 cards is 4 KB, far inside the uniform limit, and a uniform read is the
     // cheaper of the two in a per-fragment loop.
     data: uniformArray(new Array(capacity * 4).fill(0).map(() => new THREE.Vector4()),
-                       'vec4').setName(name),
+                       'vec4').setName(name).setGroup(tableGroup),
     count: uniform(int(0)),
     // How many levels finer than its cascade this light draws a card - see the
     // LOD block in createCardsTSL. The sun uses 1, point lights 0.

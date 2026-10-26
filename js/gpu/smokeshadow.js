@@ -30,6 +30,7 @@
 // Its own module so the light loop (pointlights.js) and the cubes (smoke.js),
 // which use each other, both reach it.
 import * as THREE from 'three/webgpu';
+import { tableGroup, frameValues } from './uploads.js';
 import { Fn, If, Loop, float, vec3, vec4, int, uniform, uniformArray, texture3D, exp, max, min, clamp,
          smoothstep, select } from 'three/tsl';
 import { SMOKE_CUBE, SMOKE_BOX, SMOKE_GROW_IN, SMOKE_SUN_BOXES } from '../core/smoke.js';
@@ -92,7 +93,7 @@ function createSmokeShared() {
   //      not to the slot's whole box: that is sized for a 9th-level cast (32 m),
   //      and marching all of it from everything near a small cloud doubled
   //      the frame
-  const slots = uniformArray(new Array(N * ROWS).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSmokeSlots');
+  const slots = uniformArray(new Array(N * ROWS).fill(0).map(() => new THREE.Vector4()), 'vec4').setName('bxbSmokeSlots').setGroup(tableGroup);
   return {
     occData, occTex, softData, softTex, slots,
     // Slot k's row r (above), as a node.
@@ -100,7 +101,7 @@ function createSmokeShared() {
     // How many slots are live: 0, and every smoke test is one branch.
     live: uniform(int(0)).setName('bxbSmokeLive'),
     // Seconds, on the same clock as the cast times (render/features/smoke.js).
-    time: uniform(float(0)).setName('bxbSmokeTime'),
+    time: frameValues.smokeTime,
     // How dark the smoke is to light passing through it: a scale on the depth.
     strength: uniform(float(1)).setName('bxbSmokeStrength'),
     // Slot k: the cloud's boxes (core/smoke.js), its spell and its growth,

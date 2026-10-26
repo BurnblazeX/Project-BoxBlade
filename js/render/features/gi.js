@@ -28,7 +28,7 @@ import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL, averageA
          DEFAULT_LPV_SKY_SPREAD } from '../../core/lpv.js';
 import { MATERIALS } from '../../core/materials.js';
 import { MODELS } from '../../core/models.js';
-import { createLPV } from '../../gpu/gi.js';
+import { createLPV, lpvStorage } from '../../gpu/gi.js';
 import { createTexelGI, GI_LIST_CAP } from '../../gpu/texelgi.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
 import { reflectEscapeUniform } from '../../gpu/specular.js';
@@ -258,6 +258,15 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       run: () => {
         giBatch = !giBatch;
         return `GI kernels ${giBatch ? 'batched: one submit per volume' : 'one submit per kernel'}`;
+      }
+    },
+    lpvhalf: {
+      help: 'LPV propagation in half floats (packed): half the bytes for the largest GI kernel. ' +
+            'Off: 32-bit floats, as before (rebuilds the volumes)',
+      run: () => {
+        lpvStorage.half = !lpvStorage.half;
+        rebuildLPV();
+        return `LPV propagation in ${lpvStorage.half ? 'half floats' : '32-bit floats'}`;
       }
     },
     gifar: {

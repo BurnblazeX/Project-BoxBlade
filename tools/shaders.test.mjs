@@ -104,6 +104,24 @@ for (const [name, set] of Object.entries(shaders)) for (const [stage, code] of O
   if (typeof code !== 'string') continue;
   const ubos = (code.match(/var<uniform>/g) || []).length;
   if (ubos > 12) ok(`${name} ${stage}: at most 12 uniform buffers`, ubos, 12);
+  // render, object, the shared tables and the per-frame values (gpu/uploads.js)
+  // are four - WebGPU's guaranteed maxBindGroups. One more group fails the pipeline.
+  const groups = Math.max(-1, ...[...code.matchAll(/@group\( (\d+) \)/g)].map(m => +m[1])) + 1;
+  if (groups > 4) ok(`${name} ${stage}: at most 4 bind groups`, groups, 4);
+}
+// A shader that reads any per-frame value declares them all, so the struct is
+// the same everywhere it appears in one set (and one buffer serves them).
+{
+  const layouts = new Map();
+  for (const [name, set] of Object.entries(shaders)) for (const code of Object.values(set)) {
+    const m = typeof code === 'string' && code.match(/struct bxbFrameStruct \{([^}]*)\}/);
+    if (!m) continue;
+    const set_ = name.split('/')[0], types = m[1].split(',').map(s => s.split(':')[1]?.trim()).join(' ');
+    if (!layouts.has(set_)) layouts.set(set_, new Set());
+    layouts.get(set_).add(types);
+  }
+  ok('per-frame values: shaders read them', layouts.size > 0, true);
+  ok('... one layout per set', [...layouts].filter(([, s]) => s.size > 1).map(([k]) => k).join(', '), '');
 }
 
 section('smoke builds');

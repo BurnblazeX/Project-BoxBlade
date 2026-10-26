@@ -1,4 +1,5 @@
 import { smokeTransmitTSL } from './smokeshadow.js';
+import { tableGroup } from './uploads.js';
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, uniform, max, abs, vec4, min, clamp, length, log2, uniformArray, int, select, mix } from 'three/tsl';
 import { VOXEL_METRES } from '../core/field.js';
@@ -39,7 +40,7 @@ export function createLightBindings(capacity = MAX_LIGHTS) {
   return {
     capacity,
     data: uniformArray(new Array(capacity * LIGHT_VEC4S).fill(0)
-                         .map(() => new THREE.Vector4()), 'vec4').setName('bxbLights'),
+                         .map(() => new THREE.Vector4()), 'vec4').setName('bxbLights').setGroup(tableGroup),
     count: uniform(int(0)),
     // lights.js cutAmount: the sliver of each light's reach not worth a march.
     cutoff: uniform(float(DEFAULT_LIGHT_CUTOFF))

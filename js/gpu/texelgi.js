@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { tableGroup, frameValues } from './uploads.js';
 import { Fn, If, Loop, float, vec3, uniform, storage, floor, max, abs, vec2, int, select, uint, sqrt, cos, sin, ivec3, bitXor, bitAnd, bitOr, packHalf2x16, unpackHalf2x16, min, smoothstep, mix, clamp, exp, normalize, cross, instanceIndex, shiftLeft, shiftRight, atomicAdd, atomicLoad, atomicStore, atomicMax, atomicMin, uniformArray, step, length } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
 import { MAX_GI_SPRITES } from '../core/lpv.js';
@@ -153,7 +154,7 @@ export function createTexelGI() {
     claimsAt: GI_CLAIMS,
     data: storage(dataAttr, 'uint', GI_SLOTS * GI_STRIDE).setName('bxbGIPatches'),
     dataRead: storage(dataAttr, 'uint', GI_SLOTS * GI_STRIDE).toReadOnly().setName('bxbGIPatchesRead'),
-    frame: uniform(uint(0)),
+    frame: frameValues.giFrame,
     reach: uniform(float(DEFAULT_TEXEL_GI_REACH)),
     // Frames between refreshes of a patch's direct light (1: every frame).
     directEvery: uniform(int(DEFAULT_GI_DIRECT_EVERY)),
@@ -162,7 +163,7 @@ export function createTexelGI() {
     // How far a patch's shown light moves toward its new sum this frame:
     // 1 - exp(-dt / response), set by main.js from the frame's own time - so
     // the smoothing is the same at 60 and 240 fps.
-    blend: uniform(float(1)),
+    blend: frameValues.giBlend,
     // A/B switches for the last fixes, uniforms so they flip without a
     // rebuild (Alt+V -> GI): 1 is the fix, 0 the behaviour before it.
     ab: {
@@ -180,7 +181,7 @@ export function createTexelGI() {
     // (albedo, half height), (opaque fraction, 0, 0, 0). Written each frame
     // (render/features/gi.js stepTexel).
     sprites: uniformArray(new Array(MAX_GI_SPRITES * 3).fill(0).map(() => new THREE.Vector4()), 'vec4')
-      .setName('bxbTexelGISprites'),
+      .setName('bxbTexelGISprites').setGroup(tableGroup),
     spriteCount: uniform(int(0)),
     strength: null,      // the GI strength uniform, set by main.js
     kernels: null        // { reset, patches }: built with the shading (createShadowColorNode)

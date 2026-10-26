@@ -44,6 +44,9 @@ import { createFramePacer, describePacing } from './tools/pacing.js';
 import { VERSION, bundleHash, buildLabel } from './core/version.js';
 import { createVoxelAONode, AO_DISTANCE } from './gpu/ambient.js';
 import { runComputeSmokeTest, runGPUMarch } from './gpu/diagnostics.js';
+import { installUploads, installSubmitBatching, toggleUpload, uploadFlags, countGPUCalls } from './gpu/uploads.js';
+import { textureLimitsToRequest, noteDeviceLimits, fitFallback, deviceLimits } from './gpu/limits.js';
+import { measurePasses } from './tools/passtimes.js';
 import { createDistanceTexture, updateDistanceTexture, followShadowGrid, commitShadowGrid,
          cascadeBindings, writeCascadeBindings } from './gpu/field.js';
 import { GLASS_MAX_BOUNCES, GLASS_LAYERS, GLASS_DISPERSION, glassCaustics } from './gpu/glass.js';
@@ -101,8 +104,13 @@ async function requestGPUDevice() {
       const { vendor, architecture, description } = adapter.info;
       console.info('[renderer] WebGPU adapter:', vendor, architecture, description || '');
     }
-    return adapter ? await adapter.requestDevice({ requiredFeatures: [...adapter.features] })
-                   : undefined;
+    if (!adapter) return undefined;
+    // The adapter's highest texture limits, not WebGPU's guaranteed 16 a stage
+    // (gpu/limits.js): what the shading may bind follows what was granted.
+    const device = await adapter.requestDevice({ requiredFeatures: [...adapter.features],
+                                                 requiredLimits: textureLimitsToRequest(adapter.limits) });
+    noteDeviceLimits(device.limits);
+    return device;
   } catch (err) {
     console.warn('[renderer] own WebGPU device failed, letting three request one', err);
     return undefined;
@@ -113,6 +121,10 @@ async function requestGPUDevice() {
 // stencil: the texel cache's miss pass is gated by it - see render/features/texelcache.js.
 const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: true, stencil: true,
                                            device: await requestGPUDevice() });
+// Fewer writeBuffer calls for the same bytes, and the frame's command buffers
+// in fewer submits (gpu/uploads.js, bxb.uploads).
+installUploads(renderer);
+installSubmitBatching(renderer.backend.parameters.device);
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 // Which refreshes render: every one, a cap, or uncapped - see pacing.js.
@@ -632,7 +644,8 @@ async function toggleAdvancedEffects() {
       return;
     }
     const out = [];
-    if (!perf.visible) out.push(bxbApi.perf());
+    // The frame graph is left as it is (it is on from load; hidden, it costs
+    // Firefox's WebGPU thread nothing - measure fps that way, bxb.gpu).
     if (!sun.cone) out.push(await bxbApi.soften('cone'));
     if (shadowTurnOnCompiles()) {
       notice = showNotice('Preparing shaders\u2026');
@@ -887,13 +900,13 @@ function animate(time) {
   if (shadowsOn || boxLight.active()) lighting.update();
   // After the light list: the mirrors are culled against where the lights are now.
   mirrors.update();
-  runMirrorCache();
-  if (shadowsOn) gi.update();
+  // The mirror cache and the LPV volumes: sent with split shading (collectCompute).
+  const earlyKernels = collectCompute(() => { runMirrorCache(); if (shadowsOn) gi.update(); });
 
   const tRender = performance.now();
   occlusion.update();   // the interiors' lifted blocks, before the first terrain pass
   smoke.update();   // cube bounds and light before reflections / glass read them
-  texel.render();
+  texel.render(earlyKernels);
   spriteAtlas.render();
   tonemap.update();   // meters this frame's terrain, before the main render
   fog.update();   // after the texel cache drew this frame's G-buffer
@@ -908,9 +921,26 @@ function animate(time) {
 
 // One resolve in flight at a time: each reads every query since the last and
 // returns the newest frame's GPU time; overlapping them would split frames.
-// Resolved every frame even with the graph hidden - unresolved queries fill
-// three's query pool.
+// Resolved every frame while timing is on - unresolved queries fill three's
+// query pool.
 let gpuTimePending = false;
+// GPU timing (timestamp queries) runs only while something reads it: the
+// frame graph, or a bxb measurement holding it. Each frame it costs ~2 extra
+// submits and 2 mapAsync readbacks (9.0 -> 7.25 submits, 1.9 -> 0.1 readbacks,
+// Chrome 2026-10-26) - in Firefox each a trip through its one WebGPU thread.
+let gpuTimingHolds = 0;
+function syncGPUTiming() {
+  const b = renderer.backend;
+  const supported = !b.device || b.device.features.has('timestamp-query');
+  b.trackTimestamp = supported && (perf.visible || gpuTimingHolds > 0);
+}
+// Runs fn with GPU timing on; wasOff tells it the window holds nothing yet.
+async function withGPUTiming(fn) {
+  const wasOff = !renderer.backend.trackTimestamp;
+  gpuTimingHolds++;
+  syncGPUTiming();
+  try { return await fn(wasOff); } finally { gpuTimingHolds--; syncGPUTiming(); }
+}
 function resolveGPUTime() {
   if (gpuTimePending || !renderer.backend.trackTimestamp) return;
   gpuTimePending = true;
@@ -1140,6 +1170,27 @@ let glassLayers = GLASS_LAYERS;
 let glassDispersion = 0;
 // Shadow rays tint through glass. Off only inside bxb.gpuprofile, to price it.
 let glassShadows = true;
+// Kernels that several features dispatch back to back, collected rather than
+// sent: texel.render sends them at the head of split shading's own list, as
+// ONE renderer.compute - one pass and one submit for the mirror cache, the LPV
+// volumes and the split kernels, where they were three (a submit costs
+// Firefox's WebGPU thread ~65 us whatever it holds - profile 2026-10-26). The
+// order holds within the pass, so each dispatch still sees the ones before it.
+// Nothing drawn between reads them on the GPU (the low-res and id passes only
+// write the G-buffer); without split shading the low-res pass shades and reads
+// them, so texel.render sends them first, alone. Only for features that set
+// every uniform before dispatching and read nothing back (the tone-map meter
+// reads back, so it stays out). bxb.computebatch() off: each sent as it comes.
+let computeBatchOn = true;
+function collectCompute(fn) {
+  if (!computeBatchOn) { fn(); return []; }
+  const real = renderer.compute, list = [];
+  renderer.compute = k => { for (const x of [k].flat()) list.push(x); };
+  try { fn(); } finally { renderer.compute = real; }
+  return list;
+}
+// bxb.gpuprofile: how long each change is left to settle before it is measured.
+const GPUPROFILE_SETTLE_MS = 1000;
 // The cache pass, after the mirrors and lights are packed and before anything
 // that reads it is drawn. Only for a set built to read it.
 function runMirrorCache() {
@@ -1176,8 +1227,9 @@ function spriteMeshes() {
 }
 // The shading build's options: the features' slices, and the settings main.js
 // still owns (render/shadowsets.js builds and keeps the sets).
+let fallbackNoted = '';
 function shadowNodeOptions() {
-  return {
+  const all = {
     cascades: shadowCascades,
     terrain: terrainTextures,
     // At the surface's texel - on a slope's plane, its own texture (render.js).
@@ -1192,6 +1244,16 @@ function shadowNodeOptions() {
     // The world has glass: shadow rays tint through it (gpu/trace.js createConeTraceSunTSL).
     glass: !!glassInstancedMesh
   };
+  // Split shading off: the one-shader fallback gives up what the device's
+  // texture limit cannot hold (gpu/limits.js) - said once per change.
+  const { opts, dropped } = fitFallback(all);
+  const note = dropped.join(', ');
+  if (note && note !== fallbackNoted) {
+    console.info(`[limits] split shading off: left out ${note} - the device allows ` +
+                 `${deviceLimits.sampledTextures} sampled textures a stage`);
+  }
+  fallbackNoted = note;
+  return opts;
 }
 
 // --- "Preparing shaders" ---
@@ -1394,6 +1456,7 @@ const bxbApi = installConsole(createConsole({
   mirrorcache: mirrors.commands.mirrorcache,
   gibatch: gi.commands.gibatch,
   gifar: gi.commands.gifar,
+  lpvhalf: gi.commands.lpvhalf,
   mirrors: mirrors.commands.mirrors,
   spec: {
     help: 'specular: GGX highlights and reflections. bxb.spec() toggles both, ' +
@@ -1451,13 +1514,36 @@ const bxbApi = installConsole(createConsole({
     run: () => ({ scene, renderer, ...cards.bindings(), treeMeshes,
                   playerSprite, enemySprite, perf, enemyAI })
   },
+  gpucalls: {
+    help: 'WebGPU queue calls a frame: writeBuffer calls and kB, submits, and the buffers ' +
+          'written most. What Firefox\'s WebGPU thread pays for, per call',
+    usage: 'await bxb.gpucalls()  |  await bxb.gpucalls(240)  frames to average',
+    run: (frames = 120) => countGPUCalls(renderer, frames)
+  },
+  uploads: {
+    help: "A/B the uniform upload fixes: 'coalesce' (one writeBuffer per changed buffer) and " +
+          "'unchanged' (skip a table whose bytes did not change)",
+    usage: "bxb.uploads('coalesce')  |  bxb.uploads('unchanged')  |  bxb.uploads('batch')",
+    run: name => toggleUpload(name)
+  },
+  gpupasses: {
+    help: 'GPU ms per frame by pass and by kernel, averaged over a few seconds. Compute lists ' +
+          'are split a kernel a dispatch while it measures, so read the times, not the fps',
+    usage: 'await bxb.gpupasses()  |  await bxb.gpupasses(10)  seconds',
+    run: (seconds = 5) => withGPUTiming(() => measurePasses(renderer, seconds))
+  },
+  computebatch: {
+    help: 'the mirror cache and the LPV volumes sent in the split shading compute pass and submit. ' +
+          'Off: a submit each, as before (A/B)',
+    run: () => { computeBatchOn = !computeBatchOn; return `compute batch ${computeBatchOn ? 'on' : 'off'}`; }
+  },
   gpu: {
-    help: 'average GPU ms over the last frames (render, compute), for profiling. ' +
-          'bxb.gpu(true) resets the window first and waits for it to refill',
+    help: 'average GPU ms over the last frames (render, compute) and the fps, for profiling. ' +
+          'bxb.gpu(true) resets the window first and waits for it to refill. Works with the ' +
+          'frame graph hidden (bxb.perf()), which is the fairer fps in Firefox',
     usage: 'bxb.gpu()  |  await bxb.gpu(true, 120)',
-    run: async (reset = false, frames = 120) => {
-      if (!perf.visible) perf.toggle();
-      if (reset) {
+    run: (reset = false, frames = 120) => withGPUTiming(async wasOff => {
+      if (reset || wasOff) {
         perf.resetGPU();
         await new Promise(r => setTimeout(r, 200));   // let in-flight resolves land
         perf.resetGPU();
@@ -1466,82 +1552,108 @@ const bxbApi = installConsole(createConsole({
       const { render, compute } = perf.gpuStats(frames);
       const f = x => +x.toFixed(3);
       return { render: f(render.avg), renderP95: f(render.p95), compute: f(compute.avg),
-               total: f(render.avg + compute.avg), frames: render.count };
-    }
+               total: f(render.avg + compute.avg), frames: render.count,
+               fps: +perf.stats(frames).fps.toFixed(1), graph: perf.visible };
+    })
   },
   gpuprofile: {
     help: 'what each feature costs the GPU in this view: turns each off in turn, measures, ' +
           'turns it back on. Stand still. The rebuilding cases compile first - several ' +
-          'seconds each in Firefox',
-    usage: 'await bxb.gpuprofile()  |  await bxb.gpuprofile(120)  frames per measurement',
-    run: async (frames = 90) => {
+          'seconds each in Firefox. Runs uncapped with Evil Bob held still, and lets each ' +
+          'change settle before measuring',
+    usage: 'await bxb.gpuprofile()  |  await bxb.gpuprofile(480)  frames per measurement',
+    run: async (frames = 240) => {
       if (!shadowsOn) return 'run bxb.shadows() first';
+      // Steady conditions, put back afterwards:
+      // - uncapped, so the GPU is busy every moment: at the vsync cap it idles
+      //   half of each frame and its clock moves, and the same work then times
+      //   differently from one measurement to the next;
+      // - Evil Bob held, so sprites, card shadows and GI sprites stand still.
+      const pacing = pacer.mode, ai = enemyAI.isPaused;
+      pacer.setMode('uncapped');
+      enemyAI.isPaused = true;
+      // After any change, a second before measuring: the LPV refills from
+      // empty when GI comes back, the hit and texel caches refill, texel GI
+      // and the room meter blend in. Measured at once, a case was timed
+      // through that refill, and baselines drifted ~0.65 ms (2026-10-26).
+      const settle = () => new Promise(r => setTimeout(r, GPUPROFILE_SETTLE_MS));
       const measure = async rebuilt => {
         if (rebuilt) await sets.done;
+        await settle();
         return bxbApi.gpu(true, frames);
       };
-      const glass = glassInstancedMesh;
-      const glare = mirrors.glare, caustic = glassCaustics.value, layers = glassLayers;
-      const texelGI = engine.options().texelGI;
-      const rebuild = () => buildPerPixelShadows();
-      const flag = set => [() => { set(false); rebuild(); }, () => { set(true); rebuild(); }];
-      let shown = [];
-      // [name, applies, off, back on, rebuilds]. A case already off is skipped.
-      const cases = [
-        ['glass surfaces (holes left)', !!glass,
-         () => { glass.visible = false; }, () => { glass.visible = true; }, false],
-        ['caustics', !!glass && caustic > 0,
-         () => bxbApi.caustics(0), () => bxbApi.caustics(caustic), false],
-        ['glare off glass', !!glass && glare > 0 && mirrors.on,
-         () => bxbApi.glassglare(0), () => bxbApi.glassglare(glare), false],
-        ['torch', lighting.torchOn, () => lighting.toggleTorch(), () => lighting.toggleTorch(), false],
-        [`model lights (${lighting.modelLightCount})`, lighting.modelLightCount > 0,
-         () => { lighting.modelLightsOn = false; }, () => { lighting.modelLightsOn = true; }, false],
-        ['sprites (not drawn)', true,
-         () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
-         () => shown.forEach(m => { m.visible = true; }), false],
-        ['sun shadow march', true, ...flag(v => { sun.march = v; }), true],
-        [engine.options().gi ? 'AO (cones kept for the LPV)' : 'AO cones', true, ...flag(v => { aoOn = v; }), true],
-        ['shadow rays tinting through glass', !!glass, ...flag(v => { glassShadows = v; }), true],
-        ['second glass layer', !!glass && layers > 1,
-         () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
-        ['mirror light', mirrors.on, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
-        // GI, whichever method: all of it - then, for texel GI, only the
-        // lamps' shadow marches at its ray hits.
-        [texelGI ? 'texel GI' : 'LPV GI', !!(texelGI || engine.options().gi),
-         () => bxbApi.gi(false), () => bxbApi.gi(true), true],
-        ['lamp shadows at texel GI hits', !!texelGI && texelGI.ab.hitShadows.value === 1,
-         () => { texelGI.ab.hitShadows.value = 0; }, () => { texelGI.ab.hitShadows.value = 1; }, false],
-        // Off costs MORE: every GI ray hit runs the light loop again.
-        ['patch direct-light cache (GI hits)', !!texelGI && texelGI.ab.direct.value === 1,
-         () => { texelGI.ab.direct.value = 0; }, () => { texelGI.ab.direct.value = 1; }, false],
-        ['split shading', texel.splitOn, ...flag(v => { texel.splitOn = v; }), true],
-        ['hit lighting cache', hitCacheOn, ...flag(v => { hitCacheOn = v; }), true],
-        ['model lookup in reflection hits', !!terrainTextures.modelHits, ...flag(v => { modelHitsOn = v; }), true],
-        ['reflections (and glass shading)', reflectionsOn,
-         () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
-      ];
-      const f = x => +x.toFixed(3);
-      const rows = [];
-      const before = await measure(false);
-      rows.push({ case: 'baseline', render: before.render, compute: before.compute });
-      for (const [name, applies, off, on, rebuilds] of cases) {
-        if (!applies) continue;
-        off();
-        const m = await measure(rebuilds);
-        on();
-        if (rebuilds) await sets.done;
-        rows.push({ case: `${name} off`, render: m.render, compute: m.compute });
-        console.log(`[gpuprofile] ${name} off: render ${m.render} + compute ${m.compute} ms`);
+      try {
+        const glass = glassInstancedMesh;
+        const glare = mirrors.glare, caustic = glassCaustics.value, layers = glassLayers;
+        const texelGI = engine.options().texelGI;
+        const rebuild = () => buildPerPixelShadows();
+        const flag = set => [() => { set(false); rebuild(); }, () => { set(true); rebuild(); }];
+        let shown = [];
+        // [name, applies, off, back on, rebuilds]. A case already off is skipped.
+        const cases = [
+          ['glass surfaces (holes left)', !!glass,
+           () => { glass.visible = false; }, () => { glass.visible = true; }, false],
+          ['caustics', !!glass && caustic > 0,
+           () => bxbApi.caustics(0), () => bxbApi.caustics(caustic), false],
+          ['glare off glass', !!glass && glare > 0 && mirrors.on,
+           () => bxbApi.glassglare(0), () => bxbApi.glassglare(glare), false],
+          ['torch', lighting.torchOn, () => lighting.toggleTorch(), () => lighting.toggleTorch(), false],
+          [`model lights (${lighting.modelLightCount})`, lighting.modelLightCount > 0,
+           () => { lighting.modelLightsOn = false; }, () => { lighting.modelLightsOn = true; }, false],
+          ['sprites (not drawn)', true,
+           () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
+           () => shown.forEach(m => { m.visible = true; }), false],
+          ['sun shadow march', true, ...flag(v => { sun.march = v; }), true],
+          [engine.options().gi ? 'AO (cones kept for the LPV)' : 'AO cones', true, ...flag(v => { aoOn = v; }), true],
+          ['shadow rays tinting through glass', !!glass, ...flag(v => { glassShadows = v; }), true],
+          ['second glass layer', !!glass && layers > 1,
+           () => { glassLayers = 1; rebuild(); }, () => { glassLayers = layers; rebuild(); }, true],
+          ['mirror light', mirrors.on, () => bxbApi.mirrors(), () => bxbApi.mirrors(), true],
+          // GI, whichever method: all of it - then, for texel GI, only the
+          // lamps' shadow marches at its ray hits.
+          [texelGI ? 'texel GI' : 'LPV GI', !!(texelGI || engine.options().gi),
+           () => bxbApi.gi(false), () => bxbApi.gi(true), true],
+          ['lamp shadows at texel GI hits', !!texelGI && texelGI.ab.hitShadows.value === 1,
+           () => { texelGI.ab.hitShadows.value = 0; }, () => { texelGI.ab.hitShadows.value = 1; }, false],
+          // Off costs MORE: every GI ray hit runs the light loop again.
+          ['patch direct-light cache (GI hits)', !!texelGI && texelGI.ab.direct.value === 1,
+           () => { texelGI.ab.direct.value = 0; }, () => { texelGI.ab.direct.value = 1; }, false],
+          ['split shading', texel.splitOn, ...flag(v => { texel.splitOn = v; }), true],
+          ['hit lighting cache', hitCacheOn, ...flag(v => { hitCacheOn = v; }), true],
+          ['model lookup in reflection hits', !!terrainTextures.modelHits, ...flag(v => { modelHitsOn = v; }), true],
+          ['reflections (and glass shading)', reflectionsOn,
+           () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
+        ];
+        const f = x => +x.toFixed(3);
+        const rows = [];
+        // renderP95: the spread within a measurement - a saving smaller than the
+        // baselines' drift (the last row) is not a saving.
+        const row = (name, m) => ({ case: name, render: m.render, compute: m.compute, renderP95: m.renderP95 });
+        const before = await measure(false);
+        rows.push(row('baseline', before));
+        for (const [name, applies, off, on, rebuilds] of cases) {
+          if (!applies) continue;
+          off();
+          const m = await measure(rebuilds);
+          on();
+          if (rebuilds) await sets.done;
+          rows.push(row(`${name} off`, m));
+          console.log(`[gpuprofile] ${name} off: render ${m.render} + compute ${m.compute} ms`);
+        }
+        const after = await measure(false);
+        rows.push(row('baseline again', after));
+        // Savings, render + compute (split shading moves work between them),
+        // against the mean of the two baselines; their difference is the drift.
+        const base = (before.render + before.compute + after.render + after.compute) / 2;
+        for (const r of rows) r.saved = f(base - r.render - r.compute);
+        console.table(rows);
+        console.log(`[gpuprofile] drift between the baselines: ` +
+                    `${f(after.render + after.compute - before.render - before.compute)} ms`);
+        return rows;
+      } finally {
+        pacer.setMode(pacing);
+        enemyAI.isPaused = ai;
       }
-      const after = await measure(false);
-      rows.push({ case: 'baseline again', render: after.render, compute: after.compute });
-      // Savings, render + compute (split shading moves work between them),
-      // against the mean of the two baselines; their difference is the drift.
-      const base = (before.render + before.compute + after.render + after.compute) / 2;
-      for (const r of rows) r.saved = f(base - r.render - r.compute);
-      console.table(rows);
-      return rows;
     }
   },
   wgsl: {
@@ -1595,7 +1707,7 @@ const bxbApi = installConsole(createConsole({
   },
   perf: {
     help: 'toggle the frame time graph',
-    run: () => perf.toggle() ? 'perf graph on' : 'perf graph off'
+    run: () => { const on = perf.toggle(); syncGPUTiming(); return on ? 'perf graph on' : 'perf graph off'; }
   },
   perfhz: {
     help: 'frame graph repaints per second (every frame is still sampled); 0 repaints every frame',
@@ -1707,6 +1819,15 @@ settingsPanel = createSettingsPanel({ groups: [
       get: () => cutoutsEnabled(), set: v => flip(cutoutsEnabled(), v, () => bxbApi.cutouts()) },
     ...gi.perfSettings,
     ...lighting.perfSettings,
+    { key: 'coalesce', label: 'One upload per changed buffer', type: 'toggle',
+      help: 'a uniform buffer with several changed values goes up in one writeBuffer, not one each',
+      get: () => uploadFlags.coalesce, set: v => { uploadFlags.coalesce = v; } },
+    { key: 'unchanged', label: 'Skip unchanged tables', type: 'toggle',
+      help: 'a table (lights, cards, mirrors, sky...) is uploaded only when its bytes changed',
+      get: () => uploadFlags.unchanged, set: v => { uploadFlags.unchanged = v; } },
+    { key: 'batchsubmits', label: 'Batch command buffers', type: 'toggle',
+      help: "the frame's passes go to the GPU in a few submits, not one each (same work, same order)",
+      get: () => uploadFlags.batch, set: v => { uploadFlags.batch = v; } },
     { key: 'pacing', label: 'Frame pacing', type: 'select',
       options: [{ value: 'vsync', label: 'default (vsync)' }, { value: 30, label: 'cap 30' },
                 { value: 40, label: 'cap 40' }, { value: 60, label: 'cap 60' },

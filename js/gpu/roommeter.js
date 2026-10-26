@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { frameValues } from './uploads.js';
 import { Fn, If, float, vec2, vec3, vec4, int, uint, uniform, storage, min, mix, select, round,
          atomicAdd, atomicLoad, atomicStore } from 'three/tsl';
 import { VOXEL_METRES } from '../core/field.js';
@@ -38,7 +39,7 @@ export function createRoomMeter() {
   const meanRead = storage(meanAttr, 'vec4', 1).toReadOnly().setName('bxbRoomLightRead');
   // How far the mean moves toward this frame's: 1 - exp(-dt / response), set
   // from the frame's own time (render/features/texelcache.js).
-  const blend = uniform(float(1));
+  const blend = frameValues.roomBlend;
   // A/B: 1 revealed faces take the room's light; 0 their own estimate, as before.
   const on = uniform(int(1));
 

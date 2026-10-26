@@ -6,7 +6,7 @@
 //   //##       minor
 //   a         hotfix, a = 1 (omitted when there is none)
 // e.g. B28//03d is Beta, major 28, minor 3, hotfix 4.
-export const VERSION = 'A10//00a';
+export const VERSION = 'A10//00b';
 
 // The loaded bundle's content hash, from its file name: Vite names the built
 // entry index-<hash>.js, and the hash changes with every byte of the code. So

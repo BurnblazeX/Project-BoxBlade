@@ -4,8 +4,8 @@
   "fragment": "b1eb49593ea1035e"
  },
  "default/terrain": {
-  "vertex": "20eb2cf43ce5dd60",
-  "fragment": "4fd917d8de6bc2ac"
+  "vertex": "feea07fa402aa789",
+  "fragment": "13076a07430194fc"
  },
  "default/glassLow": {
   "vertex": "997afafa06c3c7de",
@@ -17,45 +17,45 @@
  },
  "default/sprite": {
   "vertex": "3cb5f58b40ea999f",
-  "fragment": "5651ac47866aceaa"
+  "fragment": "cdfce0dc24307e9e"
  },
  "default/split.0:splitBase": {
-  "compute": "0d3967ff8bd8868c"
+  "compute": "e20d1209efa3e4da"
  },
  "default/split.1:splitPoints": {
-  "compute": "7eb5eb25c5fee824"
+  "compute": "bc7bed37180af352"
  },
  "default/split.2:splitMirror": {
-  "compute": "629a8a0fa87c7872"
+  "compute": "e757457c718a0706"
  },
  "default/split.3:splitFinal": {
-  "compute": "8bfd4d3128dcc213"
+  "compute": "5eebf1c843eeece7"
  },
  "default/split.4:splitGlassSurface": {
-  "compute": "732e40f977a9ea6f"
+  "compute": "0daf806e78fe8969"
  },
  "default/split.5:splitGlassReflect": {
-  "compute": "a1fd69e73dd1b641"
+  "compute": "daada4d4c301eddc"
  },
  "default/split.6:splitGlassThrough": {
-  "compute": "f1dd8cf271c5bc08"
+  "compute": "06add530093d9777"
  },
  "default/split.7:splitGlassCompose": {
-  "compute": "04cea75b7deccb1d"
+  "compute": "18a3c5e1e005c0ed"
  },
  "default/mirror": {
-  "compute": "10158ef68af3d5e9"
+  "compute": "3028eb5aad36153f"
  },
  "default/room:roomMeterEase": {
-  "compute": "b4f5867cbe4d9d27"
+  "compute": "246a8d722d0ea228"
  },
  "texelgi/low": {
   "vertex": "d8832c91ff1206cd",
   "fragment": "b1eb49593ea1035e"
  },
  "texelgi/terrain": {
-  "vertex": "1b7e89fd635efd34",
-  "fragment": "7ba8be6a97ea4f82"
+  "vertex": "63b4ea3bba21632d",
+  "fragment": "d573a02e43aec875"
  },
  "texelgi/glassLow": {
   "vertex": "997afafa06c3c7de",
@@ -67,134 +67,134 @@
  },
  "texelgi/sprite": {
   "vertex": "8005a253b56fa77a",
-  "fragment": "c95d1024f25343ae"
+  "fragment": "a310f3c91f089d4e"
  },
  "texelgi/split.0:splitBase": {
-  "compute": "18d54adb9ad6b73b"
+  "compute": "f49fed3b1b2935b8"
  },
  "texelgi/split.1:splitPoints": {
-  "compute": "7eb5eb25c5fee824"
+  "compute": "bc7bed37180af352"
  },
  "texelgi/split.2:splitMirror": {
-  "compute": "629a8a0fa87c7872"
+  "compute": "e757457c718a0706"
  },
  "texelgi/split.3:splitFinal": {
-  "compute": "748651d925b1bf46"
+  "compute": "044da52661546d7c"
  },
  "texelgi/split.4:splitGlassSurface": {
-  "compute": "732e40f977a9ea6f"
+  "compute": "0daf806e78fe8969"
  },
  "texelgi/split.5:splitGlassReflect": {
-  "compute": "62c0008934d0e058"
+  "compute": "0f38476da62ece89"
  },
  "texelgi/split.6:splitGlassThrough": {
-  "compute": "7c32b9f87afc8aa1"
+  "compute": "0846e09a435fa38f"
  },
  "texelgi/split.7:splitGlassCompose": {
-  "compute": "04cea75b7deccb1d"
+  "compute": "18a3c5e1e005c0ed"
  },
  "texelgi/gi.reset:giPatchReset": {
   "compute": "2e2d602bc54595e2"
  },
  "texelgi/gi.patches:giPatches": {
-  "compute": "dfe30911cf71787a"
+  "compute": "ba0e32c23eb071bb"
  },
  "texelgi/gi.sums:giSums": {
-  "compute": "c24ede7f35ca7a4d"
+  "compute": "827ec5c1e5d6a03b"
  },
  "texelgi/gi.filter:giFilter": {
-  "compute": "058a3535456835cd"
+  "compute": "71d9d9efa8d924dd"
  },
  "texelgi/gi.direct:giDirect": {
-  "compute": "a416945b8842d375"
+  "compute": "dab0a03e4e9ae29b"
  },
  "texelgi/mirror": {
-  "compute": "10158ef68af3d5e9"
+  "compute": "3028eb5aad36153f"
  },
  "texelgi/room:roomMeterEase": {
-  "compute": "b4f5867cbe4d9d27"
+  "compute": "246a8d722d0ea228"
  },
  "cache/low": {
-  "vertex": "31341b8f11ec93bd",
-  "fragment": "b5373d9155f0bceb"
+  "vertex": "2bd2723febe91b89",
+  "fragment": "4bcf5682780c3261"
  },
  "cache/terrain": {
-  "vertex": "dc0e00193268be65",
-  "fragment": "e51d8f03eb624236"
+  "vertex": "236b2284a9947ff5",
+  "fragment": "4caeff588171e267"
  },
  "cache/miss": {
-  "vertex": "77182b83eac7c9c5",
-  "fragment": "b1c53cfbba91dea2"
+  "vertex": "b95af70791a6a414",
+  "fragment": "9fa7f5f18dcfeb4e"
  },
  "cache/glassLow": {
-  "vertex": "cd20cf98eb3163e4",
-  "fragment": "b5893de890886dcd"
+  "vertex": "4f0485ac313425fa",
+  "fragment": "de8d68e1489b6721"
  },
  "cache/glass": {
   "vertex": "0615c8ba7f1c1330",
   "fragment": "d40cf740fabd7165"
  },
  "cache/glassMiss": {
-  "vertex": "084f20907df89223",
-  "fragment": "e54cc5134a7726b1"
+  "vertex": "3bd93fa44cc1f408",
+  "fragment": "f679ce6149adb297"
  },
  "cache/sprite": {
   "vertex": "3cb5f58b40ea999f",
-  "fragment": "5651ac47866aceaa"
+  "fragment": "cdfce0dc24307e9e"
  },
  "cache/mirror": {
-  "compute": "10158ef68af3d5e9"
+  "compute": "3028eb5aad36153f"
  },
  "plain/terrain": {
-  "vertex": "a19b9f05dec4ecbc",
-  "fragment": "dc35887761e10646"
+  "vertex": "d0f372971a251025",
+  "fragment": "98527c28ebf4c0f6"
  },
  "plain/glass": {
-  "vertex": "334484de26b85d81",
-  "fragment": "e7ae0bf8d2323a6b"
+  "vertex": "f66c2d9233038177",
+  "fragment": "afc8bef297761f2a"
  },
  "plain/sprite": {
   "vertex": "58add31885edb451",
-  "fragment": "cf2bb687fe87ebcc"
+  "fragment": "7830c5b0026e0d1d"
  },
  "plain/mirror": {
-  "compute": "10158ef68af3d5e9"
+  "compute": "3028eb5aad36153f"
  },
  "lpv0/0:LPV.Clear": {
-  "compute": "8dc8ffc51b0adeb8"
+  "compute": "31ed372c3175c2c9"
  },
  "lpv0/1:LPV.Solid": {
-  "compute": "803852fe655f8aad"
+  "compute": "2c969c7fbdd7c07e"
  },
  "lpv0/2:LPV.Inject": {
-  "compute": "2804135524e0b80c"
+  "compute": "a5f4e966b8b8e21a"
  },
  "lpv0/3:LPV.Propagate": {
-  "compute": "0bef43223576c841"
+  "compute": "c362048f750b370a"
  },
  "lpv0/4:LPV.Propagate": {
-  "compute": "c682770edcaad776"
+  "compute": "e66a95b9422fe241"
  },
  "lpv0/5:LPV.Resolve": {
-  "compute": "ecd00440dd0cd78e"
+  "compute": "d1b442936d5657d1"
  },
  "lpv1/0:LPV.Clear": {
-  "compute": "8dc8ffc51b0adeb8"
+  "compute": "31ed372c3175c2c9"
  },
  "lpv1/1:LPV.Solid": {
-  "compute": "803852fe655f8aad"
+  "compute": "2c969c7fbdd7c07e"
  },
  "lpv1/2:LPV.Inject": {
-  "compute": "2804135524e0b80c"
+  "compute": "a5f4e966b8b8e21a"
  },
  "lpv1/3:LPV.Propagate": {
-  "compute": "0bef43223576c841"
+  "compute": "c362048f750b370a"
  },
  "lpv1/4:LPV.Propagate": {
-  "compute": "c682770edcaad776"
+  "compute": "e66a95b9422fe241"
  },
  "lpv1/5:LPV.Resolve": {
-  "compute": "ecd00440dd0cd78e"
+  "compute": "d1b442936d5657d1"
  },
  "diag/parity": {
   "compute": "63aba38d0ce7dad7"

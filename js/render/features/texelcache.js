@@ -276,15 +276,16 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
 
   // Split shading's kernels over this frame's low-res samples, in one submit.
   let roomLastT = 0;
-  function runSplitShading(resolved) {
+  // early: other features' kernels to go first in the same pass (main.js
+  // collectCompute) - sent here only when render() found split shading on.
+  function runSplitShading(resolved, early = []) {
     const set = activeSet();
     const ks = set && set.splitKernels;
-    if (!ks || !splitShading) return;
     const s = splitShading, rt = texelCache.rt;
     s.width.value = rt.width;
     s.count.value = Math.min(rt.width * rt.height, s.lowCap);
     s.viewPos.value.copy(camera.position);
-    const list = [];
+    const list = [...early];
     // Texel GI: the patch list starts empty; the base kernel fills it.
     const gk = set.giKernels;
     if (gk) list.push(gk.reset);
@@ -315,11 +316,16 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
 
   // The low-res pass, before the main render. Only while the terrain wears the
   // material this cache was built for - mid-rebuild it may not.
-  function render() {
+  // early: kernels to send this frame (main.js collectCompute) - with split
+  // shading's own, or, when it will not run, first and alone, since then the
+  // low-res pass shades and may read what they write.
+  function render(early = []) {
     const mesh = worldInstancedMesh;
     const set = activeSet();
     const active = texelCacheOn && shadowsOn() && terrainLowMat && mesh
       && mesh.material === terrainLookupMat;
+    const splitting = !!(active && set && set.splitKernels && splitShading);
+    if (!splitting && early.length) renderer.compute(early.length === 1 ? early[0] : early);
     // Glass joins the same cache: its own low-res, lookup and miss materials,
     // the same target and ids (a glass texel is a world texel), one prepass.
     const glass = glassInstancedMesh;
@@ -349,7 +355,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     drewGBuffer = resolved;
     renderer.setRenderTarget(null);
     camera.layers.mask = mask;
-    runSplitShading(resolved);
+    if (splitting) runSplitShading(resolved, early);
     mesh.material = terrainLookupMat;
     if (glassActive) glass.material = glassLookupMat;
   }
