@@ -78,28 +78,3 @@ export function applyModifier(rollResult, modifier) {
     total: baseValue + modifier
   };
 }
-
-
-// ==========================================
-// DEV-ONLY SELF TESTS
-// ==========================================
-if (import.meta.env?.DEV) {   // ?. : no env in node (the tests)
-  console.log("--- 🎲 DICE ENGINE INITIALIZED 🎲 ---");
-  
-  console.log("1. rollDie(8):", rollDie(8));
-  
-  console.log("2. rollDice('3d6'):", rollDice("3d6"));
-  
-  console.log("3. rollD20 (Normal):", rollD20());
-  console.log("4. rollD20 (Advantage):", rollD20({ advantage: true }));
-  console.log("5. rollD20 (Disadvantage):", rollD20({ disadvantage: true }));
-  console.log("6. rollD20 (Both - Cancels out):", rollD20({ advantage: true, disadvantage: true }));
-  
-  const rawAttackRoll = rollD20({ advantage: true });
-  console.log("7. applyModifier (Attack +4):", applyModifier(rawAttackRoll, 4));
-  
-  const rawDamageRoll = rollDice("2d6");
-  console.log("8. applyModifier (Damage +2):", applyModifier(rawDamageRoll, 2));
-  
-  console.log("-------------------------------------");
-}

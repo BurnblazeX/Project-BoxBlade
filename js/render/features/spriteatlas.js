@@ -7,6 +7,10 @@
 // SPRITE_ATLAS_LAYER only, drawing sprites.js spriteAtlasGeometry. Culled with
 // its sprite; a slot off screen goes stale, and nothing reads it.
 // bxb.spriteatlas() turns it off, back to shading every pixel, for A/B.
+// Paced: the atlas is shaded at most SPRITE_ATLAS_HZ times a second (Alt+V
+// Perf, 0 = every frame). Its slots do not move with the camera, only the
+// light on them changes, and a few ms of lag on that is not visible - while
+// above ~150 fps it skips most frames' pass.
 //
 // ctx:
 //   renderer, scene, camera
@@ -20,9 +24,12 @@ import { spriteAtlasGeometry, spriteAtlasRegion, packSpriteAtlas } from '../spri
 
 const SPRITE_ATLAS_LAYER = 2;
 const SPRITE_ATLAS_WIDTH = 512;
+const SPRITE_ATLAS_HZ = 144;
 
 export function createSpriteAtlas({ renderer, scene, camera, meshes, shadowsOn, activeSet, rebuild }) {
   let spriteAtlasOn = true;
+  let atlasHz = SPRITE_ATLAS_HZ;
+  let lastShaded = -Infinity;
   const spriteAtlas = {
     rt: null,
     tex: null,
@@ -57,6 +64,7 @@ export function createSpriteAtlas({ renderer, scene, camera, meshes, shadowsOn, 
       const lit = mats && mats.get(m.userData.originalMaterial || m.material);
       if (lit) twin.material = lit;
     });
+    lastShaded = -Infinity;   // new twins or regions: shade them on the next frame
     const h = Math.max(1, height);
     if (!spriteAtlas.rt) {
       spriteAtlas.rt = new THREE.RenderTarget(SPRITE_ATLAS_WIDTH, h,
@@ -73,6 +81,10 @@ export function createSpriteAtlas({ renderer, scene, camera, meshes, shadowsOn, 
   function renderSpriteAtlas() {
     const set = activeSet();
     if (!shadowsOn() || !set || !set.atlasMats) return;
+    const now = performance.now();
+    // 2 ms of slack, so a 144 Hz display still shades every frame.
+    if (atlasHz > 0 && now - lastShaded < 1000 / atlasHz - 2) return;
+    lastShaded = now;
     const mask = camera.layers.mask;
     camera.layers.set(SPRITE_ATLAS_LAYER);
     renderer.setRenderTarget(spriteAtlas.rt);
@@ -100,6 +112,11 @@ export function createSpriteAtlas({ renderer, scene, camera, meshes, shadowsOn, 
     ready: () => spriteAtlasOn && spriteArtReady(),
     ensure: ensureSpriteAtlas,
     render: renderSpriteAtlas,
+    // For the Perf section.
+    setting: { key: 'atlashz', label: 'Sprite light rate (Hz, 0 every frame)', type: 'range',
+      min: 0, max: 480, step: 24,
+      help: 'how often the light on the sprites is worked out (the atlas pass); between, they keep the last',
+      get: () => atlasHz, set: v => { atlasHz = Math.max(0, Math.round(v)); lastShaded = -Infinity; } },
     commands
   };
 }

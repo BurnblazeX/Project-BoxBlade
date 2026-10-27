@@ -231,6 +231,16 @@ section('gi');
   ok('2 x 2 a block over C1, 1 x 1 over C2', binding.levels.map(l => l.cellMetres).join(','), '0.75,1.5');
   ok('texel GI is off in LPV mode', gi.options().texelGI, null);
 
+  // Paced (the default), the first update runs and frames back to back, owing
+  // nothing yet, skip; the frame logic below is checked unpaced.
+  const paced = gi.perfSettings.find(x => x.key === 'gipaced');
+  ok('paced by default', paced.get(), true);
+  gi.update(); gi.update();
+  ok('paced: the first update of each volume runs (a reset)', dispatched.length, 2);
+  gi.update(); gi.update();
+  ok('then frames 0 ms apart owe nothing and skip', dispatched.length, 2);
+  paced.set(false);
+  dispatched.length = 0;
   gi.update();
   ok('a frame dispatches the near volume', dispatched.length, 1);
   gi.update();
@@ -431,7 +441,7 @@ section('shadow sets');
   ok('remove puts the plain materials back', removed, 1);
   ok('keeping off', sets.commands.shadowcache.run(), 'shadow sets disposed when replaced');
   ok('the setting reads it', sets.setting.get(), false);
-  ok('on again', sets.commands.shadowcache.run(), 'shadow sets kept (newest 2)');
+  ok('on again', sets.commands.shadowcache.run(), 'shadow sets kept (newest 4)');
 }
 
 section('tone map');

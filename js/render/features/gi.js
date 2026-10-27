@@ -25,6 +25,7 @@ import { uniform, int } from 'three/tsl';
 import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL, averageAlbedo, lpvShift,
          DEFAULT_LPV_SPREAD, DEFAULT_LPV_ITERATIONS, GI_MAX_BOUNCES, DEFAULT_GI_BOUNCES,
          DEFAULT_LPV_SLICES, DEFAULT_GI_STRENGTH, LPV_VOLUMES, lpvVolumeRes, LPV_RES_OPTIONS,
+         lpvPace, LPV_PACE_MS,
          DEFAULT_LPV_SKY_SPREAD } from '../../core/lpv.js';
 import { MATERIALS } from '../../core/materials.js';
 import { MODELS } from '../../core/models.js';
@@ -81,6 +82,8 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
   // other frame. Its contents are coarse and slow-changing; the lag is two
   // frames instead of one, which nothing that far away shows.
   let giFarHalf = true;
+  // LPV iterations paced to time, not frames (core/lpv.js lpvPace).
+  let giPaced = true;
   // giBatch: each GI volume's kernels go to the GPU as one compute pass and one
   // submit, not eleven. Same kernels, same order, same result; off submits them
   // one by one as before, for A/B.
@@ -197,6 +200,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     resolveLayerAlbedos();
     giFrame++;
     const c = cascades(), albedo = terrainAlbedo();
+    const now = performance.now();
     for (const v of lpvs) {
       // lpvOrigins is only written when a volume updates, so a skipped frame
       // cannot lose a re-origin: the next update sees the move.
@@ -208,6 +212,25 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       if (!was) shift = 'reset';
       else if (at.x !== was.x || at.y !== was.y || at.z !== was.z) {
         shift = lpvShift(was, at, v.cellMetres, v.dim) || 'reset';
+      }
+      // Iterations for this update: a 60 Hz frame's worth, or - paced - what
+      // the time since the last look owes (core/lpv.js lpvPace). A frame that
+      // owes less than one ping-pong is skipped whole, unless the volume moved.
+      // Injection the same way: one slice a 60 Hz frame at most, so the
+      // whole volume is re-injected as often a second as at 60 fps.
+      const per = Math.round(lpvIterations * v.res);
+      let iterations = per, inject = true;
+      if (giPaced) {
+        const elapsed = v.paceT === undefined ? LPV_PACE_MS : now - v.paceT;
+        const pace = lpvPace(v.paceBudget || 0, per, elapsed);
+        v.paceT = now;
+        v.injectOwed = Math.min(1, (v.injectOwed || 0) + elapsed / LPV_PACE_MS);
+        if (!pace.iterations && !shift) { v.paceBudget = pace.budget; continue; }
+        iterations = Math.max(2, pace.iterations);
+        v.paceBudget = Math.max(0, pace.budget - (iterations - pace.iterations));
+        // 0.75, not 1: frame-time jitter at 60 Hz must not skip every other inject.
+        inject = v.injectOwed >= 0.75 || !!shift;
+        if (inject) v.injectOwed = Math.max(0, v.injectOwed - 1);
       }
       lpvOrigins[v.level] = at;
       const u = v.uniforms;
@@ -228,7 +251,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       u.bounces.value = Math.min(lpvBounces, v.orders);
       v.slices = lpvSlices;
       writeSunUniforms(v.sun, sun.light.position, sun.angular());
-      v.update(renderer, { shift, iterations: Math.round(lpvIterations * v.res), batch: giBatch, fog: fogOn() });
+      v.update(renderer, { shift, iterations, batch: giBatch, fog: fogOn(), inject });
     }
     lastGIms = performance.now() - t0;
   }
@@ -333,7 +356,11 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
         get: () => giBatch, set: v => flip(giBatch, v, () => commands.gibatch.run()) },
       { key: 'gifar', label: 'Far GI every 2nd frame', type: 'toggle',
         help: 'the C2 LPV volume updates at half rate',
-        get: () => giFarHalf, set: v => flip(giFarHalf, v, () => commands.gifar.run()) }
+        get: () => giFarHalf, set: v => flip(giFarHalf, v, () => commands.gifar.run()) },
+      { key: 'gipaced', label: 'LPV paced to time', type: 'toggle',
+        help: 'propagation iterations per 60 Hz frame, not per frame: the same spread a second at any ' +
+              'frame rate, so above 60 fps most frames skip the LPV. Off: every frame runs them all',
+        get: () => giPaced, set: v => { giPaced = !!v; } }
     ],
     settings: { title: 'GI', settings: [
       { key: 'mirrorbounce', label: 'Mirror bounce', type: 'toggle',
@@ -396,7 +423,8 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
         help: 'GI cells a block face. Finer is sharper bounce and dearer: ~3.4x, 8x, 27x the cells (rebuilds)',
         get: () => lpvRes,
         set: v => { const r = Number(v); if (r !== lpvRes) { lpvRes = r; rebuildLPV(); } } },
-      { key: 'giiter', label: 'Iterations / frame', type: 'range', min: 2, max: 32, step: 2,
+      { key: 'giiter', label: 'Iterations / 60 Hz frame', type: 'range', min: 2, max: 32, step: 2,
+        help: 'propagation steps; paced (Perf), this many each 1/60 s whatever the frame rate',
         get: () => lpvIterations, set: v => { lpvIterations = v; } },
       { key: 'gislices', label: 'Inject 1/N a frame', type: 'range', min: 1, max: 64, step: 1,
         help: 'injection re-marches every light per surface; 1/N of the cells each frame',

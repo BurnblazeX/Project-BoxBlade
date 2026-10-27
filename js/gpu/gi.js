@@ -619,12 +619,12 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   // and none changes partway through it, so batching cannot change a value.
   // Cached, not rebuilt per frame: three keys the pass's state on the array.
   const lists = new Map();
-  const kernelList = (prefix, iterations, fog) => {
-    const key = `${prefix}:${iterations}:${fog}`;
+  const kernelList = (prefix, iterations, fog, inject = true) => {
+    const key = `${prefix}:${iterations}:${fog}:${inject}`;
     let list = lists.get(key);
     if (!list) {
       list = prefix === 'reset' ? [clearA] : prefix === 'shift' ? [shiftKernel, copyBA] : [];
-      list.push(solidKernel, injectKernel);
+      if (inject) list.push(solidKernel, injectKernel);
       if (fog) list.push(fogKernel);
       for (let k = 0; k < iterations; k += 2) list.push(aToB, bToA);
       list.push(resolveKernel);
@@ -647,7 +647,11 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
     // batch false submits each kernel on its own, as before - the same list in
     // the same order, so the two can be A/B'd (bxb.gibatch()).
     // fog: also light the air for the froxels (the fog kernel).
-    update(renderer, { shift = null, iterations = 8, fullInject = false, batch = true, fog = false } = {}) {
+    // inject false: propagate only - the solid and inject kernels (and the
+    // slice they would have done) wait for an update that injects. A shift
+    // or a reset always injects.
+    update(renderer, { shift = null, iterations = 8, fullInject = false, batch = true, fog = false,
+                       inject = true } = {}) {
       let prefix = '';
       if (shift === 'reset') {
         prefix = 'reset';
@@ -657,15 +661,18 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
         prefix = 'shift';
         fullInject = true;
       }
-      const slices = Math.max(1, sliceCount);
-      // A full inject is one dispatch with a single slice covering every cell:
-      // the old injection is in the wrong cells after a shift.
-      u.slices.value = fullInject ? 1 : slices;
-      u.slice.value = fullInject ? 0 : frame % slices;
-      frame++;
+      if (fullInject) inject = true;
+      if (inject) {
+        const slices = Math.max(1, sliceCount);
+        // A full inject is one dispatch with a single slice covering every cell:
+        // the old injection is in the wrong cells after a shift.
+        u.slices.value = fullInject ? 1 : slices;
+        u.slice.value = fullInject ? 0 : frame % slices;
+        frame++;
+      }
       // Even, so the answer always ends in A, where resolve reads it.
       const n = Math.max(2, iterations + (iterations % 2));
-      const list = kernelList(prefix, n, fog);
+      const list = kernelList(prefix, n, fog, inject);
       if (batch) renderer.compute(list);
       else for (const k of list) renderer.compute(k);
     },

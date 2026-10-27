@@ -269,7 +269,7 @@ export function createSettingsPanel({ groups, title = 'Debug settings', parent =
   }
 
   return {
-    el, open, close, refresh, say,
+    el, open, close, refresh, say, groups,
     get isOpen() { return !el.hidden; },
     toggle() { if (el.hidden) open(); else close(); return !el.hidden; }
   };

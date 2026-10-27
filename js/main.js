@@ -60,6 +60,7 @@ import { createTickClock, createWorldClock, createTickSmoothing } from './core/c
 import { lightRadiusMetres } from './core/lights.js';
 import { createConsole, installConsole } from './tools/console.js';
 import { createSettingsPanel } from './tools/settings.js';
+import { PRESETS, PRESET_NAMES, applyPreset, matchPreset } from './tools/presets.js';
 import { unstableNames, hashText } from './core/shadowsets.js';
 import { classifyTextureAlpha, registerCutout, cutoutsEnabled, setCutoutsEnabled } from './render/cutout.js';
 import { averageAlbedo } from './core/lpv.js';
@@ -626,12 +627,15 @@ function toggleWhiteWorld() {
 // R and the "advanced effects" button. One at a time: a second press while a
 // turn-on is compiling is ignored rather than queued.
 let effectsBusy = false;
+let presetBusy = false;   // a graphics preset is being applied (tools/presets.js)
 // By id, not a module const: bxb.shadows() can run before the button's wiring.
 function syncEffectsButton() {
   const btn = document.getElementById('btn-effects');
   if (!btn) return;
   btn.textContent = shadowsOn ? 'Disable advanced effects' : 'Enable advanced effects';
   btn.disabled = effectsBusy;
+  const sel = document.getElementById('sel-preset');
+  if (sel) sel.disabled = effectsBusy || presetBusy;
 }
 async function toggleAdvancedEffects() {
   if (effectsBusy) return;
@@ -665,6 +669,43 @@ async function toggleAdvancedEffects() {
 }
 
 let settingsPanel = null;   // built after the console, below
+
+// --- Graphics presets (tools/presets.js) ---
+//
+// A preset is a list of settings-panel values, so it goes through the same
+// setters as the panel and the console. The effects switch is the one thing it
+// drives directly: off before the values, on after, so a switch compiles once.
+const PRESET_KEY = 'bxb.preset';
+const settingDefs = new Map();   // key -> setting, filled once the panel is built
+async function setEffects(on) {
+  if (on === shadowsOn) return;
+  await toggleAdvancedEffects();
+}
+function currentPreset() {
+  return effectsBusy || presetBusy ? 'custom' : (matchPreset(settingDefs, shadowsOn) || 'custom');
+}
+async function setPreset(name) {
+  if (presetBusy || effectsBusy) return 'busy - a preset or the effects are still building';
+  if (!PRESETS[name]) return `no preset '${name}' - use ${PRESET_NAMES.join(', ')}`;
+  presetBusy = true;
+  syncEffectsButton();
+  try {
+    const msg = await applyPreset(name, { defs: settingDefs, effectsOn: () => shadowsOn, setEffects });
+    try { localStorage.setItem(PRESET_KEY, name); } catch { /* private window */ }
+    return `graphics preset: ${msg}`;
+  } finally {
+    presetBusy = false;
+    syncEffectsButton();
+  }
+}
+const presetSetting = {
+  key: 'preset', label: 'Preset', type: 'select',
+  options: [...PRESET_NAMES.map(n => ({ value: n, label: `${PRESETS[n].label} (${PRESETS[n].target})` })),
+            { value: 'custom', label: 'Custom' }],
+  help: PRESET_NAMES.map(n => `${PRESETS[n].label}: ${PRESETS[n].help}`).join(' | '),
+  get: () => currentPreset(),
+  set: v => setPreset(v)
+};
 
 // Where the pointer last was, for keys that act on what is under it (Alt+F).
 const lastPointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
@@ -1387,6 +1428,22 @@ const bxbApi = installConsole(createConsole({
   proxies: cards.commands.proxies,
   cardparity: cards.commands.cardparity,
   cards: cards.commands.cards,
+  preset: {
+    help: 'graphics preset: ' + PRESET_NAMES.join(', ') + ' - what each sets is in tools/presets.js',
+    usage: "bxb.preset('low')  |  bxb.preset()  which one is on",
+    run: (name = null) => (name === null ? `graphics preset: ${currentPreset()}` : setPreset(name))
+  },
+  setting: {
+    help: 'read or set any Alt+V setting by its key (the keys tools/presets.js uses); no key lists them',
+    usage: "bxb.setting()  |  bxb.setting('gires')  |  await bxb.setting('gires', 1.5)",
+    run: (key = null, value) => {
+      if (key === null) return [...settingDefs.keys()].join(', ');
+      const def = settingDefs.get(key);
+      if (!def || !def.get) return `no setting '${key}'`;
+      if (value === undefined) return def.get();
+      return Promise.resolve(def.set(value)).then(() => `${key}: ${def.get()}`);
+    }
+  },
   spikes: {
     help: 'log a CPU breakdown of every frame over 8 ms to the console',
     run: () => {
@@ -1797,6 +1854,7 @@ const bxbApi = installConsole(createConsole({
 // two cannot drift - the panel is a front end, not a second owner of the state.
 // Ranges marked live:false rebuild the material, so they apply on release.
 settingsPanel = createSettingsPanel({ groups: [
+  { title: 'Graphics', settings: [presetSetting] },
   // The render debugger: every display that replaces or overlays the frame.
   { title: 'Debug views', settings: [
     debugView.setting,
@@ -1811,6 +1869,7 @@ settingsPanel = createSettingsPanel({ groups: [
   { title: 'Perf', settings: [
     ...texel.settings,
     sets.setting,
+    spriteAtlas.setting,
     { key: 'treemerge', label: 'Merged tree planes', type: 'toggle',
       help: "each tree's four planes drawn as one mesh",
       get: () => treeMerge, set: v => flip(treeMerge, v, () => bxbApi.treemerge()) },
@@ -1907,6 +1966,39 @@ settingsPanel = createSettingsPanel({ groups: [
       run: () => JSON.stringify(bxbApi.stats()) }
   ]}
 ]});
+
+// Every setting by key, for the graphics presets.
+for (const g of settingsPanel.groups) for (const def of g.settings) settingDefs.set(def.key, def);
+
+// The top-bar preset select: same as the panel's Graphics row. The choice is
+// remembered and put back on the next load (Potato, the default, is the load
+// state already). It shows 'custom' once any knob moves off the preset.
+{
+  const sel = document.getElementById('sel-preset');
+  // Keys too: arrows or a letter typed at the open list are not game keys.
+  for (const ev of ['pointerdown', 'pointerup', 'click', 'wheel', 'keydown', 'keyup']) {
+    sel.addEventListener(ev, e => e.stopPropagation());
+  }
+  // Just the name here; the target and what it sets are the option's tooltip.
+  for (const o of presetSetting.options) {
+    const p = PRESETS[o.value];
+    const opt = document.createElement('option');
+    opt.value = o.value; opt.textContent = p ? p.label : o.label;
+    if (p) opt.title = `${p.target}: ${p.help}`;
+    opt.disabled = o.value === 'custom';   // shown, never chosen
+    sel.appendChild(opt);
+  }
+  sel.addEventListener('change', () => { setPreset(sel.value).then(m => console.log(m)); sel.blur(); });
+  const sync = () => { if (document.activeElement !== sel && !presetBusy) sel.value = currentPreset(); };
+  setInterval(sync, 500);
+  sync();
+  let saved = null;
+  try { saved = localStorage.getItem(PRESET_KEY); } catch { /* private window */ }
+  if (saved && saved !== 'potato' && PRESETS[saved]) {
+    // After the first frames, so the world is on screen while it compiles.
+    nextFrame().then(nextFrame).then(() => setPreset(saved)).then(m => console.log(m));
+  }
+}
 
 // The top-bar Debug button: same toggle as Alt+V. It sits outside every HUD
 // layer, so Alt+U leaves it visible. Pointer events stop here so a click never

@@ -74,13 +74,14 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     } else if (aiDecision.action === 'attack') {
       const res = aiDecision.result;
       if (res.hit) {
-        console.log(`[Combat] ${enemy.name} hits for ${res.damage}! (HP: ${player.hp.current}/${player.hp.max})`);
+        UI.logDiceRoll(`<b>${enemy.name}</b> hits for <b>${res.damage}</b>! <br>[Roll: ${res.attackTotal} vs AC ${player.ac}] ` +
+                       `(HP: ${player.hp.current}/${player.hp.max})`, 'enemy-turn');
         if (isDefeated(player)) {
           endBattle('GAME OVER. You have been defeated!');
           return;
         }
       } else {
-        console.log(`[Combat] ${enemy.name} misses! (Rolled ${res.attackTotal} vs AC ${player.ac})`);
+        UI.logDiceRoll(`<b>${enemy.name}</b> misses! <br>[Roll: ${res.attackTotal} vs AC ${player.ac}]`, 'enemy-turn');
       }
       later(1000, advanceTurn);
     } else if (aiDecision.action === 'end') {
@@ -192,7 +193,7 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
   // Back to explore. message: how it ended (victory, defeat), logged; the
   // battle panels then stay up with the log. Without one (B), they close.
   function endBattle(message = null) {
-    if (message) console.log(`[Combat] ${message}`);
+    if (message) UI.logDiceRoll(`<b>${message}</b>`, 'system');
     game.mode = 'explore';
     game.battleSession++;
     worldClock.live = true;

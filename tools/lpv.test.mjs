@@ -1,9 +1,9 @@
-import { file, section, ok, near, truthy } from './lib/harness.mjs';
+import { file, section, ok, near, truthy, inRange } from './lib/harness.mjs';
 import { GRID_DIM, VOXEL_METRES } from '../js/core/field.js';
 import {
   LPV_DIM, LPV_CELLS, LPV_CELL_VOXELS, LPV_CELL_METRES, LPV_EXTENT_METRES,
   cellIndex, cellCoords, propagateStep, lpvShift, shiftVolume, averageAlbedo,
-  diffuseAlbedo, boxCellOverlap
+  diffuseAlbedo, boxCellOverlap, lpvPace, LPV_PACE_MS
 } from '../js/core/lpv.js';
 
 file('lpv.test.mjs - the light propagation volume, CPU reference');
@@ -197,4 +197,21 @@ section('the volumes: 2 x 2 a block over C1, 1 x 1 over C2');
   near('C1: 0.75 m cells', cell(LPV_VOLUMES[0]), 0.75, 1e-12);
   near('C2: 1.5 m cells', cell(LPV_VOLUMES[1]), 1.5, 1e-12);
   ok('each a whole number of cells a side', LPV_VOLUMES.every(v => Number.isInteger(LPV_DIM * lpvVolumeRes(v))), true);
+}
+
+section('iterations paced to time');
+{
+  const at60 = lpvPace(0, 8, LPV_PACE_MS);
+  ok('60 fps runs the full count, as before', at60.iterations, 8);
+  ok('30 fps never runs more than the count', lpvPace(0, 8, 2 * LPV_PACE_MS).iterations, 8);
+  // 400 fps for one second: the same iterations a second as 60 fps, give or take one ping-pong.
+  let budget = 0, total = 0, updates = 0, whole = true;
+  for (let f = 0; f < 400; f++) {
+    const p = lpvPace(budget, 8, 1000 / 400);
+    budget = p.budget; total += p.iterations; if (p.iterations) updates++;
+    if (p.iterations % 2) whole = false;
+  }
+  truthy('always whole ping-pongs', whole);
+  inRange('400 fps: ~480 iterations a second', total, 470, 482);
+  inRange('in three frames of five', updates, 230, 241);
 }

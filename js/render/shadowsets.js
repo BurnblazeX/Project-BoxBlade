@@ -22,11 +22,15 @@ import { worldInstancedMesh, glassInstancedMesh, terrainTextures } from './rende
 import { syncCutout, wantsTransparent } from './cutout.js';
 import { flip } from './engine.js';
 
-const SHADOW_SETS_KEPT = 2;
+// Four: one for each advanced graphics preset (tools/presets.js), so switching
+// between them compiles each once.
+const SHADOW_SETS_KEPT = 4;
 
 // One material per frame: building the node graph into WGSL is synchronous
-// JavaScript, and doing all four in one frame is a hitch of its own.
-export const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+// JavaScript, and doing all four in one frame is a hitch of its own. A tab
+// that is not drawn gets almost no rAF, so a timer stands in after 100 ms -
+// a build (or a preset) started there still finishes.
+export const nextFrame = () => new Promise(r => { requestAnimationFrame(() => r()); setTimeout(r, 100); });
 
 export function createShadowSets({ renderer, scene, camera, options, texel, spriteAtlas, sun, sprites }) {
   const shadowSets = createSetCache(SHADOW_SETS_KEPT);

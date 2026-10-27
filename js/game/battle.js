@@ -43,8 +43,6 @@ export function rollInitiativeForParticipants(participants) {
     if (b.initiative === a.initiative) return b.tieBreaker - a.tieBreaker;
     return b.initiative - a.initiative;
   });
-
-  console.log(`[Battle] Initiative rolled! Round ${roundNumber} begins:`, turnOrder);
 }
 
 export function getCurrentEntity(participants) {
@@ -59,13 +57,10 @@ export function nextTurn(participants, onTurnStart) {
   if (currentTurnIndex >= turnOrder.length) {
     currentTurnIndex = 0;
     roundNumber++;
-    console.log(`[Battle] --- Round ${roundNumber} ---`);
   }
   
   const current = getCurrentEntity(participants);
   if (!current) return;
-
-  console.log(`[Battle] Turn: ${current.name}`);
 
   if (onTurnStart) {
     onTurnStart(current);

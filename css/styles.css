@@ -43,7 +43,7 @@ body.ui-hidden #dialogue-panel {
   display: flex;
   gap: 6px;
 }
-#btn-debug, #btn-effects {
+#btn-debug, #btn-effects, #sel-preset {
   padding: 4px 14px;
   background: rgba(16, 18, 24, 0.85);
   border: 1px solid #333a48;
@@ -52,8 +52,10 @@ body.ui-hidden #dialogue-panel {
   font: 12px monospace;
   cursor: pointer;
 }
-#btn-debug:hover, #btn-effects:hover { background: rgba(40, 46, 60, 0.95); color: #9fb4ff; }
-#btn-effects:disabled { opacity: 0.6; cursor: wait; }
+#btn-debug:hover, #btn-effects:hover, #sel-preset:hover { background: rgba(40, 46, 60, 0.95); color: #9fb4ff; }
+#btn-effects:disabled, #sel-preset:disabled { opacity: 0.6; cursor: wait; }
+#sel-preset { padding: 4px 8px; }
+#btn-debug, #btn-effects { white-space: nowrap; }
 
 /* Version, commit and bundle checksum (js/version.js). */
 #build-stamp {

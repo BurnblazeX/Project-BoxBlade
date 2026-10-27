@@ -58,9 +58,26 @@ export function lpvVolumeRes({ level, blockCells }) {
 // (1 - alpha): near a source the volume then reads roughly what was injected,
 // and alpha only decides how FAR it spreads, not how bright it is.
 export const DEFAULT_LPV_SPREAD = 0.75;
-// Iterations a frame. Light advances one cell per iteration, so 8 crosses the
-// 24-cell volume in three frames (§6.2).
+// Iterations a frame (a 60 Hz frame, paced: lpvPace below). Light advances one
+// cell per iteration, so 8 crosses the 24-cell volume in three frames (§6.2).
 export const DEFAULT_LPV_ITERATIONS = 8;
+
+// Iterations paced to time, not frames. The volume carries its light from one
+// frame to the next and the propagation only converges on a fixed point, so the
+// count per frame sets how fast light spreads, not where it settles. Counted
+// per 60 Hz frame: at 60 fps and below each update runs `per` (as before);
+// above it the budget builds up across frames and an update runs once two
+// iterations (one ping-pong) are due - at 400 fps, three frames in five, each
+// running 2 of the 8.
+// budget: iterations owed so far; elapsedMs since the last frame looked.
+// -> { iterations: to run now, 0 = skip this frame; budget: what is left }.
+export const LPV_PACE_MS = 1000 / 60;
+export function lpvPace(budget, per, elapsedMs) {
+  const owed = Math.min(per, budget + per * Math.max(0, elapsedMs) / LPV_PACE_MS);
+  if (owed < 2) return { iterations: 0, budget: owed };
+  const iterations = Math.floor(owed / 2) * 2;
+  return { iterations, budget: owed - iterations };
+}
 // Injection is the expensive pass - a shadow march per light per surface hit -
 // and light that has not moved gives the same answer again, so each frame
 // re-injects one slice of the cells. 4 slices refreshes everything every 4th
