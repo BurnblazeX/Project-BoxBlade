@@ -22,9 +22,14 @@ grid.type = THREE.FloatType;
 grid.minFilter = grid.magFilter = THREE.NearestFilter;
 grid.generateMipmaps = false;
 grid.needsUpdate = true;
+// Only the z layers the clouds cover go up (gpu/smoke.js write).
+grid.layerUpdates = new Set();
+grid.clearLayerUpdates = () => grid.layerUpdates.clear();
 const attr = new THREE.StorageBufferAttribute(SMOKE_CUBE_CAPACITY * 4, 4);
 export const smokeView = {
-  grid, indices, attr,
+  // spans[k]: the z layers (slot k's own) the grid last held cubes in - the
+  // grid outlives each cube mesh, so the next write knows what to clear.
+  grid, indices, attr, spans: new Array(MAX_SMOKE_CLOUDS).fill(null),
   read: storage(attr, 'vec4', SMOKE_CUBE_CAPACITY * 4).toReadOnly().setName('bxbSmokeView'),
   uniforms: { time: frameValues.smokeViewTime, ...Object.fromEntries(Object.entries(DEFAULT_SMOKE).map(([k, v]) => [k, uniform(v)])) },
   sunDir: uniform(new THREE.Vector3(0, 1, 0))

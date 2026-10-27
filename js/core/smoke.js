@@ -154,27 +154,36 @@ const FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -
 // edge or through a corner, every cube touching it must be air - smoke does
 // not squeeze diagonally between two solids.
 function lineOfSight(p, q, solid) {
-  const o = [p[0] + 0.5, p[1], p[2] + 0.5], e = [q[0] + 0.5, q[1], q[2] + 0.5];
-  const d = [e[0] - o[0], e[1] - o[1], e[2] - o[2]];
-  if (Math.hypot(d[0], d[1], d[2]) < 1e-9) return true;
+  // Scalars, not arrays: it runs for every step of the spread (thousands a
+  // cast), and the arrays it allocated were most of a cast's cost.
+  const ox = p[0] + 0.5, oy = p[1], oz = p[2] + 0.5;
+  const dx = q[0] + 0.5 - ox, dy = q[1] - oy, dz = q[2] + 0.5 - oz;
+  if (Math.hypot(dx, dy, dz) < 1e-9) return true;
+  const nudge = v => (v > 0 ? 1e-9 : v < 0 ? -1e-9 : 0);
+  const sgn = v => (v > 0 ? 1 : v < 0 ? -1 : 0);
   // Start in the cube the line leaves p into; end in the one it reaches q in.
-  const cell = o.map((v, a) => Math.floor(v + (d[a] > 0 ? 1e-9 : d[a] < 0 ? -1e-9 : 0)));
-  const last = e.map((v, a) => Math.floor(v - (d[a] > 0 ? 1e-9 : d[a] < 0 ? -1e-9 : 0)));
-  const step = d.map(v => (v > 0 ? 1 : v < 0 ? -1 : 0));
-  const tMax = o.map((v, a) => (step[a] ? ((step[a] > 0 ? cell[a] + 1 : cell[a]) - v) / d[a] : Infinity));
-  const tDelta = d.map(v => (v ? Math.abs(1 / v) : Infinity));
-  const blocked = c => solid(c[0] , c[1], c[2]);
+  let cx = Math.floor(ox + nudge(dx)), cy = Math.floor(oy + nudge(dy)), cz = Math.floor(oz + nudge(dz));
+  const lx = Math.floor(q[0] + 0.5 - nudge(dx)), ly = Math.floor(q[1] - nudge(dy)), lz = Math.floor(q[2] + 0.5 - nudge(dz));
+  const sx = sgn(dx), sy = sgn(dy), sz = sgn(dz);
+  let tx = sx ? ((sx > 0 ? cx + 1 : cx) - ox) / dx : Infinity;
+  let ty = sy ? ((sy > 0 ? cy + 1 : cy) - oy) / dy : Infinity;
+  let tz = sz ? ((sz > 0 ? cz + 1 : cz) - oz) / dz : Infinity;
+  const ux = dx ? Math.abs(1 / dx) : Infinity, uy = dy ? Math.abs(1 / dy) : Infinity, uz = dz ? Math.abs(1 / dz) : Infinity;
   for (let n = 0; n < 1024; n++) {
-    if (blocked(cell)) return false;
-    if (cell[0] === last[0] && cell[1] === last[1] && cell[2] === last[2]) return true;
-    const t = Math.min(tMax[0], tMax[1], tMax[2]);
+    if (solid(cx, cy, cz)) return false;
+    if (cx === lx && cy === ly && cz === lz) return true;
+    const t = Math.min(tx, ty, tz);
     if (t > 1 + 1e-9) return true;
-    const axes = [0, 1, 2].filter(a => tMax[a] <= t + 1e-9);
-    if (axes.length > 1) {
+    const ax = tx <= t + 1e-9, ay = ty <= t + 1e-9, az = tz <= t + 1e-9;
+    if (ax + ay + az > 1) {
       // Through an edge or corner: each cube beside it, stepped on one axis.
-      for (const a of axes) { const c = cell.slice(); c[a] += step[a]; if (blocked(c)) return false; }
+      if (ax && solid(cx + sx, cy, cz)) return false;
+      if (ay && solid(cx, cy + sy, cz)) return false;
+      if (az && solid(cx, cy, cz + sz)) return false;
     }
-    for (const a of axes) { cell[a] += step[a]; tMax[a] += tDelta[a]; }
+    if (ax) { cx += sx; tx += ux; }
+    if (ay) { cy += sy; ty += uy; }
+    if (az) { cz += sz; tz += uz; }
   }
   return true;
 }

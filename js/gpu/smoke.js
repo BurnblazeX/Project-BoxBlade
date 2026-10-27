@@ -222,6 +222,11 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   mesh.frustumCulled = false;
   mesh.name = 'smokeCubes';
 
+  // The cubes the last write listed: the next clears and uploads only those.
+  let written = 0;
+  const gridSpans = smokeView.spans;
+  const LAYER = SMOKE_BOX * SMOKE_BOX;
+
   return {
     uniforms: u, sun, light: lightKernel, mesh, cubeAttr,
     // The cubes of every cloud: clouds[k] = { cloud, compact } in slot k (or
@@ -231,7 +236,12 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     write(clouds) {
       const arr = cubeAttr.array, enc = enclosedAttr.array;
       let n = 0;
-      smokeView.indices.fill(0);
+      const grid = smokeView.grid, idx = smokeView.indices;
+      const old = gridSpans.slice();
+      gridSpans.fill(null);
+      for (let k = 0; k < old.length; k++) {
+        if (old[k]) idx.fill(0, (k * SMOKE_BOX + old[k][0]) * LAYER, (k * SMOKE_BOX + old[k][1] + 1) * LAYER);
+      }
       for (const pass of [0, 1, 2]) {
         clouds.forEach((entry, k) => {
           if (!entry || (pass === 2 && entry.compact)) return;
@@ -242,15 +252,35 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
             if (kind !== pass) continue;
             enc[n] = c[9] === Infinity ? NEVER : c[9] / Math.max(cloud.gMax, 1e-6);
             const x = c[4] - cloud.box[0], y = c[5] - cloud.box[1], z = c[6] - cloud.box[2];
-            smokeView.indices[x + SMOKE_BOX * (y + SMOKE_BOX * (z + SMOKE_BOX * k))] = n + 1;
+            idx[x + SMOKE_BOX * (y + SMOKE_BOX * (z + SMOKE_BOX * k))] = n + 1;
+            const span = gridSpans[k] || (gridSpans[k] = [z, z]);
+            if (z < span[0]) span[0] = z;
+            if (z > span[1]) span[1] = z;
             arr.set([c[0], c[1], c[2], c[3] + AGAINST * c[8] + SLOT * k], 4 * n++);
           }
         });
       }
-      arr.fill(NEVER, 4 * n);
-      smokeView.grid.needsUpdate = true;
-      cubeAttr.needsUpdate = true;
-      enclosedAttr.needsUpdate = true;
+      // Past the new count only what the last list held needs clearing, and
+      // only that span goes up (the buffers are 2.5 MB whole).
+      const end = Math.max(n, written);
+      arr.fill(NEVER, 4 * n, 4 * end);
+      enc.fill(NEVER, n, end);
+      written = n;
+      let dirty = false;
+      for (const spans of [old, gridSpans]) {
+        spans.forEach((span, k) => {
+          if (!span) return;
+          for (let z = span[0]; z <= span[1]; z++) grid.layerUpdates.add(k * SMOKE_BOX + z);
+          dirty = true;
+        });
+      }
+      if (dirty) grid.needsUpdate = true;
+      if (end > 0) {
+        cubeAttr.addUpdateRange(0, 4 * end);
+        enclosedAttr.addUpdateRange(0, end);
+        cubeAttr.needsUpdate = true;
+        enclosedAttr.needsUpdate = true;
+      }
       mesh.count = n;
       u.count.value = n;
       return n;

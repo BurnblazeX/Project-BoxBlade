@@ -38,7 +38,7 @@ import { writeSunUniforms } from '../../gpu/sun.js';
 import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
-export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, cards = null, shadowsOn,
+export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, sun, cards = null, shadowsOn,
                               rebuild = () => {}, boxLight = () => null }) {
   const clouds = new Array(MAX_SMOKE_CLOUDS).fill(null);
   let nextSlot = 0;
@@ -47,6 +47,8 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, car
   let shadows = true;        // the smoke in the world's light (a rebuild to switch)
   const params = { ...DEFAULT_SMOKE };
   let gpu = null, gpuFor = null, gpuCards = null, gpuLightCards = null;
+  // The cubes whose pipelines are compiled (or compiling): see warm().
+  let warmed = null;
   // Basic mode's cubes: made over the box light's walks (gpuFor is them).
   let gpuBasic = false;
   // Bumped whenever the clouds change (a cast, a clear, a roll-out done).
@@ -99,6 +101,24 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, car
     return gpu;
   }
 
+  // The cubes' light kernel and material compiled in the background as soon
+  // as they are made, before any cloud: built on the first cast instead, the
+  // compile was a ~200 ms frame. Shown only for the synchronous part of the
+  // call, where the render object is captured (as render/shadowsets.js does).
+  async function warm(g) {
+    try {
+      await renderer.compileComputeAsync(g.light);
+      const shown = g.mesh.visible;
+      g.mesh.visible = true;
+      let pending;
+      try { pending = renderer.compileAsync(g.mesh, camera, scene); }
+      finally { g.mesh.visible = shown; }
+      await pending;
+    } catch (err) {
+      console.warn('[smoke] background compile failed - the first cast compiles instead', err);
+    }
+  }
+
   // The chosen cloud spell on the block whose top is at tile { gx, gy, gz },
   // at `level` (upcast past its own: core/smoke.js smokeRadius).
   function summonAt(tile, which = spell, level = castLevel) {
@@ -133,7 +153,9 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, car
       }
     });
     if (compacted) { version++; if (gpu) gpu.write(clouds); }
-    const live = clouds.some(Boolean) && ensure();
+    const made = ensure();
+    if (made && made !== warmed) { warmed = made; warm(made); }
+    const live = clouds.some(Boolean) && made;
     if (gpu) gpu.mesh.visible = !!live;
     if (!live) return;
     const u = gpu.uniforms;
@@ -144,7 +166,9 @@ export function createSmoke({ renderer, scene, cascades, lighting, sky, sun, car
     // its ambient leaves.
     u.sunLight.value = sun.on() ? (gpuBasic ? 1 : 1 - ambient) : 0;
     u.time.value = now();
-    renderer.compute(gpu.light);
+    // Over the cubes in the list, not the whole capacity: past the count a
+    // thread only writes a light nothing reads (128k of them, 8 MB a frame).
+    renderer.compute(gpu.light, Math.max(1, u.count.value));
   }
 
   const set = (k, v) => { params[k] = v; if (gpu) gpu.uniforms[k].value = v; };

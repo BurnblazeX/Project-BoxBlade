@@ -61,12 +61,18 @@ function createSmokeShared() {
     t.unpackAlignment = 1;
     t.generateMipmaps = false;
     t.needsUpdate = true;
+    // Only the z layers a cast touched go up (WebGPU uploads a 3D texture a
+    // layer a writeTexture - all 512 of them was the hitch on every cast).
+    t.layerUpdates = new Set();
+    t.clearLayerUpdates = () => t.layerUpdates.clear();
     return t;
   };
   const occData = new Uint8Array(SLOT * N), softData = new Uint8Array(SLOT * N);
   const occTex = texture(occData, THREE.NearestFilter), softTex = texture(softData, THREE.LinearFilter);
   const at = (x, y, z) => x + O * (y + O * z);
   const a = new Float32Array(SLOT), b = new Float32Array(SLOT);
+  // Per slot, the z layers (its own, 0..O-1) it last filled: cleared on the next write.
+  const spans = new Array(N).fill(null);
   // [1 2 1] / 4 along axis d, src -> dst, over [lo, hi] (the cloud's boxes and a margin).
   const blurAxis = (src, dst, d, lo, hi) => {
     for (let z = lo[2]; z <= hi[2]; z++) for (let y = lo[1]; y <= hi[1]; y++) for (let x = lo[0]; x <= hi[0]; x++) {
@@ -108,8 +114,11 @@ function createSmokeShared() {
     // cast at `castTime`; null clears it.
     write(k, cloud, castTime = 0) {
       const ob = k * SLOT;
+      const old = spans[k];
+      spans[k] = null;
       a.fill(0);
       occData.fill(0, ob, ob + SLOT);
+      softData.fill(0, ob, ob + SLOT);
       if (cloud) {
         const lo = [O, O, O], hi = [-1, -1, -1];
         for (const c of cloud.cubes) {
@@ -123,8 +132,14 @@ function createSmokeShared() {
         // The blur only where the cloud is, and a box round it.
         const blo = lo.map(v => Math.max(0, v - 2)), bhi = hi.map(v => Math.min(O - 1, v + 2));
         b.fill(0);
-        if (hi[0] >= 0) { blurAxis(a, b, 0, blo, bhi); a.set(b); blurAxis(a, b, 1, blo, bhi); a.set(b); blurAxis(a, b, 2, blo, bhi); }
-        for (let i = 0; i < SLOT; i++) softData[ob + i] = Math.round(255 * b[i]);
+        if (hi[0] >= 0) {
+          blurAxis(a, b, 0, blo, bhi); a.set(b); blurAxis(a, b, 1, blo, bhi); a.set(b); blurAxis(a, b, 2, blo, bhi);
+          for (let z = blo[2]; z <= bhi[2]; z++) for (let y = blo[1]; y <= bhi[1]; y++) for (let x = blo[0]; x <= bhi[0]; x++) {
+            const i = at(x, y, z);
+            softData[ob + i] = Math.round(255 * b[i]);
+          }
+          spans[k] = [blo[2], bhi[2]];
+        }
         const { box, centre, spell, radius } = cloud;
         const r = slots.array;
         const R = ROWS * k;
@@ -137,12 +152,15 @@ function createSmokeShared() {
         r[R + 4].set(corner(0), corner(1), corner(2), 0);
         r[R + 5].set(far(0), far(1), far(2), 0);
       } else {
-        occData.fill(0, ob, ob + SLOT);
-        softData.fill(0, ob, ob + SLOT);
         slots.array[ROWS * k].set(0, 0, 0, 0);
       }
-      occTex.needsUpdate = true;
-      softTex.needsUpdate = true;
+      let dirty = false;
+      for (const span of [old, spans[k]]) {
+        if (!span) continue;
+        for (let z = span[0]; z <= span[1]; z++) { occTex.layerUpdates.add(k * O + z); softTex.layerUpdates.add(k * O + z); }
+        dirty = true;
+      }
+      if (dirty) { occTex.needsUpdate = true; softTex.needsUpdate = true; }
       let live = 0;
       for (let j = 0; j < N; j++) if (slots.array[ROWS * j].w > 0.5) live++;
       this.live.value = live;

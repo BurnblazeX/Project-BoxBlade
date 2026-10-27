@@ -3,7 +3,7 @@ import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
-         loadLevel } from './core/world.js';
+         loadLevel, findPath } from './core/world.js';
 import { createEditor } from './tools/editor.js';
 import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
@@ -1173,7 +1173,7 @@ const fog = engine.add(createFog({
   sun: { light: dirLight, on: () => sun.on, uniforms: () => sun.uniforms() }
 }));
 const smoke = engine.add(createSmoke({
-  renderer, scene, cascades: () => shadowCascades,
+  renderer, scene, camera, cascades: () => shadowCascades,
   lighting, sky, cards, shadowsOn: () => shadowsOn, rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
   boxLight: () => boxLight,
   sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
@@ -1609,7 +1609,8 @@ const bxbApi = installConsole(createConsole({
       const { render, compute } = perf.gpuStats(frames);
       const f = x => +x.toFixed(3);
       return { render: f(render.avg), renderP95: f(render.p95), compute: f(compute.avg),
-               total: f(render.avg + compute.avg), frames: render.count,
+               total: f(render.avg + compute.avg), renderMax: f(render.max), computeMax: f(compute.max),
+               frames: render.count,
                fps: +perf.stats(frames).fps.toFixed(1), graph: perf.visible };
     })
   },
@@ -1841,6 +1842,18 @@ const bxbApi = installConsole(createConsole({
       playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
       game.path = [];
       return 'teleported to ' + x + ',' + top + ',' + z;
+    }
+  },
+  walk: {
+    help: 'walk the player to a block along the explore path, as a click would (for benchmarks)',
+    usage: 'bxb.walk(x, z, y?)',
+    run: (x, z, y) => {
+      const top = (y === undefined || y === null) ? getColumnTop(x, z) : y;
+      if (top === null || top === undefined) return 'no standable surface at ' + x + ',' + z;
+      const path = findPath(player.gridPos, { x, y: top, z }, true);
+      if (!path.length) return 'no path to ' + x + ',' + top + ',' + z;
+      game.path = path;
+      return 'walking ' + path.length + ' steps to ' + x + ',' + top + ',' + z;
     }
   },
   light: sun.commands.light,
