@@ -835,8 +835,10 @@ export function populateDistanceField(grid, dirty = null) {
   // it is the block's material.
   const glassBlock = grid.isGlass || (block => isGlassMaterial(block && block.materialId));
 
-  for (const [key, block] of World) {
-    const [bx, by, bz] = key.split(',').map(Number);
+  // Each block whose band can reach the footprint. The world is stored by
+  // chunk (core/chunks.js), so only the chunks around the footprint are
+  // walked - not the whole world, every strip, as the Map made it.
+  const bakeBlock = (bx, by, bz, block) => {
 
     const vx0 = (bx - grid.originBlock.x) * per;
     const vy0 = (by - grid.originBlock.y) * per;
@@ -865,8 +867,8 @@ export function populateDistanceField(grid, dirty = null) {
     // can be taken on a distance that does not already account for whatever it
     // is about to jump over. Keep the two equal if either ever moves.
     const reach = band;
-    if (vx0 + per + reach <= 0 || vy0 + per + reach <= 0 || vz0 + per + reach <= 0) continue;
-    if (vx0 - reach >= GRID_DIM || vy0 - reach >= GRID_DIM || vz0 - reach >= GRID_DIM) continue;
+    if (vx0 + per + reach <= 0 || vy0 + per + reach <= 0 || vz0 + per + reach <= 0) return;
+    if (vx0 - reach >= GRID_DIM || vy0 - reach >= GRID_DIM || vz0 - reach >= GRID_DIM) return;
 
     // Whether the block's own box - not its band - is in the footprint. Only
     // these count toward the occupancy figure, so the number keeps meaning "what
@@ -892,7 +894,7 @@ export function populateDistanceField(grid, dirty = null) {
         if (glassPart) { glassBlocks.push(...range6); if (inFootprint) glassFilled += vol; }
         else { blocks.push(...range6); if (inFootprint) filled += vol; }
       }
-      continue;
+      return;
     }
 
     // A glass half or pane is its own box (world.js BLOCK_SHAPES glass).
@@ -903,7 +905,7 @@ export function populateDistanceField(grid, dirty = null) {
       if (inFootprint) glassFilled += (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
       glassBlocks.push(vx0 + Math.floor(x0 * per), vy0 + Math.floor(y0 * per), vz0 + Math.floor(z0 * per),
                        vx0 + Math.ceil(x1 * per), vy0 + Math.ceil(y1 * per), vz0 + Math.ceil(z1 * per));
-      continue;
+      return;
     }
 
     // A block with nothing beneath it - surface ground over empty space, the
@@ -944,7 +946,7 @@ export function populateDistanceField(grid, dirty = null) {
                      (z1 - z0) / 2 * per, rects, range);
         if (inFootprint) filled += (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
       }
-      continue;
+      return;
     }
 
     // The box in voxel units, as a centre and a half-extent.
@@ -954,6 +956,13 @@ export function populateDistanceField(grid, dirty = null) {
 
     minBoxVoxels(grid, cx, cy, cz, per / 2, height / 2, per / 2, rects, range);
     if (inFootprint) filled += per * height * per;
+  };
+  if (World.forEachBlockIn) {
+    const pad = Math.ceil(band / per) + 1, span = GRID_DIM / per;
+    const ox = grid.originBlock.x, oz = grid.originBlock.z;
+    World.forEachBlockIn(ox - pad, ox + span + pad, oz - pad, oz + span + pad, bakeBlock);
+  } else {
+    for (const [key, block] of World) { const [bx, by, bz] = key.split(',').map(Number); bakeBlock(bx, by, bz, block); }
   }
 
   // Placed models (world.js ModelBoxes): each cube a box, in world texels. A

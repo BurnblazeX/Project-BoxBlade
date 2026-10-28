@@ -1,4 +1,5 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
+import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE, Y_MIN, Y_MAX, CHUNK_HEIGHT } from '../js/core/world.js';
 import { CASCADE_COUNT, cascadeVoxelsPerBlock, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, cascadeRangeVoxels, DISTANCE_RANGE_METRES,
@@ -394,9 +395,9 @@ section('placed models bake as their cubes');
   truthy('a leg is solid (x 1..2, z -2..-1)', isOccupied(h, 67, 48, 64));
   truthy('the backrest post reaches 9 up', isOccupied(h, 64, 56, 64));
   falsy('and no higher', isOccupied(h, 64, 57, 64));
-  truthy('with bounds, the tile is taken', !!World.get('5,0,5').occupant);
+  truthy('with bounds, the tile is taken', !!occupantAt('5,0,5'));
   clearWorldModels();
-  falsy('cleared, it is free again', !!World.get('5,0,5').occupant);
+  falsy('cleared, it is free again', !!occupantAt('5,0,5'));
   truthy('and standable', standable(5, 0, 5));
 }
 

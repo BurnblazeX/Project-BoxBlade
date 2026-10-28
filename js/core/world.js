@@ -1,8 +1,7 @@
 import { isGlassMaterial } from './materials.js';
 import { placeModel } from './bbmodel.js';
 import { rectCovered } from './rects.js';
-
-export const World = new Map();
+import { createChunkWorld } from './chunks.js';
 
 // --- CHUNK / VERTICAL LAYOUT ---
 // A chunk is 12x12 blocks in footprint and 48 blocks tall: 8 below ground,
@@ -25,6 +24,36 @@ export const Y_MIN = -8;
 export const Y_MAX = 39;
 export const CHUNK_HEIGHT = Y_MAX - Y_MIN + 1; // 48
 
+// The world's blocks, by chunk (core/chunks.js, World plan P3). Answers as the
+// Map from "x,y,z" it replaced, plus getAt / hasAt / forEachBlockIn. Blocks it
+// hands back are shared, frozen block TYPES: change a cell with World.set,
+// never by writing to the block.
+export const World = createChunkWorld({ size: CHUNK_SIZE, yMin: Y_MIN, height: CHUNK_HEIGHT });
+
+// --- Who stands where ---
+//
+// A cell's occupant (an entity's id, a prop's 'prop:<model>') used to be a
+// field on its block. The block objects are shared types now, so occupancy is
+// its own table, by voxel key: a few entries, not one per block. A cell
+// emptied (World.delete) or a world cleared takes its occupants with it.
+const Occupants = new Map();
+export function occupantAt(key) {
+  return Occupants.get(key) ?? null;
+}
+export function setOccupantAt(key, id) {
+  if (id === null || id === undefined) Occupants.delete(key);
+  else Occupants.set(key, id);
+}
+// Off a cell, only if it is the occupant there.
+export function vacateAt(key, id) {
+  if (Occupants.get(key) === id) Occupants.delete(key);
+}
+{
+  const clear = World.clear, del = World.delete;
+  World.clear = () => { clear(); Occupants.clear(); };
+  World.delete = key => { Occupants.delete(key); return del(key); };
+}
+
 export function getVoxelKey(x, y, z) {
   return `${Math.round(x)},${Math.round(y)},${Math.round(z)}`;
 }
@@ -41,11 +70,11 @@ export function getVoxelKey(x, y, z) {
 // automatically exposes the one beneath, with no flag to keep in sync.
 
 export function getBlock(x, y, z) {
-  return World.get(getVoxelKey(x, y, z));
+  return World.getAt(Math.round(x), Math.round(y), Math.round(z));
 }
 
 export function isSolid(x, y, z) {
-  return World.has(getVoxelKey(x, y, z));
+  return World.hasAt(Math.round(x), Math.round(y), Math.round(z));
 }
 
 // --- Block shapes ---
@@ -465,8 +494,7 @@ export function removeWorldModel(entry) {
   const i = WorldModels.indexOf(entry);
   if (i < 0) return false;
   WorldModels.splice(i, 1);
-  const block = getBlock(...entry.tile);
-  if (block && block.occupant === 'prop:' + entry.name) block.occupant = null;
+  vacateAt(getVoxelKey(...entry.tile), 'prop:' + entry.name);
   ModelBoxes.length = 0;
   for (const m of WorldModels) for (const c of m.cubes) if (!c.light) ModelBoxes.push([...c.min, ...c.max]);
   return true;
@@ -547,16 +575,13 @@ function placeEntry(model, at, yaw, owner, tile, wall = null) {
   }));
   WorldModels.push(entry);
   for (const c of placed.cubes) if (!c.light) ModelBoxes.push([...c.min, ...c.max]);
-  const block = model.bounds.length ? getBlock(...tile) : null;
-  if (block && !block.occupant) block.occupant = 'prop:' + model.name;
+  const tileKey = getVoxelKey(...tile);
+  if (model.bounds.length && getBlock(...tile) && !occupantAt(tileKey)) setOccupantAt(tileKey, 'prop:' + model.name);
   return entry;
 }
 
 export function clearWorldModels() {
-  for (const m of WorldModels) {
-    const block = getBlock(...m.tile);
-    if (block && block.occupant === 'prop:' + m.name) block.occupant = null;
-  }
+  for (const m of WorldModels) vacateAt(getVoxelKey(...m.tile), 'prop:' + m.name);
   WorldModels.length = 0;
   ModelBoxes.length = 0;
 }
@@ -778,8 +803,7 @@ export function pathDistance(a, b) {
 // impassable until Jump exists.
 function isEnterable(x, y, z) {
   if (!isStandable(x, y, z)) return false;
-  const block = getBlock(x, y, z);
-  return !block.occupant;
+  return !occupantAt(getVoxelKey(x, y, z));
 }
 
 // A* over standable tiles. Called on every click, every held-mouse retarget

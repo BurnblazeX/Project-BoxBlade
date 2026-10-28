@@ -294,15 +294,19 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     const plan = planPlacement(target);
     if (!plan) return false;
     if (plan.kind !== 'merge') return placeBlockAt(target.place);
-    const block = World.get(getVoxelKey(...plan.cell));
+    // Blocks are shared types now (core/chunks.js): change a copy, set it back.
+    const key = getVoxelKey(...plan.cell);
+    const block = { ...World.get(key) };
     if (plan.full) { delete block.shape; delete block.facing; }
     else block.second = state.materialId;
+    World.set(key, block);
     return true;
   }
   // Right click on a dual block: only the half under the cursor goes, and the
   // other stays as a plain half. Models on it go when its top drops.
   function removeHalf(c, part) {
-    const block = World.get(getVoxelKey(...c));
+    const key = getVoxelKey(...c);
+    const block = { ...World.get(key) };
     const top = surfaceLevel(...c);
     if (part === 1) delete block.second;
     else {
@@ -312,6 +316,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       if (comp.facing) block.facing = comp.facing; else delete block.facing;
       delete block.second;
     }
+    World.set(key, block);
     if (surfaceLevel(...c) !== top) removeModelsOn(c);
     return true;
   }

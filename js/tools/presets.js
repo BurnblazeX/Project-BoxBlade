@@ -25,7 +25,7 @@ const BASE = {
   // Long shadows (core/sunmap.js): the soft march (the cone's penumbra, the
   // wanted look) runs this far, the sun depth map takes over past it -
   // softened inside C2 by a grid of bilinear taps, hard past it.
-  sunreach: 'c1', farshadow: 4, farsize: 1024,
+  sunreach: 'c1', farshadow: 4,
   reflect: true, reflectbounces: 2, spec: true,
   mirrors: true, glassglare: 1, caustics: 1,
   glasslayers: 2, glassbounces: 4, dispersion: false,
@@ -63,7 +63,7 @@ export const PRESETS = {
     effects: true,
     values: { ...BASE, gires: 1.5, gibounces: 3, gifar: false, aodist: 1.25,
               reflectbounces: 3, glasslayers: 3, glassbounces: 6, dispersion: true, sunfar: 54,
-              hitbudget: 8, mirrorbudget: 8, farshadow: 6, farsize: 2048 }
+              hitbudget: 8, mirrorbudget: 8, farshadow: 6 }
   },
   ultra: {
     label: 'Ultra', target: '120+ fps',
@@ -71,7 +71,7 @@ export const PRESETS = {
     effects: true,
     values: { ...BASE, gimode: 'texel', gibounces: 3, gifar: false, aodist: 1.5,
               reflectbounces: 4, glasslayers: 4, glassbounces: 8, dispersion: true, sunfar: 72,
-              hitbudget: 16, mirrorbudget: 16, farshadow: 8, farsize: 2048,
+              hitbudget: 16, mirrorbudget: 16, farshadow: 8,
               gireach: 16, gidirectevery: 2 }
   }
 };

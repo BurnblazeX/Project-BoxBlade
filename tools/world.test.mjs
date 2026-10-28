@@ -1,4 +1,5 @@
 import { file, section, ok, near, truthy, falsy } from './lib/harness.mjs';
+import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
          findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory, currentArena,
          getBlock, stepLevel, surfaceLevel, surfaceHeight, isSolidAt, blockShape, blockBoxes, edgeLevel,
@@ -238,9 +239,9 @@ section('slopes: planes, baked as staircases under them');
 
 section('entity occupancy is respected');
 const blocker = createEntity({ id:'blocker', gridPos:{x:9,y:0,z:8} });
-World.get('9,0,8').occupant = blocker.id;
+setOccupantAt('9,0,8', blocker.id);
 ok('occupied tile is not enterable', findPath({x:8,y:0,z:8}, {x:9,y:0,z:8}).length, 0);
-World.get('9,0,8').occupant = null;
+setOccupantAt('9,0,8', null);
 
 section('battle arena carves a full chunk');
 const { arena, bounds } = enterBattle({x:8,y:0,z:8});
@@ -269,7 +270,7 @@ section('findPath: identical to the old array search, ties included');
   // The search as it was before the heap (2026-09-25): an open set scanned in
   // full every step, first tile with the lowest f wins. The new one must give
   // exactly these paths - the same tiles in the same order.
-  const isEnterable = (x, y, z) => isStandable(x, y, z) && !getBlock(x, y, z).occupant;
+  const isEnterable = (x, y, z) => isStandable(x, y, z) && !occupantAt(getVoxelKey(x, y, z));
   function oldFindPath(start, end, allowDiagonals = false) {
     const openSet = [start];
     const cameFrom = new Map();
@@ -396,7 +397,7 @@ section('levels: the world as data');
   World.clear(); clearWorldModels();
   ok('loads with nothing missing', loadLevel(JSON.parse(text), models).length, 0);
   ok('and saves back identically', JSON.stringify(serializeLevel()), text);
-  truthy('the chair takes its tile again', !!World.get('6,0,8').occupant);
+  truthy('the chair takes its tile again', !!occupantAt('6,0,8'));
   ok('the models bake again', ModelBoxes.length,
      models.get('decor_chair').cubes.length + models.get('decor_wallTorch').cubes.filter(c => !c.light).length);
   ok('an unknown model is reported, not placed',
@@ -411,7 +412,7 @@ section('levels: the world as data');
   const c = addWorldModel(models.get('decor_chair'), 1, 0, 1, 0);
   truthy('removed', removeWorldModel(c));
   ok('nothing left to bake', ModelBoxes.length, 0);
-  falsy('its tile is free', !!World.get('1,0,1').occupant);
+  falsy('its tile is free', !!occupantAt('1,0,1'));
   falsy('removing it twice does nothing', removeWorldModel(c));
 
   ok('a full block has no shape', newBlock('grass', 'full', 'N').shape, undefined);

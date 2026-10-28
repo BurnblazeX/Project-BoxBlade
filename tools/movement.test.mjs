@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { file, section, ok, near } from './lib/harness.mjs';
+import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { World, getVoxelKey, BLOCK_METRES as B } from '../js/core/world.js';
 import { followPath, walk, vacate, occupy, faceSprite, getSpriteWorldPos } from '../js/game/movement.js';
 
@@ -26,10 +27,10 @@ section('occupancy');
 floor();
 {
   const a = character('a', 1, 1), b = character('b', 2, 1);
-  ok('each holds its block', at(1, 0, 1).occupant + at(2, 0, 1).occupant, 'ab');
+  ok('each holds its block', occupantAt(getVoxelKey(1, 0, 1)) + occupantAt(getVoxelKey(2, 0, 1)), 'ab');
   a.e.gridPos = { x: 2, y: 0, z: 1 };
   vacate(a.e);
-  ok("vacating never clears another's", at(2, 0, 1).occupant, 'b');
+  ok("vacating never clears another's", occupantAt(getVoxelKey(2, 0, 1)), 'b');
 }
 
 section('following a path');
@@ -41,22 +42,22 @@ floor();
   // 8 m/s for 0.1 s is 0.8 m: not there yet.
   ok('short of the node: still walking', followPath(e, sprite, path, 8, 0.1, 0), false);
   near('moved 0.8 m along x', sprite.position.x, 0.8);
-  ok('arrival-only occupancy stays put', at(0, 0, 0).occupant, 'p');
+  ok('arrival-only occupancy stays put', occupantAt(getVoxelKey(0, 0, 0)), 'p');
   ok('facing right, walking +x at heading 0', sprite.material.map.repeat.x, -1);
   ok('arrives', followPath(e, sprite, path, 8, 0.1, 0), true);
   near('snapped onto the node', sprite.position.x, B);
   ok('the node became its gridPos', e.gridPos, node);
   ok('path consumed', path.length, 0);
-  ok('the old block is free', at(0, 0, 0).occupant, null);
-  ok('the new block is held', at(1, 0, 0).occupant, 'p');
+  ok('the old block is free', occupantAt(getVoxelKey(0, 0, 0)), null);
+  ok('the new block is held', occupantAt(getVoxelKey(1, 0, 0)), 'p');
 }
 floor();
 {
   const { e, sprite } = character('p', 0, 0);
   const path = [{ x: 1, y: 0, z: 0 }];
   followPath(e, sprite, path, 8, 0.1, 0, true);   // 0.8 m: past the column edge at 0.75 m
-  ok('continuous: the column it is over holds it', at(1, 0, 0).occupant, 'p');
-  ok('continuous: and the one it left does not', at(0, 0, 0).occupant, null);
+  ok('continuous: the column it is over holds it', occupantAt(getVoxelKey(1, 0, 0)), 'p');
+  ok('continuous: and the one it left does not', occupantAt(getVoxelKey(0, 0, 0)), null);
   ok('continuous: gridPos follows', e.gridPos.x, 1);
 }
 
@@ -67,7 +68,7 @@ floor();
   walk(e, sprite, { d: true }, 0, 0.1);
   near('d at heading 0 walks +x', sprite.position.x, B + 0.8);
   ok('into the next column', e.gridPos.x, 2);
-  ok('which it holds', at(2, 0, 1).occupant, 'p');
+  ok('which it holds', occupantAt(getVoxelKey(2, 0, 1)), 'p');
 }
 floor();
 {

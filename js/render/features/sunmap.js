@@ -5,33 +5,38 @@
 // shares its geometry and instance buffers (as the texel cache's twins do), in
 // a scene of its own so nothing else is drawn with it. Only when it is stale:
 // the sun turned past SUN_MAP_REDRAW, the world changed, the arena hid or
-// showed blocks, or the preset changed the size.
+// showed blocks, the preset changed the softening, or - over a world wider
+// than SUN_MAP_WINDOW - the player left the middle of the map's window
+// (World plan P2a: the map follows the player, it does not cover the region).
+// Its texel follows the softening grid (sunMapTexelFor), its size the window.
 //
 // ctx:
 //   renderer, sunLight
 //   shadowsOn()  whether the marched shading is on - the map is read only there
+//   focus()      the block the player stands on ({ x, y, z }, grid units)
 //
 // Settings (the Shadows section; the presets set them):
 //   farshadow   'off' | 'hard' | 4 | 6 | 8 - the map's softening inside C2:
 //               the largest grid of bilinear taps a side, each shade using as
 //               few as its penumbra needs ('hard': one smooth tap everywhere;
 //               'off': no map, the march alone at its 12 m, as before)
-//   farsize     1024 | 2048 texels a side
 //   sunreach    '12m' | 'c1' - how far the soft march (the cone's analytic
 //               penumbra, the wanted look) runs before the map takes over;
 //               never into C2, whose 0.5 m voxels step a shadow's edge
 import * as THREE from 'three/webgpu';
 import { worldInstancedMesh } from '../render.js';
-import { sunMapBounds, sunMapFrame, sunMapTexelMetres, sunMapStale, SUN_MAP_SIZES } from '../../core/sunmap.js';
+import { sunMapBounds, sunMapFrame, sunMapStale, sunMapMoved, sunMapTexelFor, sunMapSizeFor,
+         SUN_MAP_WINDOW } from '../../core/sunmap.js';
+import { BLOCK_METRES } from '../../core/world.js';
 import { sunMap, sunSoftReach, sunWorldTop, createSunMapMaterial } from '../../gpu/sunmap.js';
 
 const TAP_OPTIONS = ['off', 'hard', 4, 6, 8];
 const REACH_OPTIONS = ['12m', 'c1'];
 
-export function createSunMap({ renderer, sunLight, shadowsOn }) {
+export function createSunMap({ renderer, sunLight, shadowsOn, focus }) {
   let mode = 4;                 // TAP_OPTIONS
-  let size = SUN_MAP_SIZES[0];
   let drawnDir = null;          // the sun the map holds
+  let drawnFrame = null;        // the frame it was drawn in, for sunMapMoved
   let bounds;                   // undefined: not measured since the last change
   let dirty = true;
   let scene = null, twin = null;
@@ -65,7 +70,9 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
     const mesh = ensureTwin();
     measure();
     if (!mesh || !bounds) { sunMap.on.value = 0; return; }
-    const f = sunMapFrame(bounds, sunLight.position);
+    const texel = sunMapTexelFor(sunMap.side.value);
+    const f = sunMapFrame(bounds, sunLight.position, focusMetres(), SUN_MAP_WINDOW, texel);
+    const size = sunMapSizeFor(f, texel);
     const [cx, cy, cz] = f.centre;
     camera.left = -f.half; camera.right = f.half; camera.top = f.half; camera.bottom = -f.half;
     camera.near = f.near; camera.far = f.far;
@@ -79,7 +86,7 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
     sunMap.dir.value.set(...f.dir);
     sunMap.base.value = f.base;
     sunMap.size.value = size;
-    sunMap.texel.value = sunMapTexelMetres(f, size);
+    sunMap.texel.value = (2 * f.half) / size;
     sunMap.viewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     // Cleared to 0: "nothing toward the sun" (every stored s is above it).
     renderer.getClearColor(_clear);
@@ -90,9 +97,16 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
     renderer.setRenderTarget(null);
     renderer.setClearColor(_clear, alpha);
     drawnDir = f.dir;
+    drawnFrame = f;
     dirty = false;
     draws++;
     sunMap.on.value = 1;
+  }
+
+  // The player's feet, metres - where a following map centres.
+  function focusMetres() {
+    const g = focus();
+    return { x: g.x * BLOCK_METRES, y: g.y * BLOCK_METRES, z: g.z * BLOCK_METRES };
   }
 
   function apply() {
@@ -116,7 +130,8 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
     sunmap: {
       help: 'bxb.sunmap() - the sun depth map: size, texel, redraws',
       run() {
-        return `sun map ${mode === 'off' ? 'off' : `${size}², ${sunMap.texel.value.toFixed(3)} m a texel, ` +
+        return `sun map ${mode === 'off' ? 'off' : `${sunMap.size.value}², ${sunMap.texel.value.toFixed(3)} m a texel, ` +
+                `${drawnFrame && drawnFrame.follows ? `following the player, ${SUN_MAP_WINDOW} m each way` : 'fitted to the world'}, ` +
                 `grid up to ${sunMap.side.value}x${sunMap.side.value}, soft march to ` +
                 `${REACH_OPTIONS[sunSoftReach.value]}, drawn ${draws} times`}`;
       }
@@ -129,7 +144,7 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
     update() {
       measure();
       if (mode === 'off' || !shadowsOn()) return;
-      if (dirty || sunMapStale(drawnDir, sunLight.position)) draw();
+      if (dirty || sunMapStale(drawnDir, sunLight.position) || sunMapMoved(drawnFrame, focusMetres())) draw();
     },
     // The world changed (an edit, the arena hiding blocks): measure and draw again.
     invalidate() { bounds = undefined; sunWorldTop.value = 1e9; dirty = true; },
@@ -140,9 +155,6 @@ export function createSunMap({ renderer, sunLight, shadowsOn }) {
         help: 'shadows past the soft march, from a sun depth map over the region: softened inside C2, ' +
               'hard past it - off: they stop at the march, as before',
         get: () => mode, set: v => commands.farshadow.run(v) },
-      { key: 'farsize', label: 'Far shadow map', type: 'select',
-        options: SUN_MAP_SIZES.map(s => ({ value: s, label: `${s}²` })),
-        get: () => size, set: v => { size = Number(v); dirty = true; } },
       { key: 'sunreach', label: 'Soft sun reach', type: 'select',
         options: [{ value: '12m', label: '12 m' }, { value: 'c1', label: 'to C1 edge' }],
         help: 'how far the soft march (the cone penumbra) looks toward the sun before the far map ' +

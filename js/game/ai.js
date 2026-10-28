@@ -1,4 +1,4 @@
-import { World, getVoxelKey, pathDistance, findPath, isStandable } from '../core/world.js';
+import { World, getVoxelKey, pathDistance, findPath, isStandable, occupantAt } from '../core/world.js';
 import { followPath, ENEMY_SPEED } from './movement.js';
 
 export function createWanderAI(entity, sprite, tetherRadius) {
@@ -15,7 +15,7 @@ export function createWanderAI(entity, sprite, tetherRadius) {
         if (pathDistance(spawnPos, node) <= tetherRadius) {
             const key = getVoxelKey(node.x, node.y, node.z);
             const voxel = World.get(key);
-            if (voxel && isStandable(node.x, node.y, node.z) && !voxel.occupant) {
+            if (voxel && isStandable(node.x, node.y, node.z) && !occupantAt(key)) {
             candidates.push(node);
             }
         }

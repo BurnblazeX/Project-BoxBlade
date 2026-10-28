@@ -12,6 +12,8 @@ import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMateri
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';
 import { buildSkyTops, packSkyTops } from '../core/skytop.js';
+import { followWindow, worldBlockBounds } from '../core/follow.js';
+import { blocksIn } from '../core/chunks.js';
 
 // Every block texture, by URL, so Vite bundles them - albedo, _n and _s alike.
 // Only under Vite; in node (the shader snapshot test) there are none.
@@ -276,12 +278,16 @@ async function loadFaceLayers(m, layer) {
   }
 }
 
-// What each block is, for the rays, over a FIXED volume: an edit (the
+// What each block is, for the rays, over a FIXED-SIZE volume: an edit (the
 // editor) rewrites it in place, where a volume sized to the world's bounds
 // changed size - and every material built on the old texture had to be
-// rebuilt. 256 x 12 x 256 blocks around the origin, RGBA8, 3 MB; a block
-// outside it reads as air to the rays that ask (reflection and glass hits,
-// the GI). Per block:
+// rebuilt. 128 x 48 x 128 blocks, RGBA8, ~6 MB; a block outside it reads as
+// air to the rays that ask (reflection and glass hits, the GI). It FOLLOWS
+// THE PLAYER (World plan P2a, core/follow.js): a world that fits sits centred
+// in it and it never moves; a bigger one recentres when the player leaves the
+// window's middle half (followBlockVolume), so a region can be any size. 128
+// is enough: rays never leave C2 (+-24 blocks) and the screen spans about
+// +-17. The sky-top map shares its footprint. Per block:
 //   a block       R layer + 1 (its side), G its top layer, B its bottom, A its
 //                 shape code (world.js shapeCode: a slope's is slopeCode's,
 //                 so the split kernels read it as before; a half's or a
@@ -295,10 +301,35 @@ async function loadFaceLayers(m, layer) {
 // texture (dims) - one binding for both (gpu/volume.js volumeAtTSL).
 // modelHits: the model cubes by cell (bbmodel.js buildModelHits) - what
 // gpu/volume.js hitSurfaceTSL needs to find a hit's texel as the cube's own draw does.
-export const BLOCK_VOLUME_ORIGIN = [-96, Y_MIN, -96];
-export const BLOCK_VOLUME_SIZE = [256, CHUNK_HEIGHT, 256];
-function buildBlockVolume() {
-  const lo = BLOCK_VOLUME_ORIGIN, size = BLOCK_VOLUME_SIZE;
+export const BLOCK_VOLUME_SIZE = [128, CHUNK_HEIGHT, 128];
+// Where the window sits now: its first block. Set by placeBlockVolume.
+const blockVolumeOrigin = [0, Y_MIN, 0];
+let blockVolumeBounds;        // the world's, measured at the last build
+let blockVolumeFocus = { x: 0, z: 0 };
+// Place the window for a focus over the world as last measured; true when it
+// moved.
+function placeBlockVolume(focus, prev) {
+  const [x, z] = followWindow(prev, focus, BLOCK_VOLUME_SIZE[0], blockVolumeBounds, { pad: 1 });
+  const moved = x !== blockVolumeOrigin[0] || z !== blockVolumeOrigin[2];
+  blockVolumeOrigin[0] = x;
+  blockVolumeOrigin[2] = z;
+  return moved;
+}
+// Per frame: the window follows the player (a block position). Rebuilt only
+// when it moves - never for a world that fits.
+export function followBlockVolume(focus) {
+  if (!terrainTextures.blocks || !focus) return false;
+  blockVolumeFocus = { x: Math.round(focus.x), z: Math.round(focus.z) };
+  if (!placeBlockVolume(blockVolumeFocus, [blockVolumeOrigin[0], blockVolumeOrigin[2]])) return false;
+  buildBlockVolume(false);
+  return true;
+}
+function buildBlockVolume(remeasure = true) {
+  if (remeasure) {
+    blockVolumeBounds = worldBlockBounds(World);
+    placeBlockVolume(blockVolumeFocus, null);
+  }
+  const lo = blockVolumeOrigin, size = BLOCK_VOLUME_SIZE;
   let v = terrainTextures.blocks;
   if (!v) {
     const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 8), size[0], size[1], size[2] * 2);
@@ -310,7 +341,7 @@ function buildBlockVolume() {
     tex.unpackAlignment = 1;
     v = terrainTextures.blocks = {
       tex,
-      origin: uniform(new THREE.Vector3(...lo)),
+      origin: uniform(new THREE.Vector3(...lo)),   // moves with the window (followBlockVolume)
       size: uniform(new THREE.Vector3(...size)),
       dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * 2))   // the texture's own
     };
@@ -326,14 +357,16 @@ function buildBlockVolume() {
       attr, node: storage(attr, 'vec4', MODEL_HIT_VEC4S).toReadOnly().setName('bxbModelHits')
     };
   }
+  v.origin.value.set(...lo);
   const data = v.tex.image.data;
   data.fill(0);
   const at = c => {
     const r = c.map((x, a) => x - lo[a]);
     return r.some((x, a) => x < 0 || x >= size[a]) ? -1 : ((r[2] * size[1] + r[1]) * size[0] + r[0]) * 4;
   };
-  for (const [key, block] of World.entries()) {
-    const o = at(key.split(',').map(Number));
+  // Only the chunks under the window (core/chunks.js).
+  for (const [c, block] of blocksIn(World, [lo[0], lo[0] + size[0] - 1, lo[2], lo[2] + size[2] - 1])) {
+    const o = at(c);
     if (o < 0) continue;
     const layer = materialLayer(block.materialId), f = MATERIAL_LAYERS.faces[layer];
     data[o] = layer + 1;

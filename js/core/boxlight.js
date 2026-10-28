@@ -31,6 +31,8 @@
 import { World, ModelBoxes, BLOCK_METRES, Y_MIN, Y_MAX, isSolidAt, partAt, blockShape, blockFacing, isDual,
          isSlope } from './world.js';
 import { BOX_CELLS, BOX_METRES } from './boxgrid.js';
+import { windowAxis } from './follow.js';
+import { blocksIn } from './chunks.js';
 import { isGlassMaterial } from './materials.js';
 import { clampLevel, lightRadiusMetres, MAX_LIGHT_LEVEL, DEFAULT_LIGHT_CUTOFF } from './lights.js';
 
@@ -75,7 +77,14 @@ export const boxBit = (i, j, k) => i + BOX_CELLS * (j + BOX_CELLS * k);
 // reach, so a tall one on the highest block keeps its air. box0 is the world
 // box index of local box 0 - block lo's lowest box (blocks hold boxes
 // 3b-1..3b+1).
-export function boxLightRegion(world = World, modelBoxes = ModelBoxes) {
+//
+// A world wider than BOX_LIGHT_MAX_BLOCKS gets a window of that many around
+// focus (a block position; World plan P2a, core/follow.js), kept while focus
+// stays in its middle: prev is the last region's [x, z] first block. Same
+// dims wherever it sits, so moving it rebuilds the cells, not the kernels.
+// bounds: the world's across, for render/features/boxlight.js to tell, each
+// frame, whether the window wants moving without scanning the world.
+export function boxLightRegion(world = World, modelBoxes = ModelBoxes, focus = null, prev = null) {
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
   let y0 = Infinity, y1 = -Infinity;
   for (const key of world.keys()) {
@@ -94,15 +103,17 @@ export function boxLightRegion(world = World, modelBoxes = ModelBoxes) {
   if (x0 > x1) { x0 = z0 = 0; x1 = z1 = 0; }
   if (y0 > y1) { y0 = y1 = 0; }
   const ly = Math.max(Y_MIN, y0 - 1), hy = Math.min(Y_MAX + 1, y1 + 1);
-  const fit = (a, b) => {
+  const fit = (a, b, f, p) => {
     a -= 1; b += 1;
     const n = Math.min(b - a + 1, BOX_LIGHT_MAX_BLOCKS);
-    return [Math.round((a + b) / 2 - (n - 1) / 2), n];
+    if (n === b - a + 1 || f === null || f === undefined) return [Math.round((a + b) / 2 - (n - 1) / 2), n];
+    return [windowAxis(p, f, n, a, b), n];
   };
-  const [lx, nx] = fit(x0, x1), [lz, nz] = fit(z0, z1);
+  const [lx, nx] = fit(x0, x1, focus && focus.x, prev && prev[0]);
+  const [lz, nz] = fit(z0, z1, focus && focus.z, prev && prev[1]);
   const lo = [lx, ly, lz], size = [nx, hy - ly + 1, nz];
   return { lo, size, box0: lo.map(v => BOX_CELLS * v - 1), dims: size.map(v => v * BOX_CELLS),
-           clipped: nx < x1 - x0 + 3 || nz < z1 - z0 + 3 };
+           clipped: nx < x1 - x0 + 3 || nz < z1 - z0 + 3, bounds: { x0, x1, z0, z1 } };
 }
 
 const srgbToLinear = c => {
@@ -158,8 +169,8 @@ export function buildBoxMasks(region, world = World, glassPixels = () => null, m
   const data = new Uint32Array(nx * ny * nz * BOX_BLOCK_U32);
   const tints = [0];
   const touch = [];
-  for (const [key, block] of world.entries()) {
-    const c = key.split(',').map(Number);
+  const box = [region.lo[0], region.lo[0] + nx - 1, region.lo[2], region.lo[2] + nz - 1];
+  for (const [c, block] of blocksIn(world, box)) {
     const l = c.map((v, a) => v - region.lo[a]);
     if (l.some((v, a) => v < 0 || v >= region.size[a])) continue;
     const at = ((l[2] * ny + l[1]) * nx + l[0]) * BOX_BLOCK_U32;

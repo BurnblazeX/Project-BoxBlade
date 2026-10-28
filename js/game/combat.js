@@ -1,5 +1,5 @@
 import { rollD20, rollDice } from './dice.js';
-import { getAbilityModifier, attackRange, getVoxelKey, World, currentArena, findPath, stepLevel } from '../core/world.js';
+import { getAbilityModifier, attackRange, getVoxelKey, World, currentArena, findPath, stepLevel, occupantAt } from '../core/world.js';
 
 export function isInMeleeRange(attacker, defender) {
   return attackRange(attacker.gridPos, defender.gridPos) <= 1;
@@ -66,7 +66,7 @@ export function takeEnemyTurn(enemy, player) {
       const v = World.get(tKey);
       
       // Ensure target is valid and inside the battle arena
-      if (v && v.walkable && !v.occupant && (!currentArena || currentArena.has(tKey))) {
+      if (v && v.walkable && !occupantAt(tKey) && (!currentArena || currentArena.has(tKey))) {
         const path = findPath(enemy.gridPos, target, false); // Movement pathing is still 4-way
         if (path.length > 0 && path.length < shortest) {
           shortest = path.length;

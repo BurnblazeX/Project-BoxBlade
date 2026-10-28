@@ -10,7 +10,7 @@
 // ticks: the tick clock, for the pauses between turns. worldClock: game time,
 // which in battle stands still but for the rounds: 6 s each, counted as each
 // begins (core/clock.js).
-import { World, getVoxelKey, enterBattle, exitBattle, getReachableVoxels, isStandable, BLOCK_METRES } from '../core/world.js';
+import { World, getVoxelKey, enterBattle, exitBattle, getReachableVoxels, isStandable, BLOCK_METRES, occupantAt, setOccupantAt, vacateAt } from '../core/world.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity,
          nextTurn, addParticipant, roundNumber } from './battle.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
@@ -102,8 +102,7 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     let ez = Math.round(enemySprite.position.z / BLOCK_METRES);
 
     if (ex < minX || ex > maxX || ez < minZ || ez > maxZ) {
-      const oldV = World.get(getVoxelKey(ex, enemy.gridPos.y, ez));
-      if (oldV && oldV.occupant === enemy.id) oldV.occupant = null;
+      vacateAt(getVoxelKey(ex, enemy.gridPos.y, ez), enemy.id);
 
       // Clamp to arena edges
       ex = Math.max(minX, Math.min(ex, maxX));
@@ -117,8 +116,8 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
             const cx = ex + dx;
             const cz = ez + dz;
             if (cx >= minX && cx <= maxX && cz >= minZ && cz <= maxZ) {
-              const checkV = World.get(getVoxelKey(cx, enemy.gridPos.y, cz));
-              if (checkV && isStandable(cx, enemy.gridPos.y, cz) && !checkV.occupant) {
+              const checkKey = getVoxelKey(cx, enemy.gridPos.y, cz);
+              if (World.get(checkKey) && isStandable(cx, enemy.gridPos.y, cz) && !occupantAt(checkKey)) {
                 ex = cx;
                 ez = cz;
                 found = true;
@@ -136,8 +135,8 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
     enemy.gridPos.z = ez;
     enemySprite.position.copy(getSpriteWorldPos(enemy.gridPos));
 
-    const newV = World.get(getVoxelKey(ex, enemy.gridPos.y, ez));
-    if (newV) newV.occupant = enemy.id;
+    const newKey = getVoxelKey(ex, enemy.gridPos.y, ez);
+    if (World.get(newKey)) setOccupantAt(newKey, enemy.id);
   }
 
   // Into battle, around the player's chunk. withEnemy (Fight): the enemy is

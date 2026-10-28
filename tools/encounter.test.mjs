@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { file, section, ok } from './lib/harness.mjs';
+import { occupantAt, setOccupantAt } from '../js/core/world.js';
 
 // --- A stand-in DOM: just what ui.js and interaction.js touch ---
 // Every test file runs in one process: put back what is replaced here, at the end.
@@ -86,8 +87,8 @@ section('Fight: the enemy pulled into the arena');
   const bounds = t.calls.find(c => c[0] === 'enter')[1];
   ok('arena is the player\'s chunk', bounds.minX === 0 && bounds.maxX === CHUNK_SIZE - 1, true);
   ok('the enemy is inside it', inChunk(t.enemy.gridPos, bounds), true);
-  ok('and holds its tile there', World.get(getVoxelKey(t.enemy.gridPos.x, t.enemy.gridPos.y, t.enemy.gridPos.z)).occupant, 'e');
-  ok('its old tile is free', World.get(getVoxelKey(25, GROUND_Y, 25)).occupant, null);
+  ok('and holds its tile there', occupantAt(getVoxelKey(t.enemy.gridPos.x, t.enemy.gridPos.y, t.enemy.gridPos.z)), 'e');
+  ok('its old tile is free', occupantAt(getVoxelKey(25, GROUND_Y, 25)), null);
   ok('both fight', t.game.participants.map(p => p.id).sort().join(), 'e,p');
   ok('the enemy stops wandering', t.enemyAI.isPaused, true);
 

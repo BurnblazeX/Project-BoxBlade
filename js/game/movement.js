@@ -7,7 +7,7 @@
 // only ever clears an occupant it owns, so two overlapping briefly never
 // erase each other.
 import * as THREE from 'three/webgpu';
-import { World, getVoxelKey, stepLevel, surfaceHeight, BLOCK_METRES } from '../core/world.js';
+import { World, getVoxelKey, stepLevel, surfaceHeight, BLOCK_METRES, occupantAt, setOccupantAt, vacateAt } from '../core/world.js';
 
 // An entity's gridPos.y is the block it stands ON, so its sprite sits on that
 // block's top face - half a block lower on a half-bottom (world.js).
@@ -31,15 +31,14 @@ export function faceSprite(sprite, isFacingRight) {
 // Off the block it stands on - only if it is the occupant there.
 export function vacate(entity) {
   const p = entity.gridPos;
-  const voxel = World.get(getVoxelKey(p.x, p.y, p.z));
-  if (voxel && voxel.occupant === entity.id) voxel.occupant = null;
+  vacateAt(getVoxelKey(p.x, p.y, p.z), entity.id);
 }
 
 // Onto the block its gridPos names.
 export function occupy(entity) {
   const p = entity.gridPos;
-  const voxel = World.get(getVoxelKey(p.x, p.y, p.z));
-  if (voxel) voxel.occupant = entity.id;
+  const key = getVoxelKey(p.x, p.y, p.z);
+  if (World.get(key)) setOccupantAt(key, entity.id);
 }
 
 // The column the sprite now stands over, if it changed, taken at the level a
@@ -122,8 +121,8 @@ export function walk(entity, sprite, keys, heading, dt) {
   const canWalk = (gx, gz) => {
     const y = levelAt(gx, gz);
     if (y === null) return false;
-    const v = World.get(getVoxelKey(gx, y, gz));
-    return !v.occupant || v.occupant === entity.id;
+    const o = occupantAt(getVoxelKey(gx, y, gz));
+    return !o || o === entity.id;
   };
 
   if (canWalk(nextGX, nextGZ)) {

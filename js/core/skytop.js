@@ -18,6 +18,7 @@
 // (render.js, gpu/volume.js skyOpenTSL).
 import { BLOCK_METRES, Y_MIN, isSlope, blockSpan, blockParts } from './world.js';
 import { isGlassMaterial } from './materials.js';
+import { blocksIn } from './chunks.js';
 
 export const SKY_TOP_STEPS = 16;
 
@@ -37,8 +38,8 @@ export function roofTop(block) {
 // row-major by z (data[z * w + x]). world: a Map of 'x,y,z' -> block.
 export function buildSkyTops(world, origin, size) {
   const out = new Uint16Array(size[0] * size[1]);
-  for (const [key, block] of world.entries()) {
-    const [x, y, z] = key.split(',').map(Number);
+  const box = [origin[0], origin[0] + size[0] - 1, origin[1], origin[1] + size[1] - 1];
+  for (const [[x, y, z], block] of blocksIn(world, box)) {
     const cx = x - origin[0], cz = z - origin[1];
     if (cx < 0 || cz < 0 || cx >= size[0] || cz >= size[1]) continue;
     const hi = roofTop(block);

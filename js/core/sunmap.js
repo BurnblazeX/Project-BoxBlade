@@ -64,8 +64,27 @@ export function sunMapGrid(radius, maxSide) {
   return { side, radius: Math.min(radius, (side * SUN_MAP_TAP_SPACING) / 2) };
 }
 
-// Map sizes a preset may pick: texels a side.
-export const SUN_MAP_SIZES = [1024, 2048];
+// --- Where the map lies, and how fine it is (World plan P2a) ---
+//
+// The map follows the player rather than covering the region. A blocker
+// projects onto the map at the same texel as the shadow it casts, so only the
+// receivers need covering - a square of SUN_MAP_WINDOW either side of the
+// player's projection, the screen and its margins - while the depth range
+// still spans the whole world along the sun. A small world whose projection
+// fits keeps the map fitted to it.
+export const SUN_MAP_WINDOW = 48;
+
+// Its texel: what lets the softening grid reach the cone's full penumbra
+// without spreading its taps - side taps SUN_MAP_TAP_SPACING apart cover
+// side x 0.75 texels, so 1 / side metres a texel reaches 0.75 m. Hard (no
+// grid): the texel lock's 12.5 cm. The size in texels follows from the window.
+export const SUN_MAP_HARD_TEXEL = 0.125;
+export function sunMapTexelFor(side) {
+  return side > 0 ? SUN_PENUMBRA_CAP / ((side * SUN_MAP_TAP_SPACING) / 2) : SUN_MAP_HARD_TEXEL;
+}
+export function sunMapSizeFor(frame, texel) {
+  return Math.min(4096, Math.max(64, Math.ceil((2 * frame.half) / texel)));
+}
 
 // Metres a margin around what is drawn, so the edge of the map is never a
 // surface's edge.
@@ -111,7 +130,12 @@ const norm = v => { const l = Math.hypot(...v); return v.map(x => x / l); };
 //   near, far  its clip range from there
 //   base       under every s in the bounds, so a stored s is never 0 - the
 //              cleared value, which reads as "nothing toward the sun"
-export function sunMapFrame(bounds, sunDirection) {
+// With focus ({ x, y, z } metres) and a world wider than the window, the
+// map follows: half is windowHalf and the centre sits on the focus's
+// projection, snapped to whole texels (texel metres) so the map's grid stays
+// put on the world as it moves and shadow edges do not shimmer. follows says
+// which, and plane is the centre's [right, up] coordinates.
+export function sunMapFrame(bounds, sunDirection, focus = null, windowHalf = SUN_MAP_WINDOW, texel = 0) {
   const L = norm([sunDirection.x ?? sunDirection[0], sunDirection.y ?? sunDirection[1],
                   sunDirection.z ?? sunDirection[2]]);
   const hint = Math.abs(L[1]) > 0.999 ? [0, 0, 1] : [0, 1, 0];
@@ -129,7 +153,26 @@ export function sunMapFrame(bounds, sunDirection) {
   }
   half += MARGIN;
   const eye = hi + MARGIN;
-  return { dir: L, right, up, centre, half, eye, near: 0, far: eye - lo + MARGIN, base: sMin - MARGIN };
+  const fitted = { dir: L, right, up, centre, half, eye, near: 0, far: eye - lo + MARGIN, base: sMin - MARGIN,
+                   follows: false, plane: [dot(centre, right), dot(centre, up)] };
+  if (!focus || half <= windowHalf) return fitted;
+  const f = [focus.x, focus.y, focus.z];
+  const snap = v => (texel > 0 ? Math.round(v / texel) * texel : v);
+  const plane = [snap(dot(f, right)), snap(dot(f, up))];
+  // The new centre: the snapped projection, at the fitted centre's depth along
+  // L - so eye, near and far, measured along L, are unchanged.
+  const along = dot(centre, L);
+  const moved = [0, 1, 2].map(a => right[a] * plane[0] + up[a] * plane[1] + L[a] * along);
+  return { ...fitted, centre: moved, half: windowHalf, follows: true, plane };
+}
+
+// Whether a following map's focus has left the middle of its window - a
+// quarter of the half-window from its centre - and the map wants redrawing.
+export function sunMapMoved(frame, focus, fraction = 0.25) {
+  if (!frame || !frame.follows) return false;
+  const f = [focus.x, focus.y, focus.z];
+  return Math.abs(dot(f, frame.right) - frame.plane[0]) > frame.half * fraction ||
+         Math.abs(dot(f, frame.up) - frame.plane[1]) > frame.half * fraction;
 }
 
 // Metres a map texel covers.

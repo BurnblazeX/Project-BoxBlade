@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
+import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { parseBBModel, placeModel, facePixel, faceSwapped, transformCube, quarterTurn,
          FACE_DIRS, buildModelHits, modelInstanceData, MODEL_HIT_RECORD } from '../js/core/bbmodel.js';
 
@@ -199,7 +200,7 @@ section('wall models hang with their north against the wall');
   }
   ok('no wall, no torch', mountWorldModel(torch, 6, 1, 6, 'N'), null);
   mountWorldModel(torch, 4, 1, 4, 'N');
-  falsy('a torch has no bounds, so the tile under it stays free', !!W.get(key(4, 0, 4)).occupant);
+  falsy('a torch has no bounds, so the tile under it stays free', !!occupantAt(key(4, 0, 4)));
   clearWorldModels();
 }
 

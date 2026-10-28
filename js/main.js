@@ -3,12 +3,12 @@ import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
-         loadLevel, findPath, DEV_LEVEL } from './core/world.js';
+         loadLevel, findPath, DEV_LEVEL, setOccupantAt, vacateAt } from './core/world.js';
 import { createEditor } from './tools/editor.js';
 import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
          updateVoxelVisibility, worldInstancedMesh, glassInstancedMesh, terrainTextures,
-         setShadedAlbedo } from './render/render.js';
+         setShadedAlbedo, followBlockVolume } from './render/render.js';
 import { terrainWhite, terrainTexelTSL } from './gpu/terrain.js';
 import { createWanderAI } from './game/ai.js';
 import { createGameState } from './game/state.js';
@@ -197,7 +197,7 @@ const player = createEntity({
   speed: 6,
   mode: "explore"
 });
-World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z)).occupant = player.id;
+setOccupantAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
 
 const texLoader = new THREE.TextureLoader();
 // A pixel-art sprite texture of its own. Each character needs one so it can flip
@@ -265,7 +265,7 @@ const enemy = createEntity({
   weaponDie: "1d6",
   mode: "explore"
 });
-World.get(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z)).occupant = enemy.id;
+setOccupantAt(getVoxelKey(enemy.gridPos.x, enemy.gridPos.y, enemy.gridPos.z), enemy.id);
 
 const evilBobTexture = texLoader.load(evilBobTextureUrl);
 evilBobTexture.magFilter = THREE.NearestFilter;
@@ -374,8 +374,8 @@ function createTreeAt(gridPos, id) {
   treeMesh.position.copy(getSpriteWorldPos(treeObject.gridPos));
   scene.add(treeMesh);
 
-  const voxel = World.get(getVoxelKey(treeObject.gridPos.x, treeObject.gridPos.y, treeObject.gridPos.z));
-  if (voxel) voxel.occupant = treeObject.id;
+  const treeKey = getVoxelKey(treeObject.gridPos.x, treeObject.gridPos.y, treeObject.gridPos.z);
+  if (World.get(treeKey)) setOccupantAt(treeKey, treeObject.id);
 
   worldObjects.push({ data: treeObject, mesh: treeMesh });
   treeMeshes.push(treeMesh);
@@ -446,7 +446,7 @@ chestSprite.center.set(0.5, 0);
 chestSprite.scale.set(VOXEL_SIZE, VOXEL_SIZE, 1);
 chestSprite.position.copy(getSpriteWorldPos(chest.gridPos));
 scene.add(chestSprite);
-World.get(getVoxelKey(chest.gridPos.x, chest.gridPos.y, chest.gridPos.z)).occupant = chest.id;
+setOccupantAt(getVoxelKey(chest.gridPos.x, chest.gridPos.y, chest.gridPos.z), chest.id);
 worldObjects.push({ data: chest, mesh: chestSprite });
 
 const barrel = createObject({
@@ -461,7 +461,7 @@ const barrel = createObject({
 const barrelSprite = createObjectSprite(0x8b5a2b);
 barrelSprite.position.copy(getSpriteWorldPos(barrel.gridPos));
 scene.add(barrelSprite);
-World.get(getVoxelKey(barrel.gridPos.x, barrel.gridPos.y, barrel.gridPos.z)).occupant = barrel.id;
+setOccupantAt(getVoxelKey(barrel.gridPos.x, barrel.gridPos.y, barrel.gridPos.z), barrel.id);
 worldObjects.push({ data: barrel, mesh: barrelSprite });
 
 // Every world object's data + render node, so battle-arena visibility can be
@@ -936,6 +936,9 @@ function animate(time) {
   resolveTerrainAlbedo();
   cards.update();
   farShadows.update();
+  // The block volume follows the player (World plan P2a): rebuilt only when
+  // its window moves, never for a world that fits it.
+  followBlockVolume(fieldFocus());
   sky.update(ticks.alpha);
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
@@ -1136,7 +1139,8 @@ const sun = engine.add(createSun({
   reorigin: () => { shadowOrigins = []; }
 }));
 // The sun depth map: the sun's shadow past its march (core/sunmap.js).
-const farShadows = engine.add(createSunMap({ renderer, sunLight: dirLight, shadowsOn: () => shadowsOn }));
+const farShadows = engine.add(createSunMap({ renderer, sunLight: dirLight, shadowsOn: () => shadowsOn,
+                                             focus: () => fieldFocus() }));
 // Before the GI: it is handed their card types.
 const cards = engine.add(createCards({
   renderer, camera, pivot, sunLight: dirLight, sunAngular: () => sun.angular,
@@ -1188,7 +1192,8 @@ const smoke = engine.add(createSmoke({
 // Basic mode's light: sun shadows and lamps on the BoxGrid, with the advanced
 // effects off.
 const boxLight = engine.add(createBoxLight({
-  renderer, shadowsOn: () => shadowsOn, lighting, cards, sunLight: dirLight, ambientLight, smoke
+  renderer, shadowsOn: () => shadowsOn, lighting, cards, sunLight: dirLight, ambientLight, smoke,
+  focus: () => fieldFocus()
 }));
 const debugView = engine.add(createDebugView({
   shadowsOn: () => shadowsOn, shadows: () => bxbApi.shadows(), rebuild: () => buildPerPixelShadows()
@@ -1843,11 +1848,10 @@ const bxbApi = installConsole(createConsole({
     run: (x, z, y) => {
       const top = (y === undefined || y === null) ? getColumnTop(x, z) : y;
       if (top === null || top === undefined) return 'no standable surface at ' + x + ',' + z;
-      const old = World.get(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z));
-      if (old && old.occupant === player.id) old.occupant = null;
+      vacateAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
       player.gridPos.x = x; player.gridPos.y = top; player.gridPos.z = z;
-      const next = World.get(getVoxelKey(x, top, z));
-      if (next) next.occupant = player.id;
+      const nextKey = getVoxelKey(x, top, z);
+      if (World.get(nextKey)) setOccupantAt(nextKey, player.id);
       playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
       game.path = [];
       return 'teleported to ' + x + ',' + top + ',' + z;

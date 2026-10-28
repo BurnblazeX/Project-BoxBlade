@@ -43,6 +43,7 @@
 import * as THREE from 'three/webgpu';
 import { Fn, mix, vec3, float, max, select } from 'three/tsl';
 import { boxLightRegion, buildBoxMasks, buildBoxCells } from '../../core/boxlight.js';
+import { windowAxis } from '../../core/follow.js';
 import { LIGHT_VEC4S } from '../../core/lights.js';
 import { materialLayer } from '../../core/materials.js';
 import { createBoxLightBinding, createBoxLightKernels, boxLightAtTSL } from '../../gpu/boxlight.js';
@@ -67,7 +68,8 @@ const SUN_STEP = Math.cos(0.01);
 const AMBIENT_DIFFUSE = 0.95;
 
 export function createBoxLight({ renderer, shadowsOn, lighting, cards, sunLight, ambientLight,
-                                 smoke = { version: () => 0, growing: () => false } }) {
+                                 smoke = { version: () => 0, growing: () => false },
+                                 focus = () => null }) {
   const binding = createBoxLightBinding();
   let on = true;
   let gpu = null;
@@ -96,7 +98,8 @@ export function createBoxLight({ renderer, shadowsOn, lighting, cards, sunLight,
 
   function build() {
     const t0 = performance.now();
-    const region = boxLightRegion();
+    const prev = info ? [info.region.lo[0], info.region.lo[2]] : null;
+    const region = boxLightRegion(undefined, undefined, focus(), prev);
     const masks = buildBoxMasks(region, undefined, glassPixels);
     const { cells, top } = buildBoxCells(region, masks);
     const cb = cardBindings();
@@ -117,7 +120,10 @@ export function createBoxLight({ renderer, shadowsOn, lighting, cards, sunLight,
     gpu.write(masks, cells, top);
     binding.box0.value.set(...region.box0);
     binding.dims.value.set(...region.dims);
-    if (region.clipped) console.warn(`[boxlight] the world is wider than ${region.size[0]} x ${region.size[2]} blocks: past it, no box light`);
+    if (region.clipped && !(info && info.region.clipped)) {
+      console.log(`[boxlight] the world is wider than ${region.size[0]} x ${region.size[2]} blocks: ` +
+                  'the box light follows the player');
+    }
     info = { region, cells: cells.length, glass: (masks.tints.length - 1) / 27, ms: performance.now() - t0 };
     dirty.clear = dirty.static = dirty.sun = dirty.lamps = true;
     built = true;
@@ -213,6 +219,16 @@ export function createBoxLight({ renderer, shadowsOn, lighting, cards, sunLight,
     const cb = cardBindings();
     if (built && ((!builtWithTextures && terrainTextures.ready) ||
                   gpu.cards.sun !== cb.sun || gpu.cards.light !== cb.light)) built = false;
+    if (built && info && info.region.clipped) {
+      // A world wider than the window: does the window want moving? From the
+      // bounds measured at the build - no scan of the world a frame.
+      const f = focus(), r = info.region, b = r.bounds;
+      if (f) {
+        const x = windowAxis(r.lo[0], f.x, r.size[0], b.x0 - 1, b.x1 + 1);
+        const z = windowAxis(r.lo[2], f.z, r.size[2], b.z0 - 1, b.z1 + 1);
+        if (x !== r.lo[0] || z !== r.lo[2]) built = false;
+      }
+    }
     if (!built) build();
     // Made again when the sprites' cards arrive (the contact AO reads them).
     if (!material || materialCards !== aoCards()) {
