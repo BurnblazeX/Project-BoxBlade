@@ -22,6 +22,10 @@
 const BASE = {
   gimode: 'lpv', gi: true, gires: 1, gibounces: 2, giiter: 8, gislices: 4, gifar: true,
   soften: 'cone', sunfar: 36, aodist: 1,
+  // Long shadows (core/sunmap.js): the soft march (the cone's penumbra, the
+  // wanted look) runs this far, the sun depth map takes over past it -
+  // softened inside C2 by a grid of bilinear taps, hard past it.
+  sunreach: 'c1', farshadow: 4, farsize: 1024,
   reflect: true, reflectbounces: 2, spec: true,
   mirrors: true, glassglare: 1, caustics: 1,
   glasslayers: 2, glassbounces: 4, dispersion: false,
@@ -43,11 +47,13 @@ export const PRESETS = {
     values: { ...BASE, gibounces: 1, giiter: 4, gislices: 8,
               reflect: false, reflectbounces: 1, mirrors: false, glassglare: 0, caustics: 0,
               glasslayers: 1, glassbounces: 2,
-              budget: 2, cardbudget: 1, hitbudget: 1, mirrorbudget: 0, sunfar: 24, aodist: 0.75 }
+              budget: 2, cardbudget: 1, hitbudget: 1, mirrorbudget: 0, sunfar: 24, aodist: 0.75,
+              sunreach: '12m', farshadow: 'hard' }
   },
   original: {
     label: 'Original', target: '400+ fps',
-    help: 'the default advanced effects: LPV GI (2 cells a block near, 1 far), two bounces',
+    help: 'the default advanced effects: LPV GI (2 cells a block near, 1 far), two bounces, ' +
+          'soft sun march through C1, longer shadows from a smoothed sun map',
     effects: true, values: { ...BASE }
   },
   high: {
@@ -57,7 +63,7 @@ export const PRESETS = {
     effects: true,
     values: { ...BASE, gires: 1.5, gibounces: 3, gifar: false, aodist: 1.25,
               reflectbounces: 3, glasslayers: 3, glassbounces: 6, dispersion: true, sunfar: 54,
-              hitbudget: 8, mirrorbudget: 8 }
+              hitbudget: 8, mirrorbudget: 8, farshadow: 6, farsize: 2048 }
   },
   ultra: {
     label: 'Ultra', target: '120+ fps',
@@ -65,7 +71,7 @@ export const PRESETS = {
     effects: true,
     values: { ...BASE, gimode: 'texel', gibounces: 3, gifar: false, aodist: 1.5,
               reflectbounces: 4, glasslayers: 4, glassbounces: 8, dispersion: true, sunfar: 72,
-              hitbudget: 16, mirrorbudget: 16,
+              hitbudget: 16, mirrorbudget: 16, farshadow: 8, farsize: 2048,
               gireach: 16, gidirectevery: 2 }
   }
 };

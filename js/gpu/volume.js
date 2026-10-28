@@ -46,7 +46,8 @@ export function skyOpenTSL(terrain, p) {
   const vol = terrain.blocks;
   const col = round(vec2(p.x, p.z).div(float(BLOCK_METRES))).sub(vec2(vol.origin.x, vol.origin.z));
   const uv = col.add(float(0.5)).div(vec2(vol.size.x, vol.size.z)).toVar();
-  const code = round(texture(terrain.skyTop, uv).level(int(0)).r.mul(float(255))).toVar();
+  const rg = texture(terrain.skyTop, uv).level(int(0));
+  const code = round(rg.r.mul(float(255))).add(round(rg.g.mul(float(255))).mul(float(256))).toVar();
   const top = code.sub(float(1)).div(float(SKY_TOP_STEPS)).add(float(Y_MIN - 0.5)).mul(float(BLOCK_METRES));
   const outside = uv.x.lessThan(float(0)).or(uv.y.lessThan(float(0)))
     .or(uv.x.greaterThan(float(1))).or(uv.y.greaterThan(float(1)));

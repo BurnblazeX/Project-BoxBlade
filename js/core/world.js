@@ -5,9 +5,12 @@ import { rectCovered } from './rects.js';
 export const World = new Map();
 
 // --- CHUNK / VERTICAL LAYOUT ---
-// A chunk is 12x12 blocks in footprint and 12 blocks tall: 3 below ground,
-// ground level itself, and 8 above. Ground is y = 0, so the vertical span is
-// -3 .. 8 inclusive (12 distinct levels).
+// A chunk is 12x12 blocks in footprint and 48 blocks tall: 8 below ground,
+// ground level itself, and 39 above (60 m) - room for a church on its hill,
+// the cliff under it and the riverbed (World plan P1). Ground is y = 0, so the
+// vertical span is -8 .. 39 inclusive. Until 2026-10-28 it was -3 .. 8, 12
+// levels, the height of one field cube; the field now follows the player up
+// and down instead (core/field.js gridOriginFor).
 // One block is 1.5 m on a side. This is a property of the world, not of the
 // renderer, and core/field.js needs it without pulling Three.js in - so it lives
 // here and render.js aliases it as VOXEL_SIZE.
@@ -18,9 +21,9 @@ export const GROUND_Y = 0;
 // This is not a sandbox game: there is no terrain below the surface unless a
 // map actually goes down there, in which case the author places floors and
 // walls explicitly. Nothing is generated underground.
-export const Y_MIN = -3;
-export const Y_MAX = 8;
-export const CHUNK_HEIGHT = Y_MAX - Y_MIN + 1; // 12
+export const Y_MIN = -8;
+export const Y_MAX = 39;
+export const CHUNK_HEIGHT = Y_MAX - Y_MIN + 1; // 48
 
 export function getVoxelKey(x, y, z) {
   return `${Math.round(x)},${Math.round(y)},${Math.round(z)}`;
@@ -478,6 +481,12 @@ export function removeWorldModel(entry) {
 //     models: [[name, x, y, z, yaw], ...]            standing on block (x, y, z)
 //             [[name, x, y, z, 0, wall], ...] }      hung in cell (x, y, z)
 export const LEVEL_FORMAT = 'boxblade-level';
+
+// The Dev Level (levels/dev_level.json): the test map every feature through
+// A10 was built and measured on - the church, the glass bed, the torches. The
+// game loads it and the editor saves to it, until regions (World plan P2)
+// bring a level per region.
+export const DEV_LEVEL = 'dev_level';
 
 // second: a dual block's other half's material (isDual) - kept only for a
 // shape that has another half.

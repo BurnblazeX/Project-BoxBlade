@@ -13,8 +13,8 @@ createTestArea(36, 36);
 section('layout constants');
 ok('block is 1.5m', BLOCK_METRES, 1.5);
 ok('chunk footprint is 12', CHUNK_SIZE, 12);
-ok('chunk is 12 levels tall', CHUNK_HEIGHT, 12);
-ok('authorable span is -3..8', `${Y_MIN}..${Y_MAX}`, '-3..8');
+ok('chunk is 48 levels tall', CHUNK_HEIGHT, 48);
+ok('authorable span is -8..39', `${Y_MIN}..${Y_MAX}`, '-8..39');
 
 section('generation - surface only, no sandbox fill');
 // + 12: the glass test bed (a cube, a 3 x 2 window, a 2 x 2 stained window,
@@ -245,7 +245,7 @@ World.get('9,0,8').occupant = null;
 section('battle arena carves a full chunk');
 const { arena, bounds } = enterBattle({x:8,y:0,z:8});
 ok('arena covers the chunk footprint', arena.size, 12 * 12);
-ok('arena spans the full vertical range', `${bounds.minY}..${bounds.maxY}`, '-3..8');
+ok('arena spans the full vertical range', `${bounds.minY}..${bounds.maxY}`, '-8..39');
 truthy('reachable set stays on one level',
   [...getReachableVoxels({x:8,y:0,z:8}, 3).keys()].every(k => k.split(',')[1] === '0'));
 exitBattle();

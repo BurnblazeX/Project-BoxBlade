@@ -186,7 +186,7 @@ const cachedGrids = [];
 function beginRebuild(scene, origin, mode, sunDirection, bias) {
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const o = l === 0 ? origin : gridOriginFor(mode, pendingPlayer, sunDirection, bias, l);
-    cachedGrids[l] = createFieldAt(o.x, o.z, cachedGrids[l] || null, l);
+    cachedGrids[l] = createFieldAt(o.x, o.z, cachedGrids[l] || null, l, o.y);
   }
   cachedGrid = cachedGrids[0];
   // Each level is clipped by the one finer than it, so the ladder subtracts all
@@ -288,7 +288,8 @@ export function refreshFieldDebug(scene, playerGridPos, mode = 'explore',
 
   const { sunDirection = null, bias = SUN_BIAS_BLOCKS } = opts;
   const origin = originFor(mode, playerGridPos, sunDirection, bias);
-  if (currentOrigin && origin.x === currentOrigin.x && origin.z === currentOrigin.z) return false;
+  if (currentOrigin && origin.x === currentOrigin.x && origin.y === currentOrigin.y &&
+      origin.z === currentOrigin.z) return false;
   pendingPlayer = playerGridPos;
   beginRebuild(scene, origin, mode, sunDirection, bias);
   return true;

@@ -14,6 +14,7 @@ import { createPointLightsTSL } from './pointlights.js';
 import { smokeShared, smokeSampleTSL, smokeSunTransmitTSL } from './smokeshadow.js';
 import { sunColourUniform, skyShTSL } from './sky.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
+import { sunMapFarTSL } from './sunmap.js';
 import { createConeTraceSunTSL } from './trace.js';
 import { volumeAtTSL, skyOpenTSL } from './volume.js';
 import { BLOCK_METRES } from '../core/world.js';
@@ -354,7 +355,9 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
   const giSunShadow = (p, n) => {
     const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
     const traced = coneTrace(origin, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
-    const vis = traced.x.mul(sunRoofTSL(terrain, origin, sun.dir, sunReach));
+    // The far map, hard: the bounce under a long shadow is dark too.
+    const vis = traced.x.mul(sunRoofTSL(terrain, origin, sun.dir, sunReach))
+      .mul(sunMapFarTSL(origin, sunReach, fadeStart, sun.coneRadius, float(0)));
     return glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir).mul(vis) : vis;
   };
   const mirrorLight = terrain && mirrors
@@ -404,6 +407,8 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
               const through = glass ? glassRayTransmitTSL(glass, traced, origin, sun.dir)
                                     : vec3(1, 1, 1);
               sunLit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, origin, sun.dir, sunReach))
+                                               .mul(sunMapFarTSL(origin, sunReach, fadeStart, sun.coneRadius,
+                                                                 float(0)))
                                                .mul(ndotl).mul(u.sunGain)));
             });
             const lit = sunColourUniform.mul(sunLit).add(pointLights(p, n, NO_SKIP, n)).toVar();

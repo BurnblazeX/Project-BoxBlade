@@ -9,10 +9,11 @@ import { isGlassMaterial } from './materials.js';
 // texel, no second resolution to tune. A shadow edge can only be as fine as the
 // voxel that occluded it, so this is where the pixelation of the lighting lives.
 //
-// C0 is sized to exactly one chunk: 12 blocks x 12 texels = 144 on every axis,
-// vertically covering the full authorable range (Y_MIN .. Y_MAX, 12 levels).
-// A single-chunk encounter therefore has no cascade boundary anywhere in the
-// playable area.
+// C0 is sized to exactly one chunk: 12 blocks x 12 texels = 144 on every axis.
+// Until the world grew to 48 levels (2026-10-28) that cube also spanned the
+// whole authorable height; now it is a 12-block window that follows the player
+// up and down as it follows them across (gridOriginFor), and only the coarsest
+// level spans the full height.
 //
 // Dense Uint8Array for now, per the doc's "start dense single-grid and add
 // cascades on hitting the wall". 144^3 at one byte is ~2.99 MB, which is well
@@ -84,11 +85,39 @@ export function cascadeRangeVoxels(level) {
   return DISTANCE_RANGE_METRES / cascadeVoxelMetres(level);
 }
 
-if (CHUNK_HEIGHT * TEXELS_PER_BLOCK !== GRID_DIM) {
-  // Guards the 1:1 lock: the vertical span must produce the same voxel count as
-  // the footprint, or C0 stops being a cube and the cascade math in the design
-  // doc no longer holds.
-  throw new Error(`field is not cubic: ${GRID_DIM} wide but ${CHUNK_HEIGHT * TEXELS_PER_BLOCK} tall`);
+// Every level is a 144-voxel cube; the world is taller than the fine ones. The
+// coarsest must still hold the whole height, so a ray that leaves its top has
+// truly left the world and the one that leaves its bottom has hit the floor of
+// it - C2 at 3 voxels a block is 48 blocks tall, exactly the 48 levels.
+if (GRID_DIM / cascadeVoxelsPerBlock(CASCADE_COUNT - 1) < CHUNK_HEIGHT) {
+  throw new Error(`the coarsest field level is ${GRID_DIM / cascadeVoxelsPerBlock(CASCADE_COUNT - 1)} ` +
+                  `blocks tall, short of the world's ${CHUNK_HEIGHT}`);
+}
+
+// --- Where each level sits vertically ---
+//
+// The blocks each level keeps below the player's standing level; the rest of
+// its height is above. C0 keeps the old fixed layout's 3 below and 8 above, so
+// flat ground at y 0 is lit exactly as it was when that layout was the whole
+// world. C1 keeps 8 below - a cliff edge looks down a long way. Above, because
+// that is where the sun's casters are. The coarsest level ignores this: it
+// holds the whole height and sits at Y_MIN.
+export const CASCADE_BELOW = [3, 8, 12];
+
+// Where a level's floor sat before the field followed the player: ground level
+// minus three, the old Y_MIN. What createFieldAt assumes when no floor is
+// given (the tests, and anything that only cares about the ground).
+export const FIELD_FLOOR_DEFAULT = -3;
+
+// A level's floor block for a player standing on level y: CASCADE_BELOW under
+// them, snapped to the level's stride as x and z are, and clamped so the
+// window never leaves Y_MIN .. Y_MAX.
+export function cascadeFloorFor(y, level) {
+  const blocks = cascadeBlocks(level), snap = 1 << level;
+  const top = Y_MIN + CHUNK_HEIGHT - blocks;
+  if (top <= Y_MIN) return Y_MIN;
+  const floor = Math.round((y - CASCADE_BELOW[level]) / snap) * snap;
+  return Math.max(Y_MIN, Math.min(top, floor));
 }
 
 // --- Two distances per voxel ---
@@ -121,8 +150,11 @@ function blockMinCorner(b) {
 // The grid covers a 12x12 block footprint, but WHERE that footprint sits is the
 // caller's choice - see gridOriginFor(). Pass an existing grid as `reuse` to
 // repopulate it in place: the occupancy buffer is ~3 MB, so reallocating it
-// every time the origin moves is a visible hitch for no reason.
-export function createFieldAt(originBlockX, originBlockZ, reuse = null, level = 0) {
+// every time the origin moves is a visible hitch for no reason. originBlockY
+// is the level's floor block (gridOriginFor's y); it comes last because most
+// callers before the 48-level world had none to give.
+export function createFieldAt(originBlockX, originBlockZ, reuse = null, level = 0,
+                              originBlockY = FIELD_FLOOR_DEFAULT) {
   const grid = reuse || {
     data: new Uint8Array(GRID_DIM * GRID_DIM * GRID_DIM * FIELD_CHANNELS),
     dim: GRID_DIM,
@@ -130,8 +162,8 @@ export function createFieldAt(originBlockX, originBlockZ, reuse = null, level = 
     voxelsPerBlock: cascadeVoxelsPerBlock(level),
     voxelSize: cascadeVoxelMetres(level),
     range: cascadeRangeVoxels(level),
-    origin: { x: 0, y: blockMinCorner(Y_MIN), z: 0 },
-    originBlock: { x: 0, y: Y_MIN, z: 0 }
+    origin: { x: 0, y: blockMinCorner(originBlockY), z: 0 },
+    originBlock: { x: 0, y: originBlockY, z: 0 }
   };
   // A RE-ORIGIN IS A SCROLL, NOT A REBAKE.
   //
@@ -151,19 +183,22 @@ export function createFieldAt(originBlockX, originBlockZ, reuse = null, level = 
   // footprint decides is only which voxels EXIST, not what they mean.
   const prior = grid.filledBlocks ? grid.originBlock : null;
   const dx = prior ? originBlockX - prior.x : 0;
+  const dy = prior ? originBlockY - prior.y : 0;
   const dz = prior ? originBlockZ - prior.z : 0;
   const per = grid.voxelsPerBlock || TEXELS_PER_BLOCK;
 
   grid.origin.x = blockMinCorner(originBlockX);
+  grid.origin.y = blockMinCorner(originBlockY);
   grid.origin.z = blockMinCorner(originBlockZ);
   grid.originBlock.x = originBlockX;
+  grid.originBlock.y = originBlockY;
   grid.originBlock.z = originBlockZ;
 
-  const sx = dx * per, sz = dz * per;
-  const slid = prior && (sx !== 0 || sz !== 0) &&
-               Math.abs(sx) < GRID_DIM && Math.abs(sz) < GRID_DIM;
+  const sx = dx * per, sy = dy * per, sz = dz * per;
+  const slid = prior && (sx !== 0 || sy !== 0 || sz !== 0) &&
+               Math.abs(sx) < GRID_DIM && Math.abs(sy) < GRID_DIM && Math.abs(sz) < GRID_DIM;
   if (slid) {
-    const strips = ringScroll(grid, sx, sz);
+    const strips = ringScroll(grid, sx, sz, sy);
     populateDistanceField(grid, strips);
     // What the GPU copy has to be told about - see followShadowGrid.
     grid.uploadRects = strips;
@@ -182,10 +217,10 @@ export function createFieldAt(originBlockX, originBlockZ, reuse = null, level = 
     //   destroys the imprint of any proxy standing there - without that proxy
     //   having moved, so nothing else would notice. Hand the strips over and
     //   applyOccluders re-writes whatever they touched.
-    translateOccluderBoxes(grid, sx, sz);
+    translateOccluderBoxes(grid, sx, sz, sy);
     grid.scrollStrips = strips;
   }
-  else if (prior && sx === 0 && sz === 0) {
+  else if (prior && sx === 0 && sy === 0 && sz === 0) {
     populateDistanceField(grid, []);
     grid.uploadRects = [];
   }
@@ -248,15 +283,15 @@ export function unpackRects(grid, rects, buf) {
 }
 
 // Worker side: re-origin the mirror and describe the result.
-export function scrollForHandoff(grid, x, z) {
-  createFieldAt(x, z, grid, grid.level);
+export function scrollForHandoff(grid, x, z, y = grid.originBlock.y) {
+  createFieldAt(x, z, grid, grid.level, y);
   // null means the mirror did a full rebake - a jump too far to slide - so the
   // whole grid goes back, still in logical order.
   const full = grid.uploadRects === null;
   const rects = full
     ? [{ x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM }]
     : grid.uploadRects;
-  return { x, z, full, rects, data: packRects(grid, rects),
+  return { x, y, z, full, rects, data: packRects(grid, rects),
            occupiedCount: grid.occupiedCount, filledBlocks: grid.filledBlocks,
            glassBlocks: grid.glassBlocks };
 }
@@ -268,10 +303,14 @@ export function scrollForHandoff(grid, x, z) {
 // reset starts at zero), which is why the strips travel in logical order.
 export function applyHandoff(grid, m) {
   const per = grid.voxelsPerBlock || TEXELS_PER_BLOCK;
+  const my = m.y ?? grid.originBlock.y;
   const sx = (m.x - grid.originBlock.x) * per, sz = (m.z - grid.originBlock.z) * per;
+  const sy = (my - grid.originBlock.y) * per;
   grid.origin.x = blockMinCorner(m.x);
+  grid.origin.y = blockMinCorner(my);
   grid.origin.z = blockMinCorner(m.z);
   grid.originBlock.x = m.x;
+  grid.originBlock.y = my;
   grid.originBlock.z = m.z;
   grid.occupiedCount = m.occupiedCount;
   grid.filledBlocks = m.filledBlocks;
@@ -283,18 +322,18 @@ export function applyHandoff(grid, m) {
     grid.scrollStrips = null;
     return grid;
   }
-  ringScroll(grid, sx, sz);
+  ringScroll(grid, sx, sz, sy);
   unpackRects(grid, m.rects, m.data);
-  translateOccluderBoxes(grid, sx, sz);
+  translateOccluderBoxes(grid, sx, sz, sy);
   grid.scrollStrips = m.rects;
   grid.uploadRects = m.rects;
   return grid;
 }
 
-export function translateOccluderBoxes(grid, sx, sz) {
+export function translateOccluderBoxes(grid, sx, sz, sy = 0) {
   const boxes = grid.occluderBoxes;
   if (!boxes) return;
-  for (const b of boxes.values()) { b.cx -= sx; b.cz -= sz; }
+  for (const b of boxes.values()) { b.cx -= sx; b.cy -= sy; b.cz -= sz; }
 }
 
 // Slide the field by (sx, sz) voxels and report what scrolled in.
@@ -376,9 +415,11 @@ export function gridOriginFor(mode, gridPos, sunDirection = null,
     // centres on the same arena rather than aligning to it - padding out equally
     // on all sides keeps the arena in the middle of every level, which is what
     // makes a battle's lighting stable for its whole duration.
-    if (level === 0) return { x: cx, z: cz };
+    // Vertically the arena sits where the fight is, as explore's levels do.
+    const y = cascadeFloorFor(gridPos.y ?? 0, level);
+    if (level === 0) return { x: cx, y, z: cz };
     const pad = (cascadeBlocks(level) - CHUNK_SIZE) / 2;
-    return { x: cx - pad, z: cz - pad };
+    return { x: cx - pad, y, z: cz - pad };
   }
   const half = Math.floor(cascadeBlocks(level) / 2);
 
@@ -425,6 +466,7 @@ export function gridOriginFor(mode, gridPos, sunDirection = null,
   const snap = 1 << level;
   return {
     x: Math.round(x / snap) * snap,
+    y: cascadeFloorFor(gridPos.y ?? 0, level),
     z: Math.round(z / snap) * snap
   };
 }
@@ -437,21 +479,23 @@ export function voxelIndex(vx, vy, vz) {
 
 // --- The ring ---
 //
-// X and Z are stored as a ring buffer: logical voxel v lives at physical
+// Every axis is stored as a ring buffer: logical voxel v lives at physical
 // (v + ring) mod GRID_DIM. A re-origin then moves the ring instead of the data,
 // so a step writes only the strip that scrolled in - on the CPU AND in the GPU
 // upload, which used to be all 3 MB of every level on every block stepped. Y
-// never scrolls, so it is not ringed. The shader applies the same offset and
-// samples with repeat wrapping, so filtering across the physical seam reads the
-// logical neighbour.
+// joined X and Z when the world grew taller than a level (2026-10-28): a step
+// up or down a block is a y strip, as a step across is an x or z one. The
+// shader applies the same offset and samples with repeat wrapping, so
+// filtering across the physical seam reads the logical neighbour.
 //
 // Everything that indexes grid.data by logical coordinate goes through
 // gridIndex; the hot loops walk ringSegments so their idx++ never crosses the
 // physical seam.
 export function gridIndex(grid, vx, vy, vz) {
   let px = vx + (grid.ringX || 0); if (px >= GRID_DIM) px -= GRID_DIM;
+  let py = vy + (grid.ringY || 0); if (py >= GRID_DIM) py -= GRID_DIM;
   let pz = vz + (grid.ringZ || 0); if (pz >= GRID_DIM) pz -= GRID_DIM;
-  return px + vy * GRID_DIM + pz * GRID_DIM * GRID_DIM;
+  return px + py * GRID_DIM + pz * GRID_DIM * GRID_DIM;
 }
 
 // A logical x range [x0, x1] inclusive, as at most two runs that are each
@@ -462,7 +506,13 @@ export function ringSegments(grid, x0, x1) {
   return [[x0, cut - 1], [cut, x1]];
 }
 
-// The same for z, for the GPU strip copy, which needs physical boxes.
+// The same for y and z, for the GPU strip copy, which needs physical boxes.
+export function ringSegmentsY(grid, y0, y1) {
+  const cut = GRID_DIM - (grid.ringY || 0);
+  if (y1 < cut || y0 >= cut) return [[y0, y1]];
+  return [[y0, cut - 1], [cut, y1]];
+}
+
 export function ringSegmentsZ(grid, z0, z1) {
   const cut = GRID_DIM - (grid.ringZ || 0);
   if (z1 < cut || z0 >= cut) return [[z0, z1]];
@@ -472,14 +522,17 @@ export function ringSegmentsZ(grid, z0, z1) {
 const wrap = v => ((v % GRID_DIM) + GRID_DIM) % GRID_DIM;
 
 // The ring's scroll: new[v] = old[v + s] with no data moved, and the same dirty
-// strips scrollField reports.
-export function ringScroll(grid, sx, sz) {
+// strips scrollField reports - plus a y strip when the level moved vertically.
+export function ringScroll(grid, sx, sz, sy = 0) {
   grid.ringX = wrap((grid.ringX || 0) + sx);
+  grid.ringY = wrap((grid.ringY || 0) + sy);
   grid.ringZ = wrap((grid.ringZ || 0) + sz);
   const rects = [];
   const full = { x0: 0, x1: GRID_DIM, y0: 0, y1: GRID_DIM, z0: 0, z1: GRID_DIM };
   if (sx > 0) rects.push({ ...full, x0: GRID_DIM - sx });
   else if (sx < 0) rects.push({ ...full, x1: -sx });
+  if (sy > 0) rects.push({ ...full, y0: GRID_DIM - sy });
+  else if (sy < 0) rects.push({ ...full, y1: -sy });
   if (sz > 0) rects.push({ ...full, z0: GRID_DIM - sz });
   else if (sz < 0) rects.push({ ...full, z1: -sz });
   return rects;

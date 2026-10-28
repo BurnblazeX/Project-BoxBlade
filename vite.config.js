@@ -25,7 +25,7 @@ function levelsPlugin() {
           return res.end(fs.readFileSync(file));
         }
         if (url.pathname !== '/__levels') return next();
-        const name = url.searchParams.get('name') || 'default';
+        const name = url.searchParams.get('name') || 'dev_level';
         if (req.method !== 'POST' || !LEVEL_NAME.test(name)) { res.statusCode = 400; return res.end('bad request'); }
         let body = '';
         req.on('data', c => { body += c; if (body.length > 32e6) req.destroy(); });

@@ -1,9 +1,11 @@
 import { file, section, ok, near, truthy, falsy, inRange, note } from './lib/harness.mjs';
-import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE } from '../js/core/world.js';
+import { createTestArea, World, getVoxelKey, BLOCK_METRES, CHUNK_SIZE, Y_MIN, Y_MAX, CHUNK_HEIGHT } from '../js/core/world.js';
 import { CASCADE_COUNT, cascadeVoxelsPerBlock, cascadeVoxelMetres, cascadeBlocks,
          cascadeExtentMetres, cascadeRangeVoxels, DISTANCE_RANGE_METRES,
          createField, createFieldAt, gridOriginFor, GRID_DIM, VOXEL_METRES, TEXELS_PER_BLOCK, worldToVoxel,
-         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow } from '../js/core/field.js';
+         voxelCentreToWorld, isOccupied, inBounds, marchOccupancy, isInShadow,
+         cascadeFloorFor, CASCADE_BELOW, gridIndex, FIELD_CHANNELS, scrollForHandoff,
+         applyHandoff } from '../js/core/field.js';
 
 file('field.test.mjs - occupancy grid and DDA traversal');
 
@@ -41,9 +43,9 @@ ok('a neighbouring chunk picks up only its slice of the x=20 wall',
    createField(1, 0).occupiedCount, 144 * HALF + 8 * FULL);
 
 section('grid origin follows the mode');
-ok('battle snaps to the chunk', JSON.stringify(gridOriginFor('battle', { x: 20, z: 10 })), '{"x":12,"z":0}');
+ok('battle snaps to the chunk', JSON.stringify(gridOriginFor('battle', { x: 20, z: 10 })), '{"x":12,"y":-3,"z":0}');
 ok('explore centres on the player when no sun is given',
-   JSON.stringify(gridOriginFor('explore', { x: 20, z: 10 })), '{"x":14,"z":4}');
+   JSON.stringify(gridOriginFor('explore', { x: 20, z: 10 })), '{"x":14,"y":-3,"z":4}');
 // --- Leaning the footprint up-sun ---
 //
 // A shadow ray travels TOWARD the sun, so every occluder that can darken ground
@@ -65,7 +67,7 @@ ok('explore centres on the player when no sun is given',
   ]) {
     const o = gridOriginFor('explore', P, dir, 2);
     ok(`a sun toward ${label} leans the footprint that way`,
-       JSON.stringify(o), JSON.stringify({ x: centred.x + dx, z: centred.z + dz }));
+       JSON.stringify(o), JSON.stringify({ x: centred.x + dx, y: centred.y, z: centred.z + dz }));
   }
   // Elevation must not change it: these differ only in height.
   ok('the lean ignores the sun elevation',
@@ -119,7 +121,8 @@ ok('explore centres on the player when no sun is given',
 ok('an explore-centred grid holds the same block count as a chunk-aligned one',
    createFieldAt(0, 0).occupiedCount, createField(0, 0).occupiedCount);
 truthy('a player-centred grid puts the player near the middle',
-   (() => { const g = createFieldAt(...Object.values(gridOriginFor('explore', { x: 20, z: 10 })));
+   (() => { const o = gridOriginFor('explore', { x: 20, z: 10 });
+            const g = createFieldAt(o.x, o.z, null, 0, o.y);
             const v = worldToVoxel(g, 20 * BLOCK_METRES, 0.75, 10 * BLOCK_METRES);
             return v.vx > 60 && v.vx < 84 && v.vz > 60 && v.vz < 84; })());
 
@@ -395,4 +398,87 @@ section('placed models bake as their cubes');
   clearWorldModels();
   falsy('cleared, it is free again', !!World.get('5,0,5').occupant);
   truthy('and standable', standable(5, 0, 5));
+}
+
+// --- 48 levels: the field follows the player up and down (World plan P1) ---
+section('48 levels: each level a window that climbs with the player');
+{
+  ok('the world is 48 levels, -8 .. 39', `${CHUNK_HEIGHT} ${Y_MIN}..${Y_MAX}`, '48 -8..39');
+  ok('the coarsest level holds all of it', cascadeBlocks(CASCADE_COUNT - 1) >= CHUNK_HEIGHT, true);
+  ok('on the ground, C0 keeps the old layout: -3 .. 8', cascadeFloorFor(0, 0), -3);
+  ok('C1 keeps 8 below', cascadeFloorFor(0, 1), -8);
+  ok('C2 sits at the bottom of the world', cascadeFloorFor(0, 2), Y_MIN);
+  ok('standing on y 20: C0 from 17', cascadeFloorFor(20, 0), 20 - CASCADE_BELOW[0]);
+  ok('... C1 from 12, on its 2-block stride', cascadeFloorFor(20, 1), 12);
+  ok('... C2 still at the bottom', cascadeFloorFor(20, 2), Y_MIN);
+  ok('at the top, C0 stops at 39', cascadeFloorFor(39, 0) + cascadeBlocks(0) - 1, Y_MAX);
+  ok('... and C1', cascadeFloorFor(39, 1) + cascadeBlocks(1) - 1, Y_MAX);
+  ok('at the bottom, C0 starts at -8', cascadeFloorFor(Y_MIN, 0), Y_MIN);
+  ok('C1 stays on its stride everywhere', [-8, -3, 5, 11, 26, 39].every(y => cascadeFloorFor(y, 1) % 2 === 0), true);
+  ok('the origin carries y', gridOriginFor('explore', { x: 20, y: 20, z: 10 }).y, 17);
+  ok('a battle arena sits at the level of the fight', gridOriginFor('battle', { x: 20, y: 20, z: 10 }).y, 17);
+}
+
+section('48 levels: a climb scrolls to exactly what a fresh bake gives');
+{
+  // A tower from the ground to y 30, and a ledge on it, so every window has
+  // something different in it.
+  const added = [];
+  const put = (x, y, z) => { const k = getVoxelKey(x, y, z); if (!World.has(k)) { World.set(k, solid()); added.push(k); } };
+  for (let y = 1; y <= 30; y++) put(4, y, 4);
+  for (let x = 5; x <= 8; x++) put(x, 18, 4);
+
+  // Every voxel, both channels, in logical order - the two grids' rings differ.
+  const sameField = (a, b) => {
+    for (let vz = 0; vz < GRID_DIM; vz++) for (let vy = 0; vy < GRID_DIM; vy++) for (let vx = 0; vx < GRID_DIM; vx++) {
+      const i = gridIndex(a, vx, vy, vz) * FIELD_CHANNELS, j = gridIndex(b, vx, vy, vz) * FIELD_CHANNELS;
+      if (a.data[i] !== b.data[j] || a.data[i + 1] !== b.data[j + 1]) return `differs at ${vx},${vy},${vz}`;
+    }
+    return '';
+  };
+  for (const level of [0, 1]) {
+    const o = y => gridOriginFor('explore', { x: 4, y, z: 4 }, null, 0, level);
+    // Up the tower, a jump, back down, and into the clamp at both ends.
+    const path = [0, 1, 2, 5, 12, 30, 39, 31, 20, -8, 0];
+    let g = null;
+    for (const y of path) { const at = o(y); g = createFieldAt(at.x, at.z, g, level, at.y); }
+    const at = o(0);
+    ok(`C${level}: climbed and came back down - the same as a fresh bake`,
+       sameField(g, createFieldAt(at.x, at.z, null, level, at.y)), '');
+    const top = o(30);
+    const climbed = createFieldAt(top.x, top.z, createFieldAt(at.x, at.z, null, level, at.y), level, top.y);
+    ok(`C${level}: one long climb - the same as a fresh bake at the top`,
+       sameField(climbed, createFieldAt(top.x, top.z, null, level, top.y)), '');
+    // A step of two blocks slides; thirty is past the cube, so it re-bakes.
+    const two = o(2);
+    const stepped = createFieldAt(two.x, two.z, createFieldAt(at.x, at.z, null, level, at.y), level, two.y);
+    ok(`C${level}: a short climb moves the ring in y, not the data`, stepped.ringY > 0, true);
+  }
+
+  // The worker path: the mirror scrolls, its strips land on the main grid,
+  // whose ring differs - the result must still be the fresh field.
+  {
+    const a = gridOriginFor('explore', { x: 4, y: 2, z: 4 }), b = gridOriginFor('explore', { x: 5, y: 9, z: 4 });
+    const main = createFieldAt(a.x, a.z, null, 0, a.y);
+    createFieldAt(a.x + 12, a.z, main, 0, a.y + 3);         // its own ring, out of step with the mirror's
+    createFieldAt(a.x, a.z, main, 0, a.y);
+    const mirror = createFieldAt(a.x, a.z, null, 0, a.y);
+    applyHandoff(main, scrollForHandoff(mirror, b.x, b.z, b.y));
+    ok('a hand-off up and across lands as a fresh bake', sameField(main, createFieldAt(b.x, b.z, null, 0, b.y)), '');
+    ok('... origin and all', `${main.originBlock.x},${main.originBlock.y},${main.originBlock.z}`, `${b.x},${b.y},${b.z}`);
+  }
+
+  // Standing on the tower top, C0 holds it; C2 always holds the whole tower.
+  const top = gridOriginFor('explore', { x: 4, y: 30, z: 4 });
+  const c0 = createFieldAt(top.x, top.z, null, 0, top.y);
+  const v = worldToVoxel(c0, 4 * BLOCK_METRES, 30 * BLOCK_METRES, 4 * BLOCK_METRES);
+  truthy('on the tower top, C0 holds the top block', isOccupied(c0, v.vx, v.vy, v.vz));
+  const c2 = createFieldAt(-20, -20, null, 2, Y_MIN);
+  const per2 = cascadeVoxelsPerBlock(2);
+  // The block's upper voxel: an unsupported block (the ledge) fills its top half only.
+  const vox2 = (bx, by, bz) => [(bx + 20) * per2 + 1, (by - Y_MIN) * per2 + per2 - 1, (bz + 20) * per2 + 1];
+  truthy('C2 holds the tower top', isOccupied(c2, ...vox2(4, 30, 4)));
+  truthy('... and the ledge', isOccupied(c2, ...vox2(6, 18, 4)));
+
+  for (const k of added) World.delete(k);
 }

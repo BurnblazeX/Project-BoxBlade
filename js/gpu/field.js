@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, min, clamp, smoothstep, int, select } from 'three/tsl';
-import { GRID_DIM, VOXEL_METRES, createFieldAt, DISTANCE_RANGE, FIELD_CHANNELS, gridIndex, ringSegments, ringSegmentsZ, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
+import { GRID_DIM, VOXEL_METRES, createFieldAt, DISTANCE_RANGE, FIELD_CHANNELS, gridIndex, ringSegments, ringSegmentsY, ringSegmentsZ, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
 
@@ -31,11 +31,10 @@ export function createDistanceTexture(grid) {
   // a sub-voxel position. Radiance stays nearest; only occlusion is smooth.
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
-  // X and Z repeat because the field is a ring in those axes (see gridIndex in
-  // core/field.js): filtering across the physical seam then reads the logical
-  // neighbour. Y is not ringed and clamps as before.
-  tex.wrapS = tex.wrapR = THREE.RepeatWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
+  // Every axis repeats because the field is a ring in all three (see gridIndex
+  // in core/field.js): filtering across the physical seam then reads the
+  // logical neighbour. ringUV clamps to the logical edge first.
+  tex.wrapS = tex.wrapT = tex.wrapR = THREE.RepeatWrapping;
   tex.unpackAlignment = 1;
   tex.needsUpdate = true;
   return tex;
@@ -88,7 +87,7 @@ export function cascadeBindings(tex, grid) {
   return {
     tex,
     origin: uniform(new THREE.Vector3(grid.origin.x, grid.origin.y, grid.origin.z)),
-    ring: uniform(new THREE.Vector3(grid.ringX || 0, 0, grid.ringZ || 0)),
+    ring: uniform(new THREE.Vector3(grid.ringX || 0, grid.ringY || 0, grid.ringZ || 0)),
     voxel: uniform(float(grid.voxelSize)),
     range: uniform(float(grid.range))
   };
@@ -96,7 +95,7 @@ export function cascadeBindings(tex, grid) {
 
 export function writeCascadeBindings(b, grid) {
   b.origin.value.set(grid.origin.x, grid.origin.y, grid.origin.z);
-  b.ring.value.set(grid.ringX || 0, 0, grid.ringZ || 0);
+  b.ring.value.set(grid.ringX || 0, grid.ringY || 0, grid.ringZ || 0);
   b.voxel.value = grid.voxelSize;
   b.range.value = grid.range;
   return b;
@@ -299,7 +298,7 @@ export const levelLive = (i, skipC0, done) =>
 // is enough - the texture object and the material are unchanged, so nothing
 // rebuilds. The grid remembers its own level, so this works for any cascade.
 export function followShadowGrid(grid, tex, bindings, originBlock, renderer = null) {
-  createFieldAt(originBlock.x, originBlock.z, grid, grid.level);
+  createFieldAt(originBlock.x, originBlock.z, grid, grid.level, originBlock.y ?? grid.originBlock.y);
   return commitShadowGrid(grid, tex, bindings, renderer);
 }
 
@@ -328,25 +327,27 @@ function uploadStrips(renderer, tex, grid, rects) {
   if (!gpuTex) { tex.needsUpdate = true; return; }
   const queue = renderer.backend.device.queue;
   for (const r of rects) {
-    const h = r.y1 - r.y0;
     for (const [xa, xb] of ringSegments(grid, r.x0, r.x1 - 1)) {
-      for (const [za, zb] of ringSegmentsZ(grid, r.z0, r.z1 - 1)) {
-        const w = xb - xa + 1, d = zb - za + 1;
-        const C = FIELD_CHANNELS, row = w * C;
-        if (stripBuf.length < row * h * d) stripBuf = new Uint8Array(row * h * d);
-        let o = 0;
-        for (let vz = za; vz <= zb; vz++) {
-          for (let vy = r.y0; vy < r.y1; vy++, o += row) {
-            const base = gridIndex(grid, xa, vy, vz) * C;
-            stripBuf.set(grid.data.subarray(base, base + row), o);
+      for (const [ya, yb] of ringSegmentsY(grid, r.y0, r.y1 - 1)) {
+        for (const [za, zb] of ringSegmentsZ(grid, r.z0, r.z1 - 1)) {
+          const w = xb - xa + 1, h = yb - ya + 1, d = zb - za + 1;
+          const C = FIELD_CHANNELS, row = w * C;
+          if (stripBuf.length < row * h * d) stripBuf = new Uint8Array(row * h * d);
+          let o = 0;
+          for (let vz = za; vz <= zb; vz++) {
+            for (let vy = ya; vy <= yb; vy++, o += row) {
+              const base = gridIndex(grid, xa, vy, vz) * C;
+              stripBuf.set(grid.data.subarray(base, base + row), o);
+            }
           }
+          const phys = gridIndex(grid, xa, ya, za);
+          queue.writeTexture(
+            { texture: gpuTex,
+              origin: { x: phys % GRID_DIM, y: Math.floor(phys / GRID_DIM) % GRID_DIM,
+                        z: Math.floor(phys / (GRID_DIM * GRID_DIM)) } },
+            stripBuf, { offset: 0, bytesPerRow: row, rowsPerImage: h },
+            { width: w, height: h, depthOrArrayLayers: d });
         }
-        const phys = gridIndex(grid, xa, 0, za);
-        queue.writeTexture(
-          { texture: gpuTex,
-            origin: { x: phys % GRID_DIM, y: r.y0, z: Math.floor(phys / (GRID_DIM * GRID_DIM)) } },
-          stripBuf, { offset: 0, bytesPerRow: row, rowsPerImage: h },
-          { width: w, height: h, depthOrArrayLayers: d });
       }
     }
   }

@@ -17,9 +17,9 @@ self.onmessage = ({ data: m }) => {
     loadWorldMirror(m.blocks);
     loadModelBoxes(m.models || []);
   } else if (m.type === 'reset') {
-    grids[m.level] = createFieldAt(m.x, m.z, null, m.level);
+    grids[m.level] = createFieldAt(m.x, m.z, null, m.level, m.y);
   } else if (m.type === 'scroll') {
-    const out = scrollForHandoff(grids[m.level], m.x, m.z);
+    const out = scrollForHandoff(grids[m.level], m.x, m.z, m.y);
     self.postMessage({ ...out, level: m.level, gen: m.gen }, [out.data.buffer]);
   }
 };

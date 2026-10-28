@@ -3,7 +3,7 @@ import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
-         loadLevel, findPath } from './core/world.js';
+         loadLevel, findPath, DEV_LEVEL } from './core/world.js';
 import { createEditor } from './tools/editor.js';
 import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
@@ -31,6 +31,7 @@ import { createTexelCache } from './render/features/texelcache.js';
 import { createSpriteAtlas } from './render/features/spriteatlas.js';
 import { createCards } from './render/features/cards.js';
 import { createSun } from './render/features/sun.js';
+import { createSunMap } from './render/features/sunmap.js';
 import { createShadowSets, nextFrame } from './render/shadowsets.js';
 import { createToneMap } from './render/features/tonemap.js';
 import { createOcclusion } from './render/features/occlusion.js';
@@ -144,7 +145,7 @@ dirLight.position.set(...sunForHour(DEFAULT_SKY_HOUR));
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-// The saved level (levels/default.json - the editor writes it) if there is
+// The Dev Level (levels/dev_level.json - the editor writes it) if there is
 // one; otherwise the test area built in code, with its test props.
 async function fetchLevel(name) {
   try {
@@ -152,7 +153,7 @@ async function fetchLevel(name) {
     return res.ok ? await res.json() : null;
   } catch { return null; }
 }
-const savedLevel = await fetchLevel('default');
+const savedLevel = await fetchLevel(DEV_LEVEL);
 if (savedLevel) {
   const missing = loadLevel(savedLevel, MODELS);
   if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
@@ -535,6 +536,7 @@ function applyWorldEdit() {
   if (!r.ok) return { message: `${r.count} pieces is past the terrain mesh's room - save and reload` };
   texel.syncCount();
   mirrors.invalidate();
+  farShadows.invalidate();
   lighting.syncModelLights();
   boxLight.rebuild();
   if (shadowsOn) {
@@ -570,11 +572,13 @@ const encounter = createEncounter({
       rig.arenaCenter.set(centerX * VOXEL_SIZE, 0, centerZ * VOXEL_SIZE);
       updateVoxelVisibility(arena, true);
       updateObjectVisibility(arena, true);
+      farShadows.invalidate();
       setArenaHitBounds(bounds);
     },
     exitArena() {
       updateVoxelVisibility(null, false);
       updateObjectVisibility(null, false);
+      farShadows.invalidate();
       setArenaHitBounds(null);
     },
     clearHover() {
@@ -931,6 +935,7 @@ function animate(time) {
   // Always: with shadows off the sprites' contact AO still reads the sun's cards.
   resolveTerrainAlbedo();
   cards.update();
+  farShadows.update();
   sky.update(ticks.alpha);
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
@@ -1029,7 +1034,7 @@ let shadowOrigins = [];     // block origin each level is currently built at
 function ensureShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const o = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sun.gridBias, l);
-    shadowGrids[l] = createFieldAt(o.x, o.z, shadowGrids[l] || null, l);
+    shadowGrids[l] = createFieldAt(o.x, o.z, shadowGrids[l] || null, l, o.y);
     if (!shadowTexes[l]) shadowTexes[l] = createDistanceTexture(shadowGrids[l]);
     updateDistanceTexture(shadowTexes[l]);
     shadowCascades[l] = shadowCascades[l]
@@ -1068,7 +1073,7 @@ function resetFieldWorker() {
       applyHandoff(shadowGrids[m.level], m);
       commitShadowGrid(shadowGrids[m.level], shadowTexes[m.level],
                        shadowCascades[m.level], renderer);
-      shadowOrigins[m.level] = { x: m.x, z: m.z };
+      shadowOrigins[m.level] = { x: m.x, y: m.y, z: m.z };
       fieldApplied = true;
     };
   }
@@ -1081,7 +1086,7 @@ function resetFieldWorker() {
   fieldInFlight.length = 0;
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const o = shadowOrigins[l];
-    fieldWorker.postMessage({ type: 'reset', level: l, x: o.x, z: o.z });
+    fieldWorker.postMessage({ type: 'reset', level: l, x: o.x, y: o.y, z: o.z });
   }
 }
 
@@ -1094,11 +1099,11 @@ function followShadowGrids() {
   for (let l = 0; l < CASCADE_COUNT; l++) {
     const want = gridOriginFor(game.mode, fieldFocus(), dirLight.position, sun.gridBias, l);
     const at = shadowOrigins[l];
-    if (at && want.x === at.x && want.z === at.z) continue;
+    if (at && want.x === at.x && want.y === at.y && want.z === at.z) continue;
     if (fieldWorker) {
       if (fieldInFlight[l]) continue;
       fieldInFlight[l] = true;
-      fieldWorker.postMessage({ type: 'scroll', level: l, x: want.x, z: want.z, gen: fieldGen });
+      fieldWorker.postMessage({ type: 'scroll', level: l, x: want.x, y: want.y, z: want.z, gen: fieldGen });
       continue;
     }
     followShadowGrid(shadowGrids[l], shadowTexes[l], shadowCascades[l], want, renderer);
@@ -1130,6 +1135,8 @@ const sun = engine.add(createSun({
   sunLight: dirLight, shadowsOn: () => shadowsOn, rebuild: () => buildPerPixelShadows(),
   reorigin: () => { shadowOrigins = []; }
 }));
+// The sun depth map: the sun's shadow past its march (core/sunmap.js).
+const farShadows = engine.add(createSunMap({ renderer, sunLight: dirLight, shadowsOn: () => shadowsOn }));
 // Before the GI: it is handed their card types.
 const cards = engine.add(createCards({
   renderer, camera, pivot, sunLight: dirLight, sunAngular: () => sun.angular,
@@ -1358,7 +1365,7 @@ const bxbApi = installConsole(createConsole({
     help: 'march the same rays on CPU and GPU and diff them',
     run: async (n = 256) => {
       const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
-      const grid = createFieldAt(origin.x, origin.z);
+      const grid = createFieldAt(origin.x, origin.z, null, 0, origin.y);
       const tex = createDistanceTexture(grid);
 
       // Spread over the grid in random directions, so the comparison covers
@@ -1454,6 +1461,8 @@ const bxbApi = installConsole(createConsole({
   torchside: lighting.commands.torchside,
   cardface: cards.commands.cardface,
   soften: sun.commands.soften,
+  farshadow: farShadows.commands.farshadow,
+  sunmap: farShadows.commands.sunmap,
   ao: {
     help: "cone-traced ambient occlusion - always on. Reach in metres (bxb.view('ao') shows it alone)",
     usage: 'bxb.ao(1.5)',
@@ -1799,7 +1808,7 @@ const bxbApi = installConsole(createConsole({
     help: 'print world, grid and frame statistics',
     run: () => {
       const origin = gridOriginFor(game.mode, player.gridPos, dirLight.position, sun.gridBias);
-      const grid = createFieldAt(origin.x, origin.z);
+      const grid = createFieldAt(origin.x, origin.z, null, 0, origin.y);
       const s = perf.stats();
       const out = {
         blocks: World.size,
@@ -1920,7 +1929,8 @@ settingsPanel = createSettingsPanel({ groups: [
   { title: 'Shadows', settings: [
     { key: 'shadows', label: 'Marched shadows', type: 'toggle',
       get: () => shadowsOn, set: v => flip(shadowsOn, v, () => bxbApi.shadows()) },
-    ...sun.shadowSettings
+    ...sun.shadowSettings,
+    ...farShadows.shadowSettings
   ]},
   sun.settings,
   tonemap.settings, occlusion.settings,

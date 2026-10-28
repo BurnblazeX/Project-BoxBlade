@@ -36,8 +36,9 @@ import { clampLevel, lightRadiusMetres, MAX_LIGHT_LEVEL, DEFAULT_LIGHT_CUTOFF } 
 
 // The lit region's x and z, in blocks: past it, light is not worked out (a
 // face out there reads the sun unshadowed and no lamps). The world's own
-// bounds, one block of margin, at most this a side - 288 x 39 x 288 boxes,
-// 26 MB at RGBA16F. A bigger map needs the region to follow the camera.
+// bounds, one block of margin, at most this a side - 288 boxes across, and
+// as tall as the levels in use (13 levels: 288 x 39 x 288, 26 MB at
+// RGBA16F). A bigger map needs the region to follow the camera (World plan P2).
 export const BOX_LIGHT_MAX_BLOCKS = 96;
 
 // u32s a block in the block data.
@@ -65,24 +66,41 @@ const FULL_MASK = 2 ** 27 - 1;
 // The bit of box (i, j, k), each 0..2, in its block's mask.
 export const boxBit = (i, j, k) => i + BOX_CELLS * (j + BOX_CELLS * k);
 
-// The region over a world: blocks lo .. lo + size - 1, the whole height (and
-// one block over Y_MAX, the air on the highest tops). box0 is the world box
-// index of local box 0 - block lo's lowest box (blocks hold boxes 3b-1..3b+1).
-export function boxLightRegion(world = World) {
+// The region over a world: blocks lo .. lo + size - 1. Across, the world's
+// own bounds with a block of margin; up and down, the levels it uses with a
+// block of air under the lowest and over the highest (a bottom face reads the
+// box below it, a top face the one above), within Y_MIN .. Y_MAX + 1. Fitted
+// rather than the whole 48 levels: 288 x 147 x 288 boxes would be ~97 MB at
+// RGBA16F (World plan P1). Placed models count by the blocks their cubes
+// reach, so a tall one on the highest block keeps its air. box0 is the world
+// box index of local box 0 - block lo's lowest box (blocks hold boxes
+// 3b-1..3b+1).
+export function boxLightRegion(world = World, modelBoxes = ModelBoxes) {
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  let y0 = Infinity, y1 = -Infinity;
   for (const key of world.keys()) {
-    const [x, , z] = key.split(',').map(Number);
+    const [x, y, z] = key.split(',').map(Number);
     if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
     if (z < z0) z0 = z; if (z > z1) z1 = z;
   }
+  // A cube's texels to the blocks it spans: block b covers texels 12b - 6 ..
+  // 12b + 6.
+  const blockOfTexel = t => Math.floor((t + 6) / 12);
+  for (const c of modelBoxes) {
+    y0 = Math.min(y0, blockOfTexel(c[1]));
+    y1 = Math.max(y1, blockOfTexel(c[4] - 1e-6));
+  }
   if (x0 > x1) { x0 = z0 = 0; x1 = z1 = 0; }
+  if (y0 > y1) { y0 = y1 = 0; }
+  const ly = Math.max(Y_MIN, y0 - 1), hy = Math.min(Y_MAX + 1, y1 + 1);
   const fit = (a, b) => {
     a -= 1; b += 1;
     const n = Math.min(b - a + 1, BOX_LIGHT_MAX_BLOCKS);
     return [Math.round((a + b) / 2 - (n - 1) / 2), n];
   };
   const [lx, nx] = fit(x0, x1), [lz, nz] = fit(z0, z1);
-  const lo = [lx, Y_MIN, lz], size = [nx, Y_MAX + 1 - Y_MIN + 1, nz];
+  const lo = [lx, ly, lz], size = [nx, hy - ly + 1, nz];
   return { lo, size, box0: lo.map(v => BOX_CELLS * v - 1), dims: size.map(v => v * BOX_CELLS),
            clipped: nx < x1 - x0 + 3 || nz < z1 - z0 + 3 };
 }

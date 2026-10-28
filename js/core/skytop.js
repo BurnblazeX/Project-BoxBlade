@@ -1,6 +1,6 @@
 // --- The sky-top map: how high each column's roof is ---
 //
-// One byte per block column: the top of the highest block in it that is not
+// One code per block column: the top of the highest block in it that is not
 // glass - what a GI or reflection ray that missed everything must be above to
 // count as having reached the sky (gpu/volume.js skyOpenTSL). A ray that only
 // ran out of reach indoors ends under its room's roof, so it brings no sky in;
@@ -10,10 +10,12 @@
 // own path through the glass). Placed models are left out - a model roof does
 // not block the sky (first version).
 //
-// The byte is 0 for a column with no roof at all, else 1 + the top in
+// The code is 0 for a column with no roof at all, else 1 + the top in
 // SKY_TOP_STEPS ths of a block above the authorable range's floor, rounded
 // up: a roof is never placed lower than it is, and at most a step (9 cm)
-// higher.
+// higher. 16 bits: 48 levels at 16 steps is 769 codes, past a byte's 255
+// (World plan P1). The texture carries it as two bytes, low in R, high in G
+// (render.js, gpu/volume.js skyOpenTSL).
 import { BLOCK_METRES, Y_MIN, isSlope, blockSpan, blockParts } from './world.js';
 import { isGlassMaterial } from './materials.js';
 
@@ -34,7 +36,7 @@ export function roofTop(block) {
 // The map over a box of columns: origin [x, z] and size [w, d] in blocks,
 // row-major by z (data[z * w + x]). world: a Map of 'x,y,z' -> block.
 export function buildSkyTops(world, origin, size) {
-  const out = new Uint8Array(size[0] * size[1]);
+  const out = new Uint16Array(size[0] * size[1]);
   for (const [key, block] of world.entries()) {
     const [x, y, z] = key.split(',').map(Number);
     const cx = x - origin[0], cz = z - origin[1];
@@ -48,10 +50,17 @@ export function buildSkyTops(world, origin, size) {
   return out;
 }
 
-// World metres to the byte and back (the shader mirrors decodeSkyTop).
+// World metres to the code and back (the shader mirrors decodeSkyTop).
+export const SKY_TOP_MAX_CODE = 65535;
 export function encodeSkyTop(metres) {
   const steps = Math.ceil((metres / BLOCK_METRES - (Y_MIN - 0.5)) * SKY_TOP_STEPS - 1e-6);
-  return Math.max(1, Math.min(255, 1 + steps));
+  return Math.max(1, Math.min(SKY_TOP_MAX_CODE, 1 + steps));
+}
+
+// Codes as the texture's bytes: low byte in R, high in G.
+export function packSkyTops(codes, out = new Uint8Array(codes.length * 2)) {
+  for (let i = 0; i < codes.length; i++) { out[2 * i] = codes[i] & 255; out[2 * i + 1] = codes[i] >> 8; }
+  return out;
 }
 
 export function decodeSkyTop(code) {

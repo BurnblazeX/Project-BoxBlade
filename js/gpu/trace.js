@@ -3,6 +3,7 @@ import { GRID_DIM, VOXEL_METRES, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../c
 import { layout, memoCascades } from './layout.js';
 import { decodeFieldTSL, eachCascade, fadeWeightTSL, levelLive, ringUV, seamBlend } from './field.js';
 import { inHitBoundsTSL } from './volume.js';
+import { sunPenumbraCap, sunWorldTop } from './sunmap.js';
 
 // --- The marches: the sun's cone, a plain shadow ray, a reflection ray ---
 
@@ -40,6 +41,15 @@ export function createConeTraceSunTSL(cascades, glass = false) {
             Break();
           });
 
+          // Above the tallest thing in the world a sun ray meets nothing more:
+          // concluded, lit from here on. What keeps a march reaching C1 or C2
+          // (sunSoftReach) short on open ground - most rays clear the rooftops
+          // in metres.
+          If(origin.y.add(dir.y.mul(t)).greaterThan(sunWorldTop), () => {
+            done.assign(float(1));
+            Break();
+          });
+
           // How much this sample may darken anything: 1 well inside the march's
           // limits, falling to 0 as it approaches them, so a shadow dissolves
           // rather than stopping on a line. See fadeWeightTSL.
@@ -59,8 +69,10 @@ export function createConeTraceSunTSL(cascades, glass = false) {
           // d is in voxels of THIS level, t and the cone radius in metres. The
           // occlusion implied is 1 - ratio; weighting that rather than the
           // visibility is what makes w = 0 mean "contributes nothing" rather
-          // than "is fully lit".
-          const ratio = d.mul(c.voxel).div(coneR.mul(t));
+          // than "is fully lit". The cone's radius stops growing at the
+          // penumbra cap: past it (~12.5 m) it would outgrow the field's 1 m
+          // range and read open air as half-shadowed (core/sunmap.js).
+          const ratio = d.mul(c.voxel).div(min(coneR.mul(t), sunPenumbraCap));
           const occ = float(1).sub(clamp(ratio, float(0), float(1))).mul(w);
           res.assign(min(res, float(1).sub(occ)));
 

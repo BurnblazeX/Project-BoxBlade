@@ -66,7 +66,7 @@ export async function runGPUMarch(renderer, occTex, grid, rays) {
   const dirs = storage(dirBuf, 'vec4', n).setName('bxbParityDirs');
   const out = storage(outBuf, 'float', n).setName('bxbParityOut');
   const gridOrigin = uniform(new THREE.Vector3(grid.origin.x, grid.origin.y, grid.origin.z));
-  const ring = uniform(new THREE.Vector3(grid.ringX || 0, 0, grid.ringZ || 0));
+  const ring = uniform(new THREE.Vector3(grid.ringX || 0, grid.ringY || 0, grid.ringZ || 0));
 
   const kernel = Fn(() => {
     const o = origins.element(instanceIndex);

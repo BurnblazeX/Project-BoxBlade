@@ -1,5 +1,6 @@
 import { file, section, ok, near } from './lib/harness.mjs';
-import { buildSkyTops, encodeSkyTop, decodeSkyTop, roofTop, SKY_TOP_STEPS } from '../js/core/skytop.js';
+import { buildSkyTops, encodeSkyTop, decodeSkyTop, roofTop, packSkyTops, SKY_TOP_STEPS,
+         SKY_TOP_MAX_CODE } from '../js/core/skytop.js';
 import { BLOCK_METRES, Y_MIN, Y_MAX, newBlock } from '../js/core/world.js';
 
 file('skytop.test.mjs - each column\'s roof, for rays that missed everything');
@@ -15,7 +16,12 @@ const back = decodeSkyTop(encodeSkyTop(odd));
 ok('an odd height rounds up, never down', back >= odd, true);
 ok('... by less than a step', back - odd < step, true);
 ok('no roof decodes as no height at all', decodeSkyTop(0), -Infinity);
-ok('the highest top fits a byte', encodeSkyTop((Y_MAX + 0.5) * BLOCK_METRES) <= 255, true);
+const highest = encodeSkyTop((Y_MAX + 0.5) * BLOCK_METRES);
+ok('48 levels need more than a byte', highest > 255, true);
+ok('... and fit the 16-bit code', highest < SKY_TOP_MAX_CODE, true);
+const packed = packSkyTops([0, 1, highest]);
+ok('packed low byte then high', [...packed].join(), `0,0,1,0,${highest & 255},${highest >> 8}`);
+ok('the shader decodes r + 256 g back to the code', packed[4] + 256 * packed[5], highest);
 
 section('what is a roof');
 ok('a full block reaches its cell top', roofTop(newBlock('stone')), 1);

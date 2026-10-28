@@ -11,7 +11,7 @@ import { VOXEL_METRES } from '../core/field.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';
-import { buildSkyTops } from '../core/skytop.js';
+import { buildSkyTops, packSkyTops } from '../core/skytop.js';
 
 // Every block texture, by URL, so Vite bundles them - albedo, _n and _s alike.
 // Only under Vite; in node (the shader snapshot test) there are none.
@@ -314,8 +314,9 @@ function buildBlockVolume() {
       size: uniform(new THREE.Vector3(...size)),
       dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * 2))   // the texture's own
     };
-    const top = new THREE.DataTexture(new Uint8Array(size[0] * size[2]), size[0], size[2],
-                                      THREE.RedFormat, THREE.UnsignedByteType);
+    // Two bytes a column, the sky-top code's low and high (core/skytop.js).
+    const top = new THREE.DataTexture(new Uint8Array(size[0] * size[2] * 2), size[0], size[2],
+                                      THREE.RGFormat, THREE.UnsignedByteType);
     top.minFilter = top.magFilter = THREE.NearestFilter;
     top.generateMipmaps = false;
     top.unpackAlignment = 1;
@@ -357,7 +358,7 @@ function buildBlockVolume() {
     data[o + 2] = header >> 8;
     data[o + 3] = giIndex + 1;
   }
-  terrainTextures.skyTop.image.data.set(buildSkyTops(World, [lo[0], lo[2]], [size[0], size[2]]));
+  packSkyTops(buildSkyTops(World, [lo[0], lo[2]], [size[0], size[2]]), terrainTextures.skyTop.image.data);
   terrainTextures.skyTop.needsUpdate = true;
   const mh = terrainTextures.modelHits;
   mh.attr.array.set(hits.data);

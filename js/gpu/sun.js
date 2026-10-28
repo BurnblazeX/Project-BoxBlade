@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
-import { Fn, If, float, vec3, vec4, uniform, max, texture, vec2, normalize, clamp, cos, sin, int, mix } from 'three/tsl';
-import { VOXEL_METRES } from '../core/field.js';
+import { Fn, If, float, vec3, vec4, uniform, max, min, abs, select, texture, vec2, normalize, clamp, cos, sin, int, mix } from 'three/tsl';
+import { VOXEL_METRES, GRID_DIM } from '../core/field.js';
+import { SUN_MAP_SOFT_FADE, SUN_MAP_MIN_REACH } from '../core/sunmap.js';
 import { BAYER4, SUN_ANGULAR_SIZE, coneOffsets, coneRadius, sunBasis } from '../core/sun.js';
 import { CARD_SUN_REACH } from '../core/cards.js';
 import { layout } from './layout.js';
@@ -9,6 +10,7 @@ import { glassRayTransmitTSL } from './glass.js';
 import { createConeTraceSunTSL, createShadowTraceTSL, createReflectTraceTSL } from './trace.js';
 import { createCardsTSL } from './cards.js';
 import { skyOpenTSL } from './volume.js';
+import { sunMap, sunMapFarTSL, sunSoftReach } from './sunmap.js';
 
 // --- The sun's march, past its reach ---
 //
@@ -186,6 +188,56 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
   const outType = glass ? 'vec3' : 'float';
   const asOut = v => (glass ? vec3(v, v, v) : v);
 
+  // --- Past the march: the sun depth map (core/sunmap.js, gpu/sunmap.js) ---
+  //
+  // How far toward the sun the march looks: its 12 m cap, or (sunSoftReach)
+  // on to where the ray leaves C1 - and never into C2. C2 is the coarse level,
+  // 3 voxels a block (0.5 m): a shadow edge marched through it steps at half a
+  // metre (seen 2026-10-28 with blockers in C2). The sun map is finer than
+  // that, so everything past C1 is the map's. A receiver outside C1 still
+  // marches SUN_MAP_MIN_REACH for its contact shadows. The march stops early
+  // once the ray clears the tallest block (gpu/trace.js); the far map counts
+  // only blockers past what this covered, so the two meet.
+  const c1 = cascades[1] || null, outer = cascades[cascades.length - 1];
+  // How far along the sun ray from origin before it leaves a cascade's box; 0
+  // when origin is not in it.
+  const exitFrom = (c, origin) => {
+    const span = c.voxel.mul(float(GRID_DIM));
+    const exit = (o, d, lo) => select(abs(d).lessThan(float(1e-5)), float(1e9),
+      select(d.greaterThan(float(0)), lo.add(span), lo).sub(o).div(d));
+    const inside = origin.x.greaterThanEqual(c.origin.x).and(origin.x.lessThan(c.origin.x.add(span)))
+      .and(origin.y.greaterThanEqual(c.origin.y)).and(origin.y.lessThan(c.origin.y.add(span)))
+      .and(origin.z.greaterThanEqual(c.origin.z)).and(origin.z.lessThan(c.origin.z.add(span)));
+    return select(inside, min(min(exit(origin.x, sunDir.x, c.origin.x), exit(origin.y, sunDir.y, c.origin.y)),
+                              exit(origin.z, sunDir.z, c.origin.z)), float(0));
+  };
+  const reachFor = origin => {
+    if (!c1) return maxDist;
+    const inC1 = exitFrom(c1, origin);
+    const reach = select(sunSoftReach.equal(int(1)), inC1, min(maxDist, inC1));
+    // With no map (far shadows off, or not drawn yet) the march is all there
+    // is: its plain 12 m cap, through whatever levels it crosses, as before.
+    return select(sunMap.on.equal(int(1)), max(reach, float(SUN_MAP_MIN_REACH)), maxDist);
+  };
+  // What the march actually covered: its reach, or less where the ray left the
+  // outermost cascade first - nothing at all from a receiver outside C2 (a
+  // vista), whose march learned nothing. The map takes over from there, so a
+  // caster beside a distant wall still shadows it - from SUN_MAP_MIN_REACH on,
+  // never nearer, so no receiver reads its own surface in the map.
+  const coveredFor = (origin, reach) =>
+    max(min(reach, exitFrom(outer, origin)), float(SUN_MAP_MIN_REACH));
+  // How much of the map's softening applies: all of it inside C2, fading to
+  // one hard tap over its last SUN_MAP_SOFT_FADE metres across (C2 holds the
+  // whole height, so only x and z have an edge).
+  const softFor = p => {
+    const span = outer.voxel.mul(float(GRID_DIM));
+    const dx = min(p.x.sub(outer.origin.x), outer.origin.x.add(span).sub(p.x));
+    const dz = min(p.z.sub(outer.origin.z), outer.origin.z.add(span).sub(p.z));
+    return clamp(min(dx, dz).div(float(SUN_MAP_SOFT_FADE)), float(0), float(1));
+  };
+  const farMap = (origin, reach) =>
+    sunMapFarTSL(origin, coveredFor(origin, reach), fadeStart, coneRadiusUniform, softFor(origin));
+
   // The cone trace gets the whole penumbra from a single ray, so the sample
   // pattern, its per-texel rotation and the sample count are all irrelevant to
   // it - it is a different way of asking the question, not a cheaper sampling of
@@ -199,14 +251,17 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       // the card test below then read an origin that was never assigned, (0,0,0),
       // and every sprite shadow vanished from that region.
       const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
-      const traced = coneTrace(origin, sunDir, maxDist, coneRadiusUniform,
+      const reach = reachFor(origin).toVar();
+      const traced = coneTrace(origin, sunDir, reach, coneRadiusUniform,
                                fadeStart, edgeFade).toVar();
       const visible = traced.x.toVar();
       const through = glass ? glassRayTransmitTSL(glass, traced, origin, sunDir).toVar() : null;
       if (far) {
-        const f = far(origin, sunDir, maxDist);
+        const f = far(origin, sunDir, reach);
         if (glass) through.mulAssign(f); else visible.mulAssign(f);
       }
+      // Whatever lies further toward the sun than the march looked.
+      visible.mulAssign(farMap(origin, reach));
       // Sprites left the distance field so that each light could have them
       // facing IT - see createCardsTSL. Same ray, same cap, same cone radius, so
       // a character's penumbra and a wall's come out of one formula.
@@ -262,6 +317,7 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
     }
     const visible = lit.div(float(offsets.length)).toVar();
     if (far) visible.mulAssign(far(origin, sunDir, maxDist));
+    visible.mulAssign(farMap(origin, maxDist));
     // The sampled path takes the cards once rather than per disc sample: the
     // card test is already analytic, so sampling it N times would return the
     // same answer N times and pay for it each one.

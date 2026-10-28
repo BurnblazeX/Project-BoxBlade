@@ -14,7 +14,8 @@
 //   right drag          look around
 //   W A S D, Space      fly (Shift: faster); Left Ctrl or C down
 //   Q / E               turn the selection (slopes, models)
-//   Ctrl + S            save the level (levels/default.json, dev server only)
+//   Ctrl + S            save the level (the Dev Level, levels/dev_level.json;
+//                       dev server only)
 //   Tab                 back to the game
 //
 // A model placed on a top face stands on it; on a side face it hangs on that
@@ -27,7 +28,7 @@ import * as THREE from 'three/webgpu';
 import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, FACINGS, BLOCK_SHAPES, blockBoxes,
          blockShape, blockFacing, surfaceLevel,
          WorldModels, addWorldModel, mountWorldModel, removeWorldModel, newBlock,
-         serializeLevel, hasFacing, isDual, complementShape } from '../core/world.js';
+         serializeLevel, hasFacing, isDual, complementShape, DEV_LEVEL } from '../core/world.js';
 import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
 import { worldInstancedMesh, instanceInfo } from '../render/render.js';
@@ -41,7 +42,7 @@ const MAX_BOX_CELLS = 20000;   // one fill or clear at most
 const MAX_ROW_CELLS = 256;     // one row at most, each way
 const FACING_ORDER = ['N', 'E', 'S', 'W'];
 
-export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = 'default' }) {
+export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = DEV_LEVEL }) {
   const state = {
     active: false,
     // The selection: a block (material, shape) or a model; a facing for both.

@@ -16,35 +16,35 @@
   "fragment": "a727d2e143cfb6a0"
  },
  "default/sprite": {
-  "vertex": "3cb5f58b40ea999f",
-  "fragment": "cdfce0dc24307e9e"
+  "vertex": "8bb871ada67a8834",
+  "fragment": "696eb7263b165e8f"
  },
  "default/split.0:splitBase": {
-  "compute": "e20d1209efa3e4da"
+  "compute": "8200770014e744a7"
  },
  "default/split.1:splitPoints": {
-  "compute": "bc7bed37180af352"
+  "compute": "ce7513b092ccaf44"
  },
  "default/split.2:splitMirror": {
-  "compute": "e757457c718a0706"
+  "compute": "d67ef5abd6610557"
  },
  "default/split.3:splitFinal": {
-  "compute": "5eebf1c843eeece7"
+  "compute": "7044ea8be58057a4"
  },
  "default/split.4:splitGlassSurface": {
-  "compute": "0daf806e78fe8969"
+  "compute": "213f3e5a3d4a87a7"
  },
  "default/split.5:splitGlassReflect": {
-  "compute": "daada4d4c301eddc"
+  "compute": "144a94de67b4eebc"
  },
  "default/split.6:splitGlassThrough": {
-  "compute": "06add530093d9777"
+  "compute": "fc27ba69a18995ab"
  },
  "default/split.7:splitGlassCompose": {
   "compute": "18a3c5e1e005c0ed"
  },
  "default/mirror": {
-  "compute": "3028eb5aad36153f"
+  "compute": "b70f4e4adba66eeb"
  },
  "default/room:roomMeterEase": {
   "compute": "246a8d722d0ea228"
@@ -66,29 +66,29 @@
   "fragment": "a727d2e143cfb6a0"
  },
  "texelgi/sprite": {
-  "vertex": "8005a253b56fa77a",
-  "fragment": "a310f3c91f089d4e"
+  "vertex": "f372cca189fc3473",
+  "fragment": "710fff22f648cd22"
  },
  "texelgi/split.0:splitBase": {
-  "compute": "f49fed3b1b2935b8"
+  "compute": "4693a6763a3be340"
  },
  "texelgi/split.1:splitPoints": {
-  "compute": "bc7bed37180af352"
+  "compute": "ce7513b092ccaf44"
  },
  "texelgi/split.2:splitMirror": {
-  "compute": "e757457c718a0706"
+  "compute": "d67ef5abd6610557"
  },
  "texelgi/split.3:splitFinal": {
-  "compute": "044da52661546d7c"
+  "compute": "436e97cbda662701"
  },
  "texelgi/split.4:splitGlassSurface": {
-  "compute": "0daf806e78fe8969"
+  "compute": "213f3e5a3d4a87a7"
  },
  "texelgi/split.5:splitGlassReflect": {
-  "compute": "0f38476da62ece89"
+  "compute": "af41312c54b909fb"
  },
  "texelgi/split.6:splitGlassThrough": {
-  "compute": "0846e09a435fa38f"
+  "compute": "de8e5fc2b3717a99"
  },
  "texelgi/split.7:splitGlassCompose": {
   "compute": "18a3c5e1e005c0ed"
@@ -97,7 +97,7 @@
   "compute": "2e2d602bc54595e2"
  },
  "texelgi/gi.patches:giPatches": {
-  "compute": "ba0e32c23eb071bb"
+  "compute": "11d806763939f348"
  },
  "texelgi/gi.sums:giSums": {
   "compute": "827ec5c1e5d6a03b"
@@ -106,59 +106,59 @@
   "compute": "71d9d9efa8d924dd"
  },
  "texelgi/gi.direct:giDirect": {
-  "compute": "dab0a03e4e9ae29b"
+  "compute": "5d04abddfe677d98"
  },
  "texelgi/mirror": {
-  "compute": "3028eb5aad36153f"
+  "compute": "b70f4e4adba66eeb"
  },
  "texelgi/room:roomMeterEase": {
   "compute": "246a8d722d0ea228"
  },
  "cache/low": {
-  "vertex": "2bd2723febe91b89",
-  "fragment": "4bcf5682780c3261"
+  "vertex": "01a8d4a1d5dd228b",
+  "fragment": "8ccd3aa7ad1a723a"
  },
  "cache/terrain": {
   "vertex": "236b2284a9947ff5",
   "fragment": "4caeff588171e267"
  },
  "cache/miss": {
-  "vertex": "b95af70791a6a414",
-  "fragment": "9fa7f5f18dcfeb4e"
+  "vertex": "e96b638119e1d636",
+  "fragment": "a26f48ad04506edd"
  },
  "cache/glassLow": {
-  "vertex": "4f0485ac313425fa",
-  "fragment": "de8d68e1489b6721"
+  "vertex": "2a6e10e83adbae32",
+  "fragment": "2055b9e90528f63c"
  },
  "cache/glass": {
   "vertex": "0615c8ba7f1c1330",
   "fragment": "d40cf740fabd7165"
  },
  "cache/glassMiss": {
-  "vertex": "3bd93fa44cc1f408",
-  "fragment": "f679ce6149adb297"
+  "vertex": "5c5b67e137a44ec2",
+  "fragment": "f5091420b25a7061"
  },
  "cache/sprite": {
-  "vertex": "3cb5f58b40ea999f",
-  "fragment": "cdfce0dc24307e9e"
+  "vertex": "8bb871ada67a8834",
+  "fragment": "696eb7263b165e8f"
  },
  "cache/mirror": {
-  "compute": "3028eb5aad36153f"
+  "compute": "b70f4e4adba66eeb"
  },
  "plain/terrain": {
-  "vertex": "d0f372971a251025",
-  "fragment": "98527c28ebf4c0f6"
+  "vertex": "5ebebc57a4c8d0b1",
+  "fragment": "c81b1749b6d5b41c"
  },
  "plain/glass": {
-  "vertex": "f66c2d9233038177",
-  "fragment": "afc8bef297761f2a"
+  "vertex": "152f0e7f51f3e61b",
+  "fragment": "9beadff60626643a"
  },
  "plain/sprite": {
-  "vertex": "58add31885edb451",
-  "fragment": "7830c5b0026e0d1d"
+  "vertex": "71e2cac3170ec61b",
+  "fragment": "3ec99425eb32f0e0"
  },
  "plain/mirror": {
-  "compute": "3028eb5aad36153f"
+  "compute": "b70f4e4adba66eeb"
  },
  "lpv0/0:LPV.Clear": {
   "compute": "31ed372c3175c2c9"
@@ -167,7 +167,7 @@
   "compute": "2c969c7fbdd7c07e"
  },
  "lpv0/2:LPV.Inject": {
-  "compute": "a5f4e966b8b8e21a"
+  "compute": "4821746e51802e0b"
  },
  "lpv0/3:LPV.Propagate": {
   "compute": "c362048f750b370a"
@@ -185,7 +185,7 @@
   "compute": "2c969c7fbdd7c07e"
  },
  "lpv1/2:LPV.Inject": {
-  "compute": "a5f4e966b8b8e21a"
+  "compute": "4821746e51802e0b"
  },
  "lpv1/3:LPV.Propagate": {
   "compute": "c362048f750b370a"
