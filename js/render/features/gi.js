@@ -346,6 +346,9 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     }),
     update,
     stepTexel,
+    // Another region loaded (main.js loadRegion): every volume starts again
+    // from nothing at its next update, as on first use.
+    reset() { lpvOrigins = []; },
     // The LPV's bindings for the fog (gpu/fog.js), while the LPV is the bounce.
     lpvBinding: () => (giOn && giMode === 'lpv' && lpvs ? giBinding() : null),
     commands,

@@ -44,15 +44,24 @@ export const inHitBoundsTSL = p => p.x.greaterThanEqual(hitBounds.min.x).and(p.x
 // a ray that missed everything ended: past the roof, it reached the sky.
 export function skyOpenTSL(terrain, p) {
   const vol = terrain.blocks;
-  const col = round(vec2(p.x, p.z).div(float(BLOCK_METRES))).sub(vec2(vol.origin.x, vol.origin.z));
-  const uv = col.add(float(0.5)).div(vec2(vol.size.x, vol.size.z)).toVar();
-  const rg = texture(terrain.skyTop, uv).level(int(0));
+  const cell = round(vec2(p.x, p.z).div(float(BLOCK_METRES))).toVar();
+  const rel = cell.sub(vec2(vol.origin.x, vol.origin.z));
+  const size = vec2(vol.size.x, vol.size.z);
+  // A ring, as the block volume (core/blockvolume.js).
+  const uv = ringTSL(cell.x, size.x).add(float(0.5)).div(size.x);
+  const vv = ringTSL(cell.y, size.y).add(float(0.5)).div(size.y);
+  const rg = texture(terrain.skyTop, vec2(uv, vv)).level(int(0));
   const code = round(rg.r.mul(float(255))).add(round(rg.g.mul(float(255))).mul(float(256))).toVar();
   const top = code.sub(float(1)).div(float(SKY_TOP_STEPS)).add(float(Y_MIN - 0.5)).mul(float(BLOCK_METRES));
-  const outside = uv.x.lessThan(float(0)).or(uv.y.lessThan(float(0)))
-    .or(uv.x.greaterThan(float(1))).or(uv.y.greaterThan(float(1)));
+  const outside = rel.x.lessThan(float(0)).or(rel.y.lessThan(float(0)))
+    .or(rel.x.greaterThanEqual(size.x)).or(rel.y.greaterThanEqual(size.y));
   return select(outside.or(code.lessThan(float(0.5))).or(p.y.greaterThan(top)), float(1), float(0));
 }
+
+// v's place on a ring of n (v and n whole numbers, as floats): the block
+// volume's and the sky tops' x and z (core/blockvolume.js ring). Not WGSL's
+// %, which keeps the sign of a negative v.
+const ringTSL = (v, n) => v.sub(n.mul(floor(v.div(n))));
 
 export function axisFaceTSL(g) {
   const ag = abs(g).toVar();
@@ -202,11 +211,20 @@ export function hitTexelTSL(terrain, p, g, dir) {
 
 // A block's entry in render.js's block volume, as bytes (RGBA x 255):
 // R side layer + 1 (0 air), G top layer, B bottom layer - or, in a model's
-// cell, R 0, G + 256 B its modelHits header, A its GI entry + 1.
-export function blockVolumeTSL(terrain, block) {
+// cell, R 0, G + 256 B its modelHits header, A its GI entry + 1. second: a
+// dual block's other half's, from the texture's second half. x and z are a
+// ring (core/blockvolume.js), so a block outside the window would read
+// another's from across it: outside is air.
+export function blockVolumeTSL(terrain, block, second = false) {
   const vol = terrain.blocks;
-  const uvw = block.sub(vol.origin).add(float(0.5)).div(vol.dims);
-  return round(texture3D(vol.tex, uvw).level(int(0)).mul(float(255)));
+  const rel = block.sub(vol.origin).toVar();
+  const inside = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))
+    .and(rel.z.greaterThanEqual(float(0))).and(rel.x.lessThan(vol.size.x))
+    .and(rel.y.lessThan(vol.size.y)).and(rel.z.lessThan(vol.size.z));
+  const z = ringTSL(block.z, vol.size.z);
+  const at = vec3(ringTSL(block.x, vol.size.x), rel.y, second ? z.add(vol.size.z) : z);
+  const v = round(texture3D(vol.tex, at.add(float(0.5)).div(vol.dims)).level(int(0)).mul(float(255)));
+  return select(inside, v, vec4(0, 0, 0, 0));
 }
 
 // The layer a block's face n draws with: its top, bottom or side. Air and
@@ -240,7 +258,7 @@ export function volumeAtTSL(terrain, cell, q) {
   If(v.w.greaterThan(float(127.5)), () => {
     const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5));
     If(inCodeBoxTSL(f, codeBoxTSL(v.w)).not(), () => {
-      const v2 = blockVolumeTSL(terrain, cell.add(vec3(0, 0, terrain.blocks.size.z)));
+      const v2 = blockVolumeTSL(terrain, cell, true);
       v.assign(vec4(v2.xyz, v.w));
     });
   });
@@ -293,12 +311,11 @@ export function partAtTSL(terrain, q) {
   const dual = v.w.greaterThan(float(127.5)).and(inOwn.not()).toVar();
   const other = codeBoxTSL(complementCodeTSL(v.w));
   If(dual, () => {
-    v.assign(vec4(blockVolumeTSL(terrain, cell.add(vec3(0, 0, terrain.blocks.size.z))).x, v.y, v.z, v.w));
+    v.assign(vec4(blockVolumeTSL(terrain, cell, true).x, v.y, v.z, v.w));
   });
   const box = { lo: select(dual, other.lo, own.lo), hi: select(dual, other.hi, own.hi) };
   const inBox = inOwn.or(dual);
-  // The volume clamps at its edge, which would repeat the border: outside
-  // it is air, as blockCodeTSL reads it.
+  // Outside the volume is air (blockVolumeTSL reads it so too).
   const rel = cell.sub(terrain.blocks.origin);
   const inVol = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))
     .and(rel.z.greaterThanEqual(float(0))).and(rel.x.lessThan(terrain.blocks.size.x))

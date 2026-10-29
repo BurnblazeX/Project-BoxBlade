@@ -10,6 +10,12 @@
   </head>
   <body class="ui-hidden">
     <div id="app"></div>
+    <!-- Loading another region (main.js loadRegion, game/ui.js showLoading) -->
+    <div id="loading-screen" style="display: none;">
+      <div id="loading-name"></div>
+      <div id="loading-bar"><div id="loading-fill"></div></div>
+      <div id="loading-step"></div>
+    </div>
     <div id="top-bar">
       <button id="btn-debug" type="button" title="Debug settings (Alt+V)">Debug</button>
       <button id="btn-effects" type="button" title="Shadows, AO, GI, reflections, mirrors (R)">Enable advanced effects</button>

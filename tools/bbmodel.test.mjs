@@ -123,6 +123,35 @@ section('cube rotations');
   ok('a turn and its inverse', JSON.stringify(transformCube(transformCube(c0, T), U)), JSON.stringify(c0));
 }
 
+section('turned and stretched uvs are baked');
+{
+  const { bakeFaces } = await import('../js/core/bbmodel.js');
+  // A carpet's edge: an east face 12 long (z) and 1 tall, its uv a 1 x 12
+  // column turned 90; its top one pixel stretched over 12 x 12.
+  const m = parseBBModel({ name: 't', textures: [{ name: 't.png', width: 16, height: 16,
+    uv_width: 16, uv_height: 16, source: 'data:' }], elements: [{ name: 'c', from: [0, 0, 0], to: [12, 1, 12],
+    faces: { east: { uv: [0, 0, 1, 12], rotation: 90, texture: 0 }, up: { uv: [5, 5, 6, 6], texture: 0 } } }] });
+  ok('no warnings', m.warnings.join(' | '), '');
+  ok('two faces baked, room below the texture', `${m.bakes.length} ${m.width}x${m.height}`, '2 16x29');
+  // Pixel (x, y) holds (x, y) in R, G.
+  const rgba = new Uint8ClampedArray(m.width * m.height * 4);
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) rgba.set([x, y, 0, 255], (y * m.width + x) * 4);
+  bakeFaces(rgba, m.width, m.bakes);
+  const shows = (f, w) => { const [u, v] = facePixel(f, w); const i = (v * m.width + u) * 4; return `${rgba[i]},${rgba[i + 1]}`; };
+  const east = m.cubes[0].faces[0];
+  // Blockbench: turned 90, the face's top left shows the uv's bottom left.
+  ok('east, its left end (+z) shows the column\'s bottom', shows(east, [11, 0, 11]), '0,11');
+  ok('east, its right end (-z) shows the column\'s top', shows(east, [11, 0, 0]), '0,0');
+  const up = m.cubes[0].faces[2];
+  truthy('the stretched top is its one pixel everywhere',
+    [[0, 0], [11, 11], [3, 7]].every(([x, z]) => shows(up, [x, 0, z]) === '5,5'));
+  const half = parseBBModel({ name: 't', textures: [{ name: 't.png', width: 16, height: 16, uv_width: 16, uv_height: 16,
+    source: 'data:' }], elements: [{ name: 'c', from: [0, 0, 0], to: [2, 2, 2],
+    faces: { south: { uv: [0, 0, 2, 2], rotation: 180, texture: 0 } } }] });
+  ok('a half turn needs no bake', half.bakes.length, 0);
+  ok('a half turn: the bottom right shows the uv\'s top left', facePixel(half.cubes[0].faces[4], [1, 0, 1]).join(','), '0,0');
+}
+
 section('a lightSource cube makes a light');
 {
   const { lightColourOf } = await import('../js/core/bbmodel.js');

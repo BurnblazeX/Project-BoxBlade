@@ -128,6 +128,8 @@ export function createOcclusion({ camera, feet, picker = null }) {
   return {
     name: 'occlusion',
     update,
+    // Another region loaded: the building is looked for afresh.
+    reset() { cellKey = ''; worldSize = -1; },
     hiddenAt,
     commands,
     settings: { title: 'Interiors', settings: [

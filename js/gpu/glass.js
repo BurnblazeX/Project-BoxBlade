@@ -1,4 +1,4 @@
-import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, vec4, min, clamp, length, int, select, pow } from 'three/tsl';
+import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, vec4, min, clamp, length, int, select, pow, reflect } from 'three/tsl';
 import { GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { blockFaceTSL as boxFaceTSL, texelLockTSL } from './terrain.js';
@@ -69,20 +69,27 @@ export const glassBackGlare = uniform(float(0));
 
 export const GLASS_CAUSTIC_RANGE = [0.25, 3];   // clamp on the intensity
 
+// The texel a ray entered glass by, traced.w along it: { entry, nf (the
+// face's axis normal, either way round), layer, st, tint, f0 }.
+function glassEntryTSL(terrain, traced, origin, dir) {
+  // The march stops within a step past the surface it entered through; the
+  // face is the nearest block plane, and the texel is locked onto it as the
+  // glass's own shading locks its texels.
+  const entry = origin.add(dir.mul(traced.w)).toVar();
+  const nf = blockFaceTSL(entry, dir, false, terrain).toVar();
+  const f = boxFaceTSL(texelLockTSL(entry, nf), nf);
+  const layer = blockLayerTSL(terrain, f.block, nf, entry).toVar();
+  const st = f.st.toVar();
+  const tint = texture(terrain.albedo, st).depth(int(layer)).level(int(0)).rgb.toVar();
+  const f0 = texture(terrain.specular, st).depth(int(layer)).level(int(0)).g.toVar();
+  return { entry, nf, layer, st, tint, f0 };
+}
+
 export function glassRayTransmitTSL(terrain, traced, origin, dir) {
   const out = vec3(1, 1, 1).toVar();
   If(traced.z.greaterThan(float(1e-4)).and(traced.w.greaterThanEqual(float(0))), () => {
-    // The march stops within a step past the surface it entered through; the
-    // face is the nearest block plane, and the texel is locked onto it as the
-    // glass's own shading locks its texels.
-    const entry = origin.add(dir.mul(traced.w)).toVar();
-    const nf = blockFaceTSL(entry, dir, false, terrain).toVar();
-    const f = boxFaceTSL(texelLockTSL(entry, nf), nf);
-    const layer = blockLayerTSL(terrain, f.block, nf, entry).toVar();
-    const st = f.st.toVar();
-    const tint = texture(terrain.albedo, st).depth(int(layer)).level(int(0)).rgb;
+    const { nf, layer, st, tint, f0 } = glassEntryTSL(terrain, traced, origin, dir);
     // The two surfaces' reflection at the angle this ray meets them.
-    const f0 = texture(terrain.specular, st).depth(int(layer)).level(int(0)).g;
     const surface = glassSurfaceTransmitTSL(f0, abs(dir.dot(nf)));
     out.assign(glassTransmitTSL(traced.z, tint, surface));
     If(glassCaustics.greaterThan(float(0)), () => {
@@ -93,6 +100,25 @@ export function glassRayTransmitTSL(terrain, traced, origin, dir) {
       const k = float(1).add(glassCaustics.mul(traced.w).mul(div));
       out.mulAssign(clamp(k, float(GLASS_CAUSTIC_RANGE[0]), float(GLASS_CAUSTIC_RANGE[1])));
     });
+  });
+  return out;
+}
+
+// Glass met by a reflection ray (shade.js reflections): what is behind it
+// shows tinted, as through the glass itself, and its face reflects the
+// ambient off it - so a pane shows in a mirror or a polished floor rather
+// than vanishing. Not refracted: a reflection is the cheap view, and straight
+// through is what the trace walked. traced as glassRayTransmitTSL's.
+// seen: what the ray met beyond; ambientAt(q, d): the light around q facing d.
+export function glassInReflectionTSL(terrain, traced, origin, dir, seen, ambientAt) {
+  const out = seen.toVar();
+  If(traced.z.greaterThan(float(1e-4)).and(traced.w.greaterThanEqual(float(0))), () => {
+    const { entry, nf, tint, f0 } = glassEntryTSL(terrain, traced, origin, dir);
+    const cosI = abs(dir.dot(nf));
+    const F = f0.add(float(1).sub(f0).mul(pow(float(1).sub(clamp(cosI, float(0), float(1))), float(5))));
+    const through = glassTransmitTSL(traced.z, tint, glassSurfaceTransmitTSL(f0, cosI));
+    const off = ambientAt(entry, reflect(dir, nf));
+    out.assign(out.mul(through).add(off.mul(F)));
   });
   return out;
 }

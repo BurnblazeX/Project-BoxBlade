@@ -205,6 +205,26 @@ export function createChunkWorld({ size = 12, yMin, height }) {
       return cellsOf(box ? chunksIn(box[0], box[1], box[2], box[3]) : chunks.values(), box);
     },
     layerAt, setLayerAt,
+    // --- Whole chunks, for regions on disk (core/region.js) ---
+    // fn(cx, cz, cells, palette) per chunk: cells index the palette (0 empty).
+    // Both are the store's own - read them, never write them.
+    forEachChunk(fn) { for (const c of chunks.values()) fn(c.cx, c.cz, c.cells, palette); },
+    // Sets a whole chunk: cells (cellsPer long) index blocks, blocks[0] empty.
+    putChunk(cx, cz, cells, blocks) {
+      if (cells.length !== cellsPer) throw new Error('chunks: a chunk has ' + cellsPer + ' cells');
+      const ids = blocks.map(b => b ? intern(b) : 0);
+      const c = chunkFor(cx * size, cz * size, true);
+      let n = 0;
+      for (let i = 0; i < cellsPer; i++) {
+        const t = ids[cells[i]];
+        if (t === undefined) throw new Error(`chunks: type ${cells[i]} is not in the blocks given`);
+        c.cells[i] = t;
+        if (t) n++;
+      }
+      count += n - c.count;
+      c.count = n;
+      if (n === 0 && Object.keys(c.layers).length === 0) chunks.delete(chunkKey(cx, cz));
+    },
     // What it holds: chunks, blocks, kinds of block, and the bytes the cells
     // and layers take.
     stats() {

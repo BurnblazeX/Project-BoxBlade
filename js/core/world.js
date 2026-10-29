@@ -2,6 +2,7 @@ import { isGlassMaterial } from './materials.js';
 import { placeModel } from './bbmodel.js';
 import { rectCovered } from './rects.js';
 import { createChunkWorld } from './chunks.js';
+import { LEVEL_FORMAT, LEVEL_VERSION, migrateLevel, blockRow, chunkBounds, unionBounds } from './region.js';
 
 // --- CHUNK / VERTICAL LAYOUT ---
 // A chunk is 12x12 blocks in footprint and 48 blocks tall: 8 below ground,
@@ -502,19 +503,32 @@ export function removeWorldModel(entry) {
 
 // --- Levels: the world as data ---
 //
-// What the editor saves and the game loads: every block and every placed
-// model, by name. Entities are not in it yet.
+// What the editor saves and the game loads: every block, every placed model
+// by name, and the region's settings, spawns and exits. Entities are not in it
+// yet. On disk a region is a .bxr file, level format v2 (core/region.js); v1's
+// JSON levels, a row per block, still load:
 //   { format: 'boxblade-level', version: 1,
 //     blocks: [[x, y, z, materialId, shape?, facing?, second?], ...],
 //     models: [[name, x, y, z, yaw], ...]            standing on block (x, y, z)
 //             [[name, x, y, z, 0, wall], ...] }      hung in cell (x, y, z)
-export const LEVEL_FORMAT = 'boxblade-level';
+export { LEVEL_FORMAT };
 
-// The Dev Level (levels/dev_level.json): the test map every feature through
+// The Dev Level (levels/dev_level.bxr): the test map every feature through
 // A10 was built and measured on - the church, the glass bed, the torches. The
 // game loads it and the editor saves to it, until regions (World plan P2)
 // bring a level per region.
 export const DEV_LEVEL = 'dev_level';
+
+// The loaded region's settings (World plan P2 §4.1): its name, bounds
+// [x0, x1, z0, z1] (inclusive, in blocks), sea level, named spawn points
+// [x, y, z], and exits. Set by loadLevel; saved back by serializeLevel.
+export const Region = { name: null, bounds: null, seaLevel: null, spawns: {}, exits: [] };
+
+// A spawn point of the loaded region, [x, y, z]: the one named, else its
+// 'start', else null.
+export function regionSpawn(name = 'start') {
+  return Region.spawns[name] || Region.spawns.start || null;
+}
 
 // second: a dual block's other half's material (isDual) - kept only for a
 // shape that has another half.
@@ -526,30 +540,53 @@ export function newBlock(materialId, shape = null, facing = null, second = null)
   return block;
 }
 
+// The world as a v2 level in memory (core/region.js): copies of its chunks,
+// indexing a palette of only the block types in use. The bounds grow to take
+// in any block the editor put outside them.
 export function serializeLevel() {
-  const blocks = [];
-  for (const [key, b] of World) {
-    const row = [...key.split(',').map(Number), b.materialId ?? null];
-    if (b.shape || b.facing || b.second != null) row.push(b.shape || null);
-    if (b.facing || b.second != null) row.push(b.facing || null);
-    if (b.second != null) row.push(b.second);
-    blocks.push(row);
-  }
+  const { size, yMin, height } = World.shape;
+  const palette = [null], fileType = new Map(), chunks = [];
+  World.forEachChunk((cx, cz, cells, types) => {
+    const out = new Uint16Array(cells.length);
+    for (let i = 0; i < cells.length; i++) {
+      const t = cells[i];
+      if (!t) continue;
+      let f = fileType.get(t);
+      if (f === undefined) {
+        const b = types[t];
+        f = palette.length;
+        palette.push(blockRow(b.materialId, b.shape, b.facing, b.second));
+        fileType.set(t, f);
+      }
+      out[i] = f;
+    }
+    chunks.push({ cx, cz, cells: out });
+  });
   const models = WorldModels.map(m => m.wall
     ? [m.name, ...m.cell, 0, m.wall]
     : [m.name, m.x, m.y, m.z, m.yaw]);
-  return { format: LEVEL_FORMAT, version: 1, blocks, models };
+  const level = { format: LEVEL_FORMAT, version: LEVEL_VERSION,
+    region: { name: Region.name, bounds: Region.bounds, seaLevel: Region.seaLevel },
+    spawns: Region.spawns, exits: Region.exits, models,
+    chunk: { size, yMin, height }, palette, chunks };
+  level.region.bounds = unionBounds(Region.bounds, chunkBounds(chunks, World.shape));
+  return level;
 }
 
-// Replaces the world with a level. models: name -> parsed model (models.js).
-// Returns the names of models it could not find, or place.
-export function loadLevel(level, models) {
-  if (!level || level.format !== LEVEL_FORMAT) throw new Error('not a BoxBlade level');
+// Replaces the world with a level: v2 in memory, its readable form, or v1.
+// models: name -> parsed model (models.js); name: the region's, if the level
+// does not say. Returns the names of models it could not find, or place.
+export function loadLevel(level, models, name = null) {
+  level = migrateLevel(level, World.shape);
   clearWorldModels();
   World.clear();
-  for (const [x, y, z, materialId, shape, facing, second] of level.blocks) {
-    World.set(getVoxelKey(x, y, z), newBlock(materialId, shape, facing, second));
-  }
+  const blocks = level.palette.map(row => row && newBlock(...row));
+  for (const { cx, cz, cells } of level.chunks) World.putChunk(cx, cz, cells, blocks);
+  Region.name = level.region.name ?? name;
+  Region.bounds = level.region.bounds;
+  Region.seaLevel = level.region.seaLevel;
+  Region.spawns = level.spawns;
+  Region.exits = level.exits;
   const missing = [];
   for (const [name, x, y, z, yaw, wall] of level.models || []) {
     const model = models.get(name);

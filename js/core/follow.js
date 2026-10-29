@@ -10,8 +10,8 @@
 // centred on itself and never moves - a small level behaves exactly as it did
 // when the volumes were fitted to it. A bigger one keeps the window while the
 // focus stays in its middle (margin blocks in from either side) and recentres
-// on the focus, snapped to stride, when it leaves - so walking around costs a
-// rebuild every so often, never every block.
+// on the focus, snapped to stride and kept inside the world, when it leaves -
+// so walking around costs a rebuild every so often, never every block.
 
 // The world's blocks' bounds, { min: [x, y, z], max: [x, y, z] } in blocks;
 // null for an empty world.
@@ -35,7 +35,12 @@ export function worldBlockBounds(world) {
 export function windowAxis(prev, focus, size, lo, hi, margin = Math.floor(size / 4), stride = 8) {
   if (hi - lo + 1 <= size) return Math.round((lo + hi) / 2 - (size - 1) / 2);
   if (prev !== null && prev !== undefined && focus >= prev + margin && focus < prev + size - margin) return prev;
-  return Math.round((focus - size / 2) / stride) * stride;
+  // Never past the world's edge: a window half over air was rebuilt each time
+  // the focus came near either side, and a world a little wider than the
+  // window (a 140-block region, 128 across) moved it about every block an
+  // editor pan crossed. Clamped, it has a handful of places at most.
+  const at = Math.round((focus - size / 2) / stride) * stride;
+  return Math.max(lo, Math.min(hi - size + 1, at));
 }
 
 // Both horizontal axes: [x, z] of the window's first block. bounds from

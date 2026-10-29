@@ -7,8 +7,8 @@ import { BLOCK_METRES } from '../core/world.js';
 import { terrainSampleTSL, terrainWhite, axisNormalTSL, blockFaceTSL as boxFaceTSL, texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL, terrainTexelTSL, slopeFromCodeTSL, slopePlaneTSL } from './terrain.js';
 import { layout } from './layout.js';
 import { SURFACE_BIAS_VOXELS } from './field.js';
-import { GLASS_LAYERS, GLASS_MAX_BOUNCES, GLASS_WALK_STEPS } from './glass.js';
-import { createReflectTraceTSL } from './trace.js';
+import { GLASS_LAYERS, GLASS_MAX_BOUNCES, GLASS_WALK_STEPS, glassInReflectionTSL } from './glass.js';
+import { createReflectTraceTSL, giTraceHitTSL } from './trace.js';
 import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, isGlassCodeTSL, partAtTSL, skyOpenTSL } from './volume.js';
 import { boxBumpedNormalTSL, labNormalTSL } from './normals.js';
 import { NO_SKIP, createCardHitTSL } from './cards.js';
@@ -537,8 +537,24 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const [o] = lightBatch([hitRequest(rec)]);
     return composeHit(rec, o.vis, o.diff);
   };
-  const reflectedTSL = (origin, dir, maxDist = reflectMax) =>
-    shadeTraced(origin, dir, reflectTrace(origin, dir, maxDist).toVar());
+  // Reflection rays in a world with glass: the trace that also sums the glass
+  // it crosses (trace.js sumGlass), so a pane shows in a reflection - tinted,
+  // with the ambient off its face (glass.js glassInReflectionTSL) - instead of
+  // the ray walking through it unseen. Only for a world with glass.
+  const reflectSumTrace = reflectTrace && glass && terrain ? createReflectTraceTSL(cascades, false, true) : null;
+  // A reflection ray's hit, as reflectTrace answers, and the glass it crossed
+  // (null without glass).
+  const traceReflection = (origin, dir, reach) => {
+    if (!reflectSumTrace) return { hit: reflectTrace(origin, dir, reach).toVar(), crossed: null };
+    const g = giTraceHitTSL(reflectSumTrace(origin, dir, reach).toVar());
+    return { hit: g.hit.toVar(), crossed: g.glass.toVar() };
+  };
+  const throughGlass = (seen, origin, dir, crossed) => (crossed
+    ? glassInReflectionTSL(terrain, crossed, origin, dir, seen, ambientAt) : seen);
+  const reflectedTSL = (origin, dir, maxDist = reflectMax) => {
+    const { hit, crossed } = traceReflection(origin, dir, maxDist);
+    return throughGlass(shadeTraced(origin, dir, hit), origin, dir, crossed);
+  };
 
   // --- Glass: a surface whose shading traces through it ---
   //
@@ -1276,10 +1292,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
               return;
             }
             // shadeTraced, spelled out so the reflection-hit debug views (bxb.view) can show its parts.
-            const hit = reflectTrace(origin, dir, reach).toVar();
+            const { hit, crossed } = traceReflection(origin, dir, reach);
             const rec = traceRecord(origin, dir, hit);
             const [o] = lightBatch([hitRequest(rec)]);
-            const refl = composeHit(rec, o.vis, o.diff).toVar();
+            const refl = throughGlass(composeHit(rec, o.vis, o.diff), origin, dir, crossed).toVar();
             // 1 the hit's own colour, unlit; 2 its distance (white = 16 m, red = a miss).
             If(splitDebug.equal(int(1)), () => { refl.assign(select(rec.met.greaterThan(float(0.5)), rec.alb, rec.col)); });
             If(splitDebug.equal(int(2)), () => {

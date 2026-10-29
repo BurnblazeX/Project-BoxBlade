@@ -1,17 +1,18 @@
 import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, mix, vec3, vec4, uniform, select, Fn, floor, normalize, cameraViewMatrix, storage } from 'three/tsl';
-import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL } from '../gpu/terrain.js';
+import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL,
+         terrainAlbedoTSL } from '../gpu/terrain.js';
 import { applyOcclusionMask, outsideShadeTSL } from '../gpu/occlusion.js';
-import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey, shapeCode,
+import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey,
          isDual, blockParts,
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
 import { MODELS, TERRAIN_LAYERS } from '../core/models.js';
-import { lightColourOf, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from '../core/bbmodel.js';
+import { lightColourOf, bakeFaces, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from '../core/bbmodel.js';
 import { VOXEL_METRES } from '../core/field.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';
-import { buildSkyTops, packSkyTops } from '../core/skytop.js';
+import { enteredBoxes, ringRuns, writeVolumeBox } from '../core/blockvolume.js';
 import { followWindow, worldBlockBounds } from '../core/follow.js';
 import { blocksIn } from '../core/chunks.js';
 
@@ -59,6 +60,8 @@ export function keyForInstance(instanceId) {
 // and a loaded image ends up in on the GPU.
 export const terrainTextures = {
   albedo: null, normal: null, specular: null,
+  // The albedo mipmapped and anisotropic, for far off (filteredTwin).
+  albedoFiltered: null,
   // Source (sRGB) RGBA per layer, top-down, once loaded - what GI averages.
   rgba: [],
   // The same for each layer's _s, or undefined where it has none.
@@ -299,6 +302,9 @@ async function loadFaceLayers(m, layer) {
 // A dual block (world.js isDual) adds 128 to A, and its other half's R, G, B
 // sit BLOCK_VOLUME_SIZE[2] further along z, in the second half of the
 // texture (dims) - one binding for both (gpu/volume.js volumeAtTSL).
+// x and z are a ring (core/blockvolume.js): a block sits at its coordinates
+// mod the size wherever the window is, so a move writes and uploads only the
+// strips that slid in.
 // modelHits: the model cubes by cell (bbmodel.js buildModelHits) - what
 // gpu/volume.js hitSurfaceTSL needs to find a hit's texel as the cube's own draw does.
 export const BLOCK_VOLUME_SIZE = [128, CHUNK_HEIGHT, 128];
@@ -315,14 +321,58 @@ function placeBlockVolume(focus, prev) {
   blockVolumeOrigin[2] = z;
   return moved;
 }
-// Per frame: the window follows the player (a block position). Rebuilt only
-// when it moves - never for a world that fits.
-export function followBlockVolume(focus) {
+// Per frame: the window follows the player (a block position). Only when it
+// moves - never for a world that fits - and then only the strips that slid
+// in are written, and with a renderer, uploaded (else the whole texture).
+export function followBlockVolume(focus, renderer = null) {
   if (!terrainTextures.blocks || !focus) return false;
   blockVolumeFocus = { x: Math.round(focus.x), z: Math.round(focus.z) };
-  if (!placeBlockVolume(blockVolumeFocus, [blockVolumeOrigin[0], blockVolumeOrigin[2]])) return false;
-  buildBlockVolume(false);
+  const prev = [...blockVolumeOrigin];
+  if (!placeBlockVolume(blockVolumeFocus, [prev[0], prev[2]])) return false;
+  const boxes = enteredBoxes(prev, blockVolumeOrigin, BLOCK_VOLUME_SIZE);
+  if (!boxes || !volumeHits) { buildBlockVolume(false); return true; }
+  const v = terrainTextures.blocks, vol = blockVolumeView();
+  v.origin.value.set(...blockVolumeOrigin);
+  for (const box of boxes) writeVolumeBox(vol, World, volumeHits, box);
+  if (renderer) uploadVolumeBoxes(renderer, v.tex, boxes);
+  else v.tex.needsUpdate = true;
+  terrainTextures.skyTop.needsUpdate = true;   // 32 KB: whole
   return true;
+}
+let volumeHits = null;   // the model hit table of the last full build
+const blockVolumeView = () => ({ data: terrainTextures.blocks.tex.image.data,
+                                 skyTop: terrainTextures.skyTop.image.data,
+                                 lo: blockVolumeOrigin, size: BLOCK_VOLUME_SIZE });
+// The boxes' cells, both halves, straight into the live texture: one
+// queue.writeTexture per run of the ring (the shadow field's way, gpu/field.js
+// commitShadowGrid) - a strip of 8 blocks is 0.4 MB, not 6.
+let volumeStripBuf = new Uint8Array(0);
+function uploadVolumeBoxes(renderer, tex, boxes) {
+  renderer.initTexture(tex);
+  const gpuTex = renderer.backend.get(tex).texture;
+  if (!gpuTex) { tex.needsUpdate = true; return; }
+  const queue = renderer.backend.device.queue, data = tex.image.data;
+  const [sx, sy, sz] = BLOCK_VOLUME_SIZE;
+  for (const [x0, x1, z0, z1] of boxes) {
+    for (const [pa, pb] of ringRuns(x0, x1, sx)) {
+      for (const [qa, qb] of ringRuns(z0, z1, sz)) {
+        for (const half of [0, sz]) {
+          const w = pb - pa + 1, d = qb - qa + 1, row = w * 4;
+          if (volumeStripBuf.length < row * sy * d) volumeStripBuf = new Uint8Array(row * sy * d);
+          let o = 0;
+          for (let z = qa + half; z <= qb + half; z++) {
+            for (let y = 0; y < sy; y++, o += row) {
+              const base = ((z * sy + y) * sx + pa) * 4;
+              volumeStripBuf.set(data.subarray(base, base + row), o);
+            }
+          }
+          queue.writeTexture({ texture: gpuTex, origin: { x: pa, y: 0, z: qa + half } },
+                             volumeStripBuf, { offset: 0, bytesPerRow: row, rowsPerImage: sy },
+                             { width: w, height: sy, depthOrArrayLayers: d });
+        }
+      }
+    }
+  }
 }
 function buildBlockVolume(remeasure = true) {
   if (remeasure) {
@@ -358,40 +408,11 @@ function buildBlockVolume(remeasure = true) {
     };
   }
   v.origin.value.set(...lo);
-  const data = v.tex.image.data;
-  data.fill(0);
-  const at = c => {
-    const r = c.map((x, a) => x - lo[a]);
-    return r.some((x, a) => x < 0 || x >= size[a]) ? -1 : ((r[2] * size[1] + r[1]) * size[0] + r[0]) * 4;
-  };
-  // Only the chunks under the window (core/chunks.js).
-  for (const [c, block] of blocksIn(World, [lo[0], lo[0] + size[0] - 1, lo[2], lo[2] + size[2] - 1])) {
-    const o = at(c);
-    if (o < 0) continue;
-    const layer = materialLayer(block.materialId), f = MATERIAL_LAYERS.faces[layer];
-    data[o] = layer + 1;
-    data[o + 1] = f ? f.top : layer;
-    data[o + 2] = f ? f.bottom : layer;
-    data[o + 3] = shapeCode(block);   // its shape and facing (world.js shapeCode)
-    if (isDual(block)) {
-      data[o + 3] += 128;
-      const o2 = o + size[0] * size[1] * size[2] * 4;
-      const layer2 = materialLayer(block.second), f2 = MATERIAL_LAYERS.faces[layer2];
-      data[o2] = layer2 + 1;
-      data[o2 + 1] = f2 ? f2.top : layer2;
-      data[o2 + 2] = f2 ? f2.bottom : layer2;
-    }
-  }
-  const hits = buildModelHits(WorldModels, key => World.has(key));
+  v.tex.image.data.fill(0);
+  terrainTextures.skyTop.image.data.fill(0);
+  const hits = volumeHits = buildModelHits(WorldModels, key => World.has(key));
   if (hits.overflow) console.warn(`[terrain] model hit table full (${MODEL_HIT_VEC4S} vec4): some model cubes reflect as air`);
-  for (const [key, { header, giIndex }] of hits.index) {
-    const o = at(key.split(',').map(Number));
-    if (o < 0 || header > 65535) continue;
-    data[o + 1] = header & 255;
-    data[o + 2] = header >> 8;
-    data[o + 3] = giIndex + 1;
-  }
-  packSkyTops(buildSkyTops(World, [lo[0], lo[2]], [size[0], size[2]]), terrainTextures.skyTop.image.data);
+  writeVolumeBox(blockVolumeView(), World, hits, [lo[0], lo[0] + size[0] - 1, lo[2], lo[2] + size[2] - 1], true);
   terrainTextures.skyTop.needsUpdate = true;
   const mh = terrainTextures.modelHits;
   mh.attr.array.set(hits.data);
@@ -399,9 +420,39 @@ function buildBlockVolume(remeasure = true) {
   v.tex.needsUpdate = true;
 }
 
+// The albedo array again, for far off (gpu/terrain.js terrainAlbedoTSL):
+// the same bytes - the array is shared, never copied - with mipmaps and 16x
+// anisotropic filtering, which need linear filtering both ways, so it cannot
+// be the crisp array itself. Re-uploaded whenever that one is
+// (syncFilteredAlbedo).
+function filteredTwin(src) {
+  const { data, width, height, depth } = src.image;
+  const tex = new THREE.DataArrayTexture(data, width, height, depth);
+  tex.format = src.format;
+  tex.type = src.type;
+  tex.colorSpace = src.colorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.anisotropy = 16;
+  tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+  return tex;
+}
+let filteredFor = -1;   // the albedo's version the twin last took
+// Per frame: the twin follows the albedo's uploads (textures arriving, the
+// shaded albedo swapped in), mipmaps made again with each.
+export function syncFilteredAlbedo() {
+  const a = terrainTextures.albedo, f = terrainTextures.albedoFiltered;
+  if (!a || !f || a.version === filteredFor) return;
+  filteredFor = a.version;
+  f.needsUpdate = true;
+}
+
 function initTerrainTextures() {
   if (terrainTextures.albedo) return;
   terrainTextures.albedo = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
+  terrainTextures.albedoFiltered = filteredTwin(terrainTextures.albedo);
   terrainTextures.plain = makeArray([128, 128, 128, 255], THREE.SRGBColorSpace);
   terrainTextures.normal = makeArray([128, 128, 255, 255], THREE.NoColorSpace);
   terrainTextures.specular = makeArray(DEFAULT_SPECULAR, THREE.NoColorSpace);
@@ -499,6 +550,7 @@ async function loadModelTiles(model) {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(img, 0, 0);
     const all = ctx.getImageData(0, 0, w, h).data;
+    bakeFaces(all, w, model.bakes);   // turned and stretched faces, the same in every map
     pixels[kind] = { all, w };
     for (let ty = 0; ty < model.tilesY; ty++) for (let tx = 0; tx < model.tilesX; tx++) {
       const tile = new Uint8ClampedArray(n * n * 4);
@@ -538,7 +590,12 @@ function instanceMatrix(out, idx, key, visible = true) {
 // and every compiled shader set hold this mesh and its buffers, and a new mesh
 // would strand them all. Past its capacity an edit cannot be shown until a
 // reload (rebuildWorldInstances says so).
+// Regions load in place (World plan P2), so the first one sets the room for
+// all of them: never less than TERRAIN_MIN_CAPACITY instances (~10 MB at 156
+// bytes each), enough for the village. A region past it reloads the page into
+// that region (main.js loadRegion), which sizes the mesh for it.
 export const INSTANCE_HEADROOM = 16384;
+export const TERRAIN_MIN_CAPACITY = 65536;
 let terrain = null;   // { geometry, instanceData, attrs: {...}, capacity }
 
 function instanceCount() {
@@ -561,7 +618,8 @@ export function plainTerrainMaterial(params = {}) {
   // player is in (gpu/occlusion.js outsideShadeTSL).
   material.colorNode = Fn(() => {
     const surf = terrainSurfaceTSL();
-    const c = mix(terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb, vec3(1, 1, 1), terrainWhite);
+    const c = mix(terrainAlbedoTSL(terrainTextures.albedo, terrainTextures.albedoFiltered, surf).rgb,
+                  vec3(1, 1, 1), terrainWhite);
     return select(surf.emissive, vec3(0, 0, 0), c).mul(outsideShadeTSL());
   })();
   // A lightSource cube is unlit: all of its colour is emission. (A face a
@@ -594,7 +652,7 @@ export function initWorldRender(scene) {
   if (needed === 0) return;
   initTerrainTextures();
   buildBlockVolume();
-  const capacity = needed + INSTANCE_HEADROOM;
+  const capacity = Math.max(needed + INSTANCE_HEADROOM, TERRAIN_MIN_CAPACITY);
 
   const geometry = new THREE.BoxGeometry(VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
   // Every per-instance value in ONE interleaved buffer: WebGPU allows 8

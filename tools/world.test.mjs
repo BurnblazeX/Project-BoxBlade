@@ -136,6 +136,7 @@ section('vertical halves and panes: turned boxes, full-height tops');
 section('dual blocks: two materials, one full cell');
 {
   const { isDual, blockParts, partAt, serializeLevel, loadLevel } = await import('../js/core/world.js');
+  const { levelRows } = await import('../js/core/region.js');
   const dual = newBlock('marble', 'halfBottom', null, 'glass');
   truthy('a low half with a second material is dual', isDual(dual));
   ok('its parts: marble low, glass high', blockParts(dual).map(p => `${p.materialId}:${p.boxes[0].join(',')}`).join(' '),
@@ -148,7 +149,7 @@ section('dual blocks: two materials, one full cell');
   truthy('solid in its glass half too', isSolidAt(46 * 1.5, 0.5, 46 * 1.5));
   ok('the rays see marble below', partAt(46 * 1.5, -0.3, 46 * 1.5).materialId, 'marble');
   ok('and glass above', partAt(46 * 1.5, 0.3, 46 * 1.5).materialId, 'glass');
-  const row = serializeLevel().blocks.find(b => b[0] === 46 && b[2] === 46);
+  const row = levelRows(serializeLevel()).blocks.find(b => b[0] === 46 && b[2] === 46);
   ok('saved with its second material', JSON.stringify(row), '[46,0,46,"marble","halfBottom",null,"glass"]');
   World.delete('46,0,46');
 }
@@ -376,6 +377,7 @@ section('levels: the world as data');
   const { serializeLevel, loadLevel, newBlock, WorldModels, ModelBoxes, removeWorldModel,
           addWorldModel, mountWorldModel, clearWorldModels, LEVEL_FORMAT } = await import('../js/core/world.js');
   const { parseBBModel } = await import('../js/core/bbmodel.js');
+  const { levelRows, encodeRegion, decodeRegion } = await import('../js/core/region.js');
   const { readFileSync } = await import('node:fs');
   const models = new Map(['decor_chair', 'decor_wallTorch'].map(n => [n, parseBBModel(
     readFileSync(new URL(`../assets/objects/${n}.bbmodel`, import.meta.url), 'utf8'), n)]));
@@ -383,7 +385,7 @@ section('levels: the world as data');
   clearWorldModels();
   addWorldModel(models.get('decor_chair'), 6, 0, 8, 1);
   mountWorldModel(models.get('decor_wallTorch'), 19, 2, 11, 'E');
-  const saved = serializeLevel();
+  const saved = levelRows(serializeLevel());
   ok('its format', saved.format, LEVEL_FORMAT);
   ok('every block', saved.blocks.length, World.size);
   ok('a slope keeps its shape and facing', JSON.stringify(saved.blocks.find(b => b[0] === 29 && b[1] === 1 && b[2] === 27)),
@@ -392,11 +394,13 @@ section('levels: the world as data');
      '[0,0,0,"grass"]');
   ok('the models', JSON.stringify(saved.models),
      '[["decor_chair",6,0,8,1],["decor_wallTorch",19,2,11,0,"E"]]');
-  // Round trip: through JSON, into an emptied world, and out again the same.
-  const text = JSON.stringify(saved);
+  // Round trip: through a .bxr, into an emptied world, and out again the same.
+  const bytes = await encodeRegion(serializeLevel());
   World.clear(); clearWorldModels();
-  ok('loads with nothing missing', loadLevel(JSON.parse(text), models).length, 0);
-  ok('and saves back identically', JSON.stringify(serializeLevel()), text);
+  ok('loads with nothing missing', loadLevel(await decodeRegion(bytes), models).length, 0);
+  ok('and saves back identically', JSON.stringify(levelRows(serializeLevel())), JSON.stringify(saved));
+  ok('a v1 level still loads', loadLevel({ ...saved, version: 1 }, models).length, 0);
+  ok('the same', JSON.stringify(levelRows(serializeLevel()).blocks), JSON.stringify(saved.blocks));
   truthy('the chair takes its tile again', !!occupantAt('6,0,8'));
   ok('the models bake again', ModelBoxes.length,
      models.get('decor_chair').cubes.length + models.get('decor_wallTorch').cubes.filter(c => !c.light).length);

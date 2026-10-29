@@ -76,6 +76,7 @@ terrainTextures.albedo = layers();
 terrainTextures.normal = layers();
 terrainTextures.specular = layers();
 terrainTextures.plain = layers();
+terrainTextures.albedoFiltered = layers();
 createTestArea(40, 40);
 initWorldRender(scene);
 

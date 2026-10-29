@@ -26,3 +26,8 @@ Two tests guard the structure rather than a feature:
 
 What can't be covered here — actual rendering, input — goes in the
 in-browser checklist instead.
+
+Regions (`js/core/region.js`, level format v2) are binary `.bxr` files in
+`levels/`; `node tools/region.mjs info|dump|pack <file> [out]` shows one, dumps
+it to readable JSON (a row per block) for reading or diffing, and packs any
+level — a dump, or an old v1 `.json` — back into a `.bxr`.

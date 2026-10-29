@@ -23,7 +23,7 @@ import { createTexelCacheWriteNode, createTexelCacheLookupNode, createTexelMissN
          createSplitShading, createTexelGBufferNode, createSplitResolve, createSplitReadNode,
          createShadowMaterial } from '../../gpu/texel.js';
 import { terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, terrainRevealedTSL,
-         terrainSurfaceTSL, terrainTexelTSL, terrainWhite } from '../../gpu/terrain.js';
+         terrainSurfaceTSL, terrainTexelTSL, terrainWhite, terrainFarAlbedoRatioTSL } from '../../gpu/terrain.js';
 import { terrainEmissiveTSL } from '../../gpu/shade.js';
 import { applyOcclusionMask, outsideShadeTSL } from '../../gpu/occlusion.js';
 import { worldInstancedMesh, glassInstancedMesh, terrainTextures } from '../render.js';
@@ -116,8 +116,23 @@ export function buildTerrainMaterials({ built, opts, cache, cached }) {
   for (const m of [terrainMat, lowMat, missMat]) if (m) applyOcclusionMask(m);
   if (missMat) missMat.depthWrite = false;
   // Not under a debug view: it shows a term alone, and should show it there too.
+  if (!opts.view) for (const m of [terrainMat, missMat]) if (m) filteredFar(m);
   if (!opts.view) for (const m of [terrainMat, missMat]) if (m) litWhereRevealed(m, built.revealedLight);
   return { terrainMat, lowMat, missMat, glassMat, glassLow, glassMiss };
+}
+
+// Far off, the shaded texel's colour with its texture filtered - mipmapped
+// and anisotropic (gpu/terrain.js terrainFarAlbedoRatioTSL). Up close it is
+// untouched. In the fragment shaders only: the kernels have no derivatives.
+// The ratio before the shaded colour's branches return to it: at the top
+// level, where the derivatives are defined.
+function filteredFar(mat) {
+  const shaded = mat.colorNode;
+  mat.colorNode = Fn(() => {
+    const ratio = terrainFarAlbedoRatioTSL(terrainTextures.albedo, terrainTextures.albedoFiltered,
+                                           terrainSurfaceTSL()).toVar();
+    return vec3(shaded).mul(ratio);
+  })();
 }
 
 // A revealed face (gpu/terrain.js terrainRevealedTSL) - a wall's top under a

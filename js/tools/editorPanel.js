@@ -10,7 +10,7 @@ import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
 import { BLOCK_SHAPES, hasFacing } from '../core/world.js';
 import { textureUrl } from '../render/render.js';
-import { facePixel } from '../core/bbmodel.js';
+import { facePixel, bakeFaces } from '../core/bbmodel.js';
 
 const FACING_ORDER = ['N', 'E', 'S', 'W'];
 const FACING_ARROW = { N: '↑', E: '→', S: '↓', W: '←' };
@@ -100,9 +100,12 @@ function modelPicture(name, model) {
     const c = pixelated(size, size);
     if (!model.textures.albedo) return c;
     loadImage(model.textures.albedo).then(img => {
-      const t = pixelated(img.width, img.height);
+      // With room for its baked faces (bbmodel.js bakeFaces).
+      const iw = Math.max(img.width, model.width), ih = Math.max(img.height, model.height);
+      const t = pixelated(iw, ih);
       t.getContext('2d').drawImage(img, 0, 0);
-      const px = t.getContext('2d').getImageData(0, 0, img.width, img.height).data;
+      const px = t.getContext('2d').getImageData(0, 0, iw, ih).data;
+      bakeFaces(px, iw, model.bakes || []);
       const out = c.getContext('2d');
       const ox = Math.floor((size - w) / 2), oy = size - h;
       for (const cube of [...model.cubes].sort((a, b) => a.max[2] - b.max[2])) {
@@ -111,8 +114,8 @@ function modelPicture(name, model) {
         const z = cube.max[2] - 1;
         for (let x = cube.min[0]; x < cube.max[0]; x++) for (let y = cube.min[1]; y < cube.max[1]; y++) {
           const [u, v] = facePixel(face, [x, y, z]);
-          if (u < 0 || v < 0 || u >= img.width || v >= img.height) continue;
-          const i = (v * img.width + u) * 4;
+          if (u < 0 || v < 0 || u >= iw || v >= ih) continue;
+          const i = (v * iw + u) * 4;
           if (px[i + 3] < 8) continue;
           out.fillStyle = `rgb(${px[i]},${px[i + 1]},${px[i + 2]})`;
           out.fillRect(ox + x - lo[0], oy + hi[1] - 1 - y, 1, 1);
@@ -190,7 +193,7 @@ export function createPalette({ state, pick, levelName }) {
     const caret = keepFocus ? document.activeElement.selectionStart : 0;
     panel.textContent = '';
     const top = el('div', 'top');
-    top.append(el('b', '', 'EDITOR'), el('span', 'hint', `levels/${levelName}.json · Tab to leave`));
+    top.append(el('b', '', 'EDITOR'), el('span', 'hint', `levels/${levelName()}.bxr · Tab to leave`));
     panel.appendChild(top);
 
     // What is selected, and which way it faces.

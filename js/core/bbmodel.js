@@ -15,7 +15,8 @@
 //   floor of the cell it stands in, itself on the grid, so a model built on
 //   the grid lands on the world's.
 //   One texture pixel per unit: each face's uv rectangle is its own size in
-//   pixels.
+//   pixels. A face that breaks it - uv turned 90 or 270, or stretched - is
+//   baked to one that keeps it when the model loads (bakeFaces).
 // What breaks them is reported (warnings) with the cube's name, and the
 // nearest thing that works is done.
 //
@@ -110,6 +111,8 @@ export function quarterTurn(axis, turns, pivot = [0, 0, 0]) {
 //     width, height (the texture's pixels),
 //     cubes: [{ name, min: [x,y,z], max: [x,y,z], faces: [6] }],
 //     bounds: [{ min, max }] (its bounding_box elements),
+//     bakes: faces to resample once its pixels are decoded (bakeFaces) -
+//       width and height include their room,
 //     warnings: [string] }
 // Faces in FACE_DIRS order, each { u: {axis, o, d}, v: {axis, o, d} } -
 // pixel = [u.o + u.d * m[u.axis], v.o + v.d * m[v.axis]] for model texel m -
@@ -139,6 +142,19 @@ export function parseBBModel(src, fallbackName = 'model') {
   const sv = albedo && albedo.uv_height ? height / albedo.uv_height
     : json.resolution?.height ? height / json.resolution.height : 1;
   if (su !== 1 || sv !== 1) warn(`texture is ${su} x ${sv} pixels per uv unit - one is expected`);
+
+  // Faces whose uv is turned a quarter, or not their own size (stretched, a
+  // pixel spread over a face), are baked: resampled at load into a rectangle
+  // of their own size, shelf-packed below the texture (bakeFaces), so every
+  // face the shader sees is one pixel per texel, unturned.
+  const bakes = [];
+  const shelf = { x: 0, y: height, h: 0, w: width };
+  const place = (w, h) => {
+    if (shelf.x + w > shelf.w && shelf.x > 0) { shelf.x = 0; shelf.y += shelf.h; shelf.h = 0; }
+    const at = [shelf.x, shelf.y];
+    shelf.x += w; shelf.h = Math.max(shelf.h, h); shelf.w = Math.max(shelf.w, w);
+    return at;
+  };
 
   const cubes = [], bounds = [];
   for (const el of json.elements || []) {
@@ -181,15 +197,21 @@ export function parseBBModel(src, fallbackName = 'model') {
     for (const [bbName, spec] of Object.entries(BB_FACES)) {
       const face = el.faces && el.faces[bbName];
       if (!face || face.texture === null || face.texture === undefined || !face.uv) continue;
-      if (face.rotation) warn(`${label} ${bbName}: uv rotation ${face.rotation} is not supported - ignored`);
+      if (face.rotation % 90) warn(`${label} ${bbName}: uv rotation ${face.rotation} - drawn at the nearest quarter`);
+      const rot = ((Math.round((face.rotation || 0) / 90) % 4) + 4) % 4;
       if (albedo && texs[face.texture] !== albedo && Number(face.texture) !== albedoIndex) {
         warn(`${label} ${bbName}: uses a second texture - drawn from the first`);
       }
-      const [u0, v0, u1, v1] = [face.uv[0] * su, face.uv[1] * sv, face.uv[2] * su, face.uv[3] * sv];
+      let [u0, v0, u1, v1] = [face.uv[0] * su, face.uv[1] * sv, face.uv[2] * su, face.uv[3] * sv];
+      // A half turn is the uv run backwards both ways.
+      if (rot === 2) [u0, v0, u1, v1] = [u1, v1, u0, v0];
       const du = max[spec.u] - min[spec.u], dv = max[spec.v] - min[spec.v];
-      if (Math.abs(Math.abs(u1 - u0) - du) > EPS || Math.abs(Math.abs(v1 - v0) - dv) > EPS) {
-        warn(`${label} ${bbName}: uv is ${Math.abs(u1 - u0)} x ${Math.abs(v1 - v0)} pixels ` +
-             `for a ${du} x ${dv} face - drawn one pixel per texel from its corner`);
+      if (du <= 0 || dv <= 0) continue;
+      const fits = rot % 2 === 0 && Math.abs(Math.abs(u1 - u0) - du) <= EPS && Math.abs(Math.abs(v1 - v0) - dv) <= EPS;
+      if (!fits) {
+        const at = place(du, dv);
+        bakes.push({ to: at, size: [du, dv], uv: [u0, v0, u1, v1], rot });
+        [u0, v0, u1, v1] = [at[0], at[1], at[0] + du, at[1] + dv];
       }
       faces[spec.dir] = { u: axisMap(u0, u1, min[spec.u], max[spec.u], spec.uRev, spec.u),
                           v: axisMap(v0, v1, min[spec.v], max[spec.v], spec.vRev, spec.v) };
@@ -210,10 +232,34 @@ export function parseBBModel(src, fallbackName = 'model') {
   }
 
   return {
-    name, width, height, cubes, bounds, warnings,
+    name, cubes, bounds, warnings, bakes,
+    // With the baked faces' room below the texture's own pixels.
+    width: bakes.length ? shelf.w : width, height: bakes.length ? shelf.y + shelf.h : height,
     textures: { albedo: albedo ? albedo.source : null,
                 normal: companion('_n'), specular: companion('_s'), emissive: companion('_e') }
   };
+}
+
+// Writes a model's baked faces (parseBBModel bakes) into its decoded pixels,
+// in place: rgba, w wide and model.width x model.height at least, the
+// texture's own pixels at its top left. Each baked texel takes the pixel its
+// centre falls on in Blockbench's mapping - u right and v down over the face,
+// the uv's corners turned rot quarters clockwise, as Blockbench does.
+export function bakeFaces(rgba, w, bakes) {
+  const h = rgba.length / 4 / w;
+  for (const { to, size: [du, dv], uv: [u0, v0, u1, v1], rot } of bakes) {
+    for (let j = 0; j < dv; j++) {
+      for (let i = 0; i < du; i++) {
+        const s = (i + 0.5) / du, t = (j + 0.5) / dv;
+        // s across the face, t down it; which uv span each runs along.
+        const [a, b] = rot === 1 ? [t, 1 - s] : rot === 3 ? [1 - t, s] : [s, t];
+        const x = Math.min(w - 1, Math.max(0, Math.floor(u0 + (u1 - u0) * a)));
+        const y = Math.min(h - 1, Math.max(0, Math.floor(v0 + (v1 - v0) * b)));
+        const from = (y * w + x) * 4, at = ((to[1] + j) * w + to[0] + i) * 4;
+        for (let k = 0; k < 4; k++) rgba[at + k] = rgba[from + k];
+      }
+    }
+  }
 }
 
 // --- Placing a model in the world ---

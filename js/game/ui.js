@@ -66,3 +66,18 @@ export function updateActionResources(turnResources) {
   document.getElementById('res-spell').className = `res-box ${turnResources.spellAvailable ? 'res-avail' : 'res-spent'}`;
   document.getElementById('res-move').innerText = turnResources.moveRemaining;
 }
+
+// The loading screen, while another region loads (main.js loadRegion): its
+// name, then progress through the steps - fraction 0..1 and what is happening.
+export function showLoading(name) {
+  document.getElementById('loading-name').innerText = name;
+  setLoadingProgress(0, '');
+  document.getElementById('loading-screen').style.display = 'flex';
+}
+export function setLoadingProgress(fraction, step) {
+  document.getElementById('loading-fill').style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`;
+  document.getElementById('loading-step').innerText = step;
+}
+export function hideLoading() {
+  document.getElementById('loading-screen').style.display = 'none';
+}

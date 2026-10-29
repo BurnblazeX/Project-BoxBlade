@@ -5,8 +5,9 @@
 // terrain materials (render/render.js) and the shading (the rest of gpu/) share. Moved
 // out of render.js (2026-10-17) so the shader side never imports the meshes.
 import { attribute, texture, uv, int, vec3, vec4, uniform, select, positionLocal, Fn, abs, sign, round, float, vec2, positionWorld, normalWorld, floor, normalize, clamp, exp2,
-         cameraProjectionMatrix, cameraViewMatrix, modelWorldMatrix } from 'three/tsl';
+         cameraProjectionMatrix, cameraViewMatrix, modelWorldMatrix, dFdx, dFdy, max, length, mix, smoothstep } from 'three/tsl';
 import { BLOCK_METRES } from '../core/world.js';
+import { BLOCK_TEXELS } from '../core/materials.js';
 import { VOXEL_METRES } from '../core/field.js';
 import { occlusionRevealTSL, occlusionHiddenTSL, occlusionShrinkTSL } from './occlusion.js';
 
@@ -222,9 +223,19 @@ export const SLOPE_ROWS = 17, HALF_SLOPE_ROWS = 13;
 // The terrain's instances are only moved and scaled along their axes, never
 // turned, so the attribute already points along the face in world space; the
 // axis snap makes it identical to what normalWorld gave where that was safe.
+//
+// An edge fragment's interpolated position can land a hair past its own box,
+// and the lock then takes the NEIGHBOUR's texel. A block's neighbour shows
+// that texel itself, so nothing shows; a model face's map runs on past its uv
+// rectangle and reads a pixel of something else - a hairline seam along every
+// cube's edge. So the position is first nudged toward the box's centre, across
+// the face: instances are only moved and scaled (BoxGeometry is centred), so
+// the raw vertex position's sign points outward. A hundredth of a texel.
+const EDGE_NUDGE = VOXEL_METRES / 100;
 export function terrainSurfaceTSL(slopes = true) {
   const nA = axisNormalTSL(attribute('normal', 'vec3')).toVar();
-  const pA = texelLockTSL(positionWorld, nA).toVar();
+  const inward = sign(attribute('position', 'vec3')).mul(vec3(1, 1, 1).sub(abs(nA))).mul(float(EDGE_NUDGE));
+  const pA = texelLockTSL(positionWorld.sub(inward), nA).toVar();
   const fA = blockFaceTSL(pA, nA);
   const Ta = select(abs(nA.x).greaterThan(float(0.5)), vec3(0, 0, nA.x.negate()),
                     select(abs(nA.y).greaterThan(float(0.5)), vec3(1, 0, 0), vec3(nA.z, 0, 0)));
@@ -326,6 +337,47 @@ export const surfaceBumpTSL = (surf, t) =>
 // Without a surface (or one built without slopes), the block's own layer.
 export function terrainTexelTSL(tex, st, surf = null) {
   return surf && surf.layer ? texture(tex, st).depth(int(surf.layer)) : terrainSampleTSL(tex, st);
+}
+
+// The albedo at a surface, for the fragment shaders (basic mode, the plain
+// material): its nearest texel while a texel covers a pixel or more, so the
+// pixel art stays crisp up close; past that, where the 12-texel faces
+// shimmer, filtered - the same array mipmapped, with 16x anisotropic
+// filtering (render.js terrainTextures.albedoFiltered). The gradients come
+// from the world position, not the face uv: st jumps from 1 to 0 at every
+// block's edge, and its own derivatives there would drop a seam of the
+// smallest mip along each one. Not in the compute kernels: no derivatives
+// there. filtered null: terrainTexelTSL.
+export function terrainAlbedoTSL(tex, filtered, surf) {
+  if (!filtered) return terrainTexelTSL(tex, surf.st, surf);
+  const q = surf.p.mul(float(BLOCK_TEXELS / BLOCK_METRES));   // texels
+  const dx = dFdx(q), dy = dFdy(q);
+  const n = abs(surf.n);
+  // The two axes across the face, as the face uv runs (blockFaceTSL).
+  const across = d => select(n.x.greaterThan(float(0.5)), vec2(d.z, d.y),
+                             select(n.y.greaterThan(float(0.5)), vec2(d.x, d.z), vec2(d.x, d.y)));
+  const gx = across(dx).toVar(), gy = across(dy).toVar();
+  const texels = max(length(gx), length(gy));   // texels a pixel, the longer way
+  const layer = int(surf.layer);
+  const near = texture(tex, surf.st).depth(layer);
+  const far = texture(filtered, surf.st).grad(gx.div(float(BLOCK_TEXELS)), gy.div(float(BLOCK_TEXELS))).depth(layer);
+  return mix(near, far, smoothstep(float(0.75), float(1.5), texels));
+}
+
+// Advanced mode's anisotropic filtering, after the fact. Its kernels shade
+// each texel - albedo included - and every pixel takes its own texel's
+// colour, so far off, where a texel is smaller than a pixel, the 12-texel
+// pattern is point-sampled and shimmers. This is what to multiply that colour
+// by: the filtered albedo over the texel's own (both with whiteworld, as the
+// kernels apply it), so the pattern is mipmapped and anisotropic while the
+// light stays the texel's. Exactly 1 up close, where terrainAlbedoTSL is the
+// texel's own. The +EPS keeps a near-black texel from blowing its light up.
+const FAR_ALBEDO_EPS = 0.02;
+export function terrainFarAlbedoRatioTSL(tex, filtered, surf) {
+  const white = c => mix(c, vec3(1, 1, 1), terrainWhite);
+  const own = white(terrainTexelTSL(tex, surf.st, surf).rgb);
+  const far = white(terrainAlbedoTSL(tex, filtered, surf).rgb);
+  return far.add(float(FAR_ALBEDO_EPS)).div(own.add(float(FAR_ALBEDO_EPS)));
 }
 
 // Which block a surface point belongs to, and its uv on that face - the uv

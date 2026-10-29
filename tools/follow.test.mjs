@@ -17,6 +17,20 @@ section('one axis');
   const moved = windowAxis(first, first + 128 - 10, 128, lo, hi);
   ok('leaving the middle half moves it', moved !== first, true);
   ok('... back around the focus', moved <= first + 118 && first + 118 < moved + 128, true);
+  ok('never past the world at its low edge', windowAxis(null, lo + 3, 128, lo, hi), lo);
+  ok('nor its high one', windowAxis(null, hi - 3, 128, lo, hi), hi - 127);
+  // test_b with its pad: 142 across. Panning over it end to end and back
+  // moves the window twice each way at most, and it always covers the focus.
+  let at = null, moves = 0, covered = true;
+  const pan = [...Array(140).keys()];
+  for (const f of [...pan, ...[...pan].reverse(), ...pan]) {
+    const next = windowAxis(at, f, 128, -1, 140);
+    if (at !== null && next !== at) moves++;
+    at = next;
+    covered = covered && at <= f && f < at + 128 && at >= -1 && at + 127 <= 140;
+  }
+  ok('a world a little wider than the window: two places, one move a crossing', moves, 3);
+  ok('... always over the focus, inside the world', covered, true);
 }
 
 section('both axes, from a world');

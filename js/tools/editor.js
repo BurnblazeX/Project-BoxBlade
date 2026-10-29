@@ -14,7 +14,7 @@
 //   right drag          look around
 //   W A S D, Space      fly (Shift: faster); Left Ctrl or C down
 //   Q / E               turn the selection (slopes, models)
-//   Ctrl + S            save the level (the Dev Level, levels/dev_level.json;
+//   Ctrl + S            save the level (the loaded region's, levels/<name>.bxr;
 //                       dev server only)
 //   Tab                 back to the game
 //
@@ -29,6 +29,7 @@ import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, FACINGS, BLOCK_SHAPES, 
          blockShape, blockFacing, surfaceLevel,
          WorldModels, addWorldModel, mountWorldModel, removeWorldModel, newBlock,
          serializeLevel, hasFacing, isDual, complementShape, DEV_LEVEL } from '../core/world.js';
+import { encodeRegion } from '../core/region.js';
 import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
 import { worldInstancedMesh, instanceInfo } from '../render/render.js';
@@ -42,7 +43,8 @@ const MAX_BOX_CELLS = 20000;   // one fill or clear at most
 const MAX_ROW_CELLS = 256;     // one row at most, each way
 const FACING_ORDER = ['N', 'E', 'S', 'W'];
 
-export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = DEV_LEVEL }) {
+// levelName: the level saved to, asked at each save - the loaded region's.
+export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = () => DEV_LEVEL }) {
   const state = {
     active: false,
     // The selection: a block (material, shape) or a model; a facing for both.
@@ -441,11 +443,12 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
 
   async function save() {
     try {
-      const res = await fetch(`/__levels?name=${encodeURIComponent(levelName)}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(serializeLevel())
+      const name = levelName();
+      const res = await fetch(`/__levels?name=${encodeURIComponent(name)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' },
+        body: await encodeRegion(serializeLevel())
       });
-      status(res.ok ? `saved levels/${levelName}.json` : `save failed: ${await res.text()}`);
+      status(res.ok ? `saved levels/${name}.bxr` : `save failed: ${await res.text()}`);
     } catch (err) {
       status(`save failed - saving needs the dev server (npm run dev): ${err.message}`);
     }

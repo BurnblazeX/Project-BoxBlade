@@ -48,7 +48,7 @@ import { LIGHT_VEC4S } from '../../core/lights.js';
 import { materialLayer } from '../../core/materials.js';
 import { createBoxLightBinding, createBoxLightKernels, boxLightAtTSL } from '../../gpu/boxlight.js';
 import { voxelAOAtTSL, createSpriteAOTSL } from '../../gpu/ambient.js';
-import { terrainSurfaceTSL, terrainTexelTSL, terrainWhite } from '../../gpu/terrain.js';
+import { terrainSurfaceTSL, terrainAlbedoTSL, terrainWhite } from '../../gpu/terrain.js';
 import { outsideShadeTSL } from '../../gpu/occlusion.js';
 import { terrainTextures, worldInstancedMesh, plainTerrainMeshMaterial } from '../render.js';
 import { flip } from '../engine.js';
@@ -140,7 +140,7 @@ export function createBoxLight({ renderer, shadowsOn, lighting, cards, sunLight,
     const spriteAO = createSpriteAOTSL(aoCardBindings);
     m.colorNode = Fn(() => {
       const surf = terrainSurfaceTSL();
-      const texel = terrainTexelTSL(terrainTextures.albedo, surf.st, surf).rgb.toVar();
+      const texel = terrainAlbedoTSL(terrainTextures.albedo, terrainTextures.albedoFiltered, surf).rgb.toVar();
       const albedo = mix(texel, vec3(1, 1, 1), terrainWhite);
       const n = surf.n;
       const lit = boxLightAtTSL(binding, surf.p, n);

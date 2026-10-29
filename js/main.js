@@ -3,12 +3,13 @@ import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
-         loadLevel, findPath, DEV_LEVEL, setOccupantAt, vacateAt } from './core/world.js';
+         loadLevel, findPath, DEV_LEVEL, Region, regionSpawn, setOccupantAt, vacateAt } from './core/world.js';
+import { decodeRegion } from './core/region.js';
 import { createEditor } from './tools/editor.js';
 import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
          updateVoxelVisibility, worldInstancedMesh, glassInstancedMesh, terrainTextures,
-         setShadedAlbedo, followBlockVolume } from './render/render.js';
+         setShadedAlbedo, followBlockVolume, syncFilteredAlbedo } from './render/render.js';
 import { terrainWhite, terrainTexelTSL } from './gpu/terrain.js';
 import { createWanderAI } from './game/ai.js';
 import { createGameState } from './game/state.js';
@@ -145,17 +146,33 @@ dirLight.position.set(...sunForHour(DEFAULT_SKY_HOUR));
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-// The Dev Level (levels/dev_level.json - the editor writes it) if there is
-// one; otherwise the test area built in code, with its test props.
+// The Dev Level (levels/dev_level.bxr - the editor writes it) if there is
+// one; otherwise the test area built in code, with its test props. A region
+// is a .bxr (level format v2, core/region.js); a v1 .json still loads.
 async function fetchLevel(name) {
+  const get = ext => fetch(`${import.meta.env.BASE_URL}levels/${name}.${ext}`, { cache: 'no-store' })
+    .then(res => res.ok ? res : null, () => null);
   try {
-    const res = await fetch(`${import.meta.env.BASE_URL}levels/${name}.json`, { cache: 'no-store' });
-    return res.ok ? await res.json() : null;
-  } catch { return null; }
+    const bxr = await get('bxr');
+    if (bxr) return await decodeRegion(await bxr.arrayBuffer());
+    const json = await get('json');
+    return json ? await json.json() : null;
+  } catch (err) {
+    console.warn(`[level] ${name} could not be read: ${err.message}`);
+    return null;
+  }
 }
-const savedLevel = await fetchLevel(DEV_LEVEL);
+// ?region=<name>&spawn=<name> starts in another region - and is how a region
+// too big for the terrain mesh is loaded (loadRegion).
+const startAt = new URLSearchParams(location.search);
+let startRegion = startAt.get('region') || DEV_LEVEL;
+let savedLevel = await fetchLevel(startRegion);
+if (!savedLevel && startRegion !== DEV_LEVEL) {
+  console.warn(`[level] no region ${startRegion}: the Dev Level instead`);
+  savedLevel = await fetchLevel(startRegion = DEV_LEVEL);
+}
 if (savedLevel) {
-  const missing = loadLevel(savedLevel, MODELS);
+  const missing = loadLevel(savedLevel, MODELS, startRegion);
   if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
 } else {
 createTestArea(36, 36);
@@ -193,7 +210,8 @@ initWorldRender(scene);
 const player = createEntity({
   id: "player_1",
   name: "Bob",
-  gridPos: { x: 8, y: 0, z: 8 }, // Placed cleanly inside Chunk (0,0)
+  // The region's spawn point (?spawn=, else 'start'); else inside chunk (0, 0).
+  gridPos: (([x, y, z]) => ({ x, y, z }))(regionSpawn(startAt.get('spawn') || 'start') || [8, 0, 8]),
   speed: 6,
   mode: "explore"
 });
@@ -550,6 +568,7 @@ function applyWorldEdit() {
 const editor = createEditor({
   scene, camera, dom: renderer.domElement,
   onEdit: applyWorldEdit,
+  levelName: () => Region.name || DEV_LEVEL,
   onToggle: on => {
     if (on && game.mode !== 'explore') { console.log('the editor opens in explore mode only'); return false; }
     // Nothing carries over: no walk in progress, no key held down.
@@ -606,8 +625,8 @@ const interaction = createInteraction({
 const input = createInput({
   game, player, interaction, encounter, picker, markers,
   sprites: {
-    clickable: () => [playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes],
-    hoverable: () => [enemySprite, chestSprite, barrelSprite],
+    clickable: () => [playerSprite, enemySprite, chestSprite, barrelSprite, ...treeMeshes].filter(o => o.visible),
+    hoverable: () => [enemySprite, chestSprite, barrelSprite].filter(o => o.visible),
     targetOf: sprite => spriteToTarget.get(sprite),
     // Each hoverable back to its own base tint (not a shared white - chest/barrel
     // are untextured color sprites, not tinted photos like enemySprite).
@@ -831,7 +850,7 @@ window.addEventListener('resize', () => {
 // One 1/60 s step of the game: AI and movement. dt is always TICK_SECONDS. Reads
 // the camera's heading as the last frame left it.
 function gameTick(dt) {
-  if (game.mode === 'explore' && !editor.active) {
+  if (game.mode === 'explore' && !editor.active && !devPropsHome) {
     enemyAI.update(dt, rig.heading);
   }
 
@@ -895,7 +914,7 @@ function animate(time) {
   // 1. The game's ticks for the time that passed; the characters are then
   // drawn between their last two tick positions.
   smoothing.restore();
-  ticks.advance(realDt);
+  if (!regionLoading) ticks.advance(realDt);
   smoothing.show(ticks.alpha);
 
   // The panel closes once Bob walks out of look-range of its target;
@@ -936,9 +955,10 @@ function animate(time) {
   resolveTerrainAlbedo();
   cards.update();
   farShadows.update();
-  // The block volume follows the player (World plan P2a): rebuilt only when
-  // its window moves, never for a world that fits it.
-  followBlockVolume(fieldFocus());
+  // The block volume follows the player (World plan P2a): when its window
+  // moves - never for a world that fits it - the strips that slid in.
+  followBlockVolume(fieldFocus(), renderer);
+  syncFilteredAlbedo();
   sky.update(ticks.alpha);
   // AFTER the re-origin, never before. A scroll bakes the strip that slid in,
   // which wipes the imprint of any proxy standing there, and it translates the
@@ -1020,9 +1040,23 @@ let spikeLog = false;
 // --- DEBUG CONSOLE (bxb) ---
 let shadowsOn = false;
 // What the field is centred on: the player, or while editing, the ground the
-// editor camera looks at - so the shadows are fine where the edits are.
+// editor camera looks at - so the shadows are fine where the edits are. Every
+// window that follows (the cascades, the LPV, the block volume, the box light,
+// the sun map, the mirrors) centres on this. While editing, only once the
+// camera has settled there: following its look point as it flew dragged all
+// of them along every frame, a re-bake each step - over a solid region, the
+// hitch. In flight the shadows stay where the camera last rested.
+const EDIT_FOCUS_SETTLE_MS = 250;
+let editFocus = null;               // where the windows are centred while editing
+let editFocusWant = null, editFocusSince = 0;
 function fieldFocus() {
-  return editor && editor.active ? editor.focusGridPos() : player.gridPos;
+  if (!editor || !editor.active) { editFocus = editFocusWant = null; return player.gridPos; }
+  const want = editor.focusGridPos(), now = performance.now();
+  const same = (a, b) => a && a.x === b.x && a.y === b.y && a.z === b.z;
+  if (!editFocus) editFocus = want;
+  if (!same(editFocusWant, want)) { editFocusWant = want; editFocusSince = now; }
+  else if (!same(editFocus, want) && now - editFocusSince >= EDIT_FOCUS_SETTLE_MS) editFocus = want;
+  return editFocus;
 }
 // One entry per cascade. C0 is the fine 18 m field the texel lock is aligned to;
 // C1 is half resolution over 36 m and exists so a long shadow's ray still finds
@@ -1357,6 +1391,126 @@ function buildPerPixelShadows() {
          (sun.rays === 1 ? '. bxb.soften() for a penumbra.' : '');
 }
 
+// --- Regions, loaded in place (World plan P2 §4.2) ---
+//
+// The Dev Level's test props - Evil Bob, the trees, the chest and the barrel,
+// built in code above rather than kept in the level - stand only in the Dev
+// Level. In another region they are parked far outside it, hidden, and put
+// back where they were on the way home.
+const PARKED = -100000;
+let devPropsHome = null;   // where each prop was, while parked
+function setDevProps(home) {
+  if (!home === !!devPropsHome) return;
+  const props = [[enemy, enemySprite], ...worldObjects.map(o => [o.data, o.mesh])];
+  const keyOf = p => getVoxelKey(p.x, p.y, p.z);
+  if (!home) {
+    devPropsHome = props.map(([d]) => ({ ...d.gridPos }));
+    for (const [d, m] of props) {
+      vacateAt(keyOf(d.gridPos), d.id);
+      d.gridPos.x = d.gridPos.z = PARKED;
+      m.position.copy(getSpriteWorldPos(d.gridPos));
+      m.visible = false;
+    }
+  } else {
+    props.forEach(([d, m], i) => {
+      Object.assign(d.gridPos, devPropsHome[i]);
+      m.position.copy(getSpriteWorldPos(d.gridPos));
+      m.visible = true;
+      if (World.get(keyOf(d.gridPos))) setOccupantAt(keyOf(d.gridPos), d.id);
+    });
+    devPropsHome = null;
+  }
+}
+setDevProps(!savedLevel || startRegion === DEV_LEVEL);
+
+// Input is held while a region loads: a capture-phase listener on window that
+// stops each event before the game's (and the editor's) own see it.
+let regionLoading = false;
+for (const t of ['keydown', 'keyup', 'pointerdown', 'pointerup', 'pointermove', 'wheel', 'contextmenu']) {
+  window.addEventListener(t, e => { if (regionLoading) { e.stopImmediatePropagation(); e.preventDefault(); } },
+                          { capture: true, passive: false });
+}
+// Frames drawn behind the loading screen once the region is in: the LPV fills
+// and new pipelines compile there, not in the first frames the player sees.
+const REGION_WARMUP_FRAMES = 45;
+
+// Replaces the region with another, in place: the loading screen goes up, the
+// tick and input stop, the level replaces the world, everything made from the
+// world is rebuilt, the party stands at the spawn point, a few frames warm the
+// lighting, and the screen comes down. Explore mode only. A region the terrain
+// mesh has no room for - or with glass, in a world built without any - reloads
+// the page into it (?region=&spawn=), which builds the mesh for it.
+async function loadRegion(name, spawn = 'start') {
+  if (regionLoading) return 'a region is already loading';
+  if (game.mode !== 'explore') return 'regions load in explore mode only';
+  const t0 = performance.now();
+  regionLoading = true;
+  if (editor.active) editor.setActive(false);
+  game.path = [];
+  game.moveTargetKey = null;
+  input.forgetHover();
+  markers.reset();
+  for (const k of Object.keys(game.keys)) game.keys[k] = false;
+  UI.showLoading(name);
+  const step = async (fraction, label) => { UI.setLoadingProgress(fraction, label); await nextFrame(); };
+  let reloading = false;
+  try {
+    await step(0.05, 'reading');
+    const level = await fetchLevel(name);
+    if (!level) throw new Error(`no region ${name}`);
+
+    await step(0.25, 'building the world');
+    smoke.clear();
+    vacateAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
+    const missing = loadLevel(level, MODELS, name);
+    if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
+    setDevProps(name === DEV_LEVEL);
+    const at = regionSpawn(spawn);
+    if (!at) console.warn(`[level] ${name} has no spawn ${spawn} or start: standing at 8, 0, 8`);
+    [player.gridPos.x, player.gridPos.y, player.gridPos.z] = at || [8, 0, 8];
+    setOccupantAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
+    playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
+    rig.pivot.position.copy(playerSprite.position);
+
+    await step(0.45, 'terrain');
+    const r = rebuildWorldInstances();
+    if (!r.ok || r.glassNeeded) {
+      UI.setLoadingProgress(0.5, 'too big for this world: reloading into it');
+      reloading = true;
+      location.search = `?region=${encodeURIComponent(name)}&spawn=${encodeURIComponent(spawn)}`;
+      return `reloading into ${name}`;
+    }
+    texel.syncCount();
+    mirrors.invalidate();
+    farShadows.invalidate();
+    lighting.syncModelLights();
+    boxLight.rebuild();
+    occlusion.reset();
+    gi.reset();
+
+    await step(0.6, 'shadows');
+    if (shadowsOn) {
+      for (const g of shadowGrids) if (g) g.filledBlocks = null;
+      ensureShadowGrids();
+    }
+
+    for (let f = 0; f < REGION_WARMUP_FRAMES; f++) await step(0.65 + 0.35 * f / REGION_WARMUP_FRAMES, 'lighting');
+    const ms = performance.now() - t0;
+    console.log(`[level] ${name} loaded in ${(ms / 1000).toFixed(2)} s`);
+    return `${name}: ${World.size} blocks, ${WorldModels.length} models, at ${player.gridPos.x}, ${player.gridPos.y}, ` +
+           `${player.gridPos.z} - ${(ms / 1000).toFixed(2)} s`;
+  } catch (err) {
+    console.error(`[level] ${name} did not load: ${err.message}`);
+    return `${name} did not load: ${err.message}`;
+  } finally {
+    // Reloading: the screen stays up, and input held, until the page goes.
+    if (!reloading) {
+      UI.hideLoading();
+      regionLoading = false;
+    }
+  }
+}
+
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
 // On from the start; bxb.perf() still hides it.
@@ -1440,6 +1594,13 @@ const bxbApi = installConsole(createConsole({
   proxies: cards.commands.proxies,
   cardparity: cards.commands.cardparity,
   cards: cards.commands.cards,
+  region: {
+    help: 'load another region in place (levels/<name>.bxr), at a spawn point; no name: the one loaded',
+    usage: "bxb.region()  |  await bxb.region('dev_level')  |  await bxb.region('test_b', 'start')",
+    run: (name = null, spawn = 'start') => name === null
+      ? `region ${Region.name} - bounds ${JSON.stringify(Region.bounds)}, spawns ${Object.keys(Region.spawns).join(', ') || 'none'}`
+      : loadRegion(name, spawn)
+  },
   preset: {
     help: 'graphics preset: ' + PRESET_NAMES.join(', ') + ' - what each sets is in tools/presets.js',
     usage: "bxb.preset('low')  |  bxb.preset()  which one is on",
