@@ -81,3 +81,19 @@ export function setLoadingProgress(fraction, step) {
 export function hideLoading() {
   document.getElementById('loading-screen').style.display = 'none';
 }
+
+// The exit prompt (main.js): shown while the party stands on an exit, with
+// where it leads. onTravel: the button's click, set once.
+export function showExitPrompt(text) {
+  document.getElementById('exit-prompt-text').innerText = text;
+  document.getElementById('exit-prompt').style.display = 'flex';
+}
+export function hideExitPrompt() {
+  document.getElementById('exit-prompt').style.display = 'none';
+}
+export function onExitTravel(fn) {
+  const btn = document.getElementById('btn-travel');
+  // The prompt is not the world: a click on it is never a walk.
+  btn.parentElement.addEventListener('pointerdown', e => e.stopPropagation());
+  btn.addEventListener('click', fn);
+}

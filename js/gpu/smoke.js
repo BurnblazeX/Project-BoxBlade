@@ -33,11 +33,12 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, float, vec3, vec4, int, uniform, instanceIndex, storage, select,
          exp, max, cos, fract, sin, varying, positionGeometry, normalGeometry,
-         positionWorld, cameraProjectionMatrix, cameraViewMatrix } from 'three/tsl';
-import { SMOKE_CUBE, SMOKE_GROW_IN, SMOKE_BOX } from '../core/smoke.js';
+         positionWorld, cameraProjectionMatrix, cameraViewMatrix, smoothstep } from 'three/tsl';
+import { SMOKE_CUBE, SMOKE_GROW_IN, SMOKE_BOX, SMOKE_CAST_BORN, SMOKE_NEVER_DIES } from '../core/smoke.js';
 import { createConeTraceSunTSL } from './trace.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
+import { sunMapFarTSL } from './sunmap.js';
 import { glassRayTransmitTSL } from './glass.js';
 import { NO_SKIP, createCardsTSL, CARD_SUN_MAX } from './cards.js';
 import { smokeView, smokeColourTSL, SMOKE_CUBE_CAPACITY } from './smokeview.js';
@@ -93,7 +94,10 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     const at = share.mul(shared.row(k, 3).w).add(float(SMOKE_GROW_IN + SMOKE_ENCLOSED_DELAY));
     return shared.time.sub(shared.row(k, 2).w).lessThan(at);
   };
-  const shownTSL = (centre, w, share) => growingTSL(w, share).or(openTSL(centre, w));
+  // e: the cube's enclosed / born / died / covered-until (below). A cube a
+  // newcomer has covered since the cast stays seen until e.w, while the
+  // newcomer grows over it (core/smoke.js reshapeSmokeCloud).
+  const shownTSL = (centre, w, e) => growingTSL(w, e.x).or(openTSL(centre, w)).or(shared.time.lessThan(e.w));
   const openTSL = (centre, w) => {
     // Plain selects, no If: it is also built straight into the vertex position.
     const m = against(w);
@@ -112,10 +116,20 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   const lightAttr = smokeView.attr;
   const light = storage(lightAttr, 'vec4', COUNT * 4).setName('bxbSmokeLight');
   const lightRead = smokeView.read;
-  // Per cube: when it is enclosed, a share of the cloud's farthest travel
-  // (NEVER: open to air).
-  const enclosedAttr = new THREE.StorageInstancedBufferAttribute(new Float32Array(COUNT).fill(NEVER), 1);
-  const enclosed = storage(enclosedAttr, 'float', COUNT).setName('bxbSmokeEnclosed');
+  // Per cube: x when it is enclosed, a share of the cloud's farthest travel
+  // (NEVER: open to air); y when it was born and z when it died, on the
+  // smoke's clock - a cube that comes after the cast (a body moved off its
+  // cell, core/smoke.js reshapeSmokeCloud) grows in from y, one that goes
+  // shrinks out from z, as a cast's cubes grow in (SMOKE_GROW_IN).
+  const UNUSED = [NEVER, SMOKE_CAST_BORN, SMOKE_NEVER_DIES, 0];
+  const encData = new Float32Array(COUNT * 4);
+  for (let n = 0; n < COUNT; n++) encData.set(UNUSED, 4 * n);
+  const enclosedAttr = new THREE.StorageInstancedBufferAttribute(encData, 4);
+  const enclosed = storage(enclosedAttr, 'vec4', COUNT).setName('bxbSmokeEnclosed');
+  // Its share of its full size from being born and dying (1 for a cast's cube
+  // still there).
+  const lifeTSL = e => smoothstep(e.y, e.y.add(float(SMOKE_GROW_IN)), shared.time)
+    .mul(float(1).sub(smoothstep(e.z, e.z.add(float(SMOKE_GROW_IN)), shared.time)));
 
   const u = {
     sunLight: uniform(float(1)),
@@ -150,7 +164,11 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
       If(u.sunLight.greaterThan(float(0)), () => {
         const traced = coneTrace(p, sun.dir, sunReach, sun.coneRadius, fadeStartUniform, edgeFadeUniform).toVar();
         const through = glass ? glassRayTransmitTSL(glass, traced, p, sun.dir) : vec3(1, 1, 1);
-        lit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, p, sun.dir, sunReach))));
+        // Past the march's 12 m, the long shadows: the sun depth map, hard
+        // (gpu/sunmap.js) - as the GI's probes take it. Without it a cloud in
+        // a long shadow was lit as if in the open.
+        lit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, p, sun.dir, sunReach))
+          .mul(sunMapFarTSL(p, sunReach, fadeStartUniform, sun.coneRadius, float(0)))));
       });
       if (spriteShadow) lit.mulAssign(spriteShadow(p, sun.dir, float(CARD_SUN_MAX), sun.coneRadius, NO_SKIP));
       return sunColourUniform.mul(u.sunLight).mul(lit).mul(u.sun);
@@ -164,7 +182,8 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     const c = cubes.element(i).toVar();
     const direct = vec3(0, 0, 0).toVar(), scattered = vec3(0, 0, 0).toVar(), iso = vec3(0, 0, 0).toVar();
     const k = slotOf(c.w);
-    If(i.lessThan(u.count).and(shared.row(k, 0).w.greaterThan(float(0.5))).and(shownTSL(c.xyz, c.w, enclosed.element(i))), () => {
+    const e = enclosed.element(i).toVar();
+    If(i.lessThan(u.count).and(shared.row(k, 0).w.greaterThan(float(0.5))).and(shownTSL(c.xyz, c.w, e)), () => {
       const p = c.xyz.toVar();
       // Through the smoke toward the sun and up, from the cube's centre - the
       // same for every cube.
@@ -183,8 +202,8 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     const b = i.mul(int(4));
     const halfSize = float(0).toVar();
     If(i.lessThan(u.count), () => {
-      halfSize.assign(select(shownTSL(c.xyz, c.w, enclosed.element(i)),
-        smokeGrowthTSL(shared, k, travelOf(c.w).div(max(shared.row(k, 3).z, float(1e-6)))), float(0))
+      halfSize.assign(select(shownTSL(c.xyz, c.w, e),
+        smokeGrowthTSL(shared, k, travelOf(c.w).div(max(shared.row(k, 3).z, float(1e-6)))).mul(lifeTSL(e)), float(0))
         .mul(float(1).add(u.wave.mul(float(0.5).sub(cos(u.time.mul(u.speed).sub(c.xyz.dot(vec3(1.1, 1.7, 0.8)).mul(2))).mul(0.5)))))
         .mul(SMOKE_CUBE * 0.5));
     });
@@ -199,8 +218,9 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
   const slot = slotOf(cube.w);
   // Grown in as its box is in the shadows (the same roll from the emitter);
   // an unused cube never.
-  const grown = select(shownTSL(cube.xyz, cube.w, enclosed.element(instanceIndex)),
-    smokeGrowthTSL(shared, slot, travelOf(cube.w).div(max(shared.row(slot, 3).z, float(1e-6)))), float(0));
+  const life = enclosed.element(instanceIndex);
+  const grown = select(shownTSL(cube.xyz, cube.w, life),
+    smokeGrowthTSL(shared, slot, travelOf(cube.w).div(max(shared.row(slot, 3).z, float(1e-6)))).mul(lifeTSL(life)), float(0));
   const phase = cube.xyz.dot(vec3(1.1, 1.7, 0.8)).mul(float(2));
   const swell = float(0.5).sub(cos(u.time.mul(u.speed).sub(phase)).mul(float(0.5)));
   const scale = grown.mul(float(1).add(u.wave.mul(swell)));
@@ -232,7 +252,9 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     // The cubes of every cloud: clouds[k] = { cloud, compact } in slot k (or
     // null). Each cloud's cubes open to air first, then those seen only
     // through lifted solid, then - while it still rolls out (not compact) -
-    // the inside, shown only until enclosed. If the list is full, the last go.
+    // the inside, shown only until enclosed, then the cubes shrinking out
+    // (cloud.fading - not in the grid the view's rays read). If the list is
+    // full, the last go.
     write(clouds) {
       const arr = cubeAttr.array, enc = enclosedAttr.array;
       let n = 0;
@@ -242,29 +264,45 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
       for (let k = 0; k < old.length; k++) {
         if (old[k]) idx.fill(0, (k * SMOKE_BOX + old[k][0]) * LAYER, (k * SMOKE_BOX + old[k][1] + 1) * LAYER);
       }
+      const put = (c, cloud, k, died) => {
+        enc[4 * n] = c[9] === Infinity ? NEVER : c[9] / Math.max(cloud.gMax, 1e-6);
+        enc[4 * n + 1] = c[11] ?? SMOKE_CAST_BORN;
+        enc[4 * n + 2] = died;
+        enc[4 * n + 3] = c[12] || 0;
+        arr.set([c[0], c[1], c[2], c[3] + AGAINST * c[8] + SLOT * k], 4 * n++);
+      };
       for (const pass of [0, 1, 2]) {
         clouds.forEach((entry, k) => {
-          if (!entry || (pass === 2 && entry.compact)) return;
+          if (!entry) return;
           const { cloud } = entry;
           for (const c of cloud.cubes) {
             if (n >= COUNT) return;
             const kind = c[7] ? 0 : c[8] ? 1 : 2;
             if (kind !== pass) continue;
-            enc[n] = c[9] === Infinity ? NEVER : c[9] / Math.max(cloud.gMax, 1e-6);
+            // Rolled out, the inside goes - but for a cube kept seen while
+            // a newcomer covers it.
+            if (pass === 2 && entry.compact && !c[12]) continue;
             const x = c[4] - cloud.box[0], y = c[5] - cloud.box[1], z = c[6] - cloud.box[2];
             idx[x + SMOKE_BOX * (y + SMOKE_BOX * (z + SMOKE_BOX * k))] = n + 1;
             const span = gridSpans[k] || (gridSpans[k] = [z, z]);
             if (z < span[0]) span[0] = z;
             if (z > span[1]) span[1] = z;
-            arr.set([c[0], c[1], c[2], c[3] + AGAINST * c[8] + SLOT * k], 4 * n++);
+            put(c, cloud, k, SMOKE_NEVER_DIES);
           }
         });
       }
+      clouds.forEach((entry, k) => {
+        if (!entry) return;
+        for (const { cube, died } of entry.cloud.fading || []) {
+          if (n >= COUNT) return;
+          put(cube, entry.cloud, k, died);
+        }
+      });
       // Past the new count only what the last list held needs clearing, and
       // only that span goes up (the buffers are 2.5 MB whole).
       const end = Math.max(n, written);
       arr.fill(NEVER, 4 * n, 4 * end);
-      enc.fill(NEVER, n, end);
+      for (let j = n; j < end; j++) enc.set(UNUSED, 4 * j);
       written = n;
       let dirty = false;
       for (const spans of [old, gridSpans]) {
@@ -277,7 +315,7 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
       if (dirty) grid.needsUpdate = true;
       if (end > 0) {
         cubeAttr.addUpdateRange(0, 4 * end);
-        enclosedAttr.addUpdateRange(0, end);
+        enclosedAttr.addUpdateRange(0, 4 * end);
         cubeAttr.needsUpdate = true;
         enclosedAttr.needsUpdate = true;
       }

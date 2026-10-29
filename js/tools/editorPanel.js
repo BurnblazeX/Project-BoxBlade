@@ -8,7 +8,7 @@
 // its cubes' own pixels, a shape its profile - built once and kept.
 import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
-import { BLOCK_SHAPES, hasFacing } from '../core/world.js';
+import { BLOCK_SHAPES, hasFacing, Region } from '../core/world.js';
 import { textureUrl } from '../render/render.js';
 import { facePixel, bakeFaces } from '../core/bbmodel.js';
 
@@ -163,6 +163,9 @@ const CSS = `
 #editor-panel details { margin-top:10px; color:#9aa3ae; }
 #editor-panel details div { white-space:pre-wrap; font:11px/1.5 ui-monospace, monospace; margin-top:4px; }
 #editor-panel .empty { color:#7f8896; font-size:11px; }
+#editor-panel label { display:block; margin-top:6px; color:#9aa3ae; font-size:11px; }
+#editor-panel label input { margin-top:3px; }
+#editor-panel .marks { margin-top:6px; font:11px/1.5 ui-monospace, monospace; color:#9aa3ae; white-space:pre-wrap; }
 `;
 
 // state: the editor's (kind, materialId, shape, model, facing, message).
@@ -180,6 +183,10 @@ export function createPalette({ state, pick, levelName }) {
   }
   document.body.appendChild(panel);
   let filter = '';
+  // The regions on disk, for the exit's target (GET /__levels, dev server).
+  let regionNames = [];
+  const loadRegionNames = () => fetch('/__levels').then(r => (r.ok ? r.json() : []))
+    .then(names => { regionNames = names; }).catch(() => {});
   const match = (...labels) => !filter || labels.some(l => l.toLowerCase().includes(filter));
   const el = (tag, cls, text) => {
     const e = document.createElement(tag);
@@ -198,8 +205,14 @@ export function createPalette({ state, pick, levelName }) {
 
     // What is selected, and which way it faces.
     const sel = el('div', 'sel');
-    const turns = state.kind === 'model' || hasFacing(state.shape);
-    if (state.kind === 'model') {
+    const turns = state.kind === 'model' || (state.kind === 'block' && hasFacing(state.shape));
+    if (state.kind === 'exit' || state.kind === 'spawn') {
+      const t = el('div');
+      t.append(el('div', 'what', state.kind === 'exit' ? 'Exit' : 'Spawn'),
+               el('div', 'hint', state.kind === 'exit' ? 'click a top face · Shift+drag a box · RMB removes'
+                                                       : 'click a top face · RMB removes'));
+      sel.appendChild(t);
+    } else if (state.kind === 'model') {
       const model = MODELS.get(state.model);
       const lab = modelLabel(state.model || '');
       if (model) sel.appendChild(modelPicture(state.model, model));
@@ -275,6 +288,42 @@ export function createPalette({ state, pick, levelName }) {
     }
     if (!shown) panel.appendChild(el('div', 'empty', MODELS.size ? 'no model matches' : 'no .bbmodel in assets/objects'));
 
+    // Markers: exits and spawns (core/exits.js), in the region's header.
+    panel.appendChild(el('h3', '', 'Markers'));
+    for (const [kind, label, cat] of [['exit', 'Exit', 'to another region'], ['spawn', 'Spawn', 'where arrivals stand']]) {
+      const row = el('div', 'row' + (state.kind === kind ? ' on' : ''));
+      const t = el('div');
+      t.append(el('div', '', label), el('div', 'cat', cat));
+      row.appendChild(t);
+      row.onclick = () => pick({ kind });
+      panel.appendChild(row);
+    }
+    // A field that writes straight into the state - no re-render, so it keeps focus.
+    const field = (label, key, list = null) => {
+      const l = el('label', '', label);
+      const f = el('input');
+      f.value = state[key];
+      f.oninput = () => { state[key] = f.value; };
+      if (list) {
+        const dl = el('datalist');
+        dl.id = `editor-${key}-list`;
+        for (const n of list) { const o = el('option'); o.value = n; dl.appendChild(o); }
+        f.setAttribute('list', dl.id);
+        l.appendChild(dl);
+      }
+      l.appendChild(f);
+      panel.appendChild(l);
+    };
+    if (state.kind === 'exit') {
+      field('Leads to region', 'exitTarget', regionNames);
+      field('Arrive at spawn', 'exitSpawn');
+    }
+    if (state.kind === 'spawn') field('Spawn name', 'spawnName', Object.keys(Region.spawns));
+    const marks = [
+      ...Object.entries(Region.spawns).map(([n, at]) => `spawn ${n}  ${at.join(', ')}`),
+      ...Region.exits.map(e => `exit  ${e.cells.slice(0, 3).join(',')}..${e.cells.slice(3).join(',')} -> ${e.target}:${e.spawn}`)];
+    panel.appendChild(el('div', 'marks', marks.length ? marks.join('\n') : 'no exits or spawns'));
+
     if (state.message) panel.appendChild(el('div', 'msg', state.message));
     const help = el('details');
     help.appendChild(el('summary', '', 'Controls'));
@@ -288,6 +337,9 @@ export function createPalette({ state, pick, levelName }) {
 
   return {
     el: panel, render,
-    show(on) { panel.style.display = on ? 'block' : 'none'; if (on) render(); }
+    show(on) {
+      panel.style.display = on ? 'block' : 'none';
+      if (on) { render(); loadRegionNames().then(() => { if (panel.style.display !== 'none') render(); }); }
+    }
   };
 }

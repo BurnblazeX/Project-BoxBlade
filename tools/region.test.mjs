@@ -35,7 +35,7 @@ section('v1 levels migrate');
 section('bytes: packed, gzipped and back');
 {
   const level = migrateLevel({ ...v1, region: { name: 'test', bounds: [-20, 40, -20, 40], seaLevel: -2 },
-                               spawns: { start: [0, 1, 0] }, exits: [{ cells: [[1, 1, 0]], target: 'b', spawn: 'start' }] }, shape);
+                               spawns: { start: [0, 1, 0] }, exits: [{ cells: [1, 1, 0, 1, 1, 0], target: 'b', spawn: 'start' }] }, shape);
   const back = unpackRegion(packRegion(level));
   ok('the header comes back', JSON.stringify([back.region, back.spawns, back.exits, back.models]),
      JSON.stringify([level.region, level.spawns, level.exits, level.models]));

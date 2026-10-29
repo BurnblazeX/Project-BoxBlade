@@ -16,6 +16,11 @@
       <div id="loading-bar"><div id="loading-fill"></div></div>
       <div id="loading-step"></div>
     </div>
+    <!-- Standing on an exit (main.js, core/exits.js): where it leads, F or the button -->
+    <div id="exit-prompt" style="display: none;">
+      <span id="exit-prompt-text"></span>
+      <button id="btn-travel" class="ui-btn" type="button">[F] Travel</button>
+    </div>
     <div id="top-bar">
       <button id="btn-debug" type="button" title="Debug settings (Alt+V)">Debug</button>
       <button id="btn-effects" type="button" title="Shadows, AO, GI, reflections, mirrors (R)">Enable advanced effects</button>
@@ -24,7 +29,7 @@
     <div id="ui-layer">
       <h2>Project BoxBlade</h2>
       <p>Mode: <span id="mode-text">Explore</span></p>
-      <p>Click a tile or WASD to walk | [B] Battle mode | [Q]/[E] Rotate camera | [T] Torch</p>
+      <p>Click a tile or WASD to walk | [B] Battle mode | [Q]/[E] Rotate camera | [T] Torch | [F] Take an exit</p>
       <p>[R] Advanced effects | Graphics preset: top bar | [Tab] Level editor</p>
       <p>Debug: [Alt+V] Settings | [Alt+U] HUD | [Alt+C] Free cam | console: bxb.help()</p>
     </div>

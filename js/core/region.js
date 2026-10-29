@@ -14,7 +14,7 @@
 //   { format: 'boxblade-level', version: 2,
 //     region:  { name, bounds: [x0, x1, z0, z1] inclusive, seaLevel },
 //     spawns:  { name: [x, y, z] },
-//     exits:   [{ cells, target, spawn }],
+//     exits:   [{ cells: [x0, y0, z0, x1, y1, z1], target, spawn }] (core/exits.js),
 //     models:  as v1 ([name, x, y, z, yaw] or [name, x, y, z, 0, wall]),
 //     chunk:   { size, yMin, height },
 //     palette: [null, [materialId, shape?, facing?, second?], ...] }

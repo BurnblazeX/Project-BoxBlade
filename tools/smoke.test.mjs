@@ -115,3 +115,157 @@ ok('cubes sit on the cube grid', c.cubes.every(([x, , z]) => Math.abs(x / SMOKE_
    Math.abs(z / SMOKE_CUBE - Math.round(z / SMOKE_CUBE)) < 1e-9), true);
 ok('no two cubes in one box', new Set(w.cubes.map(keyOf)).size, w.cubes.length);
 ok('measure is 1 at the rim', sphereMeasure(6.5, -0.5, 0, 6.5), 1);
+
+section('smoke takes up space');
+{
+  const { reshapeSmokeCloud, smokeCells, bodyCells, modelCells, cellKey } = await import('../js/core/smoke.js');
+  const cells = cl => new Set(cl.cubes.map(q => cellKey(q[4], q[5], q[6])));
+  // Bob: a body 1.5 m square and 3 m tall, standing on block (2, 0, 0).
+  const bob = x => bodyCells([x * BLOCK_METRES - 0.75, 0.75, -0.75, x * BLOCK_METRES + 0.75, 3.75, 0.75]);
+  ok('a body standing on a block: 3 x 3 cells, 6 high', bob(2).size, 54);
+  const a = createSmokeCloud(tile, ground);
+  const before = cells(a);
+  ok('a cast keeps spare cells past its volume', a.candidates > a.volume, true);
+  ok('walking in: changed', reshapeSmokeCloud(a, bob(2)), true);
+  ok('... no smoke where the body stands', [...bob(2)].some(k => cells(a).has(k)), false);
+  ok('... the volume is kept', a.cubes.length, a.volume);
+  ok('... the smoke went to the rim', [...cells(a)].filter(k => !before.has(k)).length, [...bob(2)].filter(k => before.has(k)).length);
+  ok('... the hole is seen: faces on the body are open', a.cubes.some(q => q[7] && Math.abs(q[0] - 3) < 1 && q[1] < 3.75), true);
+  ok('standing still: nothing to do', reshapeSmokeCloud(a, bob(2)), false);
+  reshapeSmokeCloud(a, null);
+  ok('walking out: the hole fills and the rim draws back', [...cells(a)].every(k => before.has(k)) && cells(a).size === before.size, true);
+  ok('gameplay sees it too: the block over the emitter is full again', smokeAt(a, 0, 1, 0), 1);
+  // Cast round a body already there.
+  const round = createSmokeCloud(tile, ground, fog, 1, undefined, { blocked: bob(1) });
+  ok('cast round a body: none on it, the whole volume', [...bob(1)].some(k => cells(round).has(k)) || round.cubes.length !== round.volume, false);
+
+  // Two clouds side by side: the second grows round the first.
+  const first = createSmokeCloud(tile, ground);
+  const second = createSmokeCloud({ gx: 4, gy: 0, gz: 0 }, ground, fog, 1, undefined, { taken: smokeCells(first) });
+  const shared = [...cells(second)].filter(k => cells(first).has(k)).length;
+  ok('two clouds never share a cell', shared, 0);
+  ok('... the second still holds its volume', second.cubes.length, second.volume);
+  ok('... pushed away from the first', second.cubes.some(q => q[0] > 4 * BLOCK_METRES + c.radius * SMOKE_CUBE * 0.9), true);
+  ok('... where they meet, faces show (other smoke is seen through)',
+     second.cubes.some(q => q[7] && first.cubes.some(p => Math.abs(p[0] - q[0]) === SMOKE_CUBE && p[1] === q[1] && p[2] === q[2])), true);
+  // A body walking into the first never pushes it into the second.
+  reshapeSmokeCloud(first, bob(3), smokeCells(second));
+  ok('displaced smoke keeps out of the other cloud', [...cells(first)].some(k => cells(second).has(k)), false);
+
+  // Models: a table top over the emitter (2 texels thick) blocks; a carpet (1 texel) does not.
+  const table = [[-6, 18, -6, 6, 20, 6]];            // world texels: y 18..20 is 2.25..2.5 m
+  const carpet = [[-6, 6, -6, 6, 7, 6]];             // y 6..7: on the ground's top (0.75 m)
+  ok('a model filling half a cell blocks it', modelCells([-2, 0, -2], 8, table).has(cellKey(0, 5, 0)), true);
+  ok('a carpet (a quarter of a cell) does not', modelCells([-2, 0, -2], 8, carpet).size, 0);
+  const under = createSmokeCloud(tile, ground, fog, 1, undefined, { models: table });
+  ok('smoke keeps out of the model', [...modelCells([-32, -30, -32], 64, table)].some(k => cells(under).has(k)), false);
+  ok('... and holds its volume round it', under.cubes.length, under.volume);
+}
+
+section('reshaping step by step ends where a fresh cast would');
+{
+  const { reshapeSmokeCloud, bodyCells, cellKey } = await import('../js/core/smoke.js');
+  const walk = x => bodyCells([x - 0.75, 0.75, -1, x + 0.75, 3.75, 0.5]);
+  const live = createSmokeCloud(tile, ground);
+  for (let x = -6; x <= 3; x += 0.25) reshapeSmokeCloud(live, walk(x));
+  const fresh = createSmokeCloud(tile, ground, fog, 1, undefined, { blocked: walk(3) });
+  // Faces only: a cast round a body ends its roll-out farther out (its gMax), so travel differs.
+  const byCell = cl => new Map(cl.cubes.map(q => [cellKey(q[4], q[5], q[6]), q.slice(7, 9).join()]));
+  const a = byCell(live), b = byCell(fresh);
+  ok('the same cells', a.size === b.size && [...a.keys()].every(k => b.has(k)), true);
+  ok('each with the same faces', [...a].every(([k, v]) => b.get(k) === v), true);
+  ok('the same smoke per block', [...live.blocks].every(([k, v]) => fresh.blocks.get(k) === v) && live.blocks.size === fresh.blocks.size, true);
+}
+
+section('other clouds passed as one set a cloud (as the renderer does)');
+{
+  const { smokeCells, cellKey } = await import('../js/core/smoke.js');
+  const one = createSmokeCloud(tile, ground), two = createSmokeCloud({ gx: 0, gy: 0, gz: 5 }, ground, fog, 1, undefined, { taken: [smokeCells(one)] });
+  const three = createSmokeCloud({ gx: 4, gy: 0, gz: 2 }, ground, fog, 1, undefined, { taken: [smokeCells(one), smokeCells(two)] });
+  const of = cl => new Set(cl.cubes.map(q => cellKey(q[4], q[5], q[6])));
+  const clash = (p, q) => [...of(p)].some(k => of(q).has(k));
+  ok('three clouds, no cell shared', clash(one, two) || clash(one, three) || clash(two, three), false);
+  ok('... each holds its volume', [one, two, three].every(cl => cl.cubes.length === cl.volume), true);
+}
+
+section('sprites hold their silhouettes, turned, not their boxes');
+{
+  const { silhouetteRadii, profileCells, bodyCells, cellKey, reshapeSmokeCloud, createSmokeCloud: cast } = await import('../js/core/smoke.js');
+  // A 12 x 24 px figure on a 1.5 x 3 m quad: a 2 px neck, 6 px shoulders, 2 px legs, nothing above the head.
+  const W = 12, H = 24, rgba = new Uint8Array(W * H * 4);
+  const fill = (r0, r1, c0, c1) => { for (let r = r0; r < r1; r++) for (let c = c0; c < c1; c++) rgba[(r * W + c) * 4 + 3] = 255; };
+  fill(4, 8, 5, 7);       // head, 2 px
+  fill(8, 16, 3, 9);      // body, 6 px
+  fill(16, 24, 5, 7);     // legs
+  const s = silhouetteRadii(rgba, W, H, 1.5, 3);
+  ok('a row reaches from the middle to its farthest opaque pixel', s.radii[H - 1 - 10], 3 * 1.5 / W);
+  ok('empty rows reach nothing', s.radii[H - 1], 0);
+  const at = { x: 0, y: 0.75, z: 0 };
+  const turned = profileCells({ ...at, ...s });
+  const boxed = bodyCells([-0.75, 0.75, -0.75, 0.75, 3.75, 0.75]);
+  ok('under half the cells of its box', turned.size < boxed.size / 2, true);
+  ok('the legs: one column', [...turned].filter(k => k === cellKey(0, 2, 0) || k === cellKey(1, 2, 0)).length, 1);
+  ok('above the head is free', turned.has(cellKey(0, 7, 0)), false);
+  // Off a cell's centre (walking between two), a thin part touches both cells it straddles.
+  const mid = profileCells({ x: 0.25, y: 0.75, z: 0, ...s });
+  ok('between two cells: both', mid.has(cellKey(0, 2, 0)) && mid.has(cellKey(1, 2, 0)), true);
+  // Smoke fills round it: the cloud keeps its volume, none in the figure.
+  const cl = cast(tile, ground, fog, 1, undefined, { blocked: turned });
+  ok('smoke fills round the figure', cl.cubes.length === cl.volume && !cl.cubes.some(q => turned.has(cellKey(q[4], q[5], q[6]))), true);
+}
+
+section('cubes grow in and shrink out as they come and go');
+{
+  const { reshapeSmokeCloud, pruneFading, bodyCells, SMOKE_CAST_BORN, SMOKE_GROW_IN } = await import('../js/core/smoke.js');
+  const cl = createSmokeCloud(tile, ground);
+  ok('a cast\'s cubes grow with the roll-out', cl.cubes.every(q => q[11] === SMOKE_CAST_BORN), true);
+  const body = bodyCells([2.25, 0.75, -0.75, 3.75, 3.75, 0.75]);
+  reshapeSmokeCloud(cl, body, null, 10);
+  ok('the cubes that went shrink out, died now', cl.fading.length > 0 && cl.fading.every(f => f.died === 10), true);
+  ok('the cubes that came are born now', cl.cubes.filter(q => q[11] === 10).length, cl.fading.length);
+  ok('their neighbours keep their birth', cl.cubes.filter(q => q[11] === SMOKE_CAST_BORN).length, cl.volume - cl.fading.length);
+  ok('still shrinking: kept', pruneFading(cl, 10 + SMOKE_GROW_IN / 2), false);
+  ok('done shrinking: dropped', pruneFading(cl, 10 + SMOKE_GROW_IN) && cl.fading.length === 0, true);
+}
+
+section('a body moving through smoke: the rim holds still until it settles');
+{
+  const { reshapeSmokeCloud, bodyCells, cellKey } = await import('../js/core/smoke.js');
+  const cl = createSmokeCloud(tile, ground);
+  const of = c => new Set(c.cubes.map(q => cellKey(q[4], q[5], q[6])));
+  const cast = of(cl);
+  // Straddling and centred in turn - a column, then two - as a body walking does.
+  let rimMoved = false, inBody = false, t = 0;
+  for (let x = -4; x <= 4; x += 0.25) {
+    const body = bodyCells([x - 0.4, 0.75, -0.4, x + 0.4, 3.75, 0.4]);
+    reshapeSmokeCloud(cl, body, null, t += 0.1, false);
+    if ([...of(cl)].some(k => !cast.has(k))) rimMoved = true;
+    if ([...of(cl)].some(k => body.has(k))) inBody = true;
+  }
+  ok('while it moves, no cell past the cast\'s shape', rimMoved, false);
+  ok('... and none where it stands', inBody, false);
+  ok('... short by what it holds', cl.cubes.length < cl.volume, true);
+  const stand = bodyCells([3.6, 0.75, -0.4, 4.4, 3.75, 0.4]);
+  reshapeSmokeCloud(cl, stand, null, t += 1, true);
+  ok('settled: the volume again, the rim grown once', cl.cubes.length === cl.volume && [...of(cl)].some(k => !cast.has(k)), true);
+  reshapeSmokeCloud(cl, null, null, t += 1, false);
+  ok('moving off: the hole refills at once, the grown rim waits', [...cast].every(k => of(cl).has(k)) && cl.cubes.length > cl.volume, true);
+  reshapeSmokeCloud(cl, null, null, t += 1, true);
+  ok('settled with nothing there: the cast shape exactly', of(cl).size === cast.size && [...of(cl)].every(k => cast.has(k)), true);
+}
+
+section('a cube a newcomer covers stays seen until it has grown over it');
+{
+  const { reshapeSmokeCloud, expireCovered, bodyCells, cellKey, SMOKE_GROW_IN } = await import('../js/core/smoke.js');
+  const cl = createSmokeCloud(tile, ground);
+  const body = bodyCells([-0.4, 0.75, -0.4, 0.4, 3.75, 0.4]);
+  reshapeSmokeCloud(cl, body, null, 5, false);              // a hole: its walls are seen
+  const walls = cl.cubes.filter(q => q[7]).length;
+  reshapeSmokeCloud(cl, null, null, 6, false);              // it fills: the walls are covered again
+  const kept = cl.cubes.filter(q => q[12] > 6);
+  ok('the hole\'s walls stay seen while the fill grows', kept.length > 0 && kept.every(q => !q[7]), true);
+  ok('... until it has grown', kept.every(q => q[12] > 6 + SMOKE_GROW_IN), true);
+  ok('before then nothing expires', expireCovered(cl, 6.1), false);
+  ok('after, they go back to unseen', expireCovered(cl, 7) && cl.cubes.every(q => !q[12]), true);
+  ok('more than the walls were not kept', kept.length <= walls, true);
+}

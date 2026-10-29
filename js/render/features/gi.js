@@ -28,7 +28,7 @@ import { diffuseAlbedo, specularAlbedo, MAX_GI_SPRITES, SPRITE_GI_FILL, averageA
          lpvPace, LPV_PACE_MS,
          DEFAULT_LPV_SKY_SPREAD } from '../../core/lpv.js';
 import { MATERIALS } from '../../core/materials.js';
-import { MODELS } from '../../core/models.js';
+import { MODELS, TREE_MODELS } from '../../core/models.js';
 import { createLPV, lpvStorage } from '../../gpu/gi.js';
 import { createTexelGI, GI_LIST_CAP } from '../../gpu/texelgi.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
@@ -153,7 +153,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
       ? averageAlbedo(terrainTextures.rgba[l]) : { r: 1, g: 1, b: 1 }));
     // Then each model's entry (models.js giIndex): its texture's diffuse
     // albedo, a dielectric's specular share, no tint.
-    for (const m of MODELS.values()) {
+    for (const m of [...MODELS.values(), ...TREE_MODELS.values()]) {
       layerAlbedos[m.giIndex] = m.albedoPixels ? diffuseAlbedo(m.albedoPixels) : { r: 0.5, g: 0.5, b: 0.5 };
       layerSpecAll[m.giIndex] = layerSpecRough[m.giIndex] = grey;
       layerTints[m.giIndex] = { r: 1, g: 1, b: 1 };

@@ -31,6 +31,14 @@ function levelsPlugin() {
           return res.end(fs.readFileSync(file));
         }
         if (url.pathname !== '/__levels') return next();
+        // GET: the names of the levels there, for the editor's exits.
+        if (req.method === 'GET') {
+          const names = fs.existsSync(LEVELS_DIR)
+            ? [...new Set(fs.readdirSync(LEVELS_DIR).filter(f => /\.(bxr|json)$/.test(f)).map(f => f.replace(/\.\w+$/, '')))]
+            : [];
+          res.setHeader('Content-Type', 'application/json');
+          return res.end(JSON.stringify(names.sort()));
+        }
         const name = url.searchParams.get('name') || 'dev_level';
         if (req.method !== 'POST' || !LEVEL_NAME.test(name)) { res.statusCode = 400; return res.end('bad request'); }
         const parts = [];

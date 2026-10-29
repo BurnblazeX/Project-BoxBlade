@@ -79,11 +79,14 @@ export function transformCube(cube, T) {
     const f = cube.faces[dirIndex(sn)];
     if (!f) return null;
     // Source texel m from target texel w: s > 0, m = w - p; s < 0, m = p - 1 - w.
+    // A wrapped face (a generated tree's, core/treegen.js) tiles its tile over
+    // the world texels: its origin is the tile's, and does not move with it.
     const conv = ({ axis, o, d }) => {
       const [b, s] = T.axisOf[axis], p = T.p[b];
+      if (f.wrap) return { axis: b, o, d: s > 0 ? d : -d };
       return s > 0 ? { axis: b, o: o - d * p, d } : { axis: b, o: o + d * (p - 1), d: -d };
     };
-    return { u: conv(f.u), v: conv(f.v) };
+    return f.wrap ? { u: conv(f.u), v: conv(f.v), wrap: true } : { u: conv(f.u), v: conv(f.v) };
   });
   return { name: cube.name, light: cube.light, lightLevel: cube.lightLevel, rects: cube.rects, min, max, faces };
 }
@@ -327,6 +330,9 @@ export function modelInstanceData(cube, model) {
     if (f.u.d < 0) mask |= 1 << (2 * d);
     if (f.v.d < 0) mask |= 1 << (2 * d + 1);
     if ((d === 2 || d === 3) && faceSwapped(d, f)) mask |= 1 << (10 + d);
+    // Bit 14: its faces wrap - the pixel is the tile's origin plus the world
+    // texel modulo a tile (gpu/terrain.js modelTexelCoreTSL).
+    if (f.wrap) mask |= 1 << 14;
     uv.push(f.u.o, f.v.o);
   });
   // A lightSource cube: w = 2 (drawn unlit), and its texels from the _e

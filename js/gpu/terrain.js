@@ -316,8 +316,13 @@ export function modelTexelCoreTSL(nA, pA, info, uv0, uv1, uv2) {
   const swap = ay.and(bit(float(10).add(fi)).greaterThan(float(0.5)));
   // The face's own axes: +-x (z, y), +-y (x, z), +-z (x, y) - swapped when set.
   const ca = select(ax, t.z, t.x), cb = select(ay, t.z, t.y);
-  const px = o.x.add(dU.mul(select(swap, cb, ca)));
-  const py = o.y.add(dV.mul(select(swap, ca, cb)));
+  // Bit 14 (a generated tree's faces): wrapped - the tile at o, tiled over the
+  // world texels as a block face is (bbmodel.js modelInstanceData).
+  const wrap = bit(float(14)).greaterThan(float(0.5));
+  const tileOf = v => v.sub(float(12).mul(floor(v.div(float(12)))));
+  const su = dU.mul(select(swap, cb, ca)), sv = dV.mul(select(swap, ca, cb));
+  const px = o.x.add(select(wrap, tileOf(su), su));
+  const py = o.y.add(select(wrap, tileOf(sv), sv));
   const tx = floor(px.div(float(12))), ty = floor(py.div(float(12)));
   const layer = int(info.y.add(ty.mul(info.z)).add(tx).add(float(0.5)));
   // Tiles are stored bottom-up (writeLayer): image row iy is row 11 - iy.

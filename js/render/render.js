@@ -6,7 +6,7 @@ import { applyOcclusionMask, outsideShadeTSL } from '../gpu/occlusion.js';
 import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey,
          isDual, blockParts,
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
-import { MODELS, TERRAIN_LAYERS } from '../core/models.js';
+import { MODELS, TREE_MODELS, TERRAIN_LAYERS } from '../core/models.js';
 import { lightColourOf, bakeFaces, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from '../core/bbmodel.js';
 import { VOXEL_METRES } from '../core/field.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
@@ -492,6 +492,7 @@ function initTerrainTextures() {
     await loadSlopeLayers(m, layer);
   });
   for (const model of MODELS.values()) loads.push(loadModelTiles(model));
+  for (const model of TREE_MODELS.values()) loads.push(composeTreeTiles(model));
   Promise.allSettled(loads).then(r => {
     for (const x of r) if (x.status === 'rejected') console.warn('[terrain] texture load failed', x.reason);
     terrainTextures.ready = true;
@@ -527,6 +528,34 @@ function applyAlbedoMode() {
     }
   }
   t.albedo.needsUpdate = true;
+}
+
+// A tree species' tiles (models.js TREE_MODELS): each from a terrain texture,
+// side by side - and the leaves gradient-mapped through the species' ramp:
+// the texture's grey levels, darkest to lightest, spread over the ramp's
+// colours. Then as any model's tiles.
+async function composeTreeTiles(model) {
+  const n = BLOCK_TEXELS;
+  const canvas = document.createElement('canvas');
+  canvas.width = model.tilesX * n; canvas.height = n;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  for (const [i, { texture, ramp }] of model.compose.entries()) {
+    const url = textureUrl(texture);
+    if (!url) { console.warn(`[trees] ${model.name}: no ${texture}.png`); continue; }
+    ctx.drawImage(await loadImage(url), i * n, 0, n, n);
+    if (!ramp) continue;
+    const img = ctx.getImageData(i * n, 0, n, n), d = img.data;
+    const greys = [...new Set(Array.from({ length: n * n }, (_, p) => d[p * 4]))].sort((a, b) => a - b);
+    for (let p = 0; p < n * n; p++) {
+      const rank = greys.indexOf(d[p * 4]);
+      const c = ramp[Math.round(rank / Math.max(1, greys.length - 1) * (ramp.length - 1))];
+      d.set(c, p * 4);
+      d[p * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, i * n, 0);
+  }
+  model.textures = { ...model.textures, albedo: canvas.toDataURL() };
+  return loadModelTiles(model);
 }
 
 // A model's textures (models.js), cut into 12 x 12 tiles in its layers of the

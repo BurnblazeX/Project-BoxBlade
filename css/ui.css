@@ -66,3 +66,12 @@
 #loading-bar { width: min(420px, 80vw); height: 6px; background: #2a2a30; }
 #loading-fill { width: 0; height: 100%; background: #e8e4da; transition: width 0.15s; }
 #loading-step { font-size: 12px; opacity: 0.6; min-height: 1em; }
+
+/* Standing on an exit (game/ui.js showExitPrompt). Placeholder, as the
+   loading screen: where it leads and how to go. Shown with the HUD hidden too -
+   it is the only way through an exit. */
+#exit-prompt {
+  position: fixed; left: 50%; bottom: 12%; transform: translateX(-50%); z-index: 20;
+  display: flex; gap: 12px; align-items: center; padding: 10px 14px;
+  background: rgba(13, 13, 16, 0.88); border: 1px solid #e8e4da; color: #e8e4da; font-family: monospace;
+}

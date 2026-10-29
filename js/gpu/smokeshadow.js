@@ -71,19 +71,28 @@ function createSmokeShared() {
   const occTex = texture(occData, THREE.NearestFilter), softTex = texture(softData, THREE.LinearFilter);
   const at = (x, y, z) => x + O * (y + O * z);
   const a = new Float32Array(SLOT), b = new Float32Array(SLOT);
-  // Per slot, the z layers (its own, 0..O-1) it last filled: cleared on the next write.
-  const spans = new Array(N).fill(null);
-  // [1 2 1] / 4 along axis d, src -> dst, over [lo, hi] (the cloud's boxes and a margin).
+  // Per slot, the z layers (its own, 0..O-1) it last filled, and the box
+  // [lo, hi] it wrote: cleared on the next write. Only that box - a cloud
+  // reshapes as bodies walk through it (core/smoke.js), a write each time,
+  // and clearing a whole 64^3 slot three times over was most of one.
+  const spans = new Array(N).fill(null), boxes = new Array(N).fill(null);
+  const clearBox = (arr, off, lo, hi) => {
+    for (let z = lo[2]; z <= hi[2]; z++) for (let y = lo[1]; y <= hi[1]; y++) {
+      const r = off + at(lo[0], y, z);
+      arr.fill(0, r, r + hi[0] - lo[0] + 1);
+    }
+  };
+  // [1 2 1] / 4 along axis d, src -> dst, over [lo, hi] (the cloud's boxes and
+  // a margin); a neighbour past the slot's edge is left out.
+  const STRIDE = [1, O, O * O];
   const blurAxis = (src, dst, d, lo, hi) => {
+    const s = STRIDE[d];
     for (let z = lo[2]; z <= hi[2]; z++) for (let y = lo[1]; y <= hi[1]; y++) for (let x = lo[0]; x <= hi[0]; x++) {
-      const c = [x, y, z];
-      let sum = 2 * src[at(x, y, z)], w = 2;
-      for (const s of [-1, 1]) {
-        const n = c.slice(); n[d] += s;
-        if (n[d] < 0 || n[d] >= O) continue;
-        sum += src[at(n[0], n[1], n[2])]; w += 1;
-      }
-      dst[at(x, y, z)] = sum / w;
+      const i = at(x, y, z), v = d === 0 ? x : d === 1 ? y : z;
+      let sum = 2 * src[i], w = 2;
+      if (v > 0) { sum += src[i - s]; w++; }
+      if (v < O - 1) { sum += src[i + s]; w++; }
+      dst[i] = sum / w;
     }
   };
   // One uniform array for all of it, four vec4 a slot - each uniformArray
@@ -115,30 +124,42 @@ function createSmokeShared() {
     write(k, cloud, castTime = 0) {
       const ob = k * SLOT;
       const old = spans[k];
-      spans[k] = null;
-      a.fill(0);
-      occData.fill(0, ob, ob + SLOT);
-      softData.fill(0, ob, ob + SLOT);
+      if (boxes[k]) { clearBox(occData, ob, ...boxes[k]); clearBox(softData, ob, ...boxes[k]); }
+      spans[k] = boxes[k] = null;
       if (cloud) {
         const lo = [O, O, O], hi = [-1, -1, -1];
+        const inSlot = c => c[4] >= cloud.box[0] && c[5] >= cloud.box[1] && c[6] >= cloud.box[2] &&
+          c[4] < cloud.box[0] + O && c[5] < cloud.box[1] + O && c[6] < cloud.box[2] + O;
         for (const c of cloud.cubes) {
-          const l = [c[4] - cloud.box[0], c[5] - cloud.box[1], c[6] - cloud.box[2]];
-          if (l.some(v => v < 0 || v >= O)) continue;
-          a[at(l[0], l[1], l[2])] = 1;
-          // Hard: its travel as a share of the farthest, 1..255 (0 is no smoke).
-          occData[ob + at(l[0], l[1], l[2])] = 1 + Math.round(254 * c[3] / Math.max(cloud.gMax, 1e-6));
-          for (let d = 0; d < 3; d++) { lo[d] = Math.min(lo[d], l[d]); hi[d] = Math.max(hi[d], l[d]); }
+          if (!inSlot(c)) continue;
+          for (let d = 0; d < 3; d++) {
+            const l = c[4 + d] - cloud.box[d];
+            if (l < lo[d]) lo[d] = l;
+            if (l > hi[d]) hi[d] = l;
+          }
         }
-        // The blur only where the cloud is, and a box round it.
-        const blo = lo.map(v => Math.max(0, v - 2)), bhi = hi.map(v => Math.min(O - 1, v + 2));
-        b.fill(0);
         if (hi[0] >= 0) {
-          blurAxis(a, b, 0, blo, bhi); a.set(b); blurAxis(a, b, 1, blo, bhi); a.set(b); blurAxis(a, b, 2, blo, bhi);
+          // The blur only where the cloud is, and a box round it; it reads one
+          // more each way, so a and b are clear over that too.
+          const blo = lo.map(v => Math.max(0, v - 2)), bhi = hi.map(v => Math.min(O - 1, v + 2));
+          const clo = blo.map(v => Math.max(0, v - 1)), chi = bhi.map(v => Math.min(O - 1, v + 1));
+          clearBox(a, 0, clo, chi);
+          clearBox(b, 0, clo, chi);
+          for (const c of cloud.cubes) {
+            if (!inSlot(c)) continue;
+            const i = at(c[4] - cloud.box[0], c[5] - cloud.box[1], c[6] - cloud.box[2]);
+            a[i] = 1;
+            // Hard: its travel as a share of the farthest, 1..255 (0 is no smoke).
+            occData[ob + i] = 1 + Math.round(254 * Math.min(1, c[3] / Math.max(cloud.gMax, 1e-6)));
+          }
+          // x, y, z in turn; the result in b.
+          blurAxis(a, b, 0, blo, bhi); blurAxis(b, a, 1, blo, bhi); blurAxis(a, b, 2, blo, bhi);
           for (let z = blo[2]; z <= bhi[2]; z++) for (let y = blo[1]; y <= bhi[1]; y++) for (let x = blo[0]; x <= bhi[0]; x++) {
             const i = at(x, y, z);
             softData[ob + i] = Math.round(255 * b[i]);
           }
           spans[k] = [blo[2], bhi[2]];
+          boxes[k] = [blo, bhi];
         }
         const { box, centre, spell, radius } = cloud;
         const r = slots.array;

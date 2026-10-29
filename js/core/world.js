@@ -1,3 +1,4 @@
+import { validExit } from './exits.js';
 import { isGlassMaterial } from './materials.js';
 import { placeModel } from './bbmodel.js';
 import { rectCovered } from './rects.js';
@@ -586,7 +587,8 @@ export function loadLevel(level, models, name = null) {
   Region.bounds = level.region.bounds;
   Region.seaLevel = level.region.seaLevel;
   Region.spawns = level.spawns;
-  Region.exits = level.exits;
+  // One that cannot work (no target, a broken box) is dropped, not tripped on.
+  Region.exits = (level.exits || []).map(validExit).filter(Boolean);
   const missing = [];
   for (const [name, x, y, z, yaw, wall] of level.models || []) {
     const model = models.get(name);

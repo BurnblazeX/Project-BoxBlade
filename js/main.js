@@ -1,10 +1,12 @@
 import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3 } from 'three/tsl';
-import { MODELS } from './core/models.js';
+import { MODELS, MODELS_AND_TREES, treeModel } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
          loadLevel, findPath, DEV_LEVEL, Region, regionSpawn, setOccupantAt, vacateAt } from './core/world.js';
 import { decodeRegion } from './core/region.js';
+import { createExitTracker } from './core/exits.js';
+import { silhouetteRadii } from './core/smoke.js';
 import { createEditor } from './tools/editor.js';
 import { createObject } from './game/objects.js';
 import { initWorldRender, rebuildWorldInstances, VOXEL_SIZE, updateVoxelTints,
@@ -172,7 +174,7 @@ if (!savedLevel && startRegion !== DEV_LEVEL) {
   savedLevel = await fetchLevel(startRegion = DEV_LEVEL);
 }
 if (savedLevel) {
-  const missing = loadLevel(savedLevel, MODELS, startRegion);
+  const missing = loadLevel(savedLevel, MODELS_AND_TREES, startRegion);
   if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
 } else {
 createTestArea(36, 36);
@@ -811,6 +813,12 @@ window.addEventListener('keydown', (e) => {
     return;
   }
 
+  // F: through the exit Bob stands on, when one is offered.
+  if (key === 'f' && !e.altKey && !e.ctrlKey && !e.metaKey && offeredExit) {
+    takeExit();
+    return;
+  }
+
   // The game's keys: walking, Escape, B (game/input.js).
   input.keyDown(key);
 
@@ -920,6 +928,7 @@ function animate(time) {
   // The panel closes once Bob walks out of look-range of its target;
   // otherwise its action buttons' enabled state stays live.
   interaction.update();
+  updateExitPrompt();
 
   // 2. The camera: eased toward the mode's framing, around Bob or the arena.
   rig.update(dt, game.mode, playerSprite.position, game.keys);
@@ -1217,10 +1226,50 @@ const fog = engine.add(createFog({
   renderer, scene, camera, texel: { gbuffer: () => texel.gbuffer() }, gi, sky, shadowsOn: () => shadowsOn,
   sun: { light: dirLight, on: () => sun.on, uniforms: () => sun.uniforms() }
 }));
+// What stands in the smoke and pushes it aside (core/smoke.js): each shown
+// character and sprite prop, by its picture - its texture's opaque pixels,
+// row by row, turned about its upright axis (silhouetteRadii) - so smoke
+// fills round a neck, between legs, under a tree's crown. Read once a
+// sprite, when its pixels have arrived; until then, and for a prop with no
+// picture, the box over its feet (its quad's width square, its height tall).
+// Characters at their drawn (smoothed) position, so the smoke parts as they
+// walk.
+const CHARACTER_BODY = [VOXEL_SIZE, VOXEL_SIZE * 2];   // characterGeo
+const TREE_BODY = [VOXEL_SIZE * 2, VOXEL_SIZE * 3];    // treePlaneGeo
+const silhouettes = new WeakMap();                     // mesh -> { rowH, radii }
+function silhouetteOf(mesh, [w, h]) {
+  if (silhouettes.has(mesh)) return silhouettes.get(mesh);
+  // Its own map, or the plain material's where the lit one has taken over.
+  const mapOf = m => m && (m.material?.map || m.userData?.originalMaterial?.map);
+  const tex = mapOf(mesh) || mapOf(mesh.children?.[0]);
+  const img = tex && tex.image;
+  if (!img || !img.width || img.complete === false) return null;   // not loaded yet
+  const c = document.createElement('canvas');
+  c.width = img.width; c.height = img.height;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  const s = silhouetteRadii(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height, w, h);
+  silhouettes.set(mesh, s);
+  return s;
+}
+function smokeBodies() {
+  const out = [];
+  const add = (mesh, size) => {
+    if (!mesh.visible) return;
+    const p = mesh.position, [w, h] = size;
+    const s = silhouetteOf(mesh, size);
+    if (s) out.push({ x: p.x, y: p.y, z: p.z, rowH: s.rowH, radii: s.radii });
+    else out.push([p.x - w / 2, p.y, p.z - w / 2, p.x + w / 2, p.y + h, p.z + w / 2]);
+  };
+  add(playerSprite, CHARACTER_BODY);
+  add(enemySprite, CHARACTER_BODY);
+  for (const { mesh } of worldObjects) add(mesh, mesh.isSprite ? [mesh.scale.x, mesh.scale.y] : TREE_BODY);
+  return out;
+}
 const smoke = engine.add(createSmoke({
   renderer, scene, camera, cascades: () => shadowCascades,
   lighting, sky, cards, shadowsOn: () => shadowsOn, rebuild: () => { if (shadowsOn) buildPerPixelShadows(); },
-  boxLight: () => boxLight,
+  boxLight: () => boxLight, bodies: smokeBodies,
   sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
 }));
 // Basic mode's light: sun shadows and lamps on the BoxGrid, with the advanced
@@ -1462,12 +1511,13 @@ async function loadRegion(name, spawn = 'start') {
     await step(0.25, 'building the world');
     smoke.clear();
     vacateAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
-    const missing = loadLevel(level, MODELS, name);
+    const missing = loadLevel(level, MODELS_AND_TREES, name);
     if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
     setDevProps(name === DEV_LEVEL);
     const at = regionSpawn(spawn);
     if (!at) console.warn(`[level] ${name} has no spawn ${spawn} or start: standing at 8, 0, 8`);
     [player.gridPos.x, player.gridPos.y, player.gridPos.z] = at || [8, 0, 8];
+    exitTracker.disarm();   // arriving on an exit does not offer it back
     setOccupantAt(getVoxelKey(player.gridPos.x, player.gridPos.y, player.gridPos.z), player.id);
     playerSprite.position.copy(getSpriteWorldPos(player.gridPos));
     rig.pivot.position.copy(playerSprite.position);
@@ -1510,6 +1560,33 @@ async function loadRegion(name, spawn = 'start') {
     }
   }
 }
+
+// --- Exits (core/exits.js) ---
+//
+// Standing on one, in explore mode, offers the region it leads to: a prompt,
+// and F or its button to go. Placeholder look (World plan P2 4.4); zero
+// travel time. In co-op the party will go together, on the host's word
+// (coop-from-the-start) - for now Bob alone decides.
+const exitTracker = createExitTracker();
+exitTracker.disarm();   // the page can open onto an exit (?spawn=)
+let offeredExit = null;
+const regionTitle = name => name.split(/[_-]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+function updateExitPrompt() {
+  const e = game.mode === 'explore' && !editor.active && !regionLoading
+    ? exitTracker.update(Region.exits, player.gridPos) : null;
+  if (e === offeredExit) return;
+  offeredExit = e;
+  if (e) UI.showExitPrompt(`To ${regionTitle(e.target)}`);
+  else UI.hideExitPrompt();
+}
+async function takeExit() {
+  const e = offeredExit;
+  if (!e) return;
+  offeredExit = null;
+  UI.hideExitPrompt();
+  console.log(`[level] ${await loadRegion(e.target, e.spawn)}`);
+}
+UI.onExitTravel(takeExit);
 
 const perf = createPerfOverlay();
 perf.attachRenderer(renderer);
@@ -1594,6 +1671,22 @@ const bxbApi = installConsole(createConsole({
   proxies: cards.commands.proxies,
   cardparity: cards.commands.cardparity,
   cards: cards.commands.cards,
+  tree: {
+    help: 'grow a tree (core/treegen.js) on the block three east of Bob - saved with the region like any model',
+    usage: "bxb.tree()  a random oak  |  bxb.tree('oak', 42)  that seed  |  bxb.tree('oak', 42, 200)  older (pulses)",
+    run: (species = 'oak', seed = Math.floor(Math.random() * 1e6), pulses = null) => {
+      const base = treeModel(`tree_${species}#0@1`);
+      if (!base) return `no tree species '${species}'`;
+      const model = treeModel(`tree_${species}#${seed}@${pulses ?? base.species.pulses}`);
+      const { x, y, z } = player.gridPos;
+      const placed = addWorldModel(model, x + 3, y, z, 0);
+      if (!placed) return `nothing to stand on at ${x + 3}, ${y}, ${z}`;
+      const r = applyWorldEdit();
+      const s = model.stats;
+      return `${model.name}: ${s.wood.length} wood boxes, ${s.leaves.length} leaf boxes (${s.leafCells} leaf cells)` +
+             (r && r.message ? ` - ${r.message}` : '');
+    }
+  },
   region: {
     help: 'load another region in place (levels/<name>.bxr), at a spawn point; no name: the one loaded',
     usage: "bxb.region()  |  await bxb.region('dev_level')  |  await bxb.region('test_b', 'start')",

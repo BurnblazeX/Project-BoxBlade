@@ -328,7 +328,8 @@ export function buildSmokeShaders() {
   const smoke = G.createSmokeCubes({ cascades, lights: lighting.bindings(), biasUniform: sunU.biasUniform,
                                      fadeStartUniform: sunU.fadeStartUniform, edgeFadeUniform: sunU.edgeFadeUniform,
                                      ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures, glass: terrainTextures, cards: sc, lightCards: lc });
-  const out = { smokeLight: wgslOf(smoke.light), 'smoke cubes': { compute: wgslOf(smoke.mesh, smoke.mesh.material).fragment } };
+  const cubes = wgslOf(smoke.mesh, smoke.mesh.material);
+  const out = { smokeLight: wgslOf(smoke.light), 'smoke cubes': { compute: cubes.fragment }, 'smoke cubes vertex': { compute: cubes.vertex } };
   // The shading with the smoke in its light (its sun march and light loop).
   const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
   split.resolve = G.createSplitResolve(split, texelCache);

@@ -138,6 +138,8 @@ for (const pass of ['splitFinal', 'splitGlassReflect', 'splitGlassThrough']) {
   ok(`${pass}: traces smoke`, code.includes('bxbSmokeView') && code.includes('smokeViewHit'), true);
   ok(`${pass}: distinct traversal loop variables`, ['smvCloud', 'smvStep', 'smvNeighbour'].every(n => code.includes(`var ${n} : i32`)), true);
 }
+ok('smoke cubes grow in and shrink out by their birth and death (the vertex reads them)',
+   smokeShaders['smoke cubes vertex'].compute.includes('bxbSmokeEnclosed') && smokeShaders.smokeLight.compute.includes('bxbSmokeEnclosed'), true);
 ok('smoke lighting binds both sprite shadow atlases', smokeShaders.smokeLight.compute.includes('bxbSmokeSunCards') &&
   smokeShaders.smokeLight.compute.includes('bxbSmokeLampCards'), true);
 

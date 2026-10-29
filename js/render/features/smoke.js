@@ -31,15 +31,33 @@
 //                  by its walks (world()), and it shadows the terrain through
 //                  the smoke - version() and growing() tell it when to look
 //                  again.
-import { createSmokeCloud, smokeRadius, CLOUD_SPELLS, MAX_CAST_LEVEL, SMOKE_GROW_IN } from '../../core/smoke.js';
+//   bodies()       what stands in the smoke: the characters and sprite props,
+//                  each a turned silhouette or a box (core/smoke.js
+//                  occupiedCells). Their
+//                  cells hold no smoke; it moves to the cloud's rim and back
+//                  as they come and go (core/smoke.js reshapeSmokeCloud).
+//
+// Clouds are exclusive: each is cast round the others' cells, and smoke a
+// body pushes out never goes into another cloud.
+import { createSmokeCloud, reshapeSmokeCloud, pruneFading, expireCovered, smokeCells, occupiedCells, smokeRadius, CLOUD_SPELLS, MAX_CAST_LEVEL,
+         SMOKE_GROW_IN } from '../../core/smoke.js';
 import { createSmokeCubes, MAX_SMOKE_CLOUDS, DEFAULT_SMOKE, SMOKE_ENCLOSED_DELAY, smokeShared } from '../../gpu/smoke.js';
 import { smokeView } from '../../gpu/smokeview.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
 import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { flip } from '../engine.js';
 
+// Seconds between reshapes at most, while bodies move through smoke: each
+// re-uploads the clouds it changed.
+const RESHAPE_SECONDS = 0.1;
+// Seconds a cell a body has left stays clear before the smoke comes back,
+// and seconds the bodies' cells must hold still before a cloud's volume is
+// put right (reshapeAll).
+const SMOKE_RELEASE_SECONDS = 0.15;
+const SMOKE_SETTLE_SECONDS = 0.15;
+
 export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, sun, cards = null, shadowsOn,
-                              rebuild = () => {}, boxLight = () => null }) {
+                              rebuild = () => {}, boxLight = () => null, bodies = () => [] }) {
   const clouds = new Array(MAX_SMOKE_CLOUDS).fill(null);
   let nextSlot = 0;
   let spell = 'fogCloud';
@@ -59,12 +77,61 @@ export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, 
   // Slot k to the GPU, once a cast: its boxes and growth for the shadows and
   // the bounce, its surface cubes to draw. How far it has rolled out is worked
   // out on the GPU from the cast time (gpu/smokeshadow.js smokeGrowthTSL).
-  const write = k => {
+  // cubes false: the cube list is written by the caller, once for several.
+  const write = (k, cubes = true) => {
     const c = clouds[k];
     smokeShared.write(k, c ? c.cloud : null, c ? c.at : 0);
-    if (gpu) gpu.write(clouds);
+    if (gpu && cubes) gpu.write(clouds);
     version++;
   };
+
+  // --- What takes up space ---
+  //
+  // Two speeds, so a body moving through smoke does not churn it:
+  //   - while the cells bodies hold change, a cloud only gives up the cells
+  //     they take and fills back the cells of its own shape they leave
+  //     (core/smoke.js reshapeSmokeCloud, settle false) - after
+  //     SMOKE_RELEASE_SECONDS, so the smoke closes behind a walker rather
+  //     than flickering at its heels as its outline steps from one cell
+  //     column to two;
+  //   - once those cells have held still for SMOKE_SETTLE_SECONDS, one settled
+  //     reshape puts the volume right: the rim grows round where a body
+  //     stands, or draws back from where it left.
+  // The cells the bodies hold, and the last second each was held.
+  let blocked = new Set(), reshapedAt = -Infinity, changedAt = -Infinity, settled = true;
+  const heldAt = new Map();
+  const bodyCellsNow = t => {
+    for (const body of bodies()) for (const key of occupiedCells(body)) heldAt.set(key, t);
+    const out = new Set();
+    for (const [key, at] of heldAt) {
+      if (t - at < SMOKE_RELEASE_SECONDS) out.add(key); else heldAt.delete(key);
+    }
+    return out;
+  };
+  // Every live cloud's cells but slot `skip`'s: a Set a cloud.
+  const othersThan = skip => clouds.filter((c, k) => c && k !== skip).map(c => smokeCells(c.cloud));
+  const sameSet = (a, b) => a.size === b.size && [...a].every(x => b.has(x));
+  const reshapeEvery = (t, settle) => {
+    let any = false;
+    clouds.forEach((c, k) => {
+      if (c && reshapeSmokeCloud(c.cloud, blocked, othersThan(k), t, settle)) { write(k, false); any = true; }
+    });
+    if (any && gpu) gpu.write(clouds);
+  };
+  function reshapeAll(t) {
+    const held = bodyCellsNow(t);
+    if (!sameSet(held, blocked)) {
+      changedAt = t;
+      settled = false;
+      if (t - reshapedAt < RESHAPE_SECONDS) return;
+      blocked = held;
+      reshapedAt = t;
+      reshapeEvery(t, false);
+    } else if (!settled && t - changedAt >= SMOKE_SETTLE_SECONDS) {
+      settled = true;
+      reshapeEvery(t, true);
+    }
+  }
 
   // Made for the cascades in use (a shadows rebuild makes new ones) - or in
   // basic mode for the box light's walks (remade with its kernels).
@@ -124,9 +191,12 @@ export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, 
   function summonAt(tile, which = spell, level = castLevel) {
     const def = CLOUD_SPELLS[which];
     if (!def) return `no cloud spell '${which}' - ${Object.keys(CLOUD_SPELLS).join(', ')}`;
-    const cloud = createSmokeCloud(tile, undefined, def, Math.max(level, def.level));
-    if (!cloud.cubes.length) return `no air round block ${tile.gx}, ${tile.gy}, ${tile.gz}`;
     const k = nextSlot;
+    // Round the other clouds (not the one this replaces) and what stands there.
+    blocked = bodyCellsNow(now());
+    const cloud = createSmokeCloud(tile, undefined, def, Math.max(level, def.level), undefined,
+                                   { taken: othersThan(k), blocked });
+    if (!cloud.cubes.length) return `no air round block ${tile.gx}, ${tile.gy}, ${tile.gz}`;
     clouds[k] = { cloud, at: now() };
     nextSlot = (nextSlot + 1) % MAX_SMOKE_CLOUDS;
     write(k);
@@ -145,6 +215,15 @@ export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, 
   function update() {
     // The clock the clouds roll out by (their cast times are on it).
     smokeShared.time.value = now();
+    if (clouds.some(Boolean)) {
+      reshapeAll(now());
+      // Cubes done shrinking out leave the list.
+      let pruned = false;
+      for (const c of clouds) if (c && c.cloud.fading.length && pruneFading(c.cloud, now())) pruned = true;
+      // ... and covered cubes whose newcomers have grown over them.
+      for (const c of clouds) if (c && expireCovered(c.cloud, now())) pruned = true;
+      if (pruned && gpu) gpu.write(clouds);
+    }
     // A cloud rolled out: its inside cubes are enclosed now - drop them.
     let compacted = false;
     clouds.forEach(c => {

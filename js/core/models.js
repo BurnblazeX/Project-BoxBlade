@@ -8,6 +8,7 @@
 // across; emissiveLayer: its _e texture's, when it has one. Its warnings are
 // printed once, with its name.
 import { parseBBModel } from './bbmodel.js';
+import { TREE_SPECIES, growTree, treeBoxes, treeCubes } from './treegen.js';
 import { MATERIALS, MATERIAL_LAYERS, BLOCK_TEXELS } from './materials.js';
 
 // Only under Vite; in node (the tests) there are no models (as materials.js).
@@ -43,6 +44,37 @@ for (const [path, text] of Object.entries(sources)) {
   model.giAlbedo = null;
   MODELS.set(file, model);
 }
+
+// Generated trees (core/treegen.js): a species is a model with no cubes of
+// its own and three tiles - bark, end grain, and the leaves through its ramp
+// (render.js loadModelTiles composes them from the terrain textures). Each
+// tree is that model with its own cubes, named tree_<species>#<seed>@<pulses>
+// so a region saves and regrows it (treeModel).
+export const TREE_MODELS = new Map();
+for (const [name, species] of Object.entries(TREE_SPECIES)) {
+  const t = species.textures;
+  const model = { name: 'tree_' + name, cubes: [], bounds: [], warnings: [], bakes: [], width: 36, height: 12,
+                  textures: { albedo: null, normal: null, specular: null, emissive: null },
+                  compose: [{ texture: t.bark }, { texture: t.top }, { texture: t.leaves, ramp: species.ramp }],
+                  tilesX: 3, tilesY: 1, modelLayer: nextLayer, emissiveLayer: null, lightColour: null,
+                  giIndex: nextGi++, giAlbedo: null, species };
+  nextLayer += 3;
+  TREE_MODELS.set(name, model);
+}
+const TREE_NAME = /^tree_([A-Za-z]+)#(-?\d+)@(\d+)$/;
+// The tree named `name` (tree_<species>#<seed>@<pulses>), grown; null if it
+// names none.
+export function treeModel(name) {
+  const m = TREE_NAME.exec(name || '');
+  const base = m && TREE_MODELS.get(m[1]);
+  if (!base) return null;
+  const grown = treeBoxes(growTree(base.species, Number(m[2]), Number(m[3])));
+  const cubes = treeCubes(grown);
+  const trunk = cubes[0];
+  return { ...base, name, cubes, bounds: trunk ? [{ min: trunk.min, max: trunk.max }] : [], stats: grown };
+}
+// Models by name, trees grown on the way (for world.js loadLevel).
+export const MODELS_AND_TREES = { get: name => MODELS.get(name) || treeModel(name) };
 
 // Layers the terrain arrays need: the materials' (with their faces and
 // slopes, materials.js MATERIAL_LAYERS), then every model's tiles.

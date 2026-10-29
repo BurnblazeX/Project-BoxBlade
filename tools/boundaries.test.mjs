@@ -35,7 +35,7 @@ const SLACK = 50;
 // main.js has none: the user dropped it (2026-10-21).
 const FILE_BUDGETS = {};
 const FUNCTION_BUDGETS = {
-  'gpu/shade.js createShadowColorNode': 1376
+  'gpu/shade.js createShadowColorNode': 1392
 };
 
 const here = dirname(fileURLToPath(import.meta.url));

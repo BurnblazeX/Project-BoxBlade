@@ -18,6 +18,16 @@
 //                       dev server only)
 //   Tab                 back to the game
 //
+// With Exit or Spawn picked in the panel (Markers), clicks place those
+// instead, on the ground block's top face - the cell the party stands on:
+//   left click          a spawn of the name in the panel (moves it if it is
+//                       there already); an exit of one cell to the region and
+//                       spawn in the panel
+//   Shift + left drag   an exit over the box of cells
+//   right click         removes the exit or spawns on that cell
+// Exits and spawns are drawn while editing (cyan, yellow) and saved in the
+// region's header (core/exits.js).
+//
 // A model placed on a top face stands on it; on a side face it hangs on that
 // wall, its north side against it (world.js mountWorldModel).
 //
@@ -28,7 +38,8 @@ import * as THREE from 'three/webgpu';
 import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, FACINGS, BLOCK_SHAPES, blockBoxes,
          blockShape, blockFacing, surfaceLevel,
          WorldModels, addWorldModel, mountWorldModel, removeWorldModel, newBlock,
-         serializeLevel, hasFacing, isDual, complementShape, DEV_LEVEL } from '../core/world.js';
+         serializeLevel, hasFacing, isDual, complementShape, DEV_LEVEL, Region } from '../core/world.js';
+import { exitBox, exitsWithout } from '../core/exits.js';
 import { encodeRegion } from '../core/region.js';
 import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
@@ -49,6 +60,8 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     active: false,
     // The selection: a block (material, shape) or a model; a facing for both.
     kind: 'block', materialId: MATERIALS[0].id, shape: 'full', model: null, facing: 0,
+    // Markers (kind 'exit' or 'spawn'): where an exit leads, a spawn's name.
+    exitTarget: '', exitSpawn: 'start', spawnName: 'start',
     yaw: 0, pitch: -0.6, pos: new THREE.Vector3(),
     keys: new Set(),
     drag: null,          // { button, x, y, moved, shift, start (a target) }
@@ -124,6 +137,43 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     cursor.material.color.setHex(colour);
     cursor.visible = true;
   }
+
+  // --- Exits and spawns, drawn while editing ---
+  //
+  // An exit: the standing room over its cells, two blocks tall; a spawn: a
+  // post on its cell. Rebuilt when they change and when the editor opens.
+  const markerLines = new THREE.LineSegments(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false, transparent: true }));
+  markerLines.renderOrder = 9;
+  markerLines.visible = false;
+  markerLines.raycast = () => {};
+  markerLines.frustumCulled = false;
+  scene.add(markerLines);
+  const EXIT_COLOUR = new THREE.Color(0x55ccff), SPAWN_COLOUR = new THREE.Color(0xffd060);
+  // The room above ground cells [x0, y0, z0, x1, y1, z1], h blocks tall,
+  // inset by `inset` of a block on each side.
+  function standingBox(c, h, inset, out) {
+    boxEdges([(c[0] - 0.5 + inset) * B, (c[1] + 0.5) * B, (c[2] - 0.5 + inset) * B],
+             [(c[3] + 0.5 - inset) * B, (c[4] + 0.5 + h) * B, (c[5] + 0.5 - inset) * B], out);
+  }
+  function drawMarkers() {
+    const pts = [], cols = [];
+    const add = (from, colour) => { for (let i = from; i < pts.length; i += 3) cols.push(colour.r, colour.g, colour.b); };
+    for (const e of Region.exits) { const n = pts.length; standingBox(e.cells, 2, 0, pts); add(n, EXIT_COLOUR); }
+    for (const at of Object.values(Region.spawns)) {
+      const n = pts.length;
+      standingBox([...at, ...at], 1.5, 0.35, pts);
+      add(n, SPAWN_COLOUR);
+    }
+    markerLines.geometry.dispose();
+    markerLines.geometry = new THREE.BufferGeometry();
+    markerLines.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    markerLines.geometry.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    markerLines.visible = state.active && pts.length > 0;
+  }
+  const isMarker = () => state.kind === 'exit' || state.kind === 'spawn';
+  // A ground cell for a marker: the block whose top face is under the cursor.
+  const groundOf = target => (target && !target.model && target.normal[1] > 0 ? target.key : null);
 
   // --- Targeting ---
   const raycaster = new THREE.Raycaster();
@@ -237,6 +287,14 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
 
   function showCursor(target) {
     const d = state.drag;
+    if (isMarker()) {
+      // The cell, or the box of cells a Shift drag makes an exit of.
+      const g = groundOf(target), pts = [];
+      const from = d && d.shift && d.button === 0 && state.kind === 'exit' ? groundOf(d.start) : null;
+      if (g) standingBox(from ? exitBox(from, g) : [...g, ...g], state.kind === 'exit' ? 2 : 1.5, 0, pts);
+      setOutline(pts, d && d.button === 2 ? 0xff6666 : state.kind === 'exit' ? 0x55ccff : 0xffd060);
+      return;
+    }
     if (d && d.row) {
       const a = d.start.place, b = d.row, pts = [];
       boxEdges(a.map((v, i) => (Math.min(v, b[i]) - 0.5) * B), a.map((v, i) => (Math.max(v, b[i]) + 0.5) * B), pts);
@@ -337,6 +395,48 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       for (let z = lo[2]; z <= hi[2]; z++) out.push([x, y, z]);
     return out;
   }
+  // --- Exits and spawns ---
+  function placeExit(cells) {
+    const target = state.exitTarget.trim();
+    if (!target) { status('name the region this exit leads to (Markers)'); return; }
+    const spawn = state.exitSpawn.trim() || 'start';
+    // One exit per cell: a new one replaces any it overlaps.
+    Region.exits = [...exitsWithout(Region.exits, cells), { cells, target, spawn }];
+    drawMarkers();
+    status(`exit to ${target} (${spawn}) - Ctrl+S to save`);
+  }
+  function placeSpawn(cell) {
+    const name = state.spawnName.trim() || 'start';
+    Region.spawns = { ...Region.spawns, [name]: cell.slice() };
+    drawMarkers();
+    status(`spawn ${name} at ${cell.join(', ')} - Ctrl+S to save`);
+  }
+  function removeMarkersAt(cell) {
+    const box = [...cell, ...cell];
+    const exits = exitsWithout(Region.exits, box);
+    const spawns = Object.fromEntries(Object.entries(Region.spawns)
+      .filter(([, at]) => at[0] !== cell[0] || at[1] !== cell[1] || at[2] !== cell[2]));
+    const n = Region.exits.length - exits.length + Object.keys(Region.spawns).length - Object.keys(spawns).length;
+    Region.exits = exits;
+    Region.spawns = spawns;
+    drawMarkers();
+    status(n ? `removed ${n} marker${n > 1 ? 's' : ''} - Ctrl+S to save` : 'no exit or spawn on that cell');
+  }
+  // A marker click or drag, on release. true when it was one.
+  function markerRelease(d, target) {
+    if (!isMarker()) return false;
+    const g = groundOf(target);
+    if (d.moved && !(d.shift && d.button === 0)) return true;   // a look-around drag
+    if (!g) { status('exits and spawns go on a top face'); return true; }
+    if (d.button === 2) removeMarkersAt(g);
+    else if (state.kind === 'spawn') placeSpawn(g);
+    else {
+      const from = d.shift ? groundOf(d.start) : null;
+      placeExit(from ? exitBox(from, g) : [...g, ...g]);
+    }
+    return true;
+  }
+
   function edited(what) {
     const r = onEdit();
     if (r && r.message) status(r.message);
@@ -407,6 +507,10 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     state.drag = null;
     if (!d || d.button !== e.button) return;
     const target = targetAt(e.clientX, e.clientY);
+    if (markerRelease(d, target)) {
+      showCursor(target);
+      return;
+    }
     if (d.row) {
       let n = 0;
       for (const c of boxCells(d.start.place, d.row)) n += placeBlockAt(c);
@@ -462,6 +566,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     palette.show(on);
     state.keys.clear();
     state.drag = null;
+    drawMarkers();
     if (on) {
       // Start from where the game camera is, looking the way it looks.
       state.pos.copy(camera.position);
