@@ -28,6 +28,7 @@ import { createMirrors } from './render/features/mirrors.js';
 import { createGI } from './render/features/gi.js';
 import { createFog } from './render/features/fog.js';
 import { createSmoke } from './render/features/smoke.js';
+import { createLeaves } from './render/features/leaves.js';
 import { createBoxLight } from './render/features/boxlight.js';
 import { createDebugView } from './render/features/debugview.js';
 import { createTexelCache } from './render/features/texelcache.js';
@@ -559,6 +560,7 @@ function applyWorldEdit() {
   farShadows.invalidate();
   lighting.syncModelLights();
   boxLight.rebuild();
+  leaves.invalidate();
   if (shadowsOn) {
     // No prior footprint: a full bake, not a scroll (core/field.js createFieldAt).
     for (const g of shadowGrids) if (g) g.filledBlocks = null;
@@ -984,6 +986,7 @@ function animate(time) {
   const tRender = performance.now();
   occlusion.update();   // the interiors' lifted blocks, before the first terrain pass
   smoke.update();   // cube bounds and light before reflections / glass read them
+  leaves.update();
   texel.render(earlyKernels);
   spriteAtlas.render();
   tonemap.update();   // meters this frame's terrain, before the main render
@@ -1272,6 +1275,13 @@ const smoke = engine.add(createSmoke({
   boxLight: () => boxLight, bodies: smokeBodies,
   sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
 }));
+// The trees' leaves: cells drawn as swaying cubes, lit as the smoke's are.
+const leaves = engine.add(createLeaves({
+  renderer, scene, camera, cascades: () => shadowCascades,
+  lighting, sky, cards, shadowsOn: () => shadowsOn, boxLight: () => boxLight,
+  models: () => WorldModels, focus: () => playerSprite.position,
+  sun: { light: dirLight, on: () => sun.on, angular: () => sun.angular, uniforms: () => sun.uniforms() }
+}));
 // Basic mode's light: sun shadows and lamps on the BoxGrid, with the advanced
 // effects off.
 const boxLight = engine.add(createBoxLight({
@@ -1535,6 +1545,7 @@ async function loadRegion(name, spawn = 'start') {
     farShadows.invalidate();
     lighting.syncModelLights();
     boxLight.rebuild();
+    leaves.invalidate();
     occlusion.reset();
     gi.reset();
 
@@ -1673,11 +1684,11 @@ const bxbApi = installConsole(createConsole({
   cards: cards.commands.cards,
   tree: {
     help: 'grow a tree (core/treegen.js) on the block three east of Bob - saved with the region like any model',
-    usage: "bxb.tree()  a random oak  |  bxb.tree('oak', 42)  that seed  |  bxb.tree('oak', 42, 200)  older (pulses)",
-    run: (species = 'oak', seed = Math.floor(Math.random() * 1e6), pulses = null) => {
+    usage: "bxb.tree()  a random oak  |  bxb.tree('oak', 42)  that seed  |  bxb.tree('oak', 42, 200)  older (age; full size at 160)",
+    run: (species = 'oak', seed = Math.floor(Math.random() * 1e6), age = null) => {
       const base = treeModel(`tree_${species}#0@1`);
       if (!base) return `no tree species '${species}'`;
-      const model = treeModel(`tree_${species}#${seed}@${pulses ?? base.species.pulses}`);
+      const model = treeModel(`tree_${species}#${seed}@${age ?? base.species.pulses}`);
       const { x, y, z } = player.gridPos;
       const placed = addWorldModel(model, x + 3, y, z, 0);
       if (!placed) return `nothing to stand on at ${x + 3}, ${y}, ${z}`;
@@ -2124,7 +2135,7 @@ const bxbApi = installConsole(createConsole({
     }
   },
   light: sun.commands.light,
-  ...sky.commands, ...tonemap.commands, ...occlusion.commands, ...fog.commands, ...smoke.commands, ...boxLight.commands,
+  ...sky.commands, ...tonemap.commands, ...occlusion.commands, ...fog.commands, ...smoke.commands, ...leaves.commands, ...boxLight.commands,
   sun: sun.commands.sun
 }));
 
@@ -2228,6 +2239,7 @@ settingsPanel = createSettingsPanel({ groups: [
   gi.settings,
   fog.settings,
   smoke.settings,
+  leaves.settings,
   cards.settings,
   lighting.settings,
   boxLight.settings,

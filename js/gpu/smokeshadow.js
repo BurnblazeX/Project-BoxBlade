@@ -26,7 +26,8 @@
 //               them gives its own back (gpu/gi.js).
 // smokeInscatterTSL  a ray through smoke: what it holds back, and the lit
 //               smoke's light it gathers on the way - texel GI's rays
-//               (gpu/texelgi.js), so a sunlit cloud brightens what is round it.
+//               (gpu/texelgi.js), so a sunlit cloud brightens what is round it
+//               (and one in shadow does not).
 // Its own module so the light loop (pointlights.js) and the cubes (smoke.js),
 // which use each other, both reach it.
 import * as THREE from 'three/webgpu';
@@ -35,6 +36,9 @@ import { Fn, If, Loop, float, vec3, vec4, int, uniform, uniformArray, texture3D,
          smoothstep, select } from 'three/tsl';
 import { SMOKE_CUBE, SMOKE_BOX, SMOKE_GROW_IN, SMOKE_SUN_BOXES } from '../core/smoke.js';
 import { layout } from './layout.js';
+import { sunMapFarTSL } from './sunmap.js';
+import { sunRoofTSL } from './sun.js';
+import { skyOpenTSL } from './volume.js';
 
 // Cloud spells live at once. Each is a slot of the atlas, and every shadow
 // ray and light checks each slot's box: one more slot is one more box test a
@@ -300,10 +304,16 @@ export function smokeSampleTSL(shared, p) {
 // the smoke there is lit by - the sun through the rest of the smoke from
 // where it is thickest along the ray, and the sky - times its colour, and
 // what it gives the ray: that light times (1 - its transmittance), dimmed by
-// the clouds before it. The sun's world shadow is left out: this is the bounce.
+// the clouds before it. Smoke in the world's shadow is not lit: at that point
+// the sun takes the sun depth map (one hard tap) and the roof map toward the
+// sun, and the sky the open-sky map (terrain: the terrain textures; null, no
+// roof or sky test). Without them a cloud indoors, or in a building's shadow,
+// lit what was round it as if it stood in the open sun (2026-10-30).
 const inFns = new WeakMap();
-export function smokeInscatterTSL(shared = smokeShared) {
-  if (inFns.has(shared)) return inFns.get(shared);
+export function smokeInscatterTSL(shared = smokeShared, terrain = null) {
+  if (!inFns.has(shared)) inFns.set(shared, new Map());
+  const cache = inFns.get(shared);
+  if (cache.has(terrain)) return cache.get(terrain);
   const step = SMOKE_CUBE;
   const fn = Fn(([origin, dir, reach, sunDir, sunLight, skyLight]) => {
     const gathered = vec3(0, 0, 0).toVar(), tauAll = float(0).toVar();
@@ -327,8 +337,11 @@ export function smokeInscatterTSL(shared = smokeShared) {
           });
           If(tau.greaterThan(float(1e-4)), () => {
             const mid = origin.add(dir.mul(tw.div(tau))).toVar();
-            const toSun = smokeSunTransmitTSL(shared, mid, sunDir);
-            const lit = sunLight.mul(toSun).add(skyLight).mul(par.xyz);
+            const toSun = smokeSunTransmitTSL(shared, mid, sunDir)
+              .mul(sunMapFarTSL(mid, float(1), float(0.5), float(0), float(0)))
+              .mul(sunRoofTSL(terrain, mid, sunDir, float(12)));
+            const open = terrain && terrain.skyTop ? skyOpenTSL(terrain, mid) : float(1);
+            const lit = sunLight.mul(toSun).add(skyLight.mul(open)).mul(par.xyz);
             const T = exp(tau.mul(shared.strength).negate());
             gathered.addAssign(lit.mul(float(1).sub(T)).mul(exp(tauAll.negate())));
             tauAll.addAssign(tau.mul(shared.strength));
@@ -340,7 +353,7 @@ export function smokeInscatterTSL(shared = smokeShared) {
   }).setLayout(layout('smokeInscatter', 'vec4', [
     { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' }, { name: 'reach', type: 'float' },
     { name: 'sunDir', type: 'vec3' }, { name: 'sunLight', type: 'vec3' }, { name: 'skyLight', type: 'vec3' }]));
-  inFns.set(shared, fn);
+  cache.set(terrain, fn);
   return fn;
 }
 

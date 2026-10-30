@@ -2,7 +2,7 @@ import { file, section, ok, truthy } from './lib/harness.mjs';
 import { growTree, treeBoxes, treeCubes, TREE_SPECIES, CELL } from '../js/core/treegen.js';
 import { placeModel, modelInstanceData } from '../js/core/bbmodel.js';
 
-file('treegen.test.mjs - generated trees (pulses, pipe radius, leaf automaton, boxes)');
+file('treegen.test.mjs - generated trees (oak kit, pulses, pipe radius, leaf automaton, boxes)');
 
 const oak = TREE_SPECIES.oak;
 const a = growTree(oak, 7), b = growTree(oak, 7), c = growTree(oak, 8);
@@ -15,8 +15,11 @@ ok('older is bigger', growTree(oak, 7, 40).nodes.size < a.nodes.size, true);
 const root = a.nodes.get('0,0,0');
 ok('the trunk is the thickest', [...a.nodes.values()].every(n => n.r <= root.r), true);
 ok('... and no thicker than the species allows', root.r <= oak.maxRadius, true);
-ok('a bare trunk up to the lowest branch', [...a.nodes.values()].filter(n => n.at[1] < oak.lowestBranch - 1)
+ok('a bare trunk up to the fork', [...a.nodes.values()].filter(n => n.at[1] < a.fork)
   .every(n => n.at[0] === 0 && n.at[2] === 0), true);
+ok('... where two or more limbs leave it', [...a.nodes.values()].filter(n => n.parent && n.parent.join() === `0,${a.fork},0`).length >= 2, true);
+ok('every node in the crown or on the trunk', [...a.nodes.values()].every(n => n.at[1] <= a.fork ||
+  a.envelope.measure(...n.at) <= 1.3), true);
 ok('every node but the root hangs from a neighbour', [...a.nodes.values()].every(n => !n.parent ||
   n.parent.reduce((s, v, i) => s + Math.abs(v - n.at[i]), 0) === 1), true);
 // Pipe rule: a parent at least as thick as the root of its children's areas.
@@ -27,8 +30,32 @@ ok('thickness by the pipe rule', [...a.nodes.values()].every(n => {
 
 section('leaves');
 truthy('a crown of leaves', a.leaves.size > 50);
-ok('no leaf where wood is', [...a.leaves.keys()].some(k => a.nodes.has(k)), false);
+const shown = k => a.nodes.has(k) && Math.round(2 * a.nodes.get(k).r) >= 2;
+ok('no leaf where shown wood is', [...a.leaves.keys()].some(shown), false);
+ok('... a twig too thin to show is leaf', [...a.nodes].filter(([, n]) => Math.round(2 * n.r) < 2).every(([k]) => a.leaves.has(k)), true);
+{
+  // Every leaf joined to shown wood through leaves: none floats.
+  const near = k => { const [x, y, z] = k.split(',').map(Number);
+    return [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]].map(([p, q, r]) => `${x + p},${y + q},${z + r}`); };
+  const reached = new Set([...a.leaves.keys()].filter(k => near(k).some(shown)));
+  const queue = [...reached];
+  while (queue.length) for (const k of near(queue.pop())) if (a.leaves.has(k) && !reached.has(k)) { reached.add(k); queue.push(k); }
+  ok('no floating leaves', reached.size, a.leaves.size);
+  // A domed top: the highest layer of leaves much smaller than the widest.
+  const layers = new Map();
+  for (const k of a.leaves.keys()) { const y = Number(k.split(',')[1]); layers.set(y, (layers.get(y) || 0) + 1); }
+  const top = Math.max(...layers.keys()), widest = Math.max(...layers.values());
+  truthy('a domed top, not a flat one', layers.get(top) < widest / 3);
+}
 ok('none below ground', [...a.leaves.keys()].every(k => Number(k.split(',')[1]) >= 0), true);
+
+section('the pulse kit');
+const pine = { ...oak, kit: 'pulses', energy: 18, upProbability: 1, lowestBranch: 4 };
+const p = growTree(pine, 7);
+ok('the same seed, the same tree', shape(p), shape(growTree(pine, 7)));
+ok('a bare trunk up to the lowest branch', [...p.nodes.values()].filter(n => n.at[1] < pine.lowestBranch - 1)
+  .every(n => n.at[0] === 0 && n.at[2] === 0), true);
+truthy('... and leaves', p.leaves.size > 20);
 
 section('boxes');
 const boxes = treeBoxes(a);

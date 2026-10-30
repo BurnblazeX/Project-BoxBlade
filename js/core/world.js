@@ -604,7 +604,7 @@ export function loadLevel(level, models, name = null) {
 function placeEntry(model, at, yaw, owner, tile, wall = null) {
   const placed = placeModel(model, at, yaw);
   const [x, y, z] = owner;
-  const entry = { model, name: model.name, x, y, z, yaw, wall, tile, ...placed };
+  const entry = { model, name: model.name, x, y, z, yaw, wall, tile, at, ...placed };
   // A lightSource cube casts no shadow - it is the light - so it is not
   // baked; its centre and size are where the light is and how big.
   entry.lights = placed.cubes.filter(c => c.light).map(c => ({

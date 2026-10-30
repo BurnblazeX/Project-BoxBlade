@@ -299,6 +299,10 @@ export function buildBoxLightShaders() {
   const smoke = G.createSmokeCubes({ terrain: terrainTextures, world: box.world() });
   out['basic smoke light'] = wgslOf(smoke.light);
   out['basic smoke cubes'] = { compute: wgslOf(smoke.mesh, smoke.mesh.material).fragment };
+  // ... and the leaves.
+  const leaves = G.createLeafCubes({ terrain: terrainTextures, world: box.world() });
+  out['basic leaf light'] = wgslOf(leaves.light);
+  out['basic leaf cubes'] = { compute: wgslOf(leaves.mesh, leaves.mesh.material).fragment };
   return out;
 }
 
@@ -316,6 +320,27 @@ export function buildFogShaders() {
   const rt = new THREE.RenderTarget(64, 64, { type: THREE.FloatType, depthTexture: new THREE.DepthTexture(64, 64) });
   const quad = fog.makeQuad({ id: rt.texture, depth: rt.depthTexture });
   out['fog quad'] = { compute: wgslOf(quad, quad.material).fragment };
+  return out;
+}
+
+// The leaves (gpu/leaves.js): the per-cube light kernel and the cubes -
+// built, not snapshotted.
+export function buildLeafShaders() {
+  const atlas = G.createCardAtlasTexture({ data: new Uint8Array(4), width: 2, height: 2 });
+  const sc = G.createCardBindings(G.MAX_CARDS, 'bxbLeafSunCards'), lc = G.createCardBindings(POINT_CARD_CAPACITY, 'bxbLeafLampCards');
+  sc.atlas = lc.atlas = atlas;
+  const leaves = G.createLeafCubes({ cascades, lights: lighting.bindings(), biasUniform: sunU.biasUniform,
+                                     fadeStartUniform: sunU.fadeStartUniform, edgeFadeUniform: sunU.edgeFadeUniform,
+                                     ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures, glass: terrainTextures, cards: sc, lightCards: lc });
+  const cubes = wgslOf(leaves.mesh, leaves.mesh.material);
+  const out = { leafLight: wgslOf(leaves.light), 'leaf cubes': { compute: cubes.fragment }, 'leaf cubes vertex': { compute: cubes.vertex },
+                leafVolumeLight: wgslOf(G.leafVolume.kernel) };
+  // The shading with the leaves in its sun shadow.
+  const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  split.resolve = G.createSplitResolve(split, texelCache);
+  for (const [k, v] of Object.entries(shaderSet('leaf-shadows', { leaves: G.leafVolume, split }))) {
+    out[`shading with leaves: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
+  }
   return out;
 }
 

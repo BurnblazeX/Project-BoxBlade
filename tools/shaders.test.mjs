@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { file, section, ok, note } from './lib/harness.mjs';
 import { buildAllShaders, buildViewShaders, buildProfilingShaders, buildExposureShaders,
-         buildPlainShaders, buildFogShaders, buildSmokeShaders,
+         buildPlainShaders, buildFogShaders, buildSmokeShaders, buildLeafShaders,
          buildBoxLightShaders } from './lib/shaders.mjs';
 
 // Every shader, byte for byte, against the accepted set. A refactor that only
@@ -140,8 +140,32 @@ for (const pass of ['splitFinal', 'splitGlassReflect', 'splitGlassThrough']) {
 }
 ok('smoke cubes grow in and shrink out by their birth and death (the vertex reads them)',
    smokeShaders['smoke cubes vertex'].compute.includes('bxbSmokeEnclosed') && smokeShaders.smokeLight.compute.includes('bxbSmokeEnclosed'), true);
+{
+  // Texel GI's rays gather lit smoke only where the world lets the light in:
+  // the in-scatter takes the sun depth map (a cloud indoors lit its room).
+  const gi = Object.entries(smokeShaders).filter(([id]) => id.startsWith('texel GI with smoke'))
+    .map(([, v]) => v.compute).filter(c => c.includes('smokeInscatter'));
+  ok('texel GI gathers smoke light somewhere', gi.length > 0, true);
+  ok('... shadowed by the world (the sun depth map in the in-scatter)', gi.every(c => {
+    const body = c.slice(c.indexOf('fn smokeInscatter'));
+    return body.slice(0, body.indexOf(String.fromCharCode(10) + '}')).includes('sunMapFar');
+  }), true);
+}
 ok('smoke lighting binds both sprite shadow atlases', smokeShaders.smokeLight.compute.includes('bxbSmokeSunCards') &&
   smokeShaders.smokeLight.compute.includes('bxbSmokeLampCards'), true);
+
+section('leaves build');
+const leafShaders = buildLeafShaders();
+for (const [id, set] of Object.entries(leafShaders)) {
+  ok(`${id}: builds`, !!(set.compute && set.compute.length), true);
+  for (const code of Object.values(set)) {
+    ok(`${id}: resource limits`, (code.match(/var<uniform>/g) || []).length <= 12 &&
+      (code.match(/var<storage/g) || []).length <= 8 && (code.match(/: texture_/g) || []).length <= 16, true);
+  }
+}
+ok('leaf colour reads the species ramps', leafShaders['leaf cubes'].compute.includes('bxbLeafRamps'), true);
+ok('the shading\'s sun shadow reads the leaf volume', Object.entries(leafShaders)
+  .some(([id, v]) => id.startsWith('shading with leaves') && v.compute.includes('bxbLeafOrigin')), true);
 
 section('exposure meter builds');
 for (const [id, set] of Object.entries(buildExposureShaders())) {

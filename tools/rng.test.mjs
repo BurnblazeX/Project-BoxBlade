@@ -10,7 +10,7 @@ file('rng.test.mjs - seeded randomness, the same on every machine');
 // The modules every seeded generator lives in. A generator added in P9 goes
 // on this list, and from then on it may not reach for the functions whose
 // last bits differ between browsers.
-const GENERATOR_MODULES = ['core/rng.js'];
+const GENERATOR_MODULES = ['core/rng.js', 'core/treegen.js'];
 const UNSAFE = /\bMath\.(random|sin|cos|tan|asin|acos|atan2?|sinh|cosh|tanh|asinh|acosh|atanh|exp|expm1|log|log1p|log2|log10|pow|cbrt|hypot)\b|\*\*/;
 
 section('generators use only exact arithmetic');

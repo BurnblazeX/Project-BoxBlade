@@ -11,6 +11,7 @@ import { REFLECT_ROUGH_END, REFLECT_ROUGH_START, decodeSpecularTSL, fresnelRough
 import { NO_SKIP } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
 import { smokeInscatterTSL } from './smokeshadow.js';
+import { leafInscatterTSL } from './leafvolume.js';
 
 // --- Texel GI: a radiance cache on the block faces ---
 //
@@ -410,7 +411,7 @@ export const texelGILevelTSL = cascades => p => {
 export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass, bias, sky, ambient,
                                        shadeMode, sun, sunOn, sunShadow, sunVisZero, sunDirect,
                                        skyIrradiance, pointLight, mirrorTrace, giRead,
-                                       cones = null, nearReach = null, smoke = null }) {
+                                       cones = null, nearReach = null, smoke = null, leaves = null }) {
   const plainTrace = glass ? null : trace || createReflectTraceTSL(cascades);
   const glassTrace = glass ? createReflectTraceTSL(cascades, false, true) : null;
   const abSky = float(texelGI.ab.sky);
@@ -419,9 +420,11 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
   // integral over a hemisphere, over pi, is skyIrradiance.
   const skyRadiance = d => (sky ? skyShTSL(sky, d).mul(ambient).mul(sky.gain) : vec3(ambient, ambient, ambient));
   const q = texelGI.queue, D = texelGI.data;
-  // What lit smoke is lit by, for the rays crossing it: the sun (its world
-  // shadow left out - this is the bounce) and the sky, evenly.
-  const smokeIn = smoke ? smokeInscatterTSL(smoke) : null;
+  // What lit smoke is lit by, for the rays crossing it: the sun and the sky,
+  // evenly - each where the world lets it reach the smoke (gpu/smokeshadow.js).
+  const smokeIn = smoke ? smokeInscatterTSL(smoke, terrain) : null;
+  // ... and the trees' leaves, the same way (gpu/leafvolume.js).
+  const leafIn = leaves ? leafInscatterTSL(terrain, leaves) : null;
   const smokeSun = smoke ? sunColourUniform.mul(float(1).sub(ambient)).mul(float(sunOn ? 1 : 0)) : null;
   const smokeSky = smoke ? skyIrradiance(vec3(0, 1, 0)).add(skyIrradiance(vec3(0, -1, 0))).mul(float(0.5)) : null;
   const reset = Fn(() => {
@@ -639,6 +642,11 @@ export function createTexelGIKernels({ texelGI, cascades, terrain, trace, glass,
             const sc = smokeIn(origin, dir, sp.t,
                                sun.dir, smokeSun, smokeSky).toVar();
             L.assign(L.mul(exp(sc.w.negate())).add(sc.xyz.mul(texelGI.strength)));
+          }
+          if (leaves) {
+            const lc = leafIn(origin, dir, sp.t, sun.dir, sunColourUniform.mul(float(1).sub(ambient)).mul(float(sunOn ? 1 : 0)),
+                              skyIrradiance(vec3(0, 1, 0))).toVar();
+            L.assign(L.mul(exp(lc.w.negate())).add(lc.xyz.mul(texelGI.strength)));
           }
           c[0].addAssign(L.mul(dir.x));
           c[1].addAssign(L.mul(dir.y));

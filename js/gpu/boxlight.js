@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { leafLightTSL } from './leafvolume.js';
 import {
   Fn, If, Loop, Break, float, int, uint, vec3, vec4, uvec3, uniform, instanceIndex, storage, min,
   textureStore, texture3D, select, max, abs, length, log2, clamp, round, shiftRight, bitAnd, cos, sin, exp
@@ -89,10 +90,12 @@ export function boxLightAtTSL(b, p, n) {
     .and(uvw.z.greaterThanEqual(float(0))).and(uvw.x.lessThanEqual(float(1)))
     .and(uvw.y.lessThanEqual(float(1))).and(uvw.z.lessThanEqual(float(1)));
   const k = float(1).div(max(A.w, float(1e-3))).mul(min(A.w.mul(float(100)), float(1)));
+  // ... and through the trees' leaves (gpu/leafvolume.js): their dappled shade.
+  const leaves = leafLightTSL(p.add(n.mul(float(BOX_METRES / 2)))).toVar();
   return {
     lamp: select(inside, A.xyz.mul(k), vec3(0, 0, 0)),
-    sun: select(inside, B.xyz.mul(k), vec3(1, 1, 1)),
-    sky: select(inside, B.w.mul(k), float(1))
+    sun: select(inside, B.xyz.mul(k), vec3(1, 1, 1)).mul(leaves.x),
+    sky: select(inside, B.w.mul(k), float(1)).mul(leaves.y)
   };
 }
 

@@ -47,8 +47,9 @@ for (const [path, text] of Object.entries(sources)) {
 
 // Generated trees (core/treegen.js): a species is a model with no cubes of
 // its own and three tiles - bark, end grain, and the leaves through its ramp
-// (render.js loadModelTiles composes them from the terrain textures). Each
-// tree is that model with its own cubes, named tree_<species>#<seed>@<pulses>
+// (render.js loadModelTiles composes them from the terrain textures; the
+// leaves' tile is unused since the leaves became cells, core/leaves.js). Each
+// tree is that model with its own cubes, named tree_<species>#<seed>@<age>
 // so a region saves and regrows it (treeModel).
 export const TREE_MODELS = new Map();
 for (const [name, species] of Object.entries(TREE_SPECIES)) {
@@ -62,16 +63,18 @@ for (const [name, species] of Object.entries(TREE_SPECIES)) {
   TREE_MODELS.set(name, model);
 }
 const TREE_NAME = /^tree_([A-Za-z]+)#(-?\d+)@(\d+)$/;
-// The tree named `name` (tree_<species>#<seed>@<pulses>), grown; null if it
+// The tree named `name` (tree_<species>#<seed>@<age>), grown; null if it
 // names none.
 export function treeModel(name) {
   const m = TREE_NAME.exec(name || '');
   const base = m && TREE_MODELS.get(m[1]);
   if (!base) return null;
   const grown = treeBoxes(growTree(base.species, Number(m[2]), Number(m[3])));
-  const cubes = treeCubes(grown);
+  // The wood as cubes; the leaves as cells, drawn apart (core/leaves.js).
+  const cubes = treeCubes({ wood: grown.wood, leaves: [] });
   const trunk = cubes[0];
-  return { ...base, name, cubes, bounds: trunk ? [{ min: trunk.min, max: trunk.max }] : [], stats: grown };
+  return { ...base, name, cubes, bounds: trunk ? [{ min: trunk.min, max: trunk.max }] : [], stats: grown,
+           leafCells: grown.cells, leafAll: grown.all };
 }
 // Models by name, trees grown on the way (for world.js loadLevel).
 export const MODELS_AND_TREES = { get: name => MODELS.get(name) || treeModel(name) };

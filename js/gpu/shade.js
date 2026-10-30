@@ -1,5 +1,6 @@
 import { smokeViewHitTSL } from './smokeview.js';
 import { withSmokeTSL } from './smokeshadow.js';
+import { withLeavesTSL, leafLightTSL } from './leafvolume.js';
 import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/field.js';
 import { SUN_ANGULAR_SIZE } from '../core/sun.js';
@@ -99,7 +100,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   terrain = null,
                                   albedo = null, specular: specOn = true,
                                   reflections: reflectOn = true, sky = null,
-                                  mirrors = null, smoke = null, smokeView = false,
+                                  mirrors = null, smoke = null, smokeView = false, leaves = null,
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   gi = null,
@@ -129,12 +130,13 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const ambient = ambientUniform || uniform(float(DEFAULT_AMBIENT));
   // sunMarch false (profiling only): the sun is unshadowed everywhere - to
   // measure what its march costs. The GI's own sun march is left alone.
-  const sunShadow = withSmokeTSL(smoke, sun.dir, sunMarch ? createSoftSunTSL({
+  // Through spell smoke and the trees' leaves too (gpu/leafvolume.js: dappled shade).
+  const sunShadow = withLeavesTSL(leaves, withSmokeTSL(smoke, sun.dir, sunMarch ? createSoftSunTSL({
     cascades, sunDir: sun.dir, sunTangent: sun.tangent,
     sunBitangent: sun.bitangent, maxDist, coneRadiusUniform: sun.coneRadius,
     rayCount: rays, bayerTex, stepsUniform, biasUniform, cone, quantise,
     fadeStartUniform, edgeFadeUniform, cards, glass: glassT, terrain
-  }) : () => asColour(float(1)));
+  }) : () => asColour(float(1))));
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
   // The cones are built for AO, for GI, or both - GI gathers along them - so
@@ -210,7 +212,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const skyIrradiance = d => (sky
     ? skyShTSL(sky, d, true).mul(ambient).mul(sky.gain)
     : vec3(ambient, ambient, ambient));
-  const ambientLight = (bent, ao, keep = null) => skyIrradiance(bent).mul(keep ? ao.mul(keep) : ao);
+  // At p, less what the trees' leaves hold back of the sky (gpu/leafvolume.js).
+  const ambientLight = (bent, ao, keep = null, p = null) => {
+    const a = skyIrradiance(bent).mul(keep ? ao.mul(keep) : ao);
+    return leaves && p ? a.mul(leafLightTSL(p, leaves).y) : a;
+  };
 
   // A revealed face's light: the room's (gpu/ambient.js createRevealedLightTSL).
   const revealedLight = createRevealedLightTSL(skyIrradiance, gi, split && split.room);
@@ -952,7 +958,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     const plusGI = col => (occ.gi ? col.add(occ.gi) : col);
     // The sky ambient, along the bent normal - bent further by the normal
     // map, so the bumps catch the sky as they catch the sun.
-    const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao, occ.sky).toVar();
+    const amb = ambientLight(normalize(occ.bent.add(nS).sub(n)), ao, occ.sky, p).toVar();
 
     // The mirror light alone - not in the GI view, as it never goes through the LPV.
     if (view === 'mirror') return mirrorTrace ? mirrorLight(p, n, nS, n) : vec3(0, 0, 0);
@@ -1213,7 +1219,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         else registerPatch(p, n);
       }
       const occ = occlusion(p, n, n, NO_SKIP, S.texAO, false, S.nS);
-      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao, occ.sky);
+      const amb = ambientLight(normalize(occ.bent.add(S.nS).sub(n)), occ.ao, occ.sky, p);
       if (view) {
         // The bounce views: the split kernels stay on for them, so it is traced.
         const bounce = occ.gi || vec3(0, 0, 0);
@@ -1440,7 +1446,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       // A sprite by a mirror catches its glare too, sun or lamp. Lifted
       // straight up, as the sprite's own rays are.
       const mirrored = mirrorTrace ? mirrorLight(p, n, nS, n, skip) : null;
-      const amb0 = ambientLight(occ.bent, ao, occ.sky);
+      const amb0 = ambientLight(occ.bent, ao, occ.sky, p);
       const amb = mirrored ? amb0.add(mirrored) : amb0;
       if (view === 'indirect') { out.assign(plusGI(amb)); return; }
       if (!sunOn) {
@@ -1470,7 +1476,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     texelGI, cascades, terrain, trace: reflectTrace, glass: glassT, bias, sky, ambient, shadeMode, sun,
     sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead,
     // The near band and V_p need the cones' AO.
-    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null, smoke }) : null;
+    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null, smoke, leaves }) : null;
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
            glassNode: terrainView ? node : glassNode, sun, cascades, lights,

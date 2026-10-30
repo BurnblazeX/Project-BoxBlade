@@ -35,16 +35,10 @@ import { Fn, If, float, vec3, vec4, int, uniform, instanceIndex, storage, select
          exp, max, cos, fract, sin, varying, positionGeometry, normalGeometry,
          positionWorld, cameraProjectionMatrix, cameraViewMatrix, smoothstep } from 'three/tsl';
 import { SMOKE_CUBE, SMOKE_GROW_IN, SMOKE_BOX, SMOKE_CAST_BORN, SMOKE_NEVER_DIES } from '../core/smoke.js';
-import { createConeTraceSunTSL } from './trace.js';
-import { createPointLightsTSL } from './pointlights.js';
-import { createSunUniforms, sunRoofTSL } from './sun.js';
-import { sunMapFarTSL } from './sunmap.js';
-import { glassRayTransmitTSL } from './glass.js';
-import { NO_SKIP, createCardsTSL, CARD_SUN_MAX } from './cards.js';
+import { createSunUniforms } from './sun.js';
+import { createCubeWorldLight } from './cubelight.js';
 import { smokeView, smokeColourTSL, SMOKE_CUBE_CAPACITY } from './smokeview.js';
 export { SMOKE_CUBE_CAPACITY, DEFAULT_SMOKE } from './smokeview.js';
-import { skyShTSL, sunColourUniform } from './sky.js';
-import { skyOpenTSL } from './volume.js';
 import { liftAtTSL } from './occlusion.js';
 import { MAX_SMOKE_CLOUDS, smokeShared, smokeTauTSL, smokeGrowthTSL, smokeSunTransmitTSL } from './smokeshadow.js';
 
@@ -137,45 +131,14 @@ export function createSmokeCubes({ cascades, lights, biasUniform, fadeStartUnifo
     ...smokeView.uniforms
   };
   const sun = createSunUniforms(new THREE.Vector3(0, 1, 0));
-  const coneTrace = world ? null : createConeTraceSunTSL(cascades, !!glass);
-  const spriteShadow = world ? null : createCardsTSL(cards);
-  // The lamps through the smoke too - its soft copy, as the sun.
-  const pointLights = world ? null : createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
-                                             edgeFadeUniform, cards: lightCards, glass, smoke: shared, smokeSoft: true });
+  // The world's light at p, before the smoke (gpu/cubelight.js).
+  const worldLight = createCubeWorldLight({ cascades, lights, biasUniform, fadeStartUniform, edgeFadeUniform,
+                                            ambientUniform, sky, terrain, glass, cards, lightCards, shared, world, sun, u });
   // Through the soft copy (gpu/smokeshadow.js): the light falls off smoothly
   // through the cloud. Through the hard one, each cube counted whole boxes
   // from where it happened to sit on the lattice, and lit cubes stood out in
   // shaded parts.
   const tau = smokeTauTSL(shared, true);
-  const sunReach = float(12);
-  const skyIso = () => skyShTSL(sky, vec3(0, 1, 0), true).add(skyShTSL(sky, vec3(0, -1, 0), true))
-    .mul(float(0.5)).mul(ambientUniform).mul(sky.gain);
-
-  // The world's light at p, before the smoke: the sun (times the sun on and
-  // its gain), the lamps (through the smoke's soft copy) and the sky.
-  const PI_INV = float(1 / Math.PI);
-  const worldLight = world ? {
-    sun: p => world.binding.sunColour.mul(PI_INV).mul(u.sunLight).mul(world.sun(p)).mul(u.sun),
-    lamps: p => world.lamps(p).mul(world.binding.lampGain).mul(PI_INV),
-    sky: p => world.binding.ambient.mul(PI_INV).mul(world.sky(p))
-  } : {
-    sun: p => {
-      const lit = vec3(0, 0, 0).toVar();
-      If(u.sunLight.greaterThan(float(0)), () => {
-        const traced = coneTrace(p, sun.dir, sunReach, sun.coneRadius, fadeStartUniform, edgeFadeUniform).toVar();
-        const through = glass ? glassRayTransmitTSL(glass, traced, p, sun.dir) : vec3(1, 1, 1);
-        // Past the march's 12 m, the long shadows: the sun depth map, hard
-        // (gpu/sunmap.js) - as the GI's probes take it. Without it a cloud in
-        // a long shadow was lit as if in the open.
-        lit.assign(through.mul(traced.x.mul(sunRoofTSL(terrain, p, sun.dir, sunReach))
-          .mul(sunMapFarTSL(p, sunReach, fadeStartUniform, sun.coneRadius, float(0)))));
-      });
-      if (spriteShadow) lit.mulAssign(spriteShadow(p, sun.dir, float(CARD_SUN_MAX), sun.coneRadius, NO_SKIP));
-      return sunColourUniform.mul(u.sunLight).mul(lit).mul(u.sun);
-    },
-    lamps: p => pointLights.withSpecular(p, vec3(0, 0, 0), NO_SKIP, null),
-    sky: p => skyIso().mul(terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1))
-  };
 
   const lightKernel = Fn(() => {
     const i = int(instanceIndex);

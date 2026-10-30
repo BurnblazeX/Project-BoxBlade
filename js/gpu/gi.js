@@ -12,12 +12,14 @@ import { glassRayTransmitTSL } from './glass.js';
 import { createMirrorLightTSL } from './mirrorlight.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { smokeShared, smokeSampleTSL, smokeSunTransmitTSL } from './smokeshadow.js';
+import { leafVolume, leafDensityTSL, leafLightTSL } from './leafvolume.js';
 import { sunColourUniform, skyShTSL } from './sky.js';
 import { createSunUniforms, sunRoofTSL } from './sun.js';
 import { sunMapFarTSL } from './sunmap.js';
 import { createConeTraceSunTSL } from './trace.js';
 import { volumeAtTSL, skyOpenTSL } from './volume.js';
 import { BLOCK_METRES } from '../core/world.js';
+import { BOX_METRES } from '../core/boxgrid.js';
 import { GI_LAYERS } from '../core/models.js';
 // One entry per material, then per model (models.js giIndex).
 const GI_TABLE = Array.from({ length: GI_LAYERS });
@@ -304,7 +306,11 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
       sprite.addAssign(spriteOverlap(base, A, B).mul(u.spriteFill.element(sp)));
     });
     solid.element(c.i).assign(min(count.div(float(27)).add(sprite), float(1)));
-    smokeK.element(c.i).assign(exp(smokeSampleTSL(smokeShared, base.add(cellU.mul(float(0.5)))).w.mul(cellU).negate()));
+    // ... and through the trees' leaves (gpu/leafvolume.js): optical depth a
+    // leaf box, over the cell's width in boxes.
+    const mid = base.add(cellU.mul(float(0.5)));
+    smokeK.element(c.i).assign(exp(smokeSampleTSL(smokeShared, mid).w.mul(cellU)
+      .add(leafDensityTSL(mid).mul(leafVolume.u.strength).mul(cellU.div(float(BOX_METRES)))).negate()));
   })().compute(CELLS).setName(`LPV.Solid`);
 
   // --- inject: light leaving the surfaces around each air cell ---
@@ -482,7 +488,24 @@ export function createLPV({ cascades, lights, level = 0, biasUniform = null, res
         const colour = smk.xyz.div(smk.w);
         smokeE.assign(lit.mul(colour).mul(float(1).sub(exp(smk.w.mul(cellU).negate()))));
       });
-      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE).add(smokeE), open));
+      // The trees' leaves in this cell give back the light they are lit by
+      // (gpu/leafvolume.js): the sun through the world and through the
+      // leaves toward it, and the sky through the leaves above - times their
+      // bounce colour and the share of light they catch here.
+      const leafE = vec3(0, 0, 0).toVar();
+      const leafD = leafDensityTSL(centre).mul(leafVolume.u.strength).mul(cellU.div(float(BOX_METRES))).toVar();
+      If(leafD.greaterThan(float(1e-4)), () => {
+        const through = leafLightTSL(centre).toVar();
+        const lit = vec3(0, 0, 0).toVar();
+        If(u.sunGain.greaterThan(float(0)), () => {
+          const traced = coneTrace(centre, sun.dir, sunReach, sun.coneRadius, fadeStart, edgeFade).toVar();
+          lit.assign(sunColourUniform.mul(traced.x.mul(sunRoofTSL(terrain, centre, sun.dir, sunReach)))
+            .mul(u.sunGain).mul(through.x));
+        });
+        if (sky) lit.addAssign(skyShTSL(sky, vec3(0, 1, 0), true).mul(ambient).mul(u.skyGain).mul(skyOpenAt(centre)).mul(through.y));
+        leafE.assign(lit.mul(leafVolume.u.albedo).mul(float(1).sub(exp(leafD.negate()))));
+      });
+      E.element(c.i).assign(vec4(out.div(float(6)).add(spriteE).add(smokeE).add(leafE), open));
       W.element(c.i).assign(vec4(bounceW.div(float(6)), 0));
     });
   })().compute(CELLS).setName(`LPV.Inject`);
