@@ -9,7 +9,10 @@
 // straight up, in the basic material's units (irradiance / pi).
 //
 // gpu/smoke.js and gpu/leaves.js light their cubes by it, once a cube, in
-// their light kernels.
+// their light kernels. leaves (gpu/leafvolume.js leafVolume, shaded path):
+// the lamps through the trees' leaves too, the cube's own cell left out
+// (basic mode's walks always take them). lampsAimed(p): { sum, aim } - aim
+// the lamps' directions weighted by their luminance here (0 in basic mode).
 import { If, float, vec3 } from 'three/tsl';
 import { createConeTraceSunTSL } from './trace.js';
 import { createPointLightsTSL } from './pointlights.js';
@@ -19,26 +22,32 @@ import { glassRayTransmitTSL } from './glass.js';
 import { NO_SKIP, createCardsTSL, CARD_SUN_MAX } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
 import { skyOpenTSL } from './volume.js';
+import { BOX_METRES } from '../core/boxgrid.js';
 
 // ctx as createSmokeCubes's (gpu/smoke.js); sun: createSunUniforms's; u: the
 // cubes' uniforms - sunLight (the sun on, and its share) and sun (its gain).
-// Returns { sun(p), lamps(p), sky(p) }.
+// Returns { sun(p), lamps(p), lampsAimed(p), sky(p), skyColour(), skyShare(p) } -
+// sky(p) is skyColour() x skyShare(p), the share a number.
 export function createCubeWorldLight({ cascades, lights, biasUniform, fadeStartUniform, edgeFadeUniform,
                                        ambientUniform, sky, terrain, glass = false, cards = null, lightCards = null,
-                                       shared, world = null, sun, u }) {
+                                       shared, world = null, sun, u, leaves = null }) {
   const PI_INV = float(1 / Math.PI);
   if (world) {
     return {
       sun: p => world.binding.sunColour.mul(PI_INV).mul(u.sunLight).mul(world.sun(p)).mul(u.sun),
       lamps: p => world.lamps(p).mul(world.binding.lampGain).mul(PI_INV),
-      sky: p => world.binding.ambient.mul(PI_INV).mul(world.sky(p))
+      lampsAimed: p => ({ sum: world.lamps(p).mul(world.binding.lampGain).mul(PI_INV), aim: vec3(0, 0, 0) }),
+      sky: p => world.binding.ambient.mul(PI_INV).mul(world.sky(p)),
+      skyColour: () => world.binding.ambient.mul(PI_INV),
+      skyShare: p => world.sky(p)
     };
   }
   const coneTrace = createConeTraceSunTSL(cascades, !!glass);
   const spriteShadow = createCardsTSL(cards);
   // The lamps through the smoke too - its soft copy, as the sun.
   const pointLights = createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
-                                             edgeFadeUniform, cards: lightCards, glass, smoke: shared, smokeSoft: true });
+                                             edgeFadeUniform, cards: lightCards, glass, smoke: shared, smokeSoft: true,
+                                             leaves, leafStart: BOX_METRES });
   const sunReach = float(12);
   const skyIso = () => skyShTSL(sky, vec3(0, 1, 0), true).add(skyShTSL(sky, vec3(0, -1, 0), true))
     .mul(float(0.5)).mul(ambientUniform).mul(sky.gain);
@@ -58,6 +67,13 @@ export function createCubeWorldLight({ cascades, lights, biasUniform, fadeStartU
       return sunColourUniform.mul(u.sunLight).mul(lit).mul(u.sun);
     },
     lamps: p => pointLights.withSpecular(p, vec3(0, 0, 0), NO_SKIP, null),
-    sky: p => skyIso().mul(terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1))
+    lampsAimed: p => {
+      const aim = vec3(0, 0, 0).toVar();
+      const sum = pointLights.withSpecular(p, vec3(0, 0, 0), NO_SKIP, null, null, null, aim);
+      return { sum, aim };
+    },
+    sky: p => skyIso().mul(terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1)),
+    skyColour: skyIso,
+    skyShare: p => (terrain && terrain.skyTop ? skyOpenTSL(terrain, p) : float(1))
   };
 }

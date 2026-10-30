@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { leafLightTSL } from './leafvolume.js';
+import { leafLightTSL, leafTransmitTSL } from './leafvolume.js';
 import {
   Fn, If, Loop, Break, float, int, uint, vec3, vec4, uvec3, uniform, instanceIndex, storage, min,
   textureStore, texture3D, select, max, abs, length, log2, clamp, round, shiftRight, bitAnd, cos, sin, exp
@@ -238,7 +238,10 @@ export function createBoxLightKernels({ binding, region, capacity, tintCapacity,
   // sprite cards, and through the smoke - its hard boxes for the terrain's
   // cells, its soft copy for the smoke's own cubes (soft).
   const smokeTau = smokeTauTSL(smokeShared, false);
-  const lampsTSL = (p, c, soft) => {
+  // start: where along a lamp's ray the leaves count (gpu/leafvolume.js) -
+  // a cube's own cell left out.
+  const leafTransmit = leafTransmitTSL();
+  const lampsTSL = (p, c, soft, start = 0) => {
     const sum = vec3(0, 0, 0).toVar();
     Loop({ start: int(0), end: lights.count, type: 'int', condition: '<', name: 'li' }, ({ li }) => {
       const base = li.mul(int(LIGHT_VEC4S));
@@ -266,6 +269,7 @@ export function createBoxLightKernels({ binding, region, capacity, tintCapacity,
           T.mulAssign(float(1).sub(float(1).sub(v).mul(C.w)));
         }
         T.mulAssign(smokeTransmitTSL(smokeShared, p, dir, dist, soft));
+        T.mulAssign(leafTransmit(p, dir, dist, float(start)));
         sum.addAssign(colour.mul(amount).mul(T));
       });
     });
@@ -312,7 +316,7 @@ export function createBoxLightKernels({ binding, region, capacity, tintCapacity,
       return T;
     },
     // Every lamp at p, through the smoke's soft copy.
-    lamps: p => lampsTSL(p, localOf(p), true),
+    lamps: p => lampsTSL(p, localOf(p), true, BOX_METRES),
     // Whether the sky is open straight up from p (glass at its tint's mean).
     sky: p => {
       const c = localOf(p);

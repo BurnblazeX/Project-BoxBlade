@@ -6,7 +6,7 @@
 // are not model cubes: gpu/leaves.js draws them as cubes that sway, textured
 // by noise and coloured by the species' ramp.
 //
-// A tree draws the cells open to air (treegen.js shownLeafCells). Each is
+// A tree draws its crown's shell (treegen.js shownLeafCells). Each cell is
 // placed as its tree is: turned with it, standing where it stands.
 import { TREE_SPECIES, CELL, LEAF_FACES } from './treegen.js';
 import { quarterTurn, transformCube } from './bbmodel.js';
@@ -19,8 +19,8 @@ const SPECIES = Object.values(TREE_SPECIES);
 export const LEAF_SPECIES = Object.keys(TREE_SPECIES);
 
 // The leaf cubes of the placed models (core/world.js WorldModels), as vec4s:
-// centre (world metres), then (open faces x 4 + species) + the cell's
-// height in its crown (0 .. 0.999) - its open faces turned with the tree, a bit each in
+// centre (world metres), then (drawn faces x 4 + species) + the cell's
+// height in its crown (0 .. 0.999) - its drawn faces turned with the tree, a bit each in
 // LEAF_FACES order; at most 4 species. Written into `out` (a Float32Array, 4
 // a cube). Past its room, the nearest to `near` (metres) are kept. Returns
 // { count, total }.
@@ -77,15 +77,22 @@ export function placedLeafBoxes(models) {
 
 // The leaf density window (gpu/leafvolume.js): `out` (dims x*y*z bytes, x
 // fastest) cleared, then 255 in every box of `boxes` inside the window whose
-// min box is `origin`. Returns how many fell inside.
-export function fillLeafDensity(boxes, origin, dims, out) {
+// min box is `origin`. bounds (6 numbers, optional): the min and max box of
+// those inside, or min past max with none. Returns how many fell inside.
+export function fillLeafDensity(boxes, origin, dims, out, bounds = null) {
   out.fill(0);
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   let n = 0;
   for (let i = 0; i < boxes.length; i += 3) {
     const x = boxes[i] - origin[0], y = boxes[i + 1] - origin[1], z = boxes[i + 2] - origin[2];
     if (x < 0 || y < 0 || z < 0 || x >= dims[0] || y >= dims[1] || z >= dims[2]) continue;
     out[x + dims[0] * (y + dims[1] * z)] = 255;
+    for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], boxes[i + a]); hi[a] = Math.max(hi[a], boxes[i + a]); }
     n++;
+  }
+  if (bounds) {
+    if (n) bounds.splice(0, 6, ...lo, ...hi);
+    else bounds.splice(0, 6, 1, 1, 1, 0, 0, 0);
   }
   return n;
 }

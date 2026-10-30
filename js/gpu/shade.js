@@ -1,4 +1,4 @@
-import { smokeViewHitTSL } from './smokeview.js';
+import { leafViewHitTSL, nearestMediaTSL } from './leaves.js';
 import { withSmokeTSL } from './smokeshadow.js';
 import { withLeavesTSL, leafLightTSL } from './leafvolume.js';
 import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
@@ -100,7 +100,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                   terrain = null,
                                   albedo = null, specular: specOn = true,
                                   reflections: reflectOn = true, sky = null,
-                                  mirrors = null, smoke = null, smokeView = false, leaves = null,
+                                  mirrors = null, smoke = null, smokeView = false, leaves = null, leafView = false,
                                   viewCards = null,
                                   ao: aoOn = true, aoDistanceUniform = null,
                                   gi = null,
@@ -212,6 +212,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   const skyIrradiance = d => (sky
     ? skyShTSL(sky, d, true).mul(ambient).mul(sky.gain)
     : vec3(ambient, ambient, ambient));
+  // The leaves (lit by the sky as the leaf cubes are) and smoke a secondary ray meets (gpu/leaves.js).
+  const media = (o, d, reach) => nearestMediaTSL(leafView && ((o2, d2, r2) => leafViewHitTSL(o2, d2, r2,
+    skyIrradiance(vec3(0, 1, 0)).add(skyIrradiance(vec3(0, -1, 0))).mul(float(0.5)), sun.dir)), smokeView, o, d, reach);
   // At p, less what the trees' leaves hold back of the sky (gpu/leafvolume.js).
   const ambientLight = (bent, ao, keep = null, p = null) => {
     const a = skyIrradiance(bent).mul(keep ? ao.mul(keep) : ao);
@@ -230,7 +233,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // on and off is a uniform write rather than a rebuild.
   const pointLight = lights
     ? createPointLightsTSL({ cascades, lights, biasUniform,
-                             fadeStartUniform, edgeFadeUniform, cards: lightCards, glass: glassT, smoke })
+                             fadeStartUniform, edgeFadeUniform, cards: lightCards, glass: glassT, smoke, leaves })
     : null;
 
   // The specular path needs the terrain's arrays (its _s texels) and its albedo,
@@ -381,11 +384,11 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         rec.lambert.assign(float(1)); rec.met.assign(float(1));
       });
     }
-    if (smokeView) {
-      // Limit the smoke query to the nearest visible surface, including sprites.
+    if (smokeView || leafView) {
+      // Limit the smoke and leaf queries to the nearest visible surface, including sprites.
       const reach = select(terrainWins, max(hit.w, 0), reflectMax).toVar();
       if (sp) If(sp.t.greaterThanEqual(0), () => { reach.assign(min(reach, sp.t)); });
-      const cloud = smokeViewHitTSL(origin, dir, reach).toVar();
+      const cloud = media(origin, dir, reach).toVar();
       If(cloud.w.greaterThanEqual(0), () => {
         rec.col.assign(cloud.xyz); rec.met.assign(0); rec.nest.assign(0);
       });
@@ -440,12 +443,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         };
         lightIt();
       });
-      if (smokeView) {
-        const cloud = smokeViewHitTSL(origin, r, select(hit.w.greaterThanEqual(0), hit.w, reflectMax)).toVar();
-        If(cloud.w.greaterThanEqual(0), () => {
-          base.assign(cloud.xyz); spec.assign(vec4(...ROUGH_SPEC));
-          Break();
-        });
+      if (smokeView || leafView) {
+        const cloud = media(origin, r, select(hit.w.greaterThanEqual(0), hit.w, reflectMax).toVar()).toVar();
+        If(cloud.w.greaterThanEqual(0), () => { base.assign(cloud.xyz); spec.assign(vec4(...ROUGH_SPEC)); Break(); });
       }
     });
     out.addAssign(thr.mul(base));
@@ -726,9 +726,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         // Out of this pane. With layers left, look for more glass on the way.
         If(gl.lessThan(int(glassLayers - 1)), () => {
           const hit = seenOrGlassFn(outO, outD, reflectMax).toVar();
-          if (smokeView) {
-            const reach = select(hit.w.lessThanEqual(-2), float(-2).sub(hit.w), select(hit.w.greaterThanEqual(0), hit.w, reflectMax));
-            const cloud = smokeViewHitTSL(outO, outD, reach).toVar();
+          if (smokeView || leafView) {
+            const reach = select(hit.w.lessThanEqual(-2), float(-2).sub(hit.w), select(hit.w.greaterThanEqual(0), hit.w, reflectMax)).toVar();
+            const cloud = media(outO, outD, reach).toVar();
             // Smoke between panes ends the walk before the next pane tints it.
             if (spriteHit) {
               const sp = spriteHit(outO, outD, reach);

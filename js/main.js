@@ -100,14 +100,23 @@ scene.background = new THREE.Color(0x222233);
 // three do it.
 // High performance: on a dual-GPU laptop the default is the integrated GPU. A
 // friend's RTX 3050 laptop ran the game on its Iris Xe at ~55 fps. Chrome on
-// Windows may still pin its GPU process to one adapter, in which case only the
-// OS graphics setting for the browser moves it.
+// Windows ignores powerPreference (and warns that it does, crbug.com/369219127):
+// there only the OS's graphics setting for the browser, or Chrome's
+// force-high-performance-gpu flag, moves it. So it is not asked for there;
+// instead, on an integrated GPU the player is told how to switch
+// (integratedGPUNotice, below).
+const onWindows = /Windows/.test(navigator.userAgent);
+let gpuAdapterInfo = null;
+// Integrated, as far as the adapter says: Intel's, but for its discrete Arc
+// line (xe-hpg and on). An AMD APU's Radeon reads as AMD's discrete do.
+const isIntegratedGPU = info => !!info && info.vendor === 'intel' && !/^xe-hp/.test(info.architecture || '');
 async function requestGPUDevice() {
   try {
     const adapter = navigator.gpu &&
-      await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      await navigator.gpu.requestAdapter(onWindows ? {} : { powerPreference: 'high-performance' });
     if (adapter?.info) {
       const { vendor, architecture, description } = adapter.info;
+      gpuAdapterInfo = adapter.info;
       console.info('[renderer] WebGPU adapter:', vendor, architecture, description || '');
     }
     if (!adapter) return undefined;
@@ -131,6 +140,16 @@ const renderer = new THREE.WebGPURenderer({ antialias: true, trackTimestamp: tru
 // in fewer submits (gpu/uploads.js, bxb.uploads).
 installUploads(renderer);
 installSubmitBatching(renderer.backend.parameters.device);
+// On an integrated GPU, how to move the browser to the discrete one (see
+// requestGPUDevice): in the chat log, where the player sees it.
+if (isIntegratedGPU(gpuAdapterInfo)) {
+  const how = onWindows
+    ? 'Windows Settings &gt; System &gt; Display &gt; Graphics &gt; your browser &gt; Options &gt; High performance, ' +
+      'then restart the browser (Chrome also has chrome://flags/#force-high-performance-gpu)'
+    : 'your system\'s graphics settings for the browser';
+  console.warn('[renderer] running on integrated graphics:', gpuAdapterInfo.description || gpuAdapterInfo.architecture);
+  UI.logChatMessage(`Running on integrated graphics. If this machine has a dedicated GPU, switch the browser to it: ${how}.`);
+}
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 // Which refreshes render: every one, a cap, or uncapped - see pacing.js.

@@ -333,14 +333,25 @@ export function buildLeafShaders() {
                                      fadeStartUniform: sunU.fadeStartUniform, edgeFadeUniform: sunU.edgeFadeUniform,
                                      ambientUniform: sunU.ambientUniform, sky, terrain: terrainTextures, glass: terrainTextures, cards: sc, lightCards: lc });
   const cubes = wgslOf(leaves.mesh, leaves.mesh.material);
-  const out = { leafLight: wgslOf(leaves.light), 'leaf cubes': { compute: cubes.fragment }, 'leaf cubes vertex': { compute: cubes.vertex },
+  const out = { leafLight: wgslOf(leaves.light), leafCorners: wgslOf(leaves.corners), 'leaf cubes': { compute: cubes.fragment }, 'leaf cubes vertex': { compute: cubes.vertex },
                 leafVolumeLight: wgslOf(G.leafVolume.kernel) };
   // The shading with the leaves in its sun shadow.
   const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
   split.resolve = G.createSplitResolve(split, texelCache);
-  for (const [k, v] of Object.entries(shaderSet('leaf-shadows', { leaves: G.leafVolume, split }))) {
+  for (const [k, v] of Object.entries(shaderSet('leaf-shadows', { leaves: G.leafVolume, leafView: true, split }))) {
     out[`shading with leaves: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
   }
+  // Everything the game runs at once: texel GI, smoke and leaves, both in
+  // the reflections - the binding limits are per shader, so they add up.
+  const mode = giFeature.settings.settings.find(x => x.key === 'gimode');
+  mode.set('texel');
+  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  split2.resolve = G.createSplitResolve(split2, texelCache);
+  for (const [k, v] of Object.entries(shaderSet('leaf-all', { leaves: G.leafVolume, leafView: true, smoke: G.smokeShared,
+                                                              smokeView: true, split: split2 }))) {
+    out[`everything: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
+  }
+  mode.set('lpv');
   return out;
 }
 

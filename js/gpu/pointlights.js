@@ -1,4 +1,5 @@
 import { smokeTransmitTSL } from './smokeshadow.js';
+import { leafTransmitTSL } from './leafvolume.js';
 import { tableGroup } from './uploads.js';
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, uniform, max, abs, vec4, min, clamp, length, log2, uniformArray, int, select, mix } from 'three/tsl';
@@ -62,9 +63,14 @@ export function writeLightBindings(b, packed, count) {
 // smoke: gpu/smokeshadow.js smokeShared, or null - every light is dimmed by
 // the cloud spells between it and the point (smokeSoft: through their soft
 // copy - the smoke lighting itself).
+// leaves: gpu/leafvolume.js leafVolume, or null - every light is dimmed by the
+// trees' leaves between it and the point, more through more of them;
+// leafStart (metres) where along the ray they start to count (one box for
+// a leaf cube's own centre, so its own leaves are left out).
 export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartUniform,
                                 edgeFadeUniform, cards = null, glass = false, smoke = null,
-                                smokeSoft = false }) {
+                                smokeSoft = false, leaves = null, leafStart = 0 }) {
+  const leafTransmit = leaves ? leafTransmitTSL(leaves) : null;
   // Ranged: the point lights share one card buffer and each walks only the
   // slice that was turned to face it.
   const cardsFn = createCardsTSL(cards, { ranged: true });
@@ -89,7 +95,9 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
   // second: 1 at a SECONDARY hit (what a reflection or the view through
   // glass lands on) - there only lights in the hit-shadow budget march
   // (packLight's radius sign); the rest light it unshadowed.
-  const body = (p, n, skip, shadeN, brdf = null, second = null) => {
+  // aim: null, or a vec3 var - each light's direction is added to it, times
+  // its luminance here (a leaf cube lit on the side facing its lamps).
+  const body = (p, n, skip, shadeN, brdf = null, second = null, aim = null) => {
     const sum = vec3(0, 0, 0).toVar();
     const spec = brdf ? vec3(0, 0, 0).toVar() : null;
     // Lifted off the face along the NORMAL, the same as the sun's origin and for
@@ -185,7 +193,10 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
           else visible.assign(mix(float(1), v, weight));
         });
         if (smoke) visible.mulAssign(smokeTransmitTSL(smoke, origin, dir, reach, smokeSoft));
-        sum.addAssign(B.xyz.mul(amount).mul(visible));
+        if (leafTransmit) visible.mulAssign(leafTransmit(origin, dir, reach, float(leafStart)));
+        const arrived = aim ? B.xyz.mul(amount).mul(visible).toVar() : B.xyz.mul(amount).mul(visible);
+        sum.addAssign(arrived);
+        if (aim) aim.addAssign(dir.mul(arrived.dot(vec3(0.2126, 0.7152, 0.0722))));
         // The highlight takes the light's falloff, not the cut-remapped
         // diffuse amount - brdf carries its own N.L.
         if (brdf) spec.addAssign(B.xyz.mul(falloff).mul(visible).mul(brdf(dir)));
@@ -203,6 +214,7 @@ export function createPointLightsTSL({ cascades, lights, biasUniform, fadeStartU
       { name: 'skip', type: 'vec2' }, { name: 'shadeN', type: 'vec3' }]));
   const call = (p, n, skip, shadeN) => fn(p, n, skip, shadeN);
   // Called inline from inside another Fn, so their vars land in the caller.
-  call.withSpecular = (p, n, skip, shadeN, brdf = null, second = null) => body(p, n, skip, shadeN, brdf, second);
+  call.withSpecular = (p, n, skip, shadeN, brdf = null, second = null, aim = null) =>
+    body(p, n, skip, shadeN, brdf, second, aim);
   return call;
 }

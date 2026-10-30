@@ -29,18 +29,26 @@ const cubes = [...Array(r.count)].map((_, i) => [...out.subarray(4 * i, 4 * i + 
 ok('on the BoxGrid: centres on half metres', cubes.every(c => [0, 1, 2].every(a => Number.isInteger(c[a] * 2))), true);
 ok('above the block it stands on', cubes.every(c => c[1] > 2 * 1.5 + 0.75), true);
 ok('the species and the height in w', cubes.every(c => Math.floor(c[3]) % 4 === 0 && c[3] - Math.floor(c[3]) < 1), true);
-ok('... and which faces are open', cubes.every(c => Math.floor(Math.floor(c[3]) / 4) > 0), true);
-// An open face never faces another drawn leaf (those would cover each other).
+ok('... and which faces are drawn', cubes.every(c => Math.floor(Math.floor(c[3]) / 4) > 0), true);
+// Between two drawn cells one face, never two on one plane (they would fight).
 const FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 const facesClear = arr => {
-  const at = new Set([...Array(r.count)].map((_, i) => [0, 1, 2].map(a => Math.round(arr[4 * i + a] * 2)).join()));
-  return [...Array(r.count)].every((_, i) => {
-    const open = Math.floor(Math.floor(arr[4 * i + 3]) / 4);
-    return FACES.every((d, f) => !(open & (1 << f)) ||
-      !at.has([0, 1, 2].map(a => Math.round(arr[4 * i + a] * 2) + d[a]).join()));
-  });
+  const faces = new Map([...Array(r.count)].map((_, i) =>
+    [[0, 1, 2].map(a => Math.round(arr[4 * i + a] * 2)).join(), Math.floor(Math.floor(arr[4 * i + 3]) / 4)]));
+  return [...faces].every(([k, drawn]) => FACES.every((d, f) => {
+    if (!(drawn & (1 << f))) return true;
+    const other = faces.get(k.split(',').map((v, a) => Number(v) + d[a]).join());
+    return other === undefined || !(other & (1 << (f ^ 1)));
+  }));
 };
-ok('open faces face no other leaf', facesClear(out), true);
+ok('one face a plane between drawn cells', facesClear(out), true);
+{
+  // The shell: cells a face from air, and some further in - but not all.
+  const shell = tree.leafCells.length, inner = tree.leafCells.filter(c => c[4] !== 0).length;
+  truthy('the crown shell drawn, some inside cells among it, not every cell',
+    shell === inner && shell < tree.leafAll.length &&
+    tree.leafCells.some(([x, y, z]) => FACES.every(d => tree.leafAll.some(c => c[0] === x + d[0] && c[1] === y + d[1] && c[2] === z + d[2]))));
+}
 {
   const turned = new Float32Array(out.length);
   placedLeafCubes([{ model: tree, yaw: 1, at }], turned);
@@ -50,7 +58,7 @@ ok('open faces face no other leaf', facesClear(out), true);
   }).sort().join();
   ok('turned with its tree, about its trunk', ring(turned), ring(out));
   ok('... and actually turned', turned.some((v, i) => v !== out[i]), true);
-  ok('... its open faces turned with it', facesClear(turned), true);
+  ok('... its drawn faces turned with it', facesClear(turned), true);
 }
 
 section('capacity');

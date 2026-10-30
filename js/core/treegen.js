@@ -3,15 +3,17 @@
 // Branch nodes on the BoxGrid (half-metre cells, 4 texels), each hanging from
 // a face neighbour, grown by a species' kit:
 //
-// 'oak' - an oak's architecture, in stages. A bare trunk to the fork; two to
-// four scaffold limbs leaving it around the compass, each a stepped line that
-// starts steep and flattens outward; then the crown filled by space
-// colonization (Runions et al. 2007): points scattered in the crown envelope
-// (a dome, flatter underneath, weighted to its shell) pull the nearest node
-// within reach, nodes step toward their pull along an axis (chosen by the
-// pull's components, so diagonals stair-step), and a point a node reaches is
-// spent. The twigs end spread over the dome - that is the round crown. Age
-// sizes the tree: full at species.pulses, a little more past it.
+// 'oak' - an oak's architecture (Research/Oak_Growth.md) grown the way
+// Dynamic Trees' limbs look: straight axis runs, turning only at a joint. A
+// bare trunk to the fork; two to four scaffold limbs leaving it around the
+// compass, each out runs and up runs in turn - steep at the trunk, flattening
+// outward, as an oak's limbs do; off their joints shorter branches, and off
+// theirs shorter again (orders), each turned toward the most room left in
+// the crown, so the tips spread over the dome. No branch touches another's
+// cells: limbs never graze or tangle. A tip ends in a cluster of buds - short
+// twigs, where the leaves clump. Everything stays inside the crown envelope
+// (a dome, flatter underneath). Age sizes the tree: full at species.pulses, a
+// little more past it.
 //
 // 'pulses' - Dynamic Trees' growth: each pulse is a signal sent up from the
 // root with an energy - steps it may take. At every branch cell it picks its
@@ -49,9 +51,16 @@ export const TREE_SPECIES = {
     pulses: 160,                // the age at full size
     height: [18, 24], fork: [4, 7], scaffolds: [2, 4],
     crown: [0.5, 0.62],         // the dome's radius, a share of the height
-    limbOut: [0.4, 0.75],       // a scaffold's share of outward steps, at the fork and at its end
-    points: 120, influence: 8, kill: 3,
-    rise: 0.6,                  // the weight on a pull's upward part: an oak's limbs reach out more than up
+    // A limb's share of steps up, at the trunk and out at 0.75 of the crown's
+    // radius: the scaffolds, the leader, their branches.
+    limbRise: [0.7, 0.12], leaderRise: [0.85, 0.35], branchRise: [0.4, 0.05],
+    run: [2, 3],                // cells an out run takes
+    orders: 3,                  // orders of branch off the scaffolds
+    side: [0.85, 0.7, 0.5],     // the chance of a branch off a joint, by order
+    childScale: 0.65,           // a branch's length: its parent's steps left, times this
+    shell: 0.85,                // branches end where the envelope's measure passes this
+    buds: 0.8,                  // the chance of each of a tip's four bud twigs
+    hollow: 0.3,                // the crown is filled out from this envelope measure to its shell
     taper: 0.12, twigRadius: 0.5, maxRadius: 3.5,
     // Dynamic Trees' deciduous solver: [H, C, R].
     leafRules: [[5, 1, 4], [4, 2, 3], [3, 2, 2], [4, 1, 1], [3, 1, 1], [2, 1, 1]],
@@ -94,117 +103,154 @@ export function growTree(species, seed, age = species.pulses) {
 
 // The oak kit (see the top).
 function growOak(species, rng, age) {
-  const s = age <= species.pulses ? Math.max(0.2, age / species.pulses) : 1 + 0.3 * (1 - species.pulses / age);
+  const sc = age <= species.pulses ? Math.max(0.2, age / species.pulses) : 1 + 0.3 * (1 - species.pulses / age);
   const between = ([lo, hi]) => lo + rng.float() * (hi - lo);
-  const H = Math.max(5, Math.round(between(species.height) * s));
-  const fork = Math.max(1, Math.min(H - 4, Math.round(between(species.fork) * s)));
+  const H = Math.max(5, Math.round(between(species.height) * sc));
+  const fork = Math.max(1, Math.min(H - 4, Math.round(between(species.fork) * sc)));
   const R = Math.max(1.5, H * between(species.crown));
   const base = fork + 1, top = H - 1, cy = base + (top - base) * 0.4;
   const env = envelope(R, cy, top - cy, cy - base);
 
-  const nodes = new Map();
-  const add = (at, parent) => {
+  const nodes = new Map(), owner = new Map();
+  const add = (at, parent, id) => {
     const n = { at, r: species.twigRadius, parent: parent ? parent.at : null };
     nodes.set(key(...at), n);
+    owner.set(key(...at), id);
     return n;
   };
+  // Free for branch `id`: no node there, and no other branch's cell touching
+  // it (by a face, an edge or a corner) but `spare`'s - its parent's, for its
+  // first steps off it (-1: any).
+  const clear = (at, id, spare) => {
+    if (nodes.has(key(...at))) return false;
+    if (spare === -1) return true;
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+      const o = owner.get(key(at[0] + a, at[1] + b, at[2] + c));
+      if (o !== undefined && o !== id && o !== spare) return false;
+    }
+    return true;
+  };
+  // In the crown: the dome above its middle; below, its underside counted
+  // at 0.6 - a limb leaving the fork is low in the dome but well inside it.
+  const inCrown = ([x, y, z]) => {
+    if (y > top) return false;
+    if (y < base) return true;
+    const dy = y - cy;
+    return dy >= 0 ? env.measure(x, y, z) <= species.shell
+      : (x * x + z * z) / (R * R) + 0.6 * (dy * dy) / (env.down * env.down) <= species.shell;
+  };
+  // Where branches end, or are about to grow: a new branch heads for room.
+  const ends = [];
+  const room = p => ends.reduce((m, e) => {
+    const dx = p[0] - e[0], dy = p[1] - e[1], dz = p[2] - e[2];
+    return Math.min(m, dx * dx + dy * dy + dz * dz);
+  }, Infinity);
+
   // The trunk.
-  let n = add([0, 0, 0], null);
-  for (let y = 1; y <= fork; y++) n = add([0, y, 0], n);
+  let n = add([0, 0, 0], null, 0);
+  for (let y = 1; y <= fork; y++) n = add([0, y, 0], n, 0);
   const forkNode = n;
 
+  // A branch: from node `from`, heading (hx, hz) outward, an out run then an
+  // up run, over and over - the up run rise / (1 - rise) of the out run,
+  // rise going from b.rise[0] at the trunk to b.rise[1] at 0.75 R out.
+  // Out runs follow the heading by turns of axis (a line in runs, not in
+  // single steps). It ends at `budget` steps, the crown's shell or another
+  // branch; at its tip a cluster of buds - short twigs - and off its joints
+  // its own branches, the next order, to grow after (breadth first).
+  const queue = [];
+  let ids = 1;
+  const grow = b => {
+    const l1 = Math.abs(b.hx) + Math.abs(b.hz) || 1, ux = b.hx / l1, uz = b.hz / l1;
+    let at = b.from, steps = 0, outs = 0, px = 0, pz = 0, upAcc = 0, ended = false, out = [ux >= 0 ? 1 : -1, 0, 0];
+    const joints = [];
+    const step = d => {
+      const next = [at.at[0] + d[0], at.at[1] + d[1], at.at[2] + d[2]];
+      if (!inCrown(next) || !clear(next, b.id, steps < 2 ? b.spare : null)) return false;
+      at = add(next, at, b.id);
+      steps++;
+      return true;
+    };
+    if (b.lead) for (let i = 0; i < b.lead && !ended; i++) ended = !step([0, 1, 0]);
+    while (!ended && steps < b.budget) {
+      const r = Math.sqrt(at.at[0] * at.at[0] + at.at[2] * at.at[2]);
+      const rise = b.rise[0] + (b.rise[1] - b.rise[0]) * Math.min(1, r / (0.75 * R));
+      const len = b.firstRun && !outs ? b.firstRun : rng.range(...species.run);
+      const dx = (outs + len) * ux - px, dz = (outs + len) * uz - pz;
+      out = Math.abs(dx) >= Math.abs(dz) ? [Math.sign(dx) || 1, 0, 0] : [0, 0, Math.sign(dz) || 1];
+      for (let i = 0; i < len && !ended; i++) {
+        if (!step(out)) { ended = true; break; }
+        outs++; px += out[0]; pz += out[2];
+      }
+      if (ended) break;
+      upAcc += len * rise / (1 - rise);
+      const upLen = Math.floor(upAcc);
+      upAcc -= upLen;
+      for (let i = 0; i < upLen && !ended; i++) ended = !step([0, 1, 0]);
+      if (!ended) joints.push({ node: at, steps, out });
+    }
+    ends.push(at.at);
+    // The buds: up, on and to the sides, a twig of a cell or two each.
+    const side = [out[2], 0, out[0]];
+    for (const d of [[0, 1, 0], out, side, side.map(v => -v)]) {
+      if (!rng.chance(species.buds)) continue;
+      let tip = at;
+      for (let i = rng.range(1, 2); i > 0; i--) {
+        const next = [tip.at[0] + d[0], tip.at[1] + d[1], tip.at[2] + d[2]];
+        if (!inCrown(next) || !clear(next, b.id, null)) break;
+        tip = add(next, tip, b.id);
+      }
+    }
+    if (b.order >= species.orders) return;
+    // Off the joints (not the tip's), turned 60 or 90 degrees from the
+    // branch's heading to the side with the more room, never back in.
+    const S3 = Math.sqrt(3) / 2;
+    for (const j of joints.slice(0, -1)) {
+      if (!rng.chance(species.side[b.order])) continue;
+      const left = b.budget - j.steps;
+      const len = Math.max(2, Math.round(left * species.childScale));
+      let best = null;
+      for (const [c, sn] of [[0.5, S3], [0.5, -S3], [0, 1], [0, -1]]) {
+        const hx = b.hx * c - b.hz * sn, hz = b.hx * sn + b.hz * c;
+        const [x, y, z] = j.node.at;
+        if (x * hx + z * hz < -0.1 * (Math.abs(x) + Math.abs(z))) continue;
+        const reach = Math.min(len, 0.5 * R);
+        const probe = [x + hx * reach, y + reach * species.branchRise[0], z + hz * reach];
+        const score = room(probe) - (env.measure(...probe) > 1 ? 1e6 : 0);
+        if (!best || score > best.score) best = { hx, hz, probe, score };
+      }
+      if (!best) continue;
+      ends.push(best.probe);
+      queue.push({ from: j.node, hx: best.hx, hz: best.hz, order: b.order + 1, budget: len,
+                   rise: species.branchRise, id: ids++, spare: b.id, lead: 0 });
+    }
+  };
+
   // The scaffolds: around the compass from a seeded heading, a quarter turn
-  // of jitter each, the first the leader (steeper, its first step up).
-  const count = Math.max(1, Math.round(rng.range(...species.scaffolds) * Math.min(1, s + 0.2)));
+  // of jitter each, the first the leader (steeper, on up from the trunk).
+  // They leave over a fork zone, a cell apart up the trunk, the leader from
+  // its top: all leaving flat from one cell piled their thick first runs
+  // into a shelf round the fork (2026-10-30). The rest leave with a short
+  // out run, then climb.
+  const count = Math.max(1, Math.round(rng.range(...species.scaffolds) * Math.min(1, sc + 0.2)));
   const turn = { 1: [1, 0], 2: [-1, 0], 3: [-0.5, Math.sqrt(3) / 2], 4: [0, 1] }[Math.min(count, 4)];
+  const zone = [forkNode];
+  while (zone.length < count && zone[zone.length - 1].at[1] < top - 3) {
+    const t = zone[zone.length - 1];
+    zone.push(add([0, t.at[1] + 1, 0], t, 0));
+  }
   let hx, hz, hl;
   do { hx = rng.float() * 2 - 1; hz = rng.float() * 2 - 1; hl = hx * hx + hz * hz; } while (hl > 1 || hl < 0.05);
   for (let k = 0; k < count; k++) {
-    const jx = hx + (rng.float() - 0.5) * 0.4, jz = hz + (rng.float() - 0.5) * 0.4;
-    const l1 = Math.abs(jx) + Math.abs(jz) || 1;
-    const ux = jx / l1, uz = jz / l1;            // steps per horizontal step, x and z
     const leader = k === 0 && count > 1;
-    const [out0, out1] = leader ? species.limbOut.map(v => v * 0.5) : species.limbOut;
-    let at = forkNode, acc = leader ? 0 : 1, outs = 0, cx = 0, cz = 0;
-    for (let step = 0; step < 3 * H; step++) {
-      const t = Math.min(1, Math.sqrt(cx * cx + cz * cz) / (0.7 * R));
-      acc += out0 + (out1 - out0) * t;
-      let next;
-      if (acc >= 1) {
-        acc -= 1; outs++;
-        const ex = outs * ux - cx, ez = outs * uz - cz;
-        if (Math.abs(ex) >= Math.abs(ez)) cx += Math.sign(ex) || 1; else cz += Math.sign(ez) || 1;
-        next = [cx, at.at[1], cz];
-      } else {
-        next = [cx, at.at[1] + 1, cz];
-      }
-      // Ends well inside the crown: out to 0.7 of its radius, or into its upper shell.
-      if (next[1] > top - 1 || cx * cx + cz * cz > 0.5 * R * R ||
-          (next[1] >= env.cy && env.measure(next[0], next[1], next[2]) > 0.6)) break;
-      at = nodes.get(key(...next)) || add(next, at);
-    }
+    const from = leader ? zone[zone.length - 1] : zone[Math.min(k - (count > 1 ? 1 : 0), zone.length - 1)];
+    queue.push({ from, hx: hx + (rng.float() - 0.5) * 0.4, hz: hz + (rng.float() - 0.5) * 0.4,
+                 order: 0, budget: 3 * H, rise: leader ? species.leaderRise : species.limbRise,
+                 id: ids++, spare: leader ? 0 : -1, lead: leader ? 2 : 0, firstRun: leader ? 0 : 2 });
     // The next heading: a turn on, from the heading before jitter.
     [hx, hz] = [hx * turn[0] - hz * turn[1], hx * turn[1] + hz * turn[0]];
   }
-
-  // The crown, by space colonization. Points in the envelope, most in its
-  // outer shell.
-  const want = Math.max(24, Math.round(species.points * s * s));
-  let points = [];
-  for (let tries = 0; points.length < want && tries < want * 50; tries++) {
-    const p = [(rng.float() * 2 - 1) * R, base + rng.float() * (top - base), (rng.float() * 2 - 1) * R];
-    const m = env.measure(...p);
-    if (m > 1 || (m < 0.4 && rng.float() >= 0.3)) continue;
-    points.push(p);
-  }
-  const reach = Math.max(3, species.influence * Math.min(1, s + 0.2)), kill = species.kill;
-  // Nodes that may grow (none on the bare trunk), bucketed by reach.
-  const bucket = new Map(), kids = new Map();
-  const bkey = (x, y, z) => key(Math.floor(x / reach), Math.floor(y / reach), Math.floor(z / reach));
-  const enlist = n => {
-    const k = bkey(...n.at);
-    if (!bucket.has(k)) bucket.set(k, []);
-    bucket.get(k).push(n);
-  };
-  for (const n of nodes.values()) {
-    if (n.at[1] >= fork) enlist(n);
-    if (n.parent) kids.set(key(...n.parent), (kids.get(key(...n.parent)) || 0) + 1);
-  }
-  for (let iter = 0; iter < 4 * H && points.length; iter++) {
-    const pulls = new Map(), alive = [];
-    for (const p of points) {
-      let best = null, bd = reach * reach;
-      const bx = Math.floor(p[0] / reach), by = Math.floor(p[1] / reach), bz = Math.floor(p[2] / reach);
-      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
-        for (const n of bucket.get(key(bx + a, by + b, bz + c)) || []) {
-          const dx = p[0] - n.at[0], dy = p[1] - n.at[1], dz = p[2] - n.at[2], d = dx * dx + dy * dy + dz * dz;
-          if (d < bd) { bd = d; best = n; }
-        }
-      }
-      if (bd < kill * kill) continue;        // reached: spent
-      alive.push(p);
-      if (!best) continue;
-      const l = Math.sqrt(bd), v = pulls.get(best) || [0, 0, 0];
-      for (let a = 0; a < 3; a++) v[a] += (p[a] - best.at[a]) / l;
-      pulls.set(best, v);
-    }
-    points = alive;
-    let grew = false;
-    for (const [n, v] of pulls) {
-      if ((kids.get(key(...n.at)) || 0) >= 3) continue;
-      const choices = DIRS.map(d => {
-        const at = [n.at[0] + d[0], n.at[1] + d[1], n.at[2] + d[2]];
-        const c = d[0] * v[0] + d[1] * v[1] * species.rise + d[2] * v[2];
-        return { at, w: c > 0 && at[1] >= fork && !nodes.has(key(...at)) ? c * c : 0 };
-      });
-      const pick = rng.weighted(choices, c => c.w);
-      if (!pick || !pick.w) continue;
-      enlist(add(pick.at, n));
-      kids.set(key(...n.at), (kids.get(key(...n.at)) || 0) + 1);
-      grew = true;
-    }
-    if (!grew) break;
-  }
+  for (let q = 0; q < queue.length; q++) grow(queue[q]);
   return { nodes, fork, envelope: env };
 }
 
@@ -335,6 +381,26 @@ function growLeaves(species, rng, nodes, env) {
     if (!leaf[i]) continue;
     if (env.measure(...xyz(i)) > 1.1 + 0.25 * rng.float() || (leaf[i] === 1 && rng.float() < 0.3)) leaf[i] = 0;
   }
+  // The crown filled: its outer part (the envelope's measure from `hollow` to
+  // 1, ragged) wherever a branch is within 3 cells. The twigs' clumps alone
+  // left gaps between the limbs - a sparse crown of lobes (2026-10-30).
+  if (species.hollow !== undefined) {
+    const floor = env.cy - env.down;
+    for (const n of nodes.values()) {
+      if (n.at[1] < floor) continue;
+      for (let dx = -3; dx <= 3; dx++) for (let dy = -3; dy <= 3; dy++) for (let dz = -3; dz <= 3; dz++) {
+        if (dx * dx + dy * dy + dz * dz > 9) continue;
+        const x = n.at[0] + dx, y = n.at[1] + dy, z = n.at[2] + dz;
+        if (y < 1 || y >= hi[1] || x <= lo[0] || x >= hi[0] || z <= lo[2] || z >= hi[2]) continue;
+        const i = at(x, y, z);
+        if (wood[i] || leaf[i]) continue;
+        const m = env.measure(x, y, z);
+        if (m < species.hollow || m > 1 + 0.15 * rng.float()) continue;
+        leaf[i] = 2;
+        if (!seen[i]) { seen[i] = 1; near.push(i); }
+      }
+    }
+  }
   // Joined: flood from the leaves touching shown wood.
   const joined = new Uint8Array(sx * sy * sz), queue = [];
   const cells = near.concat([...nodes.values()].filter(hidden).map(n => at(...n.at)));
@@ -460,23 +526,44 @@ export function treeBoxes({ nodes, leaves }) {
   return { wood: woodBoxes, leaves: leafBoxes, leafCells: cells.length, cells: shownLeafCells(cells, inWood), all: cells };
 }
 
-// The leaf cells drawn (gpu/leaves.js): those with a face open to air - not
-// leaf, not wood - each with its height in the crown (0 at its lowest leaf
-// cell, 1 at its highest: the albedo darkens toward the bottom) and which of
-// its faces are open, a bit each in LEAF_FACES order - only those are drawn.
-// As [x, y, z, height, open] in cells.
+// The leaf cells drawn (gpu/leaves.js): the crown's shell, LEAF_SHELL cells
+// deep from the air - its faces are cut out, so the eye gets a layer or two
+// in and finds the branches; past the shell the crown is bare inside, as an
+// oak's is. Each with its height in the crown (0 at its lowest leaf cell, 1
+// at its highest: the albedo darkens toward the bottom) and which of its
+// faces are drawn, a bit each in LEAF_FACES order: a face to air, a face to
+// the bare inside, and between two shell cells one face, the lower cell's
+// + face (never two on one plane: they would fight). A face on wood is not
+// drawn. As [x, y, z, height, faces] in cells.
 // +x, -x, +y, -y, +z, -z: three's BoxGeometry's face order.
 export const LEAF_FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+export const LEAF_SHELL = 3;
 function shownLeafCells(cells, inWood) {
   const leaf = new Set(cells.map(c => key(...c)));
   const solid = (x, y, z) => leaf.has(key(x, y, z)) || inWood([x, y, z]);
   let lo = Infinity, hi = -Infinity;
   for (const c of cells) { lo = Math.min(lo, c[1]); hi = Math.max(hi, c[1]); }
+  // The shell: cells open to air, then each layer in from them.
+  const shell = new Set();
+  let front = cells.filter(([x, y, z]) => LEAF_FACES.some(d => !solid(x + d[0], y + d[1], z + d[2])));
+  for (const c of front) shell.add(key(...c));
+  for (let k = 1; k < LEAF_SHELL && front.length; k++) {
+    const next = [];
+    for (const [x, y, z] of front) for (const d of LEAF_FACES) {
+      const n = [x + d[0], y + d[1], z + d[2]], nk = key(...n);
+      if (leaf.has(nk) && !shell.has(nk)) { shell.add(nk); next.push(n); }
+    }
+    front = next;
+  }
   const out = [];
   for (const [x, y, z] of cells) {
-    let open = 0;
-    LEAF_FACES.forEach((d, f) => { if (!solid(x + d[0], y + d[1], z + d[2])) open |= 1 << f; });
-    if (open) out.push([x, y, z, (y - lo) / Math.max(1, hi - lo), open]);
+    if (!shell.has(key(x, y, z))) continue;
+    let faces = 0;
+    LEAF_FACES.forEach((d, f) => {
+      const n = [x + d[0], y + d[1], z + d[2]], nk = key(...n);
+      if (!solid(...n) || (leaf.has(nk) && (!shell.has(nk) || f % 2 === 0))) faces |= 1 << f;
+    });
+    if (faces) out.push([x, y, z, (y - lo) / Math.max(1, hi - lo), faces]);
   }
   return out;
 }

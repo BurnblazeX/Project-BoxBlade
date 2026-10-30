@@ -140,10 +140,13 @@ section('regions: A, then B, then A again is A loaded fresh (World plan P2 §4.5
   const { parseBBModel } = await import('../js/core/bbmodel.js');
   const { readdirSync } = await import('node:fs');
   const dir = new URL('../assets/objects/', import.meta.url);
-  const models = new Map(readdirSync(dir).filter(f => f.endsWith('.bbmodel')).map(f => {
+  const { treeModel } = await import('../js/core/models.js');
+  const files = new Map(readdirSync(dir).filter(f => f.endsWith('.bbmodel')).map(f => {
     const n = f.replace('.bbmodel', '');
     return [n, parseBBModel(readFileSync(new URL(f, dir), 'utf8'), n)];
   }));
+  // Generated trees by name too, as the game resolves them (core/models.js MODELS_AND_TREES).
+  const models = { get: n => files.get(n) || treeModel(n) };
   const read = async n => decodeRegion(new Uint8Array(readFileSync(new URL(`../levels/${n}.bxr`, import.meta.url))));
   const a = await read('dev_level'), b = await read('test_b');
   const state = () => JSON.stringify({

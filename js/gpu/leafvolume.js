@@ -5,6 +5,9 @@
 // moved when the player strays from its middle.
 //   density  1 where a leaf cell is (core/leaves.js fillLeafDensity), read
 //            nearest by the kernel.
+//   index    per box, the drawn leaf cube there (gpu/leaves.js fillIndex): its
+//            number + 1 in the low ID_BITS bits (0: none), then its species
+//            (2 bits) and its height in the crown (8 bits).
 //   light    per box, how much light reaches its centre through the leaves:
 //            r the sun (a march toward it, a box a step), g the sky - five
 //            marches, up and four at 45 degrees, cosine-weighted: most of the
@@ -15,6 +18,10 @@
 //            shaded by itself). Read trilinear: soft, half-metre dapple. The
 //            sky kernel reruns when the leaves change (into a buffer), the sun
 //            kernel when they change or the sun moves - not every frame.
+//            b: 1 where a drawn leaf cube is, a: its species x 64 + its
+//            height (0 .. 63), / 255 - so a reflection finds the leaves in a
+//            texture the shading binds anyway, not in another storage buffer
+//            (splitFinal ran out of them: 9 of 8, 2026-10-30).
 // leafLightTSL(p)  vec2(sun, sky) at world p; 1, 1 outside the window or with
 //            no leaves.
 // withLeavesTSL  a sun shadow (p, lift, skip) -> visibility, through the
@@ -22,6 +29,10 @@
 // leafDensityTSL(p)  the leaves at p, 0..1, filtered: the LPV's cells lose
 //            the bounce through them, and the lit leaves give their own
 //            (gpu/gi.js).
+// leafTransmitTSL  a lamp's ray through the leaves: exp(-optical depth),
+//            marched a box a step over the part of it inside the leaves'
+//            bounds (u.lo, u.hi) - so a lamp lit through eight leaf cells is
+//            dimmer than through one (gpu/pointlights.js).
 // leafInscatterTSL  a texel GI ray through the leaves: what they hold back,
 //            and the light the lit leaves give it - the sun only where the
 //            world lets it reach them (the sun depth map and roof map at the
@@ -29,7 +40,7 @@
 //            open; times the leaves' bounce colour (u.albedo).
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, float, vec3, vec4, int, uvec3, uniform, instanceIndex, texture3D, textureStore, storage,
-         exp, floor, select, clamp } from 'three/tsl';
+         exp, floor, ceil, select, clamp, max, min } from 'three/tsl';
 import { BOX_METRES } from '../core/boxgrid.js';
 import { layout } from './layout.js';
 import { sunMapFarTSL } from './sunmap.js';
@@ -37,6 +48,7 @@ import { sunRoofTSL } from './sun.js';
 import { skyOpenTSL } from './volume.js';
 
 export const LEAF_DIMS = [128, 64, 128];
+export const LEAF_ID_BITS = 18;
 // Boxes a march takes toward the sun (12 m), and each sky march (6 m).
 const STEPS = 24, SKY_STEPS = 12;
 
@@ -61,7 +73,10 @@ function createLeafVolume() {
     sunDir: uniform(new THREE.Vector3(0, 1, 0)),
     strength: uniform(float(0.36)),            // optical depth a leaf box: 0.7 through
     albedo: uniform(new THREE.Vector3(0.03, 0.2, 0)),   // the light the leaves bounce, linear (render/features/leaves.js)
-    live: uniform(int(0)).setName('bxbLeafLive')   // 1 once the light has been worked out
+    live: uniform(int(0)).setName('bxbLeafLive'),  // 1 once the light has been worked out
+    // The leaves inside the window, world metres (min past max: none).
+    lo: uniform(new THREE.Vector3(1, 1, 1)).setName('bxbLeafLo'),
+    hi: uniform(new THREE.Vector3(0, 0, 0)).setName('bxbLeafHi')
   };
   const dims = vec3(X, Y, Z);
   const at = c => texture3D(density, c.add(0.5).div(dims)).level(0).r;
@@ -75,6 +90,8 @@ function createLeafVolume() {
     });
     return exp(tau.mul(u.strength).negate());
   };
+  const indexAttr = new THREE.StorageBufferAttribute(new Int32Array(X * Y * Z), 1);
+  const index = storage(indexAttr, 'int', X * Y * Z).toReadOnly().setName('bxbLeafIndex');
   const cellOf = i => vec3(float(i.mod(int(X))), float(i.div(int(X)).mod(int(Y))), float(i.div(int(X * Y))));
   const skyAttr = new THREE.StorageBufferAttribute(X * Y * Z, 1);
   const skyBuf = storage(skyAttr, 'float', X * Y * Z).setName('bxbLeafSky');
@@ -92,9 +109,13 @@ function createLeafVolume() {
     const i = int(instanceIndex);
     const c = cellOf(i).toVar();
     const sun = march(c, u.sunDir);
-    textureStore(light, uvec3(c.x, c.y, c.z), vec4(sun, skyBuf.element(i), 0, 1));
+    const id = index.element(i).toVar();
+    const here = select(id.bitAnd(int((1 << LEAF_ID_BITS) - 1)).greaterThan(int(0)), float(1), float(0));
+    const code = float(id.shiftRight(int(LEAF_ID_BITS)).bitAnd(int(3)).mul(int(64))
+      .add(id.shiftRight(int(LEAF_ID_BITS + 4)).bitAnd(int(63)))).div(255);
+    textureStore(light, uvec3(c.x, c.y, c.z), vec4(sun, skyBuf.element(i), here, code));
   })().compute(X * Y * Z).setName('leafVolumeLight');
-  return { density, data, light, u, kernel, skyKernel, dims: LEAF_DIMS };
+  return { density, data, light, u, kernel, skyKernel, index, indexAttr, dims: LEAF_DIMS };
 }
 
 export const leafVolume = createLeafVolume();
@@ -116,6 +137,45 @@ const insideTSL = (uvw, v) => uvw.x.greaterThanEqual(0).and(uvw.y.greaterThanEqu
 export function leafDensityTSL(p, v = leafVolume) {
   const uvw = p.div(float(BOX_METRES)).sub(v.u.origin).add(0.5).div(vec3(...v.dims)).toVar();
   return select(insideTSL(uvw, v), texture3D(v.density, clamp(uvw, vec3(0), vec3(1))).level(0).r, float(0));
+}
+
+// Fn([origin, dir, reach, start]) -> how much light gets through the leaves
+// along origin + dir t, start < t < reach: the part inside the leaves' bounds,
+// a box a step (longer past LEAF_LAMP_STEPS), each step's filtered density
+// times strength. start: one box for a point in a leaf cell (its own leaves
+// left out, as the leaf volume's light does), 0 on a surface.
+const LEAF_LAMP_STEPS = 24;
+const transmitFns = new Map();
+export function leafTransmitTSL(v = leafVolume) {
+  if (transmitFns.has(v)) return transmitFns.get(v);
+  const fn = Fn(([origin, dir, reach, start]) => {
+    const T = float(1).toVar();
+    If(v.u.live.equal(int(1)), () => {
+      // The ray clipped to the bounds; an axis it runs along has 1/1e-7 - its
+      // slab is all or nothing.
+      const inv = float(1).div(dir.add(vec3(1e-7, 1e-7, 1e-7))).toVar();
+      const ta = v.u.lo.sub(origin).mul(inv).toVar(), tb = v.u.hi.sub(origin).mul(inv).toVar();
+      const near = min(ta, tb).toVar(), far = max(ta, tb).toVar();
+      const t0 = max(max(max(near.x, near.y), near.z), start).toVar();
+      const t1 = min(min(min(far.x, far.y), far.z), reach).toVar();
+      If(t1.greaterThan(t0), () => {
+        const n = clamp(ceil(t1.sub(t0).div(float(BOX_METRES))), float(1), float(LEAF_LAMP_STEPS)).toVar();
+        const step = t1.sub(t0).div(n).toVar();
+        const tau = float(0).toVar();
+        Loop({ start: int(0), end: int(LEAF_LAMP_STEPS), type: 'int', condition: '<', name: 'ltr' }, ({ ltr }) => {
+          If(float(ltr).lessThan(n), () => {
+            tau.addAssign(leafDensityTSL(origin.add(dir.mul(t0.add(float(ltr).add(0.5).mul(step)))), v));
+          });
+        });
+        T.assign(exp(tau.mul(step).div(float(BOX_METRES)).mul(v.u.strength).negate()));
+      });
+    });
+    return T;
+  }).setLayout(layout('leafTransmit', 'float', [
+    { name: 'origin', type: 'vec3' }, { name: 'dir', type: 'vec3' },
+    { name: 'reach', type: 'float' }, { name: 'start', type: 'float' }]));
+  transmitFns.set(v, fn);
+  return fn;
 }
 
 // Fn([origin, dir, reach, sunDir, sunLight, skyLight]) -> vec4(the light the

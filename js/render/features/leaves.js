@@ -20,16 +20,18 @@
 // mode's box light, and the bounce: the LPV and texel GI rays lose light
 // through them and gain the lit leaves' own - world-shadowed (gpu/gi.js,
 // gpu/texelgi.js). Not yet: reflections, battle hiding.
-import { createLeafCubes, DEFAULT_LEAVES, LEAF_LIGHT_SLICE } from '../../gpu/leaves.js';
+import { createLeafCubes, DEFAULT_LEAVES, LEAF_LIGHT_SLICE, leafView } from '../../gpu/leaves.js';
 import { wind, setWindHeading } from '../../gpu/wind.js';
 import { writeSunUniforms } from '../../gpu/sun.js';
 import { terrainTextures, glassInstancedMesh } from '../render.js';
 import { leafVolume, LEAF_DIMS } from '../../gpu/leafvolume.js';
 import { placedLeafBoxes, fillLeafDensity } from '../../core/leaves.js';
-import { boxIndex } from '../../core/boxgrid.js';
+import { boxIndex, BOX_METRES } from '../../core/boxgrid.js';
 import * as THREE from 'three/webgpu';
 import { TREE_SPECIES } from '../../core/treegen.js';
 
+// Metres above the player's feet the camera's view of them is aimed at.
+const PLAYER_CHEST = 0.9;
 // The window's min box from the player's: the player a quarter up it.
 const windowAt = f => [boxIndex(f.x) - LEAF_DIMS[0] / 2, boxIndex(f.y) - LEAF_DIMS[1] / 4, boxIndex(f.z) - LEAF_DIMS[2] / 2];
 // Boxes the player may stray from the window's middle before it moves.
@@ -74,7 +76,8 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
   };
 
   // The leaf volume: moved with the player, refilled, its light worked out
-  // again when anything it depends on changed. The leaf cubes are lit after.
+  // again when anything it depends on changed. The leaf cubes are lit after;
+  // their index (for the corners' light) is refilled with the window.
   function updateVolume(sunDir) {
     const v = leafVolume;
     const f = focus();
@@ -89,8 +92,17 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
     if (!windowOrigin) return;
     let relight = false;
     if (volumeDirty) {
-      fillLeafDensity(boxes, windowOrigin, LEAF_DIMS, v.data);
+      const b = [];
+      const any = fillLeafDensity(boxes, windowOrigin, LEAF_DIMS, v.data, b);
       v.density.needsUpdate = true;
+      // The leaves' bounds in metres, a box's margin round them (the lamps'
+      // march, gpu/leafvolume.js leafTransmitTSL; the density is filtered);
+      // none, min past max.
+      if (any) {
+        v.u.lo.value.set(b[0] - 1, b[1] - 1, b[2] - 1).multiplyScalar(BOX_METRES);
+        v.u.hi.value.set(b[3] + 1, b[4] + 1, b[5] + 1).multiplyScalar(BOX_METRES);
+      } else { v.u.lo.value.set(1, 1, 1); v.u.hi.value.set(0, 0, 0); }
+      gpu.fillIndex(windowOrigin);
       v.u.origin.value.set(...windowOrigin);
       volumeDirty = false;
       relight = true;
@@ -141,6 +153,7 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
   async function warm(g) {
     try {
       await renderer.compileComputeAsync(g.light);
+      await renderer.compileComputeAsync(g.corners);
       const shown = g.mesh.visible;
       g.mesh.visible = true;
       let pending;
@@ -162,21 +175,26 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
     gpu.mesh.visible = on && u.count.value > 0;
     if (!gpu.mesh.visible) { leafVolume.u.live.value = 0; lit = null; return; }
     writeSunUniforms(gpu.sun, sun.light.position, sun.angular());
+    // Where the crown thins (gpu/leaves.js hideCutTSL): the player's chest.
+    const f = focus();
+    if (f) leafView.focus.value.set(f.x, f.y + PLAYER_CHEST, f.z);
     updateVolume(gpu.sun.dir.value);
     const ambient = sun.uniforms().ambientUniform.value;
     u.sunLight.value = sun.on() ? (gpuBasic ? 1 : 1 - ambient) : 0;
     u.time.value = now();
     const n = u.count.value;
+    // The light, then its corners (gpu/leaves.js), the same cubes.
+    const pass = count => { renderer.compute(gpu.light, count); renderer.compute(gpu.corners, count * 8); };
     if (lightAll) {
       u.offset.value = 0;
-      renderer.compute(gpu.light, n);
+      pass(n);
       lightAll = false;
       offset = 0;
       return;
     }
     if (offset >= n) offset = 0;
     u.offset.value = offset;
-    renderer.compute(gpu.light, Math.min(LEAF_LIGHT_SLICE, n - offset));
+    pass(Math.min(LEAF_LIGHT_SLICE, n - offset));
     offset += LEAF_LIGHT_SLICE;
   }
 
@@ -199,7 +217,7 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
   return {
     name: 'leaves',
     // The shading's sun shadow passes through the leaves (compiled in once).
-    options: () => ({ leaves: leafVolume }),
+    options: () => ({ leaves: leafVolume, leafView: true }),
     update,
     // The placed models changed: the list is rewritten next frame.
     invalidate() { dirty = true; },
@@ -216,7 +234,11 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
       { key: 'leafwindheading', label: 'Wind heading (degrees)', type: 'range', min: 0, max: 360, step: 5,
         help: 'from +x toward +z', get: () => heading, set: v => { heading = v; setWindHeading(v); } },
       range('leafclump', 'Clump size (texels)', 'clump', 1, 8, 0.5, 'the cellular noise\'s cell: the size of a leaf clump'),
-      range('leafsss', 'Translucency', 'sss', 0, 2, 0.05, 'sun through a leaf cube onto its far faces - dimmer behind each leaf cell it crossed'),
+      range('leafsss', 'Translucency', 'sss', 0, 1, 0.05, 'the share of the sun and lamps a face turned from them still takes (as smoke takes 0.45)'),
+      range('leafms', 'Glow', 'ms', 0, 2, 0.05, 'sun scattered inside the crown, lighting every face alike - most where half of it gets through'),
+      range('leafhide', 'See-through by player', 'hide', 0, 1, 0.05, 'how far the cut-outs open round the camera\'s view of the player'),
+      range('leafhideradius', 'See-through radius (m)', 'hideRadius', 0.5, 6, 0.25, 'how wide the opening round that view is'),
+      range('leafcutout', 'Cut-outs', 'cutout', 0, 0.75, 0.05, 'how much of the leaves is gaps - the eye sees through them into the crown and its branches'),
       range('leafgradient', 'Crown gradient', 'gradient', 0, 1, 0.05, 'how much darker the leaves are at the crown\'s bottom than at its top'),
       { key: 'leafdensity', label: 'Leaf density', type: 'range', min: 0, max: 2, step: 0.02,
         help: 'optical depth a leaf cell: how much sun and sky one cell of leaves holds back (gpu/leafvolume.js)',

@@ -166,6 +166,15 @@ for (const [id, set] of Object.entries(leafShaders)) {
 ok('leaf colour reads the species ramps', leafShaders['leaf cubes'].compute.includes('bxbLeafRamps'), true);
 ok('the shading\'s sun shadow reads the leaf volume', Object.entries(leafShaders)
   .some(([id, v]) => id.startsWith('shading with leaves') && v.compute.includes('bxbLeafOrigin')), true);
+ok('the shading\'s lamps march the leaves', Object.entries(leafShaders)
+  .some(([id, v]) => id.startsWith('shading with leaves') && v.compute.includes('fn leafTransmit') && v.compute.includes('bxbLeafLo')), true);
+ok('the shading\'s reflections meet the leaves', Object.entries(leafShaders)
+  .some(([id, v]) => id.startsWith('shading with leaves') && v.compute.includes('fn leafViewHit')), true);
+ok('the leaf corners average the cubes by the window index', leafShaders.leafCorners.compute.includes('bxbLeafIndex') &&
+  leafShaders.leafCorners.compute.includes('textureStore'), true);
+ok('the leaf faces read the corners\' light', (leafShaders['leaf cubes'].compute.match(/texture_3d/g) || []).length >= 1, true);
+ok('the leaf cubes\' lamps march the leaves', Object.values(leafShaders).some(v => v.compute.includes('fn leafTransmit') &&
+  v.compute.includes('bxbLeafLight')), true);
 
 section('exposure meter builds');
 for (const [id, set] of Object.entries(buildExposureShaders())) {

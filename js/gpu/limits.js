@@ -42,10 +42,10 @@ export function noteDeviceLimits(limits) {
 
 // The fallback's sampled textures with every optional read on, and the
 // optional reads in the order they are given up: [build option, textures it
-// binds there]. Smoke in reflections and through glass first - the clouds
-// still show directly.
-export const FALLBACK_TEXTURES = 17;
-export const FALLBACK_OPTIONAL = [['smokeView', 1]];
+// binds there]. Smoke in reflections and through glass first, then the
+// leaves there (the corners' light texture) - both still show directly.
+export const FALLBACK_TEXTURES = 18;
+export const FALLBACK_OPTIONAL = [['smokeView', 1], ['leafView', 1]];
 
 // The build options with what the fallback cannot afford turned off: the same
 // object when nothing has to go (split shading on, or the device has room).
