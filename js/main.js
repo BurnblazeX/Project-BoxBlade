@@ -721,7 +721,6 @@ let settingsPanel = null;   // built after the console, below
 // A preset is a list of settings-panel values, so it goes through the same
 // setters as the panel and the console. The effects switch is the one thing it
 // drives directly: off before the values, on after, so a switch compiles once.
-const PRESET_KEY = 'bxb.preset';
 const settingDefs = new Map();   // key -> setting, filled once the panel is built
 async function setEffects(on) {
   if (on === shadowsOn) return;
@@ -737,7 +736,6 @@ async function setPreset(name) {
   syncEffectsButton();
   try {
     const msg = await applyPreset(name, { defs: settingDefs, effectsOn: () => shadowsOn, setEffects });
-    try { localStorage.setItem(PRESET_KEY, name); } catch { /* private window */ }
     return `graphics preset: ${msg}`;
   } finally {
     presetBusy = false;
@@ -2304,12 +2302,9 @@ for (const g of settingsPanel.groups) for (const def of g.settings) settingDefs.
   const sync = () => { if (document.activeElement !== sel && !presetBusy) sel.value = currentPreset(); };
   setInterval(sync, 500);
   sync();
-  let saved = null;
-  try { saved = localStorage.getItem(PRESET_KEY); } catch { /* private window */ }
-  if (saved && saved !== 'potato' && PRESETS[saved]) {
-    // After the first frames, so the world is on screen while it compiles.
-    nextFrame().then(nextFrame).then(() => setPreset(saved)).then(m => console.log(m));
-  }
+  // No preset is remembered: every load starts on the default, so a quick
+  // look at a level never waits on Ultra's shaders compiling first.
+  try { localStorage.removeItem('bxb.preset'); } catch { /* private window */ }
 }
 
 // The top-bar Debug button: same toggle as Alt+V. It sits outside every HUD

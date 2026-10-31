@@ -89,7 +89,7 @@ section('the field worker bakes glass as glass');
   // Origin (6, 6): the footprint covers blocks 6-17, so the cube at x 12 is in it.
   const real = createFieldAt(6, 6);
   const entries = worldMirrorEntries(World);
-  ok('carries the material', entries.find(([k]) => k === getVoxelKey(12, 1, 13))?.[1], 'glass');
+  ok('carries the material', entries.find(([k]) => k === getVoxelKey(12, 1, 13))?.[1][0][0], 'glass');
   loadWorldMirror(entries);
   const mirrored = createFieldAt(6, 6);
   let same = true;
@@ -194,41 +194,41 @@ section('the walk through glass, block by block (the shader\'s path, on the CPU)
   ok('the cube top: no texel trapped', trapped, 0);
 }
 
-section('glass halves and panes: the walk steps to their own faces');
+section('glass slabs and panes: the walk steps to their own faces');
 {
   const { walkThroughGlass, refractVec, blockFaceNormal, populateDistanceField: bakeField } = await import('../js/core/field.js');
   const { BLOCK_METRES: B, partAt } = await import('../js/core/world.js');
-  const W = new Map([['50,1,50', { materialId: 'glass', shape: 'middleVertical', facing: 'S' }],
-                     ['52,1,50', { materialId: 'glass', shape: 'halfBottom' }],
+  const W = new Map([['50,1,50', { materialId: 'glass', shape: 'pane', facing: 'S', at: 9 }],
+                     ['52,1,50', { materialId: 'glass', shape: 'slab' }],
                      ['52,0,50', { materialId: 'grass' }],
-                     ['54,1,50', { materialId: 'glass', shape: 'halfVertical', facing: 'E' }],
+                     ['54,1,50', { materialId: 'glass', shape: 'pane', facing: 'E', at: 2 }],
                      ['55,1,50', { materialId: 'glass' }]]);
   const walk = (p, n, d) => walkThroughGlass(p, n, d, 1.5, { world: W });
-  // The pane facing S is z 4/12 .. 8/12 of its cell: 0.5 m thick, its faces
-  // at z = 50 B -/+ 0.25.
+  // The centre pane facing S is z 4/12 .. 8/12 of its cell: 0.5 m thick, its
+  // faces at z = 50 B -/+ 0.25.
   ok('a pane is glass in its middle', partAt(50 * B, 1.5, 50 * B, W) && partAt(50 * B, 1.5, 50 * B, W).materialId, 'glass');
   ok('and air beside it', partAt(50 * B, 1.5, 50 * B + 0.4, W), null);
   const head = refractVec({ x: 0, y: 0, z: -1 }, { x: 0, y: 0, z: 1 }, 1 / 1.5);
   const pane = walk({ x: 50 * B, y: 1.5, z: 50 * B + 0.25 }, { x: 0, y: 0, z: 1 }, head);
   ok('straight through a pane: out the back face', `${pane.kind},${pane.normal && pane.normal.z}`, 'exit,-1');
   near('after its 0.5 m', pane.length, 0.5, 1e-9);
-  // A glass low half over grass: in through its top (mid-cell), down onto the grass.
+  // A glass slab over grass: in through its top (a third up), down onto the grass.
   const down = refractVec({ x: 0, y: -1, z: 0 }, { x: 0, y: 1, z: 0 }, 1 / 1.5);
-  const half = walk({ x: 52 * B, y: 1.5, z: 50 * B }, { x: 0, y: 1, z: 0 }, down);
-  ok('a glass half shows the block under it', `${half.kind},${half.normal && half.normal.y}`, 'opaque,1');
-  near('after its 0.75 m', half.length, 0.75, 1e-9);
-  // A vertical half against a whole glass block: one piece of glass.
+  const half = walk({ x: 52 * B, y: 1.25, z: 50 * B }, { x: 0, y: 1, z: 0 }, down);
+  ok('a glass slab shows the block under it', `${half.kind},${half.normal && half.normal.y}`, 'opaque,1');
+  near('after its 0.5 m', half.length, 0.5, 1e-9);
+  // A pane at a cell's east side against a whole glass block: one piece of glass.
   const east = refractVec({ x: 1, y: 0, z: 0 }, { x: -1, y: 0, z: 0 }, 1 / 1.5);
-  const slab = walk({ x: 54 * B, y: 1.5, z: 50 * B }, { x: -1, y: 0, z: 0 }, east);
-  ok('a vertical half into the block beside it: out past both', slab.kind, 'exit');
-  near('after 0.75 + 1.5 m', slab.length, 2.25, 1e-9);
+  const slab = walk({ x: 54 * B + 0.25, y: 1.5, z: 50 * B }, { x: -1, y: 0, z: 0 }, east);
+  ok('a side pane into the block beside it: out past both', slab.kind, 'exit');
+  near('after 0.5 + 1.5 m', slab.length, 2, 1e-9);
   // The face a ray crossed, on the pane's face near its cell's x edge: the
   // pane's plane, not the cell's.
   const n = blockFaceNormal({ x: 50 * B + 0.7, y: 1.5, z: 50 * B + 0.25 }, { x: 0.3, y: 0, z: -1 }, false, W);
   ok('the face picked on a pane is the pane\'s', `${n.x},${n.y},${n.z}`, '0,0,1');
   // The field: the pane's glass is its own box.
   createTestArea(36, 36);
-  World.set(getVoxelKey(5, 1, 5), { solid: true, materialId: 'testGlass', shape: 'middleVertical', facing: 'S' });
+  World.set(getVoxelKey(5, 1, 5), { solid: true, materialId: 'testGlass', shape: 'pane', facing: 'S', at: 9 });
   const g = bake();
   const c = centreVoxel(g, { x: 5, y: 1, z: 5 });
   truthy('G inside the pane is glass', glassDistanceAt(g, c.vx, c.vy, c.vz) < 0);
@@ -236,14 +236,15 @@ section('glass halves and panes: the walk steps to their own faces');
   World.delete(getVoxelKey(5, 1, 5));
 }
 
-section('dual blocks: glass over another material');
+section('stacks: glass over another material');
 {
   const { walkThroughGlass, refractVec } = await import('../js/core/field.js');
-  const W = new Map([['60,1,60', { materialId: 'glass', shape: 'halfTop', second: 'marble' }]]);
+  const W = new Map([['60,1,60', { materialId: 'glass', shape: 'slab', at: 6,
+                                   more: [{ materialId: 'marble', shape: 'slab' }, { materialId: 'marble', shape: 'slab', at: 3 }] }]]);
   const down = refractVec({ x: 0, y: -1, z: 0 }, { x: 0, y: 1, z: 0 }, 1 / 1.5);
   const w = walkThroughGlass({ x: 90, y: 2.25, z: 90 }, { x: 0, y: 1, z: 0 }, down, 1.5, { world: W });
-  ok('down through the glass half onto the marble half', `${w.kind},${w.normal && w.normal.y}`, 'opaque,1');
-  near('after 0.75 m', w.length, 0.75, 1e-9);
+  ok('down through the glass slab onto the marble ones', `${w.kind},${w.normal && w.normal.y}`, 'opaque,1');
+  near('after 0.5 m', w.length, 0.5, 1e-9);
 }
 
 section('shadow rays through glass - metres of glass crossed');

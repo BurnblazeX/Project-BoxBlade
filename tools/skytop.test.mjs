@@ -25,10 +25,10 @@ ok('the shader decodes r + 256 g back to the code', packed[4] + 256 * packed[5],
 
 section('what is a roof');
 ok('a full block reaches its cell top', roofTop(newBlock('stone')), 1);
-ok('a low half reaches half way', roofTop(newBlock('stone', 'halfBottom')), 0.5);
+ok('a slab reaches a third of the way', roofTop(newBlock('stone', 'slab')), 1 / 3);
 ok('glass is no roof', roofTop(newBlock('glass')), null);
 ok('a glass slope is no roof', roofTop(newBlock('glass', 'slope', 'E')), null);
-ok('a dual block takes its non-glass half', roofTop(newBlock('glass', 'halfTop', null, 'stone')), 0.5);
+ok('a stack takes its non-glass parts', roofTop(newBlock('glass', 'slab', null, null, 6, [{ materialId: 'stone', shape: 'slab' }])), 1 / 3);
 
 section('the map');
 const world = new Map([

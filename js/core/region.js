@@ -1,4 +1,4 @@
-// --- Regions on disk: level format v2 (World plan P2 §4.1) ---
+// --- Regions on disk: level format v3 (World plan P2 §4.1) ---
 //
 // A level was JSON with a row per block, [x, y, z, materialId, ...]: 47 KB for
 // the Dev Level, but 15-20 MB for a 512 x 512 region a few layers deep, and a
@@ -11,13 +11,17 @@
 //     per chunk:       i16 cx, i16 cz, u16 runs, then runs x (u16 length, u16 type)
 //
 // all little-endian. The header holds everything but the blocks:
-//   { format: 'boxblade-level', version: 2,
+//   { format: 'boxblade-level', version: 3,
 //     region:  { name, bounds: [x0, x1, z0, z1] inclusive, seaLevel },
 //     spawns:  { name: [x, y, z] },
 //     exits:   [{ cells: [x0, y0, z0, x1, y1, z1], target, spawn }] (core/exits.js),
 //     models:  as v1 ([name, x, y, z, yaw] or [name, x, y, z, 0, wall]),
 //     chunk:   { size, yMin, height },
-//     palette: [null, [materialId, shape?, facing?, second?], ...] }
+//     palette: [null, [part, ...], ...] }
+// A palette row is a tile's parts (world.js tileParts), each part
+// [materialId, shape?, facing?, state?, at?]. v1 and v2 rows were one block,
+// [materialId, shape?, facing?, second?], in halves: legacyParts turns them
+// into parts on the Grid (a half is a slab, a third of the tile).
 // A chunk's cells run in the chunk store's own order (core/chunks.js: x, then
 // z, then y), so a load decodes runs straight into its Uint16Arrays, and whole
 // layers of ground are a run each. Type 0 is empty; the palette is the file's
@@ -31,16 +35,46 @@
 // tools read and write regions with it too.
 
 export const LEVEL_FORMAT = 'boxblade-level';
-export const LEVEL_VERSION = 2;
+export const LEVEL_VERSION = 3;
 const MAGIC = [0x42, 0x58, 0x52, 0x00];   // 'BXR' 0
 
-// A palette row's block, or a block row's tail: [materialId, shape?, facing?, second?].
-export function blockRow(materialId, shape, facing, second) {
-  const row = [materialId ?? null];
-  if (shape || facing || second != null) row.push(shape || null);
-  if (facing || second != null) row.push(facing || null);
-  if (second != null) row.push(second);
+// A part's row: [materialId, shape?, facing?, state?, at?], trailing
+// defaults left off.
+export function partRow({ materialId, shape, facing, state, at }) {
+  const row = [materialId ?? null, shape || null, facing || null, state || null, at || 0];
+  while (row.length > 1 && !row[row.length - 1]) row.pop();
   return row;
+}
+
+// A v1 or v2 block row's tail, [materialId, shape?, facing?, second?], as
+// parts. Halves become a slab or a pane a Grid cell thick, at the side the
+// half was on; a dual block's second material fills the other two thirds. A
+// slope is a high one, a half slope a medium one, a high half slope a low one
+// on two slabs - the same ends, 0 to 1 over the two. Stairs are three steps.
+const SIDE = { E: [2, 'E'], W: [0, 'E'], S: [18, 'S'], N: [0, 'S'] };
+const OTHER_SIDES = { E: [0, 1], W: [1, 2], S: [0, 9], N: [9, 18] };
+export function legacyParts([materialId, shape, facing, second]) {
+  const m = materialId ?? null, f = facing || 'E';
+  const slabs = (mat, ...ats) => ats.map(at => partRow({ materialId: mat, shape: 'slab', at }));
+  switch (shape) {
+    case 'halfBottom': return [...slabs(m, 0), ...(second != null ? slabs(second, 3, 6) : [])];
+    case 'halfTop': return [...slabs(m, 6), ...(second != null ? slabs(second, 0, 3) : [])];
+    case 'halfVertical': {
+      const [at, axis] = SIDE[f] || SIDE.E;
+      const rest = second != null ? (OTHER_SIDES[f] || OTHER_SIDES.E).map(a =>
+        partRow({ materialId: second, shape: 'pane', facing: axis, at: a })) : [];
+      return [partRow({ materialId: m, shape: 'pane', facing: axis, at }), ...rest];
+    }
+    case 'middleVertical': {
+      const ns = f === 'N' || f === 'S';
+      return [partRow({ materialId: m, shape: 'pane', facing: ns ? 'S' : 'E', at: ns ? 9 : 1 })];
+    }
+    case 'slope': return [partRow({ materialId: m, shape: 'slope', facing: f, state: 'high' })];
+    case 'halfSlope': return [partRow({ materialId: m, shape: 'slope', facing: f, state: 'medium' })];
+    case 'halfSlopeHigh': return [...slabs(m, 0, 3), partRow({ materialId: m, shape: 'slope', facing: f, state: 'low', at: 6 })];
+    case 'stairs': return [partRow({ materialId: m, shape: 'steps', facing: f })];
+    default: return [[m]];
+  }
 }
 
 const header = level => ({
@@ -71,15 +105,20 @@ export function unionBounds(a, b) {
   return [Math.min(a[0], b[0]), Math.max(a[1], b[1]), Math.min(a[2], b[2]), Math.max(a[3], b[3])];
 }
 
-// Any level - v1, the readable v2 form, or v2 in memory - as v2 in memory,
-// chunked to `shape` ({ size, yMin, height }, the world's: World.shape).
-// A v1 level's bounds come from its blocks; it has no spawns or exits.
+// Any level - v1, the readable v2 or v3 form, or v2 or v3 in memory - as v3
+// in memory, chunked to `shape` ({ size, yMin, height }, the world's:
+// World.shape). A v1 level's bounds come from its blocks; it has no spawns or
+// exits. Rows before v3 are halves, made parts (legacyParts).
 export function migrateLevel(level, shape) {
   if (!level || level.format !== LEVEL_FORMAT) throw new Error('not a BoxBlade level');
-  if ((level.version ?? 1) > LEVEL_VERSION) throw new Error(`level version ${level.version} is newer than this game's ${LEVEL_VERSION}`);
+  const version = level.version ?? 1;
+  if (version > LEVEL_VERSION) throw new Error(`level version ${level.version} is newer than this game's ${LEVEL_VERSION}`);
   const { size, yMin, height } = shape;
   const same = level.chunk && level.chunk.size === size && level.chunk.yMin === yMin && level.chunk.height === height;
-  if (level.chunks && same) return level;
+  if (level.chunks && same) {
+    if (version === LEVEL_VERSION) return level;
+    return { ...level, version: LEVEL_VERSION, palette: level.palette.map(r => r && legacyParts(r)) };
+  }
   const rows = level.chunks ? levelRows(level).blocks : level.blocks;
   if (!Array.isArray(rows)) throw new Error('not a BoxBlade level');
   const out = { ...header(level), chunk: { size, yMin, height }, palette: [null], chunks: [] };
@@ -87,7 +126,8 @@ export function migrateLevel(level, shape) {
   const cellsPer = size * size * height;
   for (const [x, y, z, ...tail] of rows) {
     if (y < yMin || y >= yMin + height) throw new Error(`block at y ${y} is outside ${yMin}..${yMin + height - 1}`);
-    const row = blockRow(...tail), sig = JSON.stringify(row);
+    const row = version >= 3 ? tail.map(r => partRow({ materialId: r[0], shape: r[1], facing: r[2], state: r[3], at: r[4] }))
+                              : legacyParts(tail), sig = JSON.stringify(row);
     let t = types.get(sig);
     if (t === undefined) { t = out.palette.length; out.palette.push(row); types.set(sig, t); }
     const cx = Math.floor(x / size), cz = Math.floor(z / size), key = `${cx},${cz}`;
@@ -99,7 +139,8 @@ export function migrateLevel(level, shape) {
   return out;
 }
 
-// The readable form: the header, with a block row per block.
+// The readable form: the header, with a block row per block - [x, y, z,
+// part, ...] (v1's [x, y, z, materialId, ...] for a level before v3).
 export function levelRows(level) {
   const { size, yMin, height } = level.chunk;
   const cellsPer = size * size * height, blocks = [];

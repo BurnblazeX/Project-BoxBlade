@@ -10,28 +10,31 @@
 // followBlockVolume), as the shadow field's slides do. y is not a ring: the
 // window spans every level.
 //
-// The texture is size[2] * 2 deep: a dual block's second half sits size[2]
-// further along z (gpu/volume.js blockVolumeTSL, its `second`). The shader
-// reads the same ring, and calls anything outside [lo, lo + size) air.
+// The texture is size[2] * VOLUME_SLOTS deep: a tile's parts (world.js
+// tileParts), one a slot, each slot size[2] further along z (gpu/volume.js
+// blockVolumeTSL, its `slot`). The shader reads the same ring, and calls
+// anything outside [lo, lo + size) air.
 //
-// A cell, 4 bytes (gpu/volume.js reads them): R side layer + 1 (0 air), G top
-// layer, B bottom layer, A the shape code (+128 for a dual block) - or, in a
-// model's cell, G + 256 B its modelHits header and A its GI entry + 1.
+// A slot, 4 bytes (gpu/volume.js reads them): R the part's side layer + 1 (0
+// none), G top layer, B bottom layer, A its shape code (world.js shapeCode) -
+// or, for a model in the tile (the first slot no part takes), R 0, G + 256 B
+// its modelHits header and A its GI entry + 1.
 // The sky tops (core/skytop.js) are a 2D ring of the same columns, two bytes
 // each.
 
 import { blocksIn } from './chunks.js';
 import { materialLayer, MATERIAL_LAYERS } from './materials.js';
-import { shapeCode, isDual } from './world.js';
+import { shapeCode, tileParts } from './world.js';
 import { buildSkyTops } from './skytop.js';
 
 // v's place on a ring of n, for any integer v.
 export const ring = (v, n) => ((v % n) + n) % n;
 
-// The byte offset of block (x, y, z) in the volume's data; second: its
-// dual half's.
-export function volumeOffset(lo, size, x, y, z, second = false) {
-  return (((ring(z, size[2]) + (second ? size[2] : 0)) * size[1] + (y - lo[1])) * size[0] + ring(x, size[0])) * 4;
+export const VOLUME_SLOTS = 3;     // world.js MAX_PARTS
+
+// The byte offset of block (x, y, z)'s slot in the volume's data.
+export function volumeOffset(lo, size, x, y, z, slot = 0) {
+  return (((ring(z, size[2]) + slot * size[2]) * size[1] + (y - lo[1])) * size[0] + ring(x, size[0])) * 4;
 }
 
 // The parts of the window at lo that the window at prev did not cover, as
@@ -72,9 +75,9 @@ export function writeVolumeBox(vol, world, hits, box, cleared = false) {
   if (!cleared) {
     for (let z = z0; z <= z1; z++) {
       for (let x = x0; x <= x1; x++) {
-        for (const second of [false, true]) {
+        for (let slot = 0; slot < VOLUME_SLOTS; slot++) {
           for (let y = lo[1]; y < lo[1] + size[1]; y++) {
-            const o = volumeOffset(lo, size, x, y, z, second);
+            const o = volumeOffset(lo, size, x, y, z, slot);
             data[o] = data[o + 1] = data[o + 2] = data[o + 3] = 0;
           }
         }
@@ -83,25 +86,23 @@ export function writeVolumeBox(vol, world, hits, box, cleared = false) {
   }
   for (const [[x, y, z], block] of blocksIn(world, box)) {
     if (y < lo[1] || y >= lo[1] + size[1]) continue;
-    const o = volumeOffset(lo, size, x, y, z);
-    const layer = materialLayer(block.materialId), f = MATERIAL_LAYERS.faces[layer];
-    data[o] = layer + 1;
-    data[o + 1] = f ? f.top : layer;
-    data[o + 2] = f ? f.bottom : layer;
-    data[o + 3] = shapeCode(block);   // its shape and facing (world.js shapeCode)
-    if (isDual(block)) {
-      data[o + 3] += 128;
-      const o2 = volumeOffset(lo, size, x, y, z, true);
-      const layer2 = materialLayer(block.second), f2 = MATERIAL_LAYERS.faces[layer2];
-      data[o2] = layer2 + 1;
-      data[o2 + 1] = f2 ? f2.top : layer2;
-      data[o2 + 2] = f2 ? f2.bottom : layer2;
-    }
+    tileParts(block).slice(0, VOLUME_SLOTS).forEach((part, slot) => {
+      const o = volumeOffset(lo, size, x, y, z, slot);
+      const layer = materialLayer(part.materialId), f = MATERIAL_LAYERS.faces[layer];
+      data[o] = layer + 1;
+      data[o + 1] = f ? f.top : layer;
+      data[o + 2] = f ? f.bottom : layer;
+      data[o + 3] = shapeCode(part);   // its shape, state, facing and Grid cell
+    });
   }
+  // A model goes in the first slot no part took; none left, the rays miss it.
   for (const [key, { header, giIndex }] of hits.index) {
     const [x, y, z] = key.split(',').map(Number);
     if (x < x0 || x > x1 || z < z0 || z > z1 || y < lo[1] || y >= lo[1] + size[1] || header > 65535) continue;
-    const o = volumeOffset(lo, size, x, y, z);
+    let slot = 0;
+    while (slot < VOLUME_SLOTS && data[volumeOffset(lo, size, x, y, z, slot)]) slot++;
+    if (slot === VOLUME_SLOTS) continue;
+    const o = volumeOffset(lo, size, x, y, z, slot);
     data[o + 1] = header & 255;
     data[o + 2] = header >> 8;
     data[o + 3] = giIndex + 1;

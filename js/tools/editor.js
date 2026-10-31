@@ -3,17 +3,19 @@
 // Tab in and out. While it is on, the game waits (main.js gates movement and
 // the AI on editor.active), the camera flies free, and the mouse edits:
 //
-//   left click          place the selection on the face under the cursor; a
-//                       half on another half's open side fills it (a dual
-//                       block: half of each material)
+//   left click          place the selection on the face under the cursor, in
+//                       the Grid cell against it: a part stacks into a tile
+//                       beside the parts already there (world.js withPart)
 //   left drag           place a row of blocks along the axis the drag follows
-//   right click         remove what is under the cursor (a block, a model,
-//                       or one half of a dual block)
+//   right click         remove what is under the cursor (a model, or one
+//                       part of a tile)
 //   Shift + left drag   fill the box between two cells with the selection
 //   Shift + right drag  clear the box between two cells
 //   right drag          look around
 //   W A S D, Space      fly (Shift: faster); Left Ctrl or C down
-//   Q / E               turn the selection (slopes, models)
+//   Q / E               turn the selection (slopes, steps, panes, models)
+//   F                   the selection's next state (shapes: world.js
+//                       BLOCK_SHAPES states; models: object states, none yet)
 //   Ctrl + S            save the level (the loaded region's, levels/<name>.bxr;
 //                       dev server only)
 //   Tab                 back to the game
@@ -35,10 +37,10 @@
 // main.js hands in, onEdit, which rebuilds what depends on the world: the
 // terrain instances, the field, the mirrors, the model lights.
 import * as THREE from 'three/webgpu';
-import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, FACINGS, BLOCK_SHAPES, blockBoxes,
-         blockShape, blockFacing, surfaceLevel,
-         WorldModels, addWorldModel, mountWorldModel, removeWorldModel, newBlock,
-         serializeLevel, hasFacing, isDual, complementShape, DEV_LEVEL, Region } from '../core/world.js';
+import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, GRID, partBoxes, partSpan, partFacing, isSlope,
+         surfaceLevel, tileParts, withPart, withoutPart, gridAt,
+         WorldModels, addWorldModel, mountWorldModel, removeWorldModel,
+         serializeLevel, DEV_LEVEL, Region, nextShapeState } from '../core/world.js';
 import { exitBox, exitsWithout } from '../core/exits.js';
 import { encodeRegion } from '../core/region.js';
 import { MATERIALS } from '../core/materials.js';
@@ -58,8 +60,9 @@ const FACING_ORDER = ['N', 'E', 'S', 'W'];
 export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = () => DEV_LEVEL }) {
   const state = {
     active: false,
-    // The selection: a block (material, shape) or a model; a facing for both.
-    kind: 'block', materialId: MATERIALS[0].id, shape: 'full', model: null, facing: 0,
+    // The selection: a block (material, shape and its state) or a model; a
+    // facing for both.
+    kind: 'block', materialId: MATERIALS[0].id, shape: 'full', shapeState: 'full', model: null, facing: 0,
     // Markers (kind 'exit' or 'spawn'): where an exit leads, a spawn's name.
     exitTarget: '', exitSpawn: 'start', spawnName: 'start',
     yaw: 0, pitch: -0.6, pos: new THREE.Vector3(),
@@ -79,8 +82,8 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   // --- The cursor: the outline of what a click would do ---
   //
   // Placing, the outline is the selection's own shape where it would go - a
-  // slope's wedge, the stairs' step, a model's cubes as placed; removing, the
-  // shape of what would go; dragging a box, the box. Line segments rebuilt
+  // slope's wedge, the steps' treads, a model's cubes as placed; removing, the
+  // part that would go; dragging a box, the box. Line segments rebuilt
   // per target (a few hundred floats), drawn over everything.
   const cursor = new THREE.LineSegments(new THREE.BufferGeometry(),
     new THREE.LineBasicMaterial({ color: 0x66ff88, depthTest: false, transparent: true }));
@@ -100,23 +103,24 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     for (const [i, j] of [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4],
                           [0, 4], [1, 5], [2, 6], [3, 7]]) out.push(...c[i], ...c[j]);
   }
-  // A block shape's outline in cell (x, y, z): its boxes, or a slope's wedge -
-  // the plane, as it is drawn, not the staircase the field bakes.
-  function shapeEdges(shape, facing, cell, out) {
+  // A part's outline in cell (x, y, z): its boxes, or a slope's wedge - the
+  // plane, as it is drawn, not the staircase the field bakes.
+  function partEdges(part, cell, out) {
     const base = [(cell[0] - 0.5) * B, (cell[1] - 0.5) * B, (cell[2] - 0.5) * B];
-    const s = BLOCK_SHAPES[shape] || BLOCK_SHAPES.full;
-    if (!s.slope) {
-      for (const [x0, x1, y0, y1, z0, z1] of blockBoxes({ shape, facing })) {
+    if (!isSlope(part)) {
+      for (const [x0, x1, y0, y1, z0, z1] of partBoxes(part)) {
         boxEdges([base[0] + x0 * B, base[1] + y0 * B, base[2] + z0 * B],
                  [base[0] + x1 * B, base[1] + y1 * B, base[2] + z1 * B], out);
       }
       return;
     }
-    // The wedge, climbing +x (facing E), then turned as blockBoxes turns boxes.
+    // The wedge, climbing +x (facing E), then turned as partBoxes turns boxes.
+    const facing = partFacing(part);
     const turn = ([x, y, z]) => facing === 'W' ? [1 - x, y, z] : facing === 'S' ? [z, y, x]
                               : facing === 'N' ? [z, y, 1 - x] : [x, y, z];
     const P = (x, y, z) => turn([x, y, z]).map((v, a) => base[a] + v * B);
-    const prof = [[0, 0], [1, 0], [1, s.high], [0, s.low]];
+    const [lo, hi] = partSpan(part);
+    const prof = [[0, lo], [1, lo], [1, hi], [0, lo]];
     const seg = (p, q) => { if (p.some((v, i) => Math.abs(v - q[i]) > 1e-6)) out.push(...p, ...q); };
     for (let i = 0; i < 4; i++) {
       const [x0, y0] = prof[i], [x1, y1] = prof[(i + 1) % 4];
@@ -178,9 +182,10 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   // --- Targeting ---
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
-  // What is under the screen point: { place: cell [x,y,z] (the empty cell
-  // against the face), key: the block hit, normal, model: the placed model
-  // hit, if it was one }.
+  // What is under the screen point: { place: cell [x,y,z] (the cell across
+  // the drawn box's face), key: the block hit, normal, model: the placed model
+  // hit, if it was one, part: the tile's part hit, grid: the Grid cell
+  // against the face - { cell, at: [x, y, z] of the tile } }.
   function targetAt(clientX, clientY) {
     if (!worldInstancedMesh) return null;
     ndc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
@@ -196,39 +201,42 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     const place = info.model
       ? [0, 1, 2].map(a => Math.round((hit.point.getComponent(a) + n.getComponent(a) * 0.01) / BLOCK_METRES))
       : [key[0] + n.x, key[1] + n.y, key[2] + n.z];
-    return { place, key, normal: [n.x, n.y, n.z], model: info.model, part: info.part };
+    const q = [0, 1, 2].map(a => hit.point.getComponent(a) / BLOCK_METRES + n.getComponent(a) * 0.01);
+    const gcell = q.map(Math.round);
+    const at = q.map((v, a) => Math.max(0, Math.min(GRID - 1, Math.floor((v - gcell[a] + 0.5) * GRID))));
+    return { place, key, normal: [n.x, n.y, n.z], model: info.model, part: info.part, grid: { cell: gcell, at } };
   }
 
   // What a left click on this target would place - the one answer both the
   // outline and the click use. null: nothing can go there.
   const WALL_YAW = { N: 0, W: 1, S: 2, E: 3 };   // as world.js mountWorldModel
-  // A half shape clicked on a half block's open side - its face mid-cell,
-  // toward the empty half - fills that half (world.js isDual): the facing is
-  // the complement's, whatever the selection's. The same material makes it a
-  // full block. null when the click is anything else.
-  const HORIZONTAL = new Set(['halfBottom', 'halfTop']);
-  function mergePlan(target) {
-    if (target.model || !complementShape(state.shape, FACING_ORDER[state.facing])) return null;
-    const block = World.get(getVoxelKey(...target.key));
-    if (!block || isDual(block)) return null;
-    const shape = blockShape(block), facing = blockFacing(block);
-    const comp = complementShape(shape, facing);
-    if (!comp || HORIZONTAL.has(comp.shape) !== HORIZONTAL.has(state.shape)) return null;
-    const [dx, dz] = FACINGS[facing];
-    const open = shape === 'halfBottom' ? [0, 1, 0] : shape === 'halfTop' ? [0, -1, 0] : [-dx, 0, -dz];
-    if (open.some((v, a) => v !== target.normal[a])) return null;
-    return { kind: 'merge', cell: target.key, shape: comp.shape, facing: comp.facing || 'E',
-             full: block.materialId === state.materialId };
+  // The selection as a part at Grid cell g of a tile (world.js gridAt).
+  function selectedPart(g) {
+    const part = { materialId: state.materialId, shape: state.shape, state: state.shapeState,
+                   facing: FACING_ORDER[state.facing], at: 0 };
+    part.at = gridAt(part, g);
+    return part;
   }
+  // The tile a part goes in, and the block it makes there (world.js
+  // withPart): the Grid cell against the face, or - full there, or no room -
+  // the tile across the drawn box's face, at its near side.
+  function blockPlan(target) {
+    const tries = [[target.grid.cell, target.grid.at]];
+    const g = target.grid.at.map((v, a) => target.normal[a] > 0 ? 0 : target.normal[a] < 0 ? GRID - 1 : v);
+    if (target.place.some((v, a) => v !== target.grid.cell[a])) tries.push([target.place, g]);
+    for (const [cell, at] of tries) {
+      if (!inBounds(cell[1])) continue;
+      const part = selectedPart(at);
+      const block = withPart(World.get(getVoxelKey(...cell)), part);
+      if (block) return { kind: 'block', cell, part, block };
+    }
+    return null;
+  }
+  // The tile a row or box starts from: the one the first click would place in.
+  const startCell = t => { const p = state.kind === 'block' && planPlacement(t); return p ? p.cell : t.place; };
   function planPlacement(target) {
     if (!target) return null;
-    if (state.kind === 'block') {
-      const merge = mergePlan(target);
-      if (merge) return merge;
-      const c = target.place;
-      if (!inBounds(c[1]) || World.has(getVoxelKey(...c))) return null;
-      return { kind: 'block', cell: c, shape: state.shape, facing: FACING_ORDER[state.facing] };
-    }
+    if (state.kind === 'block') return target.model ? null : blockPlan(target);
     const model = MODELS.get(state.model);
     if (!model || target.model) return null;
     const [nx, ny, nz] = target.normal;
@@ -296,7 +304,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       return;
     }
     if (d && d.row) {
-      const a = d.start.place, b = d.row, pts = [];
+      const a = startCell(d.start), b = d.row, pts = [];
       boxEdges(a.map((v, i) => (Math.min(v, b[i]) - 0.5) * B), a.map((v, i) => (Math.max(v, b[i]) + 0.5) * B), pts);
       setOutline(pts, 0x66ff88);
       return;
@@ -306,24 +314,20 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     const pts = [];
     if (d && d.shift && d.start) {
       // A box: its whole extent, in cells.
-      const a = removing ? d.start.key : d.start.place;
+      const a = removing ? d.start.key : startCell(d.start);
       const b = removing ? target.key : target.place;
       const lo = a.map((v, i) => (Math.min(v, b[i]) - 0.5) * B), hi = a.map((v, i) => (Math.max(v, b[i]) + 0.5) * B);
       boxEdges(lo, hi, pts);
     } else if (removing) {
-      // What would go: the model hit, or the block with its own shape.
+      // What would go: the model hit, or the part of the tile.
       if (target.model) cubeEdges(target.model.cubes, pts);
       else {
-        const block = World.get(getVoxelKey(...target.key));
-        // A dual block's second half is the complement of its shape.
-        const half = block && isDual(block) && target.part === 1
-          ? complementShape(blockShape(block), blockFacing(block)) : null;
-        if (half) shapeEdges(half.shape, half.facing || 'E', target.key, pts);
-        else if (block) shapeEdges(blockShape(block), blockFacing(block), target.key, pts);
+        const part = tileParts(World.get(getVoxelKey(...target.key)))[target.part || 0];
+        if (part) partEdges(part, target.key, pts);
       }
     } else {
       const plan = planPlacement(target);
-      if (plan && (plan.kind === 'block' || plan.kind === 'merge')) shapeEdges(plan.shape, plan.facing, plan.cell, pts);
+      if (plan && plan.kind === 'block') partEdges(plan.part, plan.cell, pts);
       else if (plan) cubeEdges(plan.cubes, pts);
     }
     setOutline(pts, removing ? 0xff6666 : 0x66ff88);
@@ -335,10 +339,14 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   function removeModelsOn(key) {
     for (const m of [...WorldModels]) if (m.x === key[0] && m.y === key[1] && m.z === key[2]) removeWorldModel(m);
   }
-  function placeBlockAt(c) {
+  // The selection in cell c, at the Grid cell of the drag's first tile
+  // (part.at), beside whatever is there; false when it does not fit.
+  function placeBlockAt(c, part) {
     const k = getVoxelKey(...c);
-    if (!inBounds(c[1]) || World.has(k)) return false;
-    World.set(k, newBlock(state.materialId, state.shape, FACING_ORDER[state.facing]));
+    if (!inBounds(c[1])) return false;
+    const block = withPart(World.get(k), part);
+    if (!block) return false;
+    World.set(k, block);
     return true;
   }
   function removeBlockAt(c) {
@@ -348,34 +356,21 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     World.delete(k);
     return true;
   }
-  // A click's placement: a merge into a half block, or a block in the cell
-  // against the face.
+  // A click's placement: the plan's block in its tile. Blocks are shared
+  // types (core/chunks.js): a new block is set, never one changed in place.
   function placeAt(target) {
     const plan = planPlacement(target);
     if (!plan) return false;
-    if (plan.kind !== 'merge') return placeBlockAt(target.place);
-    // Blocks are shared types now (core/chunks.js): change a copy, set it back.
-    const key = getVoxelKey(...plan.cell);
-    const block = { ...World.get(key) };
-    if (plan.full) { delete block.shape; delete block.facing; }
-    else block.second = state.materialId;
-    World.set(key, block);
+    World.set(getVoxelKey(...plan.cell), plan.block);
     return true;
   }
-  // Right click on a dual block: only the half under the cursor goes, and the
-  // other stays as a plain half. Models on it go when its top drops.
-  function removeHalf(c, part) {
+  // Right click on a tile of parts: only the part under the cursor goes.
+  // Models on it go when its top drops.
+  function removePart(c, i) {
     const key = getVoxelKey(...c);
-    const block = { ...World.get(key) };
+    const block = withoutPart(World.get(key), i);
+    if (!block) return removeBlockAt(c);
     const top = surfaceLevel(...c);
-    if (part === 1) delete block.second;
-    else {
-      const comp = complementShape(blockShape(block), blockFacing(block));
-      block.materialId = block.second;
-      block.shape = comp.shape;
-      if (comp.facing) block.facing = comp.facing; else delete block.facing;
-      delete block.second;
-    }
     World.set(key, block);
     if (surfaceLevel(...c) !== top) removeModelsOn(c);
     return true;
@@ -469,6 +464,14 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       showCursor(state.hover);   // the outline turns with it
       return;
     }
+    if (k === 'f' && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      if (state.kind === 'block') {
+        const next = nextShapeState(state.shape, state.shapeState);
+        if (next !== state.shapeState) { state.shapeState = next; renderPanel(); showCursor(state.hover); }
+        else status(`${state.shape} has one state`);
+      } else if (state.kind === 'model') status('models have no states yet');
+      return;
+    }
     state.keys.add(e.code);
     if (e.code === 'Space') e.preventDefault();
   }
@@ -495,7 +498,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       state.pitch = Math.max(-1.5, Math.min(1.5, state.pitch - e.movementY * LOOK_SPEED));
     }
     if (d && d.moved && d.button === 0 && !d.shift && d.start && state.kind === 'block') {
-      d.row = rowEnd(d.start.place, e.clientX, e.clientY);
+      d.row = rowEnd(startCell(d.start), e.clientX, e.clientY);
     }
     state.hover = targetAt(e.clientX, e.clientY);
     showCursor(state.hover);
@@ -511,14 +514,17 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       showCursor(target);
       return;
     }
+    // Rows and boxes take the part the first tile would: the same Grid cell in each.
+    const startPlan = d.start && state.kind === 'block' ? planPlacement(d.start) : null;
     if (d.row) {
       let n = 0;
-      for (const c of boxCells(d.start.place, d.row)) n += placeBlockAt(c);
+      if (startPlan) for (const c of boxCells(startPlan.cell, d.row)) n += placeBlockAt(c, startPlan.part);
       if (n) edited(`placed a row of ${n}`);
     } else if (d.shift && d.start && target) {
       let n = 0;
-      if (d.button === 0 && state.kind === 'block') {
-        for (const c of boxCells(d.start.place, target.place)) n += placeBlockAt(c);
+      if (d.button === 0 && startPlan) {
+        const endPlan = planPlacement(target);
+        for (const c of boxCells(startPlan.cell, endPlan ? endPlan.cell : target.place)) n += placeBlockAt(c, startPlan.part);
       } else if (d.button === 2) {
         for (const c of boxCells(d.start.key, target.key)) n += removeBlockAt(c);
       }
@@ -527,8 +533,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       let ok = false;
       if (d.button === 0) ok = state.kind === 'block' ? placeAt(target) : placeModel(target);
       else if (target.model) ok = removeWorldModel(target.model);
-      else if (isDual(World.get(getVoxelKey(...target.key)))) ok = removeHalf(target.key, target.part);
-      else ok = removeBlockAt(target.key);
+      else ok = removePart(target.key, target.part || 0);
       if (ok) edited(d.button === 0 ? 'placed' : 'removed');
     }
     showCursor(targetAt(e.clientX, e.clientY));

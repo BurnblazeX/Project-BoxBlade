@@ -147,65 +147,68 @@ section('the mirror texel cache: bases and budget');
   ok('and counts only what it packed', small.texels, first[0] * first[1]);
 }
 
-section('half blocks: their own faces');
+section('slabs: their own faces');
 {
   const { buildMirrors } = await import('../js/core/mirrors.js');
   const { BLOCK_METRES: B } = await import('../js/core/world.js');
-  const m = (shape) => ({ materialId: 'marble', ...(shape ? { shape } : {}) });
-  // A full marble block at (0,1,0) with a half-bottom beside it at (1,1,0),
-  // both on marble ground.
-  const W = new Map([['0,0,0', m()], ['1,0,0', m()], ['0,1,0', m()], ['1,1,0', m('halfBottom')]]);
+  const m = (shape, at) => ({ materialId: 'marble', ...(shape ? { shape, at } : {}) });
+  const sixths = v => Math.round(v / B * 6);
+  // A full marble block at (0,1,0) with a slab beside it at (1,1,0), both on
+  // marble ground.
+  const W = new Map([['0,0,0', m()], ['1,0,0', m()], ['0,1,0', m()], ['1,1,0', m('slab')]]);
   const r = buildMirrors(W, new Set(['marble']));
   const find = (axis, sign, plane) => r.filter(q => q.axis === axis && q.sign === sign &&
                                                    Math.abs(q.plane - plane * B) < 1e-9);
-  const top = find(1, 1, 1);
-  ok('the half-bottom\'s top is a rectangle at mid-cell', top.length, 1);
+  const top = find(1, 1, 5 / 6);
+  ok('the slab\'s top is a rectangle a third up its cell', top.length, 1);
   ok('one block across', top[0] && (top[0].max[0] - top[0].min[0]) / B, 1);
-  // The full block's +x face: its lower half is against the half-bottom.
+  // The full block's +x face: its lower third is against the slab.
   const side = find(0, 1, 0.5);
   ok('the full block\'s +x face is one rectangle', side.length, 1);
-  ok('covering only its upper half (y 1 .. 1.5 blocks)',
-     side[0] && `${side[0].min[0] / B},${side[0].max[0] / B}`, '1,1.5');
-  // The half-bottom's own +x face: half a block tall.
+  ok('covering only its upper two thirds (y 5/6 .. 1.5 blocks)',
+     side[0] && `${sixths(side[0].min[0])},${sixths(side[0].max[0])}`, '5,9');
+  // The slab's own +x face: a third of a block tall.
   const own = find(0, 1, 1.5).filter(q => q.min[0] >= 0.5 * B);
-  ok('the half-bottom\'s side is half a block tall', own[0] && (own[0].max[0] - own[0].min[0]) / B, 0.5);
-  // A half-top's underside is a face even over a full block.
-  const W2 = new Map([['0,0,0', m()], ['0,1,0', m('halfTop')]]);
+  ok('the slab\'s side is a third of a block tall', own[0] && sixths(own[0].max[0] - own[0].min[0]), 2);
+  // A slab at the top of its cell has an underside, even over a full block.
+  const W2 = new Map([['0,0,0', m()], ['0,1,0', m('slab', 6)]]);
   const under = buildMirrors(W2, new Set(['marble'])).filter(q => q.axis === 1 && q.sign === -1);
-  ok('a half-top\'s underside faces the gap', under.length && under[0].plane / B, 1);
+  ok('a raised slab\'s underside faces the gap', under.length && sixths(under[0].plane), 7);
 }
 
-section('vertical halves and panes: faces mid-cell across x and z');
+section('panes: faces mid-cell across x and z');
 {
   const { buildMirrors } = await import('../js/core/mirrors.js');
   const { BLOCK_METRES: B } = await import('../js/core/world.js');
-  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfVertical', facing: 'E' }],
-                     ['3,0,0', { materialId: 'marble', shape: 'middleVertical', facing: 'N' }],
+  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'pane', facing: 'E', at: 2 }],
+                     ['3,0,0', { materialId: 'marble', shape: 'pane', facing: 'N', at: 9 }],
                      ['-1,0,0', { materialId: 'marble' }]]);
   const r = buildMirrors(W, new Set(['marble']));
   const at = (axis, sign, plane) => r.filter(q => q.axis === axis && q.sign === sign && Math.abs(q.plane - plane * B) < 1e-9);
-  ok("the vertical half's west face sits mid-cell", at(0, -1, 0).length, 1);
-  ok('its top is half a block wide (x 0 .. 0.5)', at(1, 1, 0.5).filter(q => q.min[0] >= -1e-9 && q.max[0] <= B + 1e-9).map(q => `${q.min[0] / B},${q.max[0] / B}`).join(), '0,0.5');
-  ok("the pane's faces sit 4/12 and 8/12 across z", at(2, -1, -1 / 6).length + at(2, 1, 1 / 6).length, 2);
-  ok("the full block's +x face, beside the vertical half's gap, is whole", at(0, 1, -0.5).length, 1);
+  ok("the side pane's west face sits two thirds across its cell", at(0, -1, 1 / 6).length, 1);
+  ok('its top is a third of a block wide (x 1/6 .. 1/2)', at(1, 1, 0.5).filter(q => q.min[0] >= -1e-9 && q.max[0] <= B + 1e-9)
+     .map(q => `${Math.round(q.min[0] / B * 6)},${Math.round(q.max[0] / B * 6)}`).join(), '1,3');
+  ok("the centre pane's faces sit 4/12 and 8/12 across z", at(2, -1, -1 / 6).length + at(2, 1, 1 / 6).length, 2);
+  ok("the full block's +x face, beside the side pane's gap, is whole", at(0, 1, -0.5).length, 1);
 }
 
-section('dual blocks: each half by its own material');
+section('stacks: each part by its own material');
 {
   const { buildMirrors } = await import('../js/core/mirrors.js');
   const { BLOCK_METRES: B } = await import('../js/core/world.js');
-  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'halfTop', second: 'grass' }]]);
+  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'slab', at: 6,
+                                 more: [{ materialId: 'grass', shape: 'slab' }, { materialId: 'grass', shape: 'slab', at: 3 }] }]]);
   const r = buildMirrors(W, new Set(['marble']));
-  ok('the marble half\'s top is a mirror', r.filter(q => q.axis === 1 && q.sign === 1).length, 1);
-  ok('the face between the halves is not', r.filter(q => q.axis === 1 && q.sign === -1).length, 0);
-  ok('its sides are half a block tall', r.filter(q => q.axis === 0).map(q => (q.max[0] - q.min[0]) / B).join(), '0.5,0.5');
+  ok('the marble slab\'s top is a mirror', r.filter(q => q.axis === 1 && q.sign === 1).length, 1);
+  ok('the face between it and the grass is not', r.filter(q => q.axis === 1 && q.sign === -1).length, 0);
+  ok('its sides are a third of a block tall', r.filter(q => q.axis === 0).map(q => Math.round((q.max[0] - q.min[0]) / B * 3)).join(), '1,1');
 }
 
 section('slopes throw no mirror light');
 {
   const { buildMirrors } = await import('../js/core/mirrors.js');
   const W = new Map([['0,0,0', { materialId: 'marble' }],
-                     ['0,1,0', { materialId: 'marble', shape: 'slope', facing: 'E' }]]);
+                     ['0,1,0', { materialId: 'marble', shape: 'slope', state: 'high', facing: 'E' }]]);
   const r = buildMirrors(W, new Set(['marble']));
   truthy('no rectangle above the ground block', r.every(q => !(q.axis === 1 && q.plane > 0.75 + 1e-9)));
   falsy('the ground block top is covered by the slope', r.some(q => q.axis === 1 && q.sign === 1));

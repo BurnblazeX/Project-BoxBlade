@@ -28,8 +28,8 @@
 //
 // CPU and pure: the GPU kernels mirror boxRay, boxSky and boxLampAmount, and
 // the tests check them here.
-import { World, ModelBoxes, BLOCK_METRES, Y_MIN, Y_MAX, isSolidAt, partAt, blockShape, blockFacing, isDual,
-         isSlope } from './world.js';
+import { World, ModelBoxes, BLOCK_METRES, Y_MIN, Y_MAX, isSolidAt, partAt, partShape, partFacing, isMulti,
+         isSlope, tileParts } from './world.js';
 import { BOX_CELLS, BOX_METRES } from './boxgrid.js';
 import { windowAxis } from './follow.js';
 import { blocksIn } from './chunks.js';
@@ -149,9 +149,9 @@ export const unpackTint = v => [(v & 255) / 255, ((v >>> 8) & 255) / 255, ((v >>
 // Whether a glass block's face is crossed along x: a pane facing east or west,
 // or a whole block in a wall that runs along z (its neighbours are at z +- 1).
 function crossedAlongX(block, c, world) {
-  const shape = blockShape(block);
-  if (shape === 'halfVertical' || shape === 'middleVertical') {
-    const f = blockFacing(block);
+  const pane = tileParts(block).find(p => partShape(p) === 'pane');
+  if (pane) {
+    const f = partFacing(pane);
     return f === 'E' || f === 'W';
   }
   const has = (dx, dz) => world.has(`${c[0] + dx},${c[1]},${c[2] + dz}`);
@@ -175,11 +175,11 @@ export function buildBoxMasks(region, world = World, glassPixels = () => null, m
     if (l.some((v, a) => v < 0 || v >= region.size[a])) continue;
     const at = ((l[2] * ny + l[1]) * nx + l[0]) * BOX_BLOCK_U32;
     // Most blocks are whole and opaque: all 27 boxes solid.
-    const whole = blockShape(block) === 'full' && !isDual(block);
+    const whole = partShape(block) === 'full' && !isMulti(block);
     if (whole && !isGlassMaterial(block.materialId)) { data[at] = FULL_MASK; continue; }
     let solid = 0, glass = 0;
     // A slope's box is tested at its top: solid only under the plane throughout.
-    const lift = isSlope(block) ? BOX_METRES / 2 - 1e-4 : 0;
+    const lift = tileParts(block).some(isSlope) ? BOX_METRES / 2 - 1e-4 : 0;
     for (let k = 0; k < BOX_CELLS; k++) for (let j = 0; j < BOX_CELLS; j++) for (let i = 0; i < BOX_CELLS; i++) {
       // Box centres sit at -1/3, 0, 1/3 of a block from the block's.
       const wx = (c[0] + (i - 1) / BOX_CELLS) * BLOCK_METRES;
@@ -204,7 +204,7 @@ export function buildBoxMasks(region, world = World, glassPixels = () => null, m
     }
     if (glass) {
       data[at + 2] = tints.length;
-      const rgba = glassPixels(isGlassMaterial(block.materialId) ? block.materialId : block.second);
+      const rgba = glassPixels(tileParts(block).find(p => isGlassMaterial(p.materialId)).materialId);
       const alongX = crossedAlongX(block, c, world);
       for (let b = 0; b < BOX_CELLS ** 3; b++) {
         const i = b % BOX_CELLS, j = Math.floor(b / BOX_CELLS) % BOX_CELLS, k = Math.floor(b / BOX_CELLS ** 2);

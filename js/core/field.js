@@ -1,5 +1,5 @@
 import { World, getVoxelKey, CHUNK_SIZE, Y_MIN, CHUNK_HEIGHT, BLOCK_METRES, blockSpan, blockBoxes,
-         ModelBoxes, partAt, shapeCode, codeBox, isDual, blockParts } from './world.js';
+         ModelBoxes, partAt, shapeCode, codeBox, isMulti, blockParts, tileParts } from './world.js';
 import { isGlassMaterial } from './materials.js';
 
 // --- field: the fine occupancy / light field ---
@@ -879,25 +879,26 @@ export function populateDistanceField(grid, dirty = null) {
     // GLASS goes into G, whole: it is seen through, so its underside is as
     // visible as any other face, and a ray inside it must find the true exit.
     // It is not in R at all - see FIELD_CHANNELS.
-    // A dual block (world.js isDual): each half its own box, in its own
-    // material's channel - a glass half in G, the other in R.
-    if (isDual(block)) {
+    // A stack of parts (world.js isMulti): each part's boxes, in its own
+    // material's channel - a glass part in G, the others in R.
+    if (isMulti(block)) {
       for (const part of blockParts(block)) {
-        const [x0, x1, y0, y1, z0, z1] = part.boxes[0];
         const glassPart = glassBlock({ ...block, materialId: part.materialId });
-        const vol = (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
-        minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per, vz0 + (z0 + z1) / 2 * per,
-                     (x1 - x0) / 2 * per, (y1 - y0) / 2 * per, (z1 - z0) / 2 * per, rects, range,
-                     glassPart ? GLASS_CHANNEL : OPAQUE_CHANNEL);
-        const range6 = [vx0 + Math.floor(x0 * per), vy0 + Math.floor(y0 * per), vz0 + Math.floor(z0 * per),
-                        vx0 + Math.ceil(x1 * per), vy0 + Math.ceil(y1 * per), vz0 + Math.ceil(z1 * per)];
-        if (glassPart) { glassBlocks.push(...range6); if (inFootprint) glassFilled += vol; }
-        else { blocks.push(...range6); if (inFootprint) filled += vol; }
+        for (const [x0, x1, y0, y1, z0, z1] of part.boxes) {
+          const vol = (x1 - x0) * (y1 - y0) * (z1 - z0) * per ** 3;
+          minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per, vz0 + (z0 + z1) / 2 * per,
+                       (x1 - x0) / 2 * per, (y1 - y0) / 2 * per, (z1 - z0) / 2 * per, rects, range,
+                       glassPart ? GLASS_CHANNEL : OPAQUE_CHANNEL);
+          const range6 = [vx0 + Math.floor(x0 * per), vy0 + Math.floor(y0 * per), vz0 + Math.floor(z0 * per),
+                          vx0 + Math.ceil(x1 * per), vy0 + Math.ceil(y1 * per), vz0 + Math.ceil(z1 * per)];
+          if (glassPart) { glassBlocks.push(...range6); if (inFootprint) glassFilled += vol; }
+          else { blocks.push(...range6); if (inFootprint) filled += vol; }
+        }
       }
       return;
     }
 
-    // A glass half or pane is its own box (world.js BLOCK_SHAPES glass).
+    // A glass slab or pane is its own box (world.js BLOCK_SHAPES glass).
     if (glassBlock(block)) {
       const [x0, x1, y0, y1, z0, z1] = blockBoxes(block)[0];
       minBoxVoxels(grid, vx0 + (x0 + x1) / 2 * per, vy0 + (y0 + y1) / 2 * per, vz0 + (z0 + z1) / 2 * per,
@@ -917,10 +918,10 @@ export function populateDistanceField(grid, dirty = null) {
     // special case any more, just a box of a different height.
     // Glass below counts as support, and must: the underside shows through
     // glass, so a block standing on it keeps its full height in the field.
-    // A half block (world.js BLOCK_SHAPES) is a box over its own span, half a
-    // block being six voxels at C0; only a full block over nothing at all is
-    // trimmed. Anything below counts - over a half-bottom's gap the underside
-    // can be seen, and rays come up to it.
+    // A slab (world.js BLOCK_SHAPES) is a box over its own span, a third of a
+    // block being four voxels at C0; only a full block over nothing at all is
+    // trimmed. Anything below counts - under a raised slab the underside can
+    // be seen, and rays come up to it.
     const [lo, hi] = blockSpan(block);
     const supported = World.has(getVoxelKey(bx, by - 1, bz));
     const dyStart = lo > 0 ? lo * per : hi === 1 && !supported ? per / 2 : 0;
@@ -936,7 +937,7 @@ export function populateDistanceField(grid, dirty = null) {
     // its own - the min of their distances is the staircase's. A step is a
     // twelfth of a block: half a voxel at C1, a quarter at C2, placed
     // continuously like any box. So is a box short of the cell across x or z
-    // (a vertical half, a pane): the span below is only the height.
+    // (a pane): the span below is only the height.
     const boxes = blockBoxes(block);
     const b0 = boxes[0];
     if (boxes.length > 1 || b0[0] > 0 || b0[1] < 1 || b0[4] > 0 || b0[5] < 1) {
@@ -1032,18 +1033,19 @@ export function sphereTrace(grid, origin, dir, maxDistance) {
 // The CPU mirror of gpu/volume.js blockFaceTSL: the block-grid plane p is nearest to,
 // among those the ray is not parallel to, a tie going to the one it crosses
 // most squarely. leaving: normal along dir, else against it. With a world,
-// the planes of the shape in p's cell count too (world.js codeBox): a pane's
-// or a half's faces sit mid-cell.
+// the planes of its parts in p's cell count too (world.js codeBox): a pane's
+// or a slab's faces sit mid-cell.
 export function blockFaceNormal(p, dir, leaving, world = null) {
   const axes = ['x', 'y', 'z'];
   const cell = axes.map(a => Math.round(p[a] / BLOCK_METRES));
   const block = world && world.get(cell.join(','));
-  const box = block ? codeBox(shapeCode(block)) : [0, 1, 0, 1, 0, 1];
+  const boxes = block ? tileParts(block).map(part => codeBox(shapeCode(part))) : [];
   let best = null, bestBack = Infinity;
   axes.forEach((a, k) => {
     const f = p[a] / BLOCK_METRES - cell[k] + 0.5;
     const ad = Math.abs(dir[a]);
-    const near = Math.min(f, 1 - f, Math.abs(f - box[2 * k]), Math.abs(f - box[2 * k + 1]));
+    let near = Math.min(f, 1 - f);
+    for (const box of boxes) near = Math.min(near, Math.abs(f - box[2 * k]), Math.abs(f - box[2 * k + 1]));
     const score = near * BLOCK_METRES - ad * 1e-3 + (ad < 1e-3 ? 1e3 : 0);
     if (score < bestBack) { bestBack = score; best = a; }
   });

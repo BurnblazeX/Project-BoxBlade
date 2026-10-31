@@ -13,7 +13,7 @@
 //
 // CPU and pure, so it is tested headlessly. gpu/mirrorlight.js createMirrorLightTSL reads
 // the packed form.
-import { BLOCK_METRES, GROUND_Y, blockBoxes, blockParts, isCompound, isDual } from './world.js';
+import { BLOCK_METRES, GROUND_Y, blockParts, tileParts, partBoxes } from './world.js';
 import { subtractRect } from './rects.js';
 import { BLOCK_TEXELS } from './materials.js';
 import { lightContribution, shadowScore } from './lights.js';
@@ -53,56 +53,67 @@ const PLANE_AXES = [[1, 2], [0, 2], [0, 1]];
 // thickness means nothing, so coplanar faces merge whatever they are made of -
 // the same light, in fewer rectangles: a ray crosses a plane at one point,
 // which lies in one rectangle of a group or another, never two.
+// What covers a face from beyond it, in the face's plane axes (ua, va): the
+// boxes of a block's parts (but skip) whose near side lies on its plane. A
+// slope or steps covers only a top face under it, and only from its tile's
+// floor.
+function coverRects(block, axis, sign, plane, skip = null) {
+  const [ua, va] = PLANE_AXES[axis], out = [];
+  for (const part of tileParts(block)) {
+    if (part === skip) continue;
+    const boxes = partBoxes(part);
+    if (boxes.length > 1) {
+      if (axis === 1 && sign > 0 && plane === 0 && Math.min(...boxes.map(b => b[2])) === 0) out.push([0, 1, 0, 1]);
+      continue;
+    }
+    const b = boxes[0];
+    if (b[2 * axis + (sign > 0 ? 0 : 1)] === plane) out.push([b[2 * ua], b[2 * ua + 1], b[2 * va], b[2 * va + 1]]);
+  }
+  return out;
+}
+
 export function buildMirrors(world, reflective, isGlass = () => false, { backFaces = true } = {}) {
   const groups = new Map();
   for (const [key, whole] of world) {
-    const dual = isDual(whole);
-    for (const part of blockParts(whole)) {
-      // Each half of a dual block reflects as its own material, and the face
-      // between the halves is covered.
-      const block = { ...whole, materialId: part.materialId };
+    for (const { materialId, part, boxes } of blockParts(whole)) {
+      // Each part of a stack reflects as its own material, and the faces
+      // between parts are covered.
+      const block = { ...whole, materialId };
       if (!reflective.has(block.materialId)) continue;
-      // A slope's staircase would be dozens of one-texel rectangles, and stairs
-      // are faces at two depths: they reflect through the view ray, but throw
+      // A slope's staircase would be dozens of one-texel rectangles, and steps
+      // are faces at three depths: they reflect through the view ray, but throw
       // no mirror light.
-      if (isCompound(block)) continue;
+      if (boxes.length > 1) continue;
       const c = key.split(',').map(Number);
       const glass = isGlass(block.materialId);
-      // The block's one box (cell fractions): a half's, a vertical half's or a
-      // pane's faces can sit mid-cell on any axis.
-      const box = part.boxes[0];
+      // The part's one box (cell fractions): a slab's or a pane's faces can
+      // sit mid-cell on any axis.
+      const box = boxes[0];
       for (let axis = 0; axis < 3; axis++) {
         const [ua, va] = PLANE_AXES[axis];
         for (const sign of [1, -1]) {
           const at = box[2 * axis + (sign > 0 ? 1 : 0)];
           const onEdge = sign > 0 ? at === 1 : at === 0;
-          // The face, as [u0, u1, v0, v1] of the cell, less what the neighbour
-          // across it covers - only a face on the cell's boundary can be
-          // covered. Beside a slope or stairs only a top face under it is (each
-          // fills its cell's floor); anything else is left whole - conservative,
-          // and the legs are traced through the field anyway.
+          // The face, as [u0, u1, v0, v1] of the cell, less what covers it:
+          // the neighbour across it for a face on the cell's boundary, the
+          // tile's other parts for one inside it (coverRects). Anything
+          // else is left whole - conservative, and the legs are traced
+          // through the field anyway.
           const face = [box[2 * ua], box[2 * ua + 1], box[2 * va], box[2 * va + 1]];
           let parts = [face];
           const nb = c.slice(); nb[axis] += sign;
           const nbBlock = onEdge ? world.get(nb.join(',')) : null;
-          if (!onEdge && dual) parts = [];
-          else if (nbBlock && isDual(nbBlock)) parts = [];
-          else if (nbBlock && isCompound(nbBlock)) {
-            if (axis === 1 && sign > 0) parts = [];
-          } else if (nbBlock) {
-            const nbox = blockBoxes(nbBlock)[0];
-            if (sign > 0 ? nbox[2 * axis] === 0 : nbox[2 * axis + 1] === 1) {
-              parts = subtractRect(face, [nbox[2 * ua], nbox[2 * ua + 1], nbox[2 * va], nbox[2 * va + 1]]);
-            }
-          }
+          const covers = onEdge ? (nbBlock ? coverRects(nbBlock, axis, sign, sign > 0 ? 0 : 1) : [])
+                                : coverRects(whole, axis, sign, at, part);
+          for (const r of covers) parts = parts.flatMap(p => subtractRect(p, r));
           if (!parts.length) continue;                    // not exposed
           // The underside of the ground layer faces the void under the world -
           // nothing is ever there to receive from it.
           if (axis === 1 && sign === -1 && c[1] <= GROUND_Y && at === 0) continue;
           let thickness = 0;
           if (glass && backFaces && (box[2 * axis] > 0 || box[2 * axis + 1] < 1)) {
-            // A glass half or pane: its own depth, with air (or the cell's
-            // other half) behind - conservative, as a slab is.
+            // A glass slab or pane: its own depth, with air (or the tile's
+            // other parts) behind - conservative.
             thickness = (box[2 * axis + 1] - box[2 * axis]) * BLOCK_METRES;
           } else if (glass && backFaces) {
             // Walk back through the glass behind this face.

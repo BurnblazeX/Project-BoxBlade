@@ -45,12 +45,12 @@ section('region and masks');
   truthy('the box below it is solid', boxSolid(region, masks, c[0], c[1] - 1, c[2]));
 }
 
-section('half blocks and glass');
+section('slabs and glass');
 {
-  const { region, masks, cells } = world([['0,1,0', { materialId: 'grass', shape: 'halfBottom' }],
+  const { region, masks, cells } = world([['0,1,0', { materialId: 'grass', shape: 'slab' }],
                                           ['2,1,0', { materialId: 'glass' }]]);
   const c = above(region, 0, 0);
-  truthy('a bottom half: its lowest box layer is solid', boxSolid(region, masks, ...c));
+  truthy('a slab: its lowest box layer is solid', boxSolid(region, masks, ...c));
   falsy('its middle layer is air (a box solid when its centre is)', boxSolid(region, masks, c[0], c[1] + 1, c[2]));
   const g = above(region, 2, 0);
   ok('glass boxes are glass, not solid', boxKind(region, masks, ...g), 2);

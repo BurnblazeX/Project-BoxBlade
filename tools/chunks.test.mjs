@@ -15,7 +15,7 @@ section('answers as the Map did');
   // Across chunk borders, both signs, every height.
   const cells = [[0, 0, 0], [-1, 0, -1], [11, Y_MAX, 12], [-13, Y_MIN, 5], [25, 7, -40], [12, 0, 0]];
   cells.forEach(([x, y, z], i) => {
-    const b = newBlock(i % 2 ? 'grass' : 'marble', i === 3 ? 'halfTop' : null);
+    const b = newBlock(i % 2 ? 'grass' : 'marble', i === 3 ? 'slab' : null);
     w.set(`${x},${y},${z}`, b);
     m.set(`${x},${y},${z}`, b);
   });
@@ -108,7 +108,7 @@ section('a million blocks (a 512-block region)');
   const w = make();
   const t0 = performance.now();
   // 512 x 512 columns, a surface block and two under it, varied a little.
-  const types = [newBlock('grass'), newBlock('marble'), newBlock('grass', 'halfBottom')];
+  const types = [newBlock('grass'), newBlock('marble'), newBlock('grass', 'slab')];
   for (let x = -256; x < 256; x++) for (let z = -256; z < 256; z++) {
     const top = ((x * 7 + z * 13) & 7) - 2;
     for (let y = top - 2; y <= top; y++) w.setAt(x, y, z, types[(x + y + z) & 1 ? 0 : (y === top ? 2 : 1)]);

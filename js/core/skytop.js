@@ -16,7 +16,7 @@
 // higher. 16 bits: 48 levels at 16 steps is 769 codes, past a byte's 255
 // (World plan P1). The texture carries it as two bytes, low in R, high in G
 // (render.js, gpu/volume.js skyOpenTSL).
-import { BLOCK_METRES, Y_MIN, isSlope, blockSpan, blockParts } from './world.js';
+import { BLOCK_METRES, Y_MIN, isSlope, partSpan, blockParts } from './world.js';
 import { isGlassMaterial } from './materials.js';
 import { blocksIn } from './chunks.js';
 
@@ -25,11 +25,12 @@ export const SKY_TOP_STEPS = 16;
 // The top of a block's non-glass parts, in blocks above its cell's floor -
 // null for a block that is glass all through.
 export function roofTop(block) {
-  if (isSlope(block)) return isGlassMaterial(block.materialId) ? null : blockSpan(block)[1];
   let hi = null;
-  for (const part of blockParts(block)) {
-    if (isGlassMaterial(part.materialId)) continue;
-    for (const b of part.boxes) if (hi === null || b[3] > hi) hi = b[3];
+  for (const { materialId, part, boxes } of blockParts(block)) {
+    if (isGlassMaterial(materialId)) continue;
+    // A slope's top is its plane's, over the staircase.
+    const top = isSlope(part) ? partSpan(part)[1] : Math.max(...boxes.map(b => b[3]));
+    if (hi === null || top > hi) hi = top;
   }
   return hi;
 }

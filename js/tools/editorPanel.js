@@ -8,13 +8,14 @@
 // its cubes' own pixels, a shape its profile - built once and kept.
 import { MATERIALS } from '../core/materials.js';
 import { MODELS } from '../core/models.js';
-import { BLOCK_SHAPES, hasFacing, Region } from '../core/world.js';
+import { BLOCK_SHAPES, hasFacing, Region, shapeStates, partBoxes, partSpan } from '../core/world.js';
 import { textureUrl } from '../render/render.js';
 import { facePixel, bakeFaces } from '../core/bbmodel.js';
 
 const FACING_ORDER = ['N', 'E', 'S', 'W'];
 const FACING_ARROW = { N: '↑', E: '→', S: '↓', W: '←' };
-export const SHAPE_ORDER = ['full', ...Object.keys(BLOCK_SHAPES).filter(s => s !== 'full')];
+// One tile a shape; F picks its state (world.js BLOCK_SHAPES states).
+export const SHAPE_ORDER = Object.keys(BLOCK_SHAPES);
 
 // 'ironPlate' -> 'Iron Plate'; 'decor_wallTorch' -> { category: 'decor', name: 'Wall Torch' }.
 export const titleCase = s => s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ')
@@ -24,10 +25,8 @@ export function modelLabel(name) {
   return i > 0 ? { category: name.slice(0, i), name: titleCase(name.slice(i + 1)) }
                : { category: '', name: titleCase(name) };
 }
-const SHAPE_LABELS = { full: 'Full', halfBottom: 'Half, low', halfTop: 'Half, high', slope: 'Slope',
-                       halfSlope: 'Half slope', halfSlopeHigh: 'Half slope, high', stairs: 'Stairs',
-                       halfVertical: 'Half, vertical', middleVertical: 'Pane' };
-export const shapeLabel = s => SHAPE_LABELS[s] || titleCase(s);
+// 'Slope, medium'; a shape of one state by its name alone.
+export const shapeLabel = (s, st) => titleCase(s) + (shapeStates(s).length > 1 && st ? `, ${st}` : '');
 
 // --- Pictures ---
 const pixelated = (w, h, css) => {
@@ -68,20 +67,22 @@ function materialPicture(m) {
   });
 }
 
-// A shape: its profile seen from the side, climbing to the right (facing E).
-function shapePicture(shape) {
-  return picture('s:' + shape, () => {
+// A shape in a state: its profile seen from the side, climbing to the right
+// (facing E), at the bottom of its tile.
+function shapePicture(shape, state) {
+  return picture(`s:${shape}:${state}`, () => {
     const n = 24, c = pixelated(n, n);
     const g = c.getContext('2d');
     g.fillStyle = '#c8ccd4';
-    const s = BLOCK_SHAPES[shape];
-    if (s.slope) {
+    const part = { shape, state, facing: 'E' };
+    if (BLOCK_SHAPES[shape].slope) {
+      const [lo, hi] = partSpan(part);
       g.beginPath();
       g.moveTo(0, n); g.lineTo(n, n);
-      g.lineTo(n, n - s.high * n); g.lineTo(0, n - s.low * n);
+      g.lineTo(n, n - hi * n); g.lineTo(0, n - lo * n);
       g.closePath(); g.fill();
     } else {
-      for (const [x0, x1, y0, y1] of s.boxes) g.fillRect(x0 * n, n - y1 * n, (x1 - x0) * n, (y1 - y0) * n);
+      for (const [x0, x1, y0, y1] of partBoxes(part)) g.fillRect(x0 * n, n - y1 * n, (x1 - x0) * n, (y1 - y0) * n);
     }
     return c;
   });
@@ -223,7 +224,8 @@ export function createPalette({ state, pick, levelName }) {
       const m = MATERIALS.find(x => x.id === state.materialId);
       if (m) sel.appendChild(materialPicture(m));
       const t = el('div');
-      t.append(el('div', 'what', titleCase(state.materialId)), el('div', 'hint', shapeLabel(state.shape)));
+      t.append(el('div', 'what', titleCase(state.materialId)), el('div', 'hint', shapeLabel(state.shape, state.shapeState) +
+               (shapeStates(state.shape).length > 1 ? ' · F' : '')));
       sel.appendChild(t);
     }
     if (turns) {
@@ -261,10 +263,11 @@ export function createPalette({ state, pick, levelName }) {
     const shapes = el('div', 'grid shapes');
     for (const s of SHAPE_ORDER) {
       const on = state.kind === 'block' && state.shape === s;
+      const st = on ? state.shapeState : shapeStates(s)[0];
       const tile = el('div', 'tile' + (on ? ' on' : ''));
-      tile.title = s + (hasFacing(s) ? ' - turns with Q/E' : '');
-      tile.append(shapePicture(s), el('span', '', shapeLabel(s)));
-      tile.onclick = () => pick({ kind: 'block', shape: s });
+      tile.title = s + (hasFacing(s) ? ' - turns with Q/E' : '') + (shapeStates(s).length > 1 ? ', F for its state' : '');
+      tile.append(shapePicture(s, st), el('span', '', shapeLabel(s, st)));
+      tile.onclick = () => pick({ kind: 'block', shape: s, shapeState: on ? st : shapeStates(s)[0] });
       shapes.appendChild(tile);
     }
     panel.appendChild(shapes);

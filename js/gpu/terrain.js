@@ -57,15 +57,17 @@ export function slopeTSL() {
   return slopeFromCodeTSL(attribute('blockSlope', 'float'));
 }
 // The same from a code node (a split-shading kernel reads it from the block
-// volume's A channel). kind: 1 slope, 2 half slope, 3 high half slope.
+// volume's A channel, less world.js SLOPE_CODE_BASE - 4). kind: 1 + world.js
+// SLOPE_KINDS' index - by rise and Grid height: 1 high, 2-4 low at heights 0,
+// 1, 2, 5-6 medium at heights 0, 1.
 export function slopeFromCodeTSL(code) {
   const kind = floor(code.mul(float(0.25)).add(float(0.01)));
   const facing = code.sub(kind.mul(float(4)));
   const f = select(facing.lessThan(float(0.5)), vec2(0, -1),
             select(facing.lessThan(float(1.5)), vec2(1, 0),
             select(facing.lessThan(float(2.5)), vec2(0, 1), vec2(-1, 0))));
-  const grad = select(kind.lessThan(float(1.5)), float(1), float(0.5));
-  const base = select(kind.greaterThan(float(2.5)), float(0.5), float(0));
+  const grad = select(kind.lessThan(float(1.5)), float(1), select(kind.lessThan(float(4.5)), float(1 / 3), float(2 / 3)));
+  const base = select(kind.equal(float(3)).or(kind.equal(float(6))), float(1 / 3), select(kind.equal(float(4)), float(2 / 3), float(0)));
   const n = normalize(vec3(f.x.mul(grad).negate(), float(1), f.y.mul(grad).negate()));
   return { on: code.greaterThan(float(0.5)), f, grad, base, n, kind };
 }

@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
 import { If, Loop, Break, float, vec2, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
-import { BLOCK_METRES, Y_MIN } from '../core/world.js';
+import { BLOCK_METRES, Y_MIN, SLOPE_CODE_BASE } from '../core/world.js';
+import { VOLUME_SLOTS } from '../core/blockvolume.js';
 import { SKY_TOP_STEPS } from '../core/skytop.js';
 import { terrainWhite, blockFaceTSL as boxFaceTSL, texelLockTSL, modelTexelCoreTSL } from './terrain.js';
 import { MODEL_HIT_RECORD } from '../core/bbmodel.js';
@@ -80,16 +81,26 @@ export function axisFaceTSL(g) {
 // to the wrong axis, an exit bent against the wrong face and sent the ray to
 // the sky - the white rims along every glass edge. Mirrored on the CPU by
 // core/field.js blockFaceNormal.
-// terrain: the block volume, so the planes of the shape in p's cell count too
-// (world.js codeBox) - a pane's or a half's faces sit mid-cell. Mirrors
+// terrain: the block volume, so the planes of the parts in p's cell count
+// too (world.js codeBox) - a pane's or a slab's faces sit mid-cell. Mirrors
 // core/field.js blockFaceNormal with a world.
 export function blockFaceTSL(p, dir, leaving, terrain = null) {
   const f = fract(p.div(float(BLOCK_METRES)).add(float(0.5))).toVar();
   const ad = abs(dir).toVar();
   const edge = min(f, vec3(1, 1, 1).sub(f)).toVar();
   if (terrain) {
-    const box = codeBoxTSL(blockVolumeTSL(terrain, round(p.div(float(BLOCK_METRES)))).w);
-    edge.assign(min(edge, min(abs(f.sub(box.lo)), abs(f.sub(box.hi)))));
+    const cell = round(p.div(float(BLOCK_METRES))).toVar();
+    // Slot by slot while there are parts: a later slot holds one only if
+    // the slot before it does.
+    const near = s => {
+      const v = blockVolumeTSL(terrain, cell, s).toVar();
+      If(v.x.greaterThan(float(0.5)), () => {
+        const box = codeBoxTSL(v.w);
+        edge.assign(min(edge, min(abs(f.sub(box.lo)), abs(f.sub(box.hi)))));
+        if (s + 1 < VOLUME_SLOTS) near(s + 1);
+      });
+    };
+    near(0);
   }
   // Metres to the nearest boundary on each axis, less a millimetre's worth of
   // how squarely the ray crosses it (the tie-break), and ruled out where the ray
@@ -209,20 +220,20 @@ export function hitTexelTSL(terrain, p, g, dir) {
   return { n, p: inner.add(n.mul(q.mul(float(0.5)))) };
 }
 
-// A block's entry in render.js's block volume, as bytes (RGBA x 255):
-// R side layer + 1 (0 air), G top layer, B bottom layer - or, in a model's
-// cell, R 0, G + 256 B its modelHits header, A its GI entry + 1. second: a
-// dual block's other half's, from the texture's second half. x and z are a
-// ring (core/blockvolume.js), so a block outside the window would read
-// another's from across it: outside is air.
-export function blockVolumeTSL(terrain, block, second = false) {
+// A tile's slot in render.js's block volume, as bytes (RGBA x 255): a part's
+// R side layer + 1 (0 none), G top layer, B bottom layer, A shape code - or a
+// model's R 0, G + 256 B its modelHits header, A its GI entry + 1. slot: the
+// tile's part (0..VOLUME_SLOTS - 1), each a size.z further along the
+// texture. x and z are a ring (core/blockvolume.js), so a block outside the
+// window would read another's from across it: outside is air.
+export function blockVolumeTSL(terrain, block, slot = 0) {
   const vol = terrain.blocks;
   const rel = block.sub(vol.origin).toVar();
   const inside = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))
     .and(rel.z.greaterThanEqual(float(0))).and(rel.x.lessThan(vol.size.x))
     .and(rel.y.lessThan(vol.size.y)).and(rel.z.lessThan(vol.size.z));
   const z = ringTSL(block.z, vol.size.z);
-  const at = vec3(ringTSL(block.x, vol.size.x), rel.y, second ? z.add(vol.size.z) : z);
+  const at = vec3(ringTSL(block.x, vol.size.x), rel.y, slot ? z.add(vol.size.z.mul(float(slot))) : z);
   const v = round(texture3D(vol.tex, at.add(float(0.5)).div(vol.dims)).level(int(0)).mul(float(255)));
   return select(inside, v, vec4(0, 0, 0, 0));
 }
@@ -239,8 +250,7 @@ function faceLayerTSL(code, n) {
   return select(code.x.greaterThan(float(0.5)), face, int(0));
 }
 
-// p: a point on the face (n its outward normal) - a dual block's half is the
-// one behind it.
+// p: a point on the face (n its outward normal) - the part behind it.
 export function blockLayerTSL(terrain, block, n, p) {
   return faceLayerTSL(volumeAtTSL(terrain, block, p.sub(n.mul(float(VOXEL_METRES * 0.5)))), n);
 }
@@ -250,71 +260,69 @@ const inCodeBoxTSL = (f, box) => f.x.greaterThanEqual(box.lo.x).and(f.x.lessThan
   .and(f.y.greaterThanEqual(box.lo.y)).and(f.y.lessThan(box.hi.y))
   .and(f.z.greaterThanEqual(box.lo.z)).and(f.z.lessThan(box.hi.z));
 
-// A cell's entry as blockVolumeTSL reads it, for the part holding world point
-// q: a dual block (A >= 128; render.js buildBlockVolume) outside its own
-// half's box answers its other half's R, G, B from the volume's second half.
+// Whether a slot holds cell fractions f: a part whose box does, or a model.
+const holdsTSL = (v, f) => v.x.greaterThan(float(0.5)).and(inCodeBoxTSL(f, codeBoxTSL(v.w)))
+  .or(v.x.lessThan(float(0.5)).and(v.w.greaterThan(float(0.5))));
+
+// A tile's slot as blockVolumeTSL reads it, for the part holding world point
+// q: the first slot whose part's box (codeBoxTSL) holds it, or that holds the
+// tile's model - the first slot when none does (a hit a hair outside its
+// part, a full tile). A later slot is read only past a part that missed.
 export function volumeAtTSL(terrain, cell, q) {
   const v = blockVolumeTSL(terrain, cell).toVar();
-  If(v.w.greaterThan(float(127.5)), () => {
-    const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5));
-    If(inCodeBoxTSL(f, codeBoxTSL(v.w)).not(), () => {
-      const v2 = blockVolumeTSL(terrain, cell, true);
-      v.assign(vec4(v2.xyz, v.w));
-    });
-  });
+  const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5)).toVar();
+  const next = s => {
+    const u = blockVolumeTSL(terrain, cell, s).toVar();
+    If(holdsTSL(u, f), () => { v.assign(u); })
+      .ElseIf(u.x.greaterThan(float(0.5)), () => { if (s + 1 < VOLUME_SLOTS) next(s + 1); });
+  };
+  If(v.x.greaterThan(float(0.5)).and(inCodeBoxTSL(f, codeBoxTSL(v.w)).not()), () => { next(1); });
   return v;
 }
 
 // The box the rays take for a shape code (the volume's A; world.js codeBox),
-// in cell fractions: a low or high half, a vertical half or a pane turned to
-// its facing (0 N, 1 E, 2 S, 3 W), else the whole cell.
+// in cell fractions: a box on the Grid, its span on each axis one of six
+// pairs of thirds (x + 6y + 36z), or a slope's span over the whole tile.
+// Divisions offset half a step, so an inexact one never floors low.
+const spanLoTSL = k => select(k.lessThan(float(2.5)), float(0), select(k.lessThan(float(4.5)), float(1), float(2)));
+const spanHiTSL = k => select(k.lessThan(float(0.5)), float(3), select(k.lessThan(float(1.5)), float(1),
+                      select(k.lessThan(float(3.5)), float(2), float(3))));
 function codeBoxTSL(a) {
-  const c = a.mod(float(128)).toVar();
-  const f = c.mod(float(4));
-  const alongX = f.equal(float(1)).or(f.equal(float(3)));
-  const plus = f.equal(float(1)).or(f.equal(float(2)));            // E, S: the + side
-  const vert = c.greaterThanEqual(float(19.5)).and(c.lessThan(float(23.5)));
-  const pane = c.greaterThanEqual(float(23.5)).and(c.lessThan(float(27.5)));
-  // Along the shape's axis: [0.5, 1] or [0, 0.5] for a vertical half, the
-  // middle four texels for a pane, else [0, 1].
-  const a0 = select(vert, select(plus, float(0.5), float(0)), select(pane, float(4 / 12), float(0)));
-  const a1 = select(vert, select(plus, float(1), float(0.5)), select(pane, float(8 / 12), float(1)));
-  const y0 = select(c.equal(float(17)), float(0.5), float(0));
-  const y1 = select(c.equal(float(16)), float(0.5), float(1));
-  const lo = vec3(select(alongX, a0, float(0)), y0, select(alongX, float(0), a0));
-  const hi = vec3(select(alongX, a1, float(1)), y1, select(alongX, float(1), a1));
-  return { lo, hi };
-}
-
-// The other half's code for a dual block's (world.js complementShape): low
-// and high halves swap, a vertical half turns to face the other way.
-function complementCodeTSL(a) {
-  const c = a.mod(float(128));
-  const f = c.mod(float(4));
-  return select(c.equal(float(16)), float(17), select(c.equal(float(17)), float(16),
-                c.sub(f).add(f.add(float(2)).mod(float(4)))));
+  const c = a.toVar();
+  const slope = c.greaterThan(float(SLOPE_CODE_BASE - 0.5));
+  // SLOPE_KINDS: [rise, Grid height] - 0 [3, 0], 1 [1, 0], 2 [1, 1], 3 [1, 2], 4 [2, 0], 5 [2, 1].
+  const kind = floor(c.sub(float(SLOPE_CODE_BASE)).add(float(0.5)).div(float(4)));
+  const rise = select(kind.lessThan(float(0.5)), float(3), select(kind.lessThan(float(3.5)), float(1), float(2)));
+  const sy0 = select(kind.equal(float(2)).or(kind.equal(float(5))), float(1), select(kind.equal(float(3)), float(2), float(0)));
+  const ky = floor(c.add(float(0.5)).div(float(6))), kz = floor(c.add(float(0.5)).div(float(36)));
+  const kx = c.sub(ky.mul(float(6))), kyy = ky.sub(kz.mul(float(6)));
+  const lo = vec3(select(slope, float(0), spanLoTSL(kx)), select(slope, sy0, spanLoTSL(kyy)), select(slope, float(0), spanLoTSL(kz)));
+  const hi = vec3(select(slope, float(3), spanHiTSL(kx)), select(slope, sy0.add(rise), spanHiTSL(kyy)), select(slope, float(3), spanHiTSL(kz)));
+  return { lo: lo.div(float(3)), hi: hi.div(float(3)) };
 }
 
 // What fills world point q for the walk through glass (world.js partAt, its
-// CPU mirror): code, the material's layer + 1 (0 air - and a model's cell,
-// which the walk ignores), and that part's box, lo and hi in metres. Outside
-// the volume or the battle arena, air.
+// CPU mirror): code, the material's layer + 1 (0 air - and a model, which the
+// walk ignores), and that part's box, lo and hi in metres - the first part
+// whose box holds q. Outside the volume or the battle arena, air.
 export function partAtTSL(terrain, q) {
   const Bm = float(BLOCK_METRES);
   const cell = round(q.div(Bm)).toVar();
-  const v = blockVolumeTSL(terrain, cell).toVar();
   const f = q.div(Bm).sub(cell).add(float(0.5)).toVar();
-  const own = codeBoxTSL(v.w);
-  const inOwn = inCodeBoxTSL(f, own).toVar();
-  // A dual block's other half fills the rest of the cell: its code from the
-  // volume's second half, its box the complement's.
-  const dual = v.w.greaterThan(float(127.5)).and(inOwn.not()).toVar();
-  const other = codeBoxTSL(complementCodeTSL(v.w));
-  If(dual, () => {
-    v.assign(vec4(blockVolumeTSL(terrain, cell, true).x, v.y, v.z, v.w));
-  });
-  const box = { lo: select(dual, other.lo, own.lo), hi: select(dual, other.hi, own.hi) };
-  const inBox = inOwn.or(dual);
+  const v = vec4(0, 0, 0, 0).toVar();
+  const box = { lo: vec3(0, 0, 0).toVar(), hi: vec3(1, 1, 1).toVar() };
+  const take = s => {
+    const u = blockVolumeTSL(terrain, cell, s).toVar();
+    If(u.x.greaterThan(float(0.5)), () => {
+      const b = codeBoxTSL(u.w);
+      const lo = b.lo.toVar(), hi = b.hi.toVar();
+      If(inCodeBoxTSL(f, { lo, hi }), () => {
+        v.assign(u); box.lo.assign(lo); box.hi.assign(hi);
+      }).Else(() => { if (s + 1 < VOLUME_SLOTS) take(s + 1); });
+    });
+  };
+  take(0);
+  const inBox = v.x.greaterThan(float(0.5));
   // Outside the volume is air (blockVolumeTSL reads it so too).
   const rel = cell.sub(terrain.blocks.origin);
   const inVol = rel.x.greaterThanEqual(float(0)).and(rel.y.greaterThanEqual(float(0)))

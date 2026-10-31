@@ -3,7 +3,7 @@ import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { World, getVoxelKey, createTestArea, createEntity, isStandable, isSolid, getColumnTop,
          findPath, getReachableVoxels, enterBattle, exitBattle, addToInventory, currentArena,
          getBlock, stepLevel, surfaceLevel, surfaceHeight, isSolidAt, blockShape, blockBoxes, edgeLevel,
-         slopeLevel, groundHeightAt, followGround, blockSpan, hasFacing, newBlock,
+         slopeLevel, groundHeightAt, followGround, blockSpan, hasFacing, newBlock, tileParts, blockRows, isSlope,
          pathDistance, attackRange, getAbilityModifier,
          BLOCK_METRES, CHUNK_SIZE, CHUNK_HEIGHT, Y_MIN, Y_MAX } from '../js/core/world.js';
 
@@ -19,10 +19,11 @@ ok('authorable span is -8..39', `${Y_MIN}..${Y_MAX}`, '-8..39');
 
 section('generation - surface only, no sandbox fill');
 // + 12: the glass test bed (a cube, a 3 x 2 window, a 2 x 2 stained window,
-// a frosted cube). + 7: the half-tile bed (two steps, an arch of two pillars
-// and a lintel). + 3: the slope bed (a slope, a half slope, a high one).
-// + 3: the stair bed (two stairs and the marble block under the upper one).
-ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16 + 14 + 12 + 12 + 7 + 3 + 3);
+// a frosted cube). + 9: the slab bed (two rows of steps, a slab and two
+// stacked, an arch of two pillars and a lintel). + 3: the slope bed (a high
+// slope, a medium one, a low one on two slabs). + 3: the steps bed (two
+// steps and the marble block under the upper one).
+ok('ground layer + test features only', World.size, 36 * 36 + 14 + 3 + 16 + 14 + 12 + 12 + 9 + 3 + 3);
 
 section('glass test bed');
 ok('the cube is glass', World.get(getVoxelKey(12, 1, 13))?.materialId, 'glass');
@@ -55,12 +56,12 @@ section('occupancy blocks traversal');
 truthy('solid where the wall is', isSolid(20, 1, 10));
 falsy('not solid above the wall', isSolid(20, 3, 10));
 
-section('pathfinding steps by half a block, no more');
+section('pathfinding steps by a third of a block, no more');
 truthy('flat path found', findPath({x:8,y:0,z:8}, {x:14,y:0,z:8}).length > 0);
 {
   const up = findPath({x:8,y:0,z:8}, {x:30,y:1,z:30});
   truthy('climbs to the platform', up.length > 0);
-  truthy('by the half-tile steps', up.some(n => n.x === 27 && n.y === 1 && (n.z === 29 || n.z === 30)));
+  truthy('by the slab steps', up.some(n => n.x === 27 && n.y === 1 && (n.z === 29 || n.z === 30)));
   truthy('and back down', findPath({x:30,y:1,z:30}, {x:8,y:0,z:8}).length > 0);
 }
 ok('cannot climb the pillar (a full block, no stairs)', findPath({x:8,y:0,z:10}, {x:26,y:3,z:20}).length, 0);
@@ -70,121 +71,147 @@ truthy('routes around the wall', around.length > 0);
 falsy('never passes through it', around.some(n => n.x === 20 && n.z >= 8 && n.z <= 14));
 truthy('stays on one level', around.every(n => n.y === 0));
 
-section('half tiles');
-ok('the steps are half-bottoms', blockShape(getBlock(27, 1, 29)), 'halfBottom');
-ok('the lintel is a half-top', blockShape(getBlock(24, 2, 25)), 'halfTop');
+section('slabs: a Grid layer, stacked');
+ok('the first step is a slab', blockShape(getBlock(26, 1, 29)), 'slab');
+ok('the next is two', tileParts(getBlock(27, 1, 29)).length, 2);
+ok('the lintel is a slab at the top of its tile', JSON.stringify(blockBoxes(getBlock(24, 2, 25))[0].map(v => Math.round(v * 3))),
+   '[0,3,2,3,0,3]');
 ok('a block without a shape is full', blockShape(getBlock(8, 0, 8)), 'full');
-ok('a half-bottom stands half a block up', surfaceLevel(27, 1, 29), 1.5);
+near('a slab stands a third up', surfaceLevel(26, 1, 29), 4 / 3, 1e-9);
+near('two stand two thirds up', surfaceLevel(27, 1, 29), 5 / 3, 1e-9);
 ok('ground stands at level 1', surfaceLevel(8, 0, 8), 1);
-ok('surface height in metres', surfaceHeight(27, 1, 29), 1.5);
+near('surface height in metres', surfaceHeight(26, 1, 29), 1.25, 1e-9);
 ok('ground surface height is unchanged', surfaceHeight(8, 0, 8), 0.75);
-truthy('a half-bottom is standable', isStandable(27, 1, 29));
-falsy('the ground under a step is not', isStandable(27, 0, 29));
-truthy('walk under the lintel: 1.5 m of headroom', isStandable(24, 0, 25));
-ok('step up onto a half-bottom', stepLevel(26, 0, 29, 27, 29), 1);
-ok('step up again onto the platform', stepLevel(27, 1, 29, 28, 29), 1);
+truthy('a slab is standable', isStandable(26, 1, 29));
+falsy('the ground under it is not', isStandable(26, 0, 29));
+truthy('walk under the lintel: 2.5 m of headroom', isStandable(24, 0, 25));
+ok('step up onto a slab', stepLevel(25, 0, 29, 26, 29), 1);
+ok('onto the two', stepLevel(26, 1, 29, 27, 29), 1);
+ok('onto the platform', stepLevel(27, 1, 29, 28, 29), 1);
+ok('two slabs are too high from the ground', stepLevel(27, 0, 28, 27, 29), null);
 ok('no step onto a full block', stepLevel(19, 0, 10, 20, 10), null);
 ok('step down from the platform', stepLevel(28, 1, 29, 27, 29), 1);
-truthy('solid in a half-bottom lower half', isSolidAt(27 * 1.5, 1.2, 29 * 1.5));
-falsy('air in its upper half', isSolidAt(27 * 1.5, 1.8, 29 * 1.5));
-falsy('a point on its top face is outside', isSolidAt(27 * 1.5, 1.5, 29 * 1.5));
+truthy('solid in a slab', isSolidAt(26 * 1.5, 1.0, 29 * 1.5));
+falsy('air over it', isSolidAt(26 * 1.5, 1.5, 29 * 1.5));
+falsy('a point on its top face is outside', isSolidAt(26 * 1.5, 1.25, 29 * 1.5));
 truthy('solid in the lintel', isSolidAt(24 * 1.5, 3.4, 25 * 1.5));
 falsy('air under it', isStandable(24, 1, 25));
 {
-  // Headroom over a half-bottom: a half-top above leaves 1.5 m; a full
-  // block or another half-bottom leaves 0.75.
-  const put = (k, b) => World.set(k, { solid: true, walkable: true, materialId: 'grass', ...b });
-  put('40,0,40', { shape: 'halfBottom' });
-  put('40,1,40', { shape: 'halfTop' });
-  truthy('half-bottom under a half-top: standable', isStandable(40, 0, 40));
-  put('40,1,40', { shape: 'halfBottom' });
-  falsy('under a half-bottom: not', isStandable(40, 0, 40));
-  put('40,1,40', {});
+  // Headroom over a slab: a slab at the middle or the top of the tile above
+  // leaves a tile or more; one at its bottom, or a full block, too little.
+  const put = (k, ...b) => World.set(k, newBlock('grass', ...b));
+  put('40,0,40', 'slab');
+  put('40,1,40', 'slab', null, null, 6);
+  truthy('a slab under one at the top of the tile above: standable', isStandable(40, 0, 40));
+  put('40,1,40', 'slab', null, null, 3);
+  truthy('under one at its middle: a tile of room, standable', isStandable(40, 0, 40));
+  put('40,1,40', 'slab');
+  falsy('under one at its bottom: not', isStandable(40, 0, 40));
+  put('40,1,40');
   falsy('under a full block: not', isStandable(40, 0, 40));
-  put('41,0,40', {});
-  put('41,1,40', { shape: 'halfTop' });
-  falsy('a full block under a half-top: not', isStandable(41, 0, 40));
+  put('41,0,40');
+  put('41,1,40', 'slab', null, null, 6);
+  falsy('a full block under a slab at the top: not', isStandable(41, 0, 40));
   // Glass takes the one-box shapes; a glass slope is whole.
-  put('42,0,40', { shape: 'halfBottom', materialId: 'glass' });
-  ok('glass keeps a half', blockShape(getBlock(42, 0, 40)), 'halfBottom');
+  World.set('42,0,40', newBlock('glass', 'slab'));
+  ok('glass keeps a slab', blockShape(getBlock(42, 0, 40)), 'slab');
   ok('but not a slope', blockShape({ materialId: 'glass', shape: 'slope', facing: 'E' }), 'full');
   for (const k of ['40,0,40', '40,1,40', '41,0,40', '41,1,40', '42,0,40']) World.delete(k);
 }
 
-section('vertical halves and panes: turned boxes, full-height tops');
+section('panes: a Grid column, at the side or the centre');
 {
-  const vb = facing => blockBoxes({ materialId: 'grass', shape: 'halfVertical', facing })[0].join(',');
-  ok('a vertical half facing E is the east half', vb('E'), '0.5,1,0,1,0,1');
-  ok('facing W the west half', vb('W'), '0,0.5,0,1,0,1');
-  ok('facing S the south half (+z)', vb('S'), '0,1,0,1,0.5,1');
-  ok('facing N the north half', vb('N'), '0,1,0,1,0,0.5');
-  const pane = facing => blockBoxes({ materialId: 'grass', shape: 'middleVertical', facing })[0]
-    .map(v => Math.round(v * 12)).join(',');
-  ok('a pane facing E is four texels thick across x, in the middle', pane('E'), '4,8,0,12,0,12');
-  ok('facing N across z', pane('N'), '0,12,0,12,4,8');
-  truthy('both turn with Q/E', hasFacing('halfVertical') && hasFacing('middleVertical'));
-  falsy('half slabs do not', hasFacing('halfBottom'));
-  ok('they keep their facing when made', newBlock('grass', 'middleVertical', 'N').facing, 'N');
-  World.set('44,0,44', { ...newBlock('grass', 'halfVertical', 'E') });
-  truthy('a vertical half is standable', isStandable(44, 0, 44));
+  const pb = (facing, at = 0) => blockBoxes(newBlock('grass', 'pane', facing, null, at))[0].map(v => Math.round(v * 12)).join(',');
+  ok('a pane facing E is four texels across x, at the west side', pb('E'), '0,4,0,12,0,12');
+  ok('facing W the same pane: it turns by axis', pb('W'), pb('E'));
+  ok('at Grid x 1, the centre', pb('E', 1), '4,8,0,12,0,12');
+  ok('at Grid x 2, the east side', pb('E', 2), '8,12,0,12,0,12');
+  ok('facing S across z', pb('S', 18), '0,12,0,12,8,12');
+  truthy('panes, slopes and steps turn', hasFacing('pane') && hasFacing('slope') && hasFacing('steps'));
+  falsy('slabs do not', hasFacing('slab'));
+  ok('a pane keeps its axis when made', newBlock('grass', 'pane', 'N').facing, 'S');
+  World.set('44,0,44', newBlock('grass', 'pane', 'E', null, 2));
+  truthy('a pane is standable', isStandable(44, 0, 44));
   ok('at full height', surfaceLevel(44, 0, 44), 1);
-  truthy('solid in its east half', isSolidAt(44 * 1.5 + 0.3, 0, 44 * 1.5));
-  falsy('air in its west half', isSolidAt(44 * 1.5 - 0.3, 0, 44 * 1.5));
+  truthy('solid at its east side', isSolidAt(44 * 1.5 + 0.6, 0, 44 * 1.5));
+  falsy('air in its middle', isSolidAt(44 * 1.5, 0, 44 * 1.5));
   World.delete('44,0,44');
 }
 
-section('dual blocks: two materials, one full cell');
+section('stacks: up to three parts in a tile, a material each');
 {
-  const { isDual, blockParts, partAt, serializeLevel, loadLevel } = await import('../js/core/world.js');
-  const { levelRows } = await import('../js/core/region.js');
-  const dual = newBlock('marble', 'halfBottom', null, 'glass');
-  truthy('a low half with a second material is dual', isDual(dual));
-  ok('its parts: marble low, glass high', blockParts(dual).map(p => `${p.materialId}:${p.boxes[0].join(',')}`).join(' '),
-     'marble:0,1,0,0.5,0,1 glass:0,1,0.5,1,0,1');
-  const v = newBlock('grass', 'halfVertical', 'N', 'marble');
-  ok('a vertical half\'s other half faces away', blockParts(v)[1].boxes[0].join(','), '0,1,0,1,0.5,1');
-  falsy('a pane has no other half', isDual(newBlock('grass', 'middleVertical', 'E', 'marble')));
-  World.set('46,0,46', dual);
+  const { blockParts, partAt, serializeLevel, withPart, withoutPart, isMulti, gridAt } = await import('../js/core/world.js');
+  const { levelRows, legacyParts } = await import('../js/core/region.js');
+  let s = newBlock('marble', 'slab');
+  s = withPart(s, { materialId: 'glass', shape: 'slab', at: 3 });
+  s = withPart(s, { materialId: 'grass', shape: 'slab', at: 6 });
+  truthy('three slabs of three materials stack', isMulti(s) && tileParts(s).length === 3);
+  ok('their parts', blockParts(s).map(p => `${p.materialId}:${p.boxes[0].map(v => Math.round(v * 3)).join(',')}`).join(' '),
+     'marble:0,3,0,1,0,3 glass:0,3,1,2,0,3 grass:0,3,2,3,0,3');
+  ok('a fourth does not fit', withPart(s, { materialId: 'grass', shape: 'pane' }), null);
+  ok('nor a part where one is', withPart(newBlock('grass', 'slab'), { materialId: 'grass', shape: 'pane' }), null);
+  ok('a slope on a slab', tileParts(withPart(newBlock('grass', 'slab'),
+     { materialId: 'grass', shape: 'slope', state: 'low', facing: 'E', at: 3 })).length, 2);
+  ok('a part taken out leaves the rest', JSON.stringify(blockRows(withoutPart(s, 1))),
+     '[["marble","slab"],["grass","slab",null,null,6]]');
+  ok('the last taken out leaves nothing', withoutPart(newBlock('grass'), 0), null);
+  ok('a click takes the Grid cell nearest it that fits',
+     `${gridAt({ shape: 'slab' }, [2, 1, 0])},${gridAt({ shape: 'slope', state: 'medium' }, [0, 2, 0])},${gridAt({ shape: 'pane', facing: 'S' }, [1, 1, 2])}`,
+     '3,3,18');
+  World.set('46,0,46', s);
   ok('stood on at full height', surfaceLevel(46, 0, 46), 1);
-  truthy('solid in its glass half too', isSolidAt(46 * 1.5, 0.5, 46 * 1.5));
-  ok('the rays see marble below', partAt(46 * 1.5, -0.3, 46 * 1.5).materialId, 'marble');
-  ok('and glass above', partAt(46 * 1.5, 0.3, 46 * 1.5).materialId, 'glass');
+  truthy('solid in its glass slab too', isSolidAt(46 * 1.5, 0, 46 * 1.5));
+  ok('the rays see marble below', partAt(46 * 1.5, -0.5, 46 * 1.5).materialId, 'marble');
+  ok('glass in the middle', partAt(46 * 1.5, 0, 46 * 1.5).materialId, 'glass');
+  ok('and grass above', partAt(46 * 1.5, 0.5, 46 * 1.5).materialId, 'grass');
   const row = levelRows(serializeLevel()).blocks.find(b => b[0] === 46 && b[2] === 46);
-  ok('saved with its second material', JSON.stringify(row), '[46,0,46,"marble","halfBottom",null,"glass"]');
+  ok('saved part by part', JSON.stringify(row),
+     '[46,0,46,["marble","slab"],["glass","slab",null,null,3],["grass","slab",null,null,6]]');
   World.delete('46,0,46');
+  // Levels before v3 were halves.
+  ok('a dual half block: a slab, and the second material in the other two thirds',
+     JSON.stringify(legacyParts(['marble', 'halfBottom', null, 'glass'])),
+     '[["marble","slab"],["glass","slab",null,null,3],["glass","slab",null,null,6]]');
+  ok('a high half slope: a low slope on two slabs', JSON.stringify(legacyParts(['grass', 'halfSlopeHigh', 'W'])),
+     '[["grass","slab"],["grass","slab",null,null,3],["grass","slope","W","low",6]]');
+  ok('a vertical half: the pane at its side', JSON.stringify(legacyParts(['grass', 'halfVertical', 'N'])),
+     '[["grass","pane","S"]]');
 }
 
 section('slopes: planes, baked as staircases under them');
 {
   const slope = getBlock(29, 1, 27), half = getBlock(33, 1, 29), high = getBlock(32, 1, 29);
-  ok('a slope bakes as 11 steps (the first has no height)', blockBoxes(slope).length, 11);
-  ok('a half slope as 11', blockBoxes(half).length, 11);
-  ok('a high half slope as 12 (on its half block)', blockBoxes(high).length, 12);
+  const raised = tileParts(high).find(isSlope);
+  ok('a high slope bakes as 11 steps (the first has no height)', blockBoxes(slope).length, 11);
+  ok('a medium one as 11', blockBoxes(half).length, 11);
+  ok('a low one on two slabs as 13: two slabs and its 11', blockBoxes(high).length, 13);
+  const { partBoxes } = await import('../js/core/world.js');
   truthy('every step is one texel deep',
-    [slope, half, high].every(b => blockBoxes(b).every(q =>
+    [slope, half, raised].every(b => partBoxes(b).every(q =>
       Math.abs((q[1] - q[0]) * 12 - 1) < 1e-9 || Math.abs((q[5] - q[4]) * 12 - 1) < 1e-9)));
   // THE PLANE IS NEVER INSIDE ITS OWN STEPS: every step's top is at or under
   // the plane across its whole width, and meets it at its downhill edge.
-  const under = b => blockBoxes(b).every(q => {
+  const under = b => partBoxes(b).every(q => {
     const corners = [[q[0], q[4]], [q[1], q[4]], [q[0], q[5]], [q[1], q[5]]];
     const levels = corners.map(([x, z]) => slopeLevel(b, x, z));
     return levels.every(l => q[3] <= l + 1e-9) && levels.some(l => Math.abs(q[3] - l) < 1e-9);
   });
-  truthy('each step lies under the plane and touches it', [slope, half, high].every(under));
+  truthy('each step lies under the plane and touches it', [slope, half, raised].every(under));
   for (const facing of ['N', 'E', 'S', 'W']) {
-    const b = { materialId: 'grass', shape: 'slope', facing };
-    truthy(`... facing ${facing} too`, under(b));
+    for (const state of ['low', 'medium', 'high']) {
+      truthy(`... ${state}, facing ${facing} too`, under({ materialId: 'grass', shape: 'slope', state, facing }));
+    }
   }
   // Facing S climbs toward +z: the step at the +z edge is the tallest.
   const tall = blockBoxes(slope).reduce((a, b) => (b[3] > a[3] ? b : a));
   ok('facing S, the tallest step is at the +z edge', `${tall[4]},${tall[5]},${tall[3]}`, `${11 / 12},1,${11 / 12}`);
   // Drawn from its plane's top: the head is level with the next block's top.
-  ok('a slope spans its whole cell', blockSpan(slope).join(','), '0,1');
-  ok('a half slope the lower half', blockSpan(half).join(','), '0,0.5');
-  ok('a high half slope the whole cell', blockSpan(high).join(','), '0,1');
+  ok('a high slope spans its whole cell', blockSpan(slope).join(','), '0,1');
+  ok('a medium one the lower two thirds', blockSpan(half).map(v => Math.round(v * 3)).join(','), '0,2');
+  ok('a low one on two slabs the whole cell', blockSpan(high).join(','), '0,1');
   ok('the plane at the foot and head', `${slopeLevel(slope, 0.5, 0)},${slopeLevel(slope, 0.5, 1)}`, '0,1');
-  ok('a half slope\'s plane', `${slopeLevel(half, 1, 0.5)},${slopeLevel(half, 0, 0.5)}`, '0,0.5');
-  ok('a high half slope\'s plane', `${slopeLevel(high, 1, 0.5)},${slopeLevel(high, 0, 0.5)}`, '0.5,1');
+  ok('a medium slope\'s plane', [slopeLevel(half, 1, 0.5), slopeLevel(half, 0, 0.5)].map(v => Math.round(v * 3)).join(','), '0,2');
+  ok('the raised low one\'s', [slopeLevel(raised, 1, 0.5), slopeLevel(raised, 0, 0.5)].map(v => Math.round(v * 3)).join(','), '2,3');
   // Edges: the slope joins the ground at its foot and the platform at its head.
   ok('slope foot (toward -z) at ground level', edgeLevel(29, 1, 27, 0, -1), 1);
   ok('slope head (toward +z) at platform level', edgeLevel(29, 1, 27, 0, 1), 2);
@@ -195,10 +222,10 @@ section('slopes: planes, baked as staircases under them');
   ok('down the slope from the platform', stepLevel(29, 1, 28, 29, 27), 1);
   const up = findPath({x:29,y:0,z:22}, {x:29,y:1,z:30});
   truthy('a path up the slope', up.length > 0 && up.some(n => n.x === 29 && n.z === 27 && n.y === 1));
-  // The gentle ramp: ground (1) -> half slope (1 .. 1.5) -> high (1.5 .. 2) -> platform (2).
-  ok('half slope foot (east) at ground level', edgeLevel(33, 1, 29, 1, 0), 1);
-  ok('half slope head meets the high one', edgeLevel(33, 1, 29, -1, 0), edgeLevel(32, 1, 29, 1, 0));
-  ok('high half slope head at platform level', edgeLevel(32, 1, 29, -1, 0), 2);
+  // The gentle ramp: ground (1) -> medium slope (1 .. 1 2/3) -> low on two slabs (1 2/3 .. 2) -> platform (2).
+  ok('medium slope foot (east) at ground level', edgeLevel(33, 1, 29, 1, 0), 1);
+  near('its head meets the raised one\'s foot', edgeLevel(33, 1, 29, -1, 0), edgeLevel(32, 1, 29, 1, 0), 1e-9);
+  ok('the raised one\'s head at platform level', edgeLevel(32, 1, 29, -1, 0), 2);
   const ramp = findPath({x:35,y:0,z:29}, {x:30,y:1,z:29});
   truthy('a path up the gentle ramp',
     ramp.some(n => n.x === 33 && n.y === 1) && ramp.some(n => n.x === 32 && n.y === 1));
@@ -228,14 +255,14 @@ section('slopes: planes, baked as staircases under them');
   truthy('ground to slope to platform: no jump bigger than the walk', worst < 0.02);
 
   // followGround: a ledge is eased, a slope followed.
-  const sprite = { position: { x: 26 * B, y: 0.75, z: 29 * B }, userData: {} };
-  followGround(sprite, { x: 26, y: 0, z: 29 }, 1 / 60);
+  const sprite = { position: { x: 25 * B, y: 0.75, z: 29 * B }, userData: {} };
+  followGround(sprite, { x: 25, y: 0, z: 29 }, 1 / 60);
   ok('standing on the ground', sprite.position.y, 0.75);
-  sprite.position.x = 27 * B;                       // onto the half-bottom step
-  followGround(sprite, { x: 27, y: 1, z: 29 }, 1 / 60);
-  truthy('a ledge is not snapped', sprite.position.y < 1.4);
-  for (let i = 0; i < 60; i++) followGround(sprite, { x: 27, y: 1, z: 29 }, 1 / 60);
-  near('and is eased onto it', sprite.position.y, 1.5, 1e-3);
+  sprite.position.x = 26 * B;                       // onto the slab
+  followGround(sprite, { x: 26, y: 1, z: 29 }, 1 / 60);
+  truthy('a ledge is not snapped', sprite.position.y < 1.2);
+  for (let i = 0; i < 60; i++) followGround(sprite, { x: 26, y: 1, z: 29 }, 1 / 60);
+  near('and is eased onto it', sprite.position.y, 1.25, 1e-3);
 }
 
 section('entity occupancy is respected');
@@ -388,10 +415,10 @@ section('levels: the world as data');
   const saved = levelRows(serializeLevel());
   ok('its format', saved.format, LEVEL_FORMAT);
   ok('every block', saved.blocks.length, World.size);
-  ok('a slope keeps its shape and facing', JSON.stringify(saved.blocks.find(b => b[0] === 29 && b[1] === 1 && b[2] === 27)),
-     '[29,1,27,"grass","slope","S"]');
-  ok('a plain block is four numbers and a material', JSON.stringify(saved.blocks.find(b => b[0] === 0 && b[2] === 0)),
-     '[0,0,0,"grass"]');
+  ok('a slope keeps its shape, facing and state', JSON.stringify(saved.blocks.find(b => b[0] === 29 && b[1] === 1 && b[2] === 27)),
+     '[29,1,27,["grass","slope","S","high"]]');
+  ok('a plain block is three numbers and a part of a material', JSON.stringify(saved.blocks.find(b => b[0] === 0 && b[2] === 0)),
+     '[0,0,0,["grass"]]');
   ok('the models', JSON.stringify(saved.models),
      '[["decor_chair",6,0,8,1],["decor_wallTorch",19,2,11,0,"E"]]');
   // Round trip: through a .bxr, into an emptied world, and out again the same.
@@ -399,11 +426,12 @@ section('levels: the world as data');
   World.clear(); clearWorldModels();
   ok('loads with nothing missing', loadLevel(await decodeRegion(bytes), models).length, 0);
   ok('and saves back identically', JSON.stringify(levelRows(serializeLevel())), JSON.stringify(saved));
-  ok('a v1 level still loads', loadLevel({ ...saved, version: 1 }, models).length, 0);
-  ok('the same', JSON.stringify(levelRows(serializeLevel()).blocks), JSON.stringify(saved.blocks));
   truthy('the chair takes its tile again', !!occupantAt('6,0,8'));
   ok('the models bake again', ModelBoxes.length,
      models.get('decor_chair').cubes.length + models.get('decor_wallTorch').cubes.filter(c => !c.light).length);
+  ok('a v1 level still loads', loadLevel({ format: LEVEL_FORMAT, version: 1, blocks: [[0, 0, 0, 'grass', 'halfTop']] }, models).length, 0);
+  ok('its half a slab at the top of the tile', JSON.stringify(levelRows(serializeLevel()).blocks),
+     '[[0,0,0,["grass","slab",null,null,6]]]');
   ok('an unknown model is reported, not placed',
      JSON.stringify(loadLevel({ format: LEVEL_FORMAT, blocks: [[0, 0, 0, 'grass']], models: [['nope', 0, 0, 0, 0]] }, models)),
      '["nope"]');
@@ -420,33 +448,45 @@ section('levels: the world as data');
   falsy('removing it twice does nothing', removeWorldModel(c));
 
   ok('a full block has no shape', newBlock('grass', 'full', 'N').shape, undefined);
-  ok('only a slope keeps a facing', `${newBlock('grass', 'halfTop', 'N').facing},${newBlock('grass', 'slope', 'W').facing}`,
+  ok('only a shape that turns keeps a facing', `${newBlock('grass', 'slab', 'N').facing},${newBlock('grass', 'slope', 'W').facing}`,
      'undefined,W');
+  ok('a default state is left off', `${newBlock('grass', 'slope', 'W', 'low').state},${newBlock('grass', 'slope', 'W', 'high').state}`,
+     'undefined,high');
   createTestArea(36, 36);
 }
 
-section('stairs');
+section('steps');
 {
-  const { blockShape: shapeOf, hasFacing, isCompound, isSlope: slopeOf, groundHeightAt: ground } = await import('../js/core/world.js');
+  const { blockShape: shapeOf, isCompound, groundHeightAt: ground } = await import('../js/core/world.js');
   const lower = getBlock(18, 1, 12), upper = getBlock(19, 2, 12);
-  ok('marble stairs', `${lower.materialId},${shapeOf(lower)},${lower.facing}`, 'marble,stairs,E');
-  truthy('stairs turn', hasFacing('stairs'));
-  falsy('stairs are no slope plane', slopeOf(lower));
-  truthy('two boxes', isCompound(lower));
-  ok('facing E, the upper half is the +x half', JSON.stringify(blockBoxes(lower)[1]), '[0.5,1,0.5,1,0,1]');
-  ok('its foot (toward -x) at half height', edgeLevel(18, 1, 12, -1, 0), 1.5);
+  ok('marble steps', `${lower.materialId},${shapeOf(lower)},${lower.facing}`, 'marble,steps,E');
+  truthy('steps turn', hasFacing('steps'));
+  falsy('steps are no slope plane', isSlope(lower));
+  ok('three boxes', blockBoxes(lower).length, 3);
+  truthy('compound', isCompound(lower));
+  ok('facing E, the middle tread is the +x two thirds', JSON.stringify(blockBoxes(lower)[1].map(v => Math.round(v * 3))), '[1,3,1,2,0,3]');
+  near('its foot (toward -x) a third up', edgeLevel(18, 1, 12, -1, 0), 4 / 3, 1e-9);
   ok('its head at the top', edgeLevel(18, 1, 12, 1, 0), 2);
-  ok('onto the stairs from the ground', stepLevel(17, 0, 12, 18, 12), 1);
-  ok('onto the upper stairs', stepLevel(18, 1, 12, 19, 12), 2);
+  ok('onto the steps from the ground', stepLevel(17, 0, 12, 18, 12), 1);
+  ok('onto the upper steps', stepLevel(18, 1, 12, 19, 12), 2);
   ok('onto the wall top', stepLevel(19, 2, 12, 20, 12), 2);
   const up = findPath({ x: 12, y: 0, z: 12 }, { x: 20, y: 2, z: 10 });
-  truthy('a path up the stairs onto the wall', up.length > 0 && up.some(n => n.x === 19 && n.y === 2 && n.z === 12));
-  // The treads under a point: the downhill half at half height, the uphill at full.
+  truthy('a path up the steps onto the wall', up.length > 0 && up.some(n => n.x === 19 && n.y === 2 && n.z === 12));
+  // The tread under a point: a third, two thirds, the top.
   const B = 1.5;
-  ok('the lower tread', ground({ x: 18, y: 1, z: 12 }, 18 * B - 0.3, 12 * B), (1.5 - 0.5) * B);
-  ok('the upper tread', ground({ x: 18, y: 1, z: 12 }, 18 * B + 0.3, 12 * B), (2 - 0.5) * B);
-  truthy('solid under the upper tread', isSolidAt(18 * B + 0.3, 2.1, 12 * B));
-  falsy('air over the lower tread', isSolidAt(18 * B - 0.3, 2.1, 12 * B));
+  near('the lowest tread', ground({ x: 18, y: 1, z: 12 }, 18 * B - 0.5, 12 * B), (4 / 3 - 0.5) * B, 1e-9);
+  near('the middle tread', ground({ x: 18, y: 1, z: 12 }, 18 * B, 12 * B), (5 / 3 - 0.5) * B, 1e-9);
+  near('the top tread', ground({ x: 18, y: 1, z: 12 }, 18 * B + 0.6, 12 * B), (2 - 0.5) * B, 1e-9);
+  truthy('solid under the top tread', isSolidAt(18 * B + 0.6, 2.1, 12 * B));
+  falsy('air over the lowest tread', isSolidAt(18 * B - 0.5, 1.5, 12 * B));
+  // Its other states.
+  World.set('48,0,48', newBlock('marble', 'steps', 'E', 'two'));
+  ok('two steps: the floor at their foot', edgeLevel(48, 0, 48, -1, 0), 0);
+  near('their head two thirds up', edgeLevel(48, 0, 48, 1, 0), 2 / 3, 1e-9);
+  World.set('48,0,48', newBlock('marble', 'steps', 'E', 'flipped'));
+  ok('flipped: flat on top', `${edgeLevel(48, 0, 48, -1, 0)},${edgeLevel(48, 0, 48, 1, 0)}`, '1,1');
+  falsy('and open under its foot', isSolidAt(48 * B - 0.6, -0.5, 48 * B));
+  World.delete('48,0,48');
 }
 
 section('buried faces are not drawn');
@@ -456,29 +496,32 @@ section('buried faces are not drawn');
   const cells = new Map([['1,0,0', [full]], ['0,-1,0', [full]]]);
   const at = (x, y, z) => cells.get(`${x},${y},${z}`) || [];
   ok('+x and -y buried, the rest drawn', exposedFaceMask(0, 0, 0, full, false, at), ALL_FACES & ~1 & ~8);
-  ok('a half block\'s top is inside its cell: drawn', exposedFaceMask(0, 0, 0, [0, 1, 0, 0.5, 0, 1], false,
+  ok('a slab\'s top is inside its cell: drawn', exposedFaceMask(0, 0, 0, [0, 1, 0, 1 / 3, 0, 1], false,
      () => [full]) & 4, 4);
   ok('a slope\'s top (its plane) is never buried', exposedFaceMask(0, 0, 0, full, true, () => [full]) & 4, 4);
   ok('nothing around: all drawn', exposedFaceMask(0, 0, 0, full, false, () => []), ALL_FACES);
   ok('glass hides nothing', opaqueBoxes({ materialId: 'glass' }).length, 0);
   ok('a slope hides only with its floor', JSON.stringify(opaqueBoxes({ materialId: 'grass', shape: 'slope', facing: 'E' })), '[[0,1,0,0,0,1]]');
+  ok('a raised slope hides with its floor where it starts',
+     JSON.stringify(opaqueBoxes(newBlock('grass', 'slope', 'E', 'low', 6)).map(b => b.map(v => Math.round(v * 3)))), '[[0,3,2,2,0,3]]');
   // Shapes against shapes.
-  const half = opaqueBoxes({ materialId: 'grass', shape: 'halfBottom' })[0];
+  const half = opaqueBoxes(newBlock('grass', 'slab'))[0];
   const nb = new Map([['1,0,0', [half]], ['0,1,0', [half]]]);
   const atH = (x, y, z) => nb.get(`${x},${y},${z}`) || [];
-  ok('two low halves side by side: the face between is buried', exposedFaceMask(0, 0, 0, half, false, atH) & 1, 0);
-  ok('a full block beside a low half: its side is drawn (half covered)', exposedFaceMask(0, 0, 0, full, false, atH) & 1, 1);
-  const paneE = opaqueBoxes({ materialId: 'grass', shape: 'middleVertical', facing: 'E' })[0];
-  const paneW = opaqueBoxes({ materialId: 'grass', shape: 'middleVertical', facing: 'W' })[0];
+  ok('two slabs side by side: the face between is buried', exposedFaceMask(0, 0, 0, half, false, atH) & 1, 0);
+  ok('a full block beside a slab: its side is drawn (partly covered)', exposedFaceMask(0, 0, 0, full, false, atH) & 1, 1);
+  const paneE = opaqueBoxes(newBlock('grass', 'pane', 'E', null, 1))[0];
+  const paneW = opaqueBoxes(newBlock('grass', 'pane', 'W', null, 1))[0];
   ok('a pane turned W lands on the same planes as E', paneW.join(), paneE.join());
   ok('a row of panes hides the faces between', exposedFaceMask(0, 0, 0, paneE, false, (x, y, z) => (z === 1 ? [paneW] : [])) & 16, 0);
-  const stairs = opaqueBoxes({ materialId: 'grass', shape: 'stairs', facing: 'E' });
-  ok('stairs: the upper step\'s underside on the lower is buried', exposedFaceMask(0, 0, 0, stairs[1], false, () => stairs) & 8, 0);
-  ok('the lower step\'s top is drawn where the upper does not cover it', exposedFaceMask(0, 0, 0, stairs[0], false, () => stairs) & 4, 4);
-  const dual = { materialId: 'grass', shape: 'halfBottom', second: 'glass' };
-  ok('a dual with glass: only its opaque half hides', opaqueBoxes(dual).length, 1);
-  ok('its glass half\'s underside on the opaque half is buried',
-     exposedFaceMask(0, 0, 0, [0, 1, 0.5, 1, 0, 1], false, () => opaqueBoxes(dual)) & 8, 0);
-  ok('its opaque half\'s top under the glass is drawn', exposedFaceMask(0, 0, 0, half, false, () => opaqueBoxes(dual)) & 4, 4);
+  const steps = opaqueBoxes(newBlock('grass', 'steps', 'E'));
+  ok('steps: a tread\'s underside on the one below is buried', exposedFaceMask(0, 0, 0, steps[1], false, () => steps) & 8, 0);
+  ok('the lowest tread\'s top is drawn where the next does not cover it', exposedFaceMask(0, 0, 0, steps[0], false, () => steps) & 4, 4);
+  const stack = newBlock('grass', 'slab', null, null, 0, [{ materialId: 'glass', shape: 'slab', at: 3 }]);
+  const glassSlab = tileParts(stack).map(p => blockBoxes(p))[1];
+  ok('a stack with glass: only its opaque part hides', opaqueBoxes(stack).length, 1);
+  ok('the glass slab\'s underside on the opaque one is buried',
+     exposedFaceMask(0, 0, 0, glassSlab ? opaqueBoxes(newBlock('grass', 'slab', null, null, 3))[0] : [], false, () => opaqueBoxes(stack)) & 8, 0);
+  ok('the opaque slab\'s top under the glass is drawn', exposedFaceMask(0, 0, 0, half, false, () => opaqueBoxes(stack)) & 4, 4);
 }
 

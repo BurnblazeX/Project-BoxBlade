@@ -3,8 +3,7 @@ import { attribute, texture, uv, mix, vec3, vec4, uniform, select, Fn, floor, no
 import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL,
          terrainAlbedoTSL } from '../gpu/terrain.js';
 import { applyOcclusionMask, outsideShadeTSL } from '../gpu/occlusion.js';
-import { World, BLOCK_METRES, blockBoxes, blockSpan, isSlope, blockShape, blockFacing, getVoxelKey,
-         isDual, blockParts,
+import { World, BLOCK_METRES, isSlope, partShape, partFacing, partBoxes, partSpan, slopeKind, tileParts, getVoxelKey,
          WorldModels, Y_MIN, CHUNK_HEIGHT, exposedFaceMask, opaqueBoxes } from '../core/world.js';
 import { MODELS, TREE_MODELS, TERRAIN_LAYERS } from '../core/models.js';
 import { lightColourOf, bakeFaces, modelInstanceData, buildModelHits, modelFaceMasks, MODEL_HIT_VEC4S, MODEL_HIT_RECORD } from '../core/bbmodel.js';
@@ -12,7 +11,7 @@ import { VOXEL_METRES } from '../core/field.js';
 import { MATERIALS, BLOCK_TEXELS, DEFAULT_SPECULAR, materialLayer, isGlassMaterial,
          MATERIAL_LAYERS, SLOPE_SUFFIXES } from '../core/materials.js';
 import { terrainNormals } from '../core/normals.js';
-import { enteredBoxes, ringRuns, writeVolumeBox } from '../core/blockvolume.js';
+import { enteredBoxes, ringRuns, writeVolumeBox, VOLUME_SLOTS } from '../core/blockvolume.js';
 import { followWindow, worldBlockBounds } from '../core/follow.js';
 import { blocksIn } from '../core/chunks.js';
 
@@ -92,29 +91,26 @@ export const terrainTextures = {
 // A slope is SEEN as a plane (world.js BLOCK_SHAPES; the field holds its
 // steps). It is one instance of the terrain box over the slope's span, with
 // the top face's downhill edge dropped by the rise, so the top face IS the
-// plane; the downhill face collapses (or, on a high half slope, is left at
-// half height) and the sides become its profile. Per instance, blockSlope:
-// 0 for any other block, else kind * 4 + facing - kind 1 slope, 2 half
-// slope, 3 high half slope; facing 0 N, 1 E, 2 S, 3 W (uphill).
-const SLOPE_KIND = { slope: 1, halfSlope: 2, halfSlopeHigh: 3 };
+// plane; the downhill face collapses and the sides become its profile. Per
+// instance, blockSlope: 0 for any other part, else kind * 4 + facing - kind
+// 1 + world.js slopeKind (by rise and Grid height: SLOPE_KINDS); facing 0 N,
+// 1 E, 2 S, 3 W (uphill).
 const FACING_INDEX = { N: 0, E: 1, S: 2, W: 3 };
-export function slopeCode(block) {
-  if (!isSlope(block)) return 0;
-  return SLOPE_KIND[blockShape(block)] * 4 + FACING_INDEX[blockFacing(block)];
+export function slopeCode(part) {
+  if (!isSlope(part)) return 0;
+  return (slopeKind(part) + 1) * 4 + FACING_INDEX[partFacing(part)];
 }
 
-// The instances a block draws: its boxes (one, unless it is a slope), or for
-// a slope one box over its span, which terrainShapeTSL makes the plane.
-export function drawnBoxes(block) {
-  if (!isSlope(block)) return blockBoxes(block);
-  const [lo, hi] = blockSpan(block);
+// The instances a part draws: its boxes, or for a slope one box over its
+// span, which terrainShapeTSL makes the plane.
+export function drawnBoxes(part) {
+  if (!isSlope(part)) return partBoxes(part);
+  const [lo, hi] = partSpan(part);
   return [[0, 1, lo, hi, 0, 1]];
 }
-// Per material part (world.js blockParts): a dual block draws each half with
-// its own material.
+// Part by part (world.js blockParts), each with its own material.
 function drawnParts(block) {
-  if (!isDual(block)) return [{ materialId: block.materialId, boxes: drawnBoxes(block) }];
-  return blockParts(block);
+  return tileParts(block).map(part => ({ materialId: part.materialId, part, boxes: drawnBoxes(part) }));
 }
 
 
@@ -290,18 +286,16 @@ async function loadFaceLayers(m, layer) {
 // in it and it never moves; a bigger one recentres when the player leaves the
 // window's middle half (followBlockVolume), so a region can be any size. 128
 // is enough: rays never leave C2 (+-24 blocks) and the screen spans about
-// +-17. The sky-top map shares its footprint. Per block:
-//   a block       R layer + 1 (its side), G its top layer, B its bottom, A its
-//                 shape code (world.js shapeCode: a slope's is slopeCode's,
-//                 so the split kernels read it as before; a half's or a
-//                 pane's gives the box the glass walk steps to);
-//   a model cell  R 0 (air to the walk through glass, which ignores models),
-//                 G + 256 B its cell in modelHits, A the model's GI entry + 1
-//                 (models.js giIndex);
-//   air           all 0.
-// A dual block (world.js isDual) adds 128 to A, and its other half's R, G, B
-// sit BLOCK_VOLUME_SIZE[2] further along z, in the second half of the
-// texture (dims) - one binding for both (gpu/volume.js volumeAtTSL).
+// +-17. The sky-top map shares its footprint. Per tile, a slot a part
+// (core/blockvolume.js VOLUME_SLOTS), each BLOCK_VOLUME_SIZE[2] further along
+// z in the texture (dims) - one binding for all (gpu/volume.js volumeAtTSL):
+//   a part        R layer + 1 (its side), G its top layer, B its bottom, A its
+//                 shape code (world.js shapeCode: the box the rays and the
+//                 glass walk take, or a slope's plane);
+//   a model       in the first slot no part takes: R 0 (air to the walk
+//                 through glass, which ignores models), G + 256 B its cell in
+//                 modelHits, A the model's GI entry + 1 (models.js giIndex);
+//   nothing       all 0.
 // x and z are a ring (core/blockvolume.js): a block sits at its coordinates
 // mod the size wherever the window is, so a move writes and uploads only the
 // strips that slid in.
@@ -343,7 +337,7 @@ let volumeHits = null;   // the model hit table of the last full build
 const blockVolumeView = () => ({ data: terrainTextures.blocks.tex.image.data,
                                  skyTop: terrainTextures.skyTop.image.data,
                                  lo: blockVolumeOrigin, size: BLOCK_VOLUME_SIZE });
-// The boxes' cells, both halves, straight into the live texture: one
+// The boxes' cells, every slot, straight into the live texture: one
 // queue.writeTexture per run of the ring (the shadow field's way, gpu/field.js
 // commitShadowGrid) - a strip of 8 blocks is 0.4 MB, not 6.
 let volumeStripBuf = new Uint8Array(0);
@@ -356,7 +350,7 @@ function uploadVolumeBoxes(renderer, tex, boxes) {
   for (const [x0, x1, z0, z1] of boxes) {
     for (const [pa, pb] of ringRuns(x0, x1, sx)) {
       for (const [qa, qb] of ringRuns(z0, z1, sz)) {
-        for (const half of [0, sz]) {
+        for (let half = 0; half < sz * VOLUME_SLOTS; half += sz) {
           const w = pb - pa + 1, d = qb - qa + 1, row = w * 4;
           if (volumeStripBuf.length < row * sy * d) volumeStripBuf = new Uint8Array(row * sy * d);
           let o = 0;
@@ -382,7 +376,8 @@ function buildBlockVolume(remeasure = true) {
   const lo = blockVolumeOrigin, size = BLOCK_VOLUME_SIZE;
   let v = terrainTextures.blocks;
   if (!v) {
-    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 8), size[0], size[1], size[2] * 2);
+    const tex = new THREE.Data3DTexture(new Uint8Array(size[0] * size[1] * size[2] * 4 * VOLUME_SLOTS),
+                                        size[0], size[1], size[2] * VOLUME_SLOTS);
     tex.format = THREE.RGBAFormat;
     tex.type = THREE.UnsignedByteType;
     tex.minFilter = tex.magFilter = THREE.NearestFilter;
@@ -393,7 +388,7 @@ function buildBlockVolume(remeasure = true) {
       tex,
       origin: uniform(new THREE.Vector3(...lo)),   // moves with the window (followBlockVolume)
       size: uniform(new THREE.Vector3(...size)),
-      dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * 2))   // the texture's own
+      dims: uniform(new THREE.Vector3(size[0], size[1], size[2] * VOLUME_SLOTS))   // the texture's own
     };
     // Two bytes a column, the sky-top code's low and high (core/skytop.js).
     const top = new THREE.DataTexture(new Uint8Array(size[0] * size[2] * 2), size[0], size[2],
@@ -410,7 +405,12 @@ function buildBlockVolume(remeasure = true) {
   v.origin.value.set(...lo);
   v.tex.image.data.fill(0);
   terrainTextures.skyTop.image.data.fill(0);
-  const hits = volumeHits = buildModelHits(WorldModels, key => World.has(key));
+  // A model's cubes in a tile with parts (a chair on a slab) are found too;
+  // not in a tile a full block fills, nor one whose slots the parts all take.
+  const hits = volumeHits = buildModelHits(WorldModels, key => {
+    const parts = tileParts(World.get(key));
+    return parts.length >= VOLUME_SLOTS || (parts.length === 1 && partShape(parts[0]) === 'full');
+  });
   if (hits.overflow) console.warn(`[terrain] model hit table full (${MODEL_HIT_VEC4S} vec4): some model cubes reflect as air`);
   writeVolumeBox(blockVolumeView(), World, hits, [lo[0], lo[0] + size[0] - 1, lo[2], lo[2] + size[2] - 1], true);
   terrainTextures.skyTop.needsUpdate = true;
@@ -767,7 +767,6 @@ function fillInstances() {
     if (!b) hiding.set(key, b = opaqueBoxes(World.get(key)));
     return b;
   };
-  const slopeKind = { slope: 0, halfSlope: 1, halfSlopeHigh: 1 };
   let i = 0, glassCount = 0;
   // Every SOLID block renders, not just standable ones: walls, pillars and the
   // underground layers are all real geometry that the lighting work needs to
@@ -777,10 +776,10 @@ function fillInstances() {
     // index -> key so a raycast hit (which reports only an instanceId) can be
     // resolved back to the block that was clicked.
     const ids = [];
-    const slope = slopeCode(block);
     const [bx, by, bz] = key.split(',').map(Number);
     let anyGlass = false;
-    drawnParts(block).forEach(({ materialId, boxes }, part) => {
+    drawnParts(block).forEach(({ materialId, part: p, boxes }, part) => {
+      const slope = slopeCode(p);
       const layer = materialLayer(materialId);
       const glass = isGlassMaterial(materialId);
       anyGlass = anyGlass || glass;
@@ -794,9 +793,10 @@ function fillInstances() {
         t.glassFlags.setX(i, (glass ? 1 : 0) + 2 * exposedFaceMask(bx, by, bz, box, !!slope, boxesAt));
         t.slopes.setX(i, slope);
         // A block's modelInfo (w 0): its slope plane's first layer + 1 (0: the
-        // side stretched), its top and bottom layers (terrainSurfaceTSL).
+        // side stretched), its top and bottom layers (terrainSurfaceTSL). A
+        // high slope takes the slope plane, the gentler ones the half plane.
         const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1] };
-        const sk = slope ? slopeKind[blockShape(block)] : null;
+        const sk = slope ? (slopeKind(p) === 0 ? 0 : 1) : null;
         t.modelAttrs[0].setXYZW(i, sk == null ? 0 : f.slope[sk] + 1, f.top, f.bottom, 0);
         for (let k = 1; k < 4; k++) t.modelAttrs[k].setXYZW(i, ...zero4);
         i++;

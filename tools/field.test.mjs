@@ -309,55 +309,57 @@ ok('and 4 at C1', cascadeRangeVoxels(1), 4);
           g1.occupiedCount / g0.occupiedCount, 0.1, 0.16);
 }
 
-section('half blocks bake over their own span');
+section('slabs bake over their own span');
 {
   createTestArea(12, 12);
-  const put = (x, y, z, shape) => World.set(getVoxelKey(x, y, z), { ...solid(), shape });
-  put(3, 1, 3, 'halfBottom');
-  put(5, 1, 3, 'halfTop');
-  put(7, 1, 3, 'halfBottom');
-  put(7, 2, 3, undefined);          // a full block over a half-bottom's gap
+  const put = (x, y, z, shape, at) => World.set(getVoxelKey(x, y, z), { ...solid(), shape, at });
+  put(3, 1, 3, 'slab');
+  put(5, 1, 3, 'slab', 6);
+  put(7, 1, 3, 'slab');
+  put(7, 2, 3, undefined);          // a full block over a slab's gap
   const h = createField(0, 0);
   // Block y 1 is vy 48..59; x 3 is vx 36..47, x 5 60..71, x 7 84..95; z 3 is 36..47.
-  truthy('a half-bottom fills its lower six voxels', isOccupied(h, 40, 48, 40) && isOccupied(h, 40, 53, 40));
-  falsy('and not its upper six', isOccupied(h, 40, 54, 40) || isOccupied(h, 40, 59, 40));
-  truthy('a half-top fills its upper six', isOccupied(h, 64, 54, 40) && isOccupied(h, 64, 59, 40));
-  falsy('and not its lower six', isOccupied(h, 64, 48, 40) || isOccupied(h, 64, 53, 40));
-  truthy('a full block over a half-bottom fills all of itself (unsupported underside kept)',
+  truthy('a slab fills its lower four voxels', isOccupied(h, 40, 48, 40) && isOccupied(h, 40, 51, 40));
+  falsy('and not the eight above', isOccupied(h, 40, 53, 40) || isOccupied(h, 40, 59, 40));
+  truthy('a slab at the top fills its upper four', isOccupied(h, 64, 56, 40) && isOccupied(h, 64, 59, 40));
+  falsy('and not the eight under', isOccupied(h, 64, 48, 40) || isOccupied(h, 64, 54, 40));
+  truthy('a full block over a slab fills all of itself (unsupported underside kept)',
          isOccupied(h, 88, 60, 40) && isOccupied(h, 88, 71, 40));
   falsy('the gap between them is air', isOccupied(h, 88, 55, 40));
 }
 
-section('vertical halves and panes bake across x and z');
+section('panes bake across x and z');
 {
   createTestArea(12, 12);
-  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfVertical', facing: 'E' });
-  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'middleVertical', facing: 'S' });
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'pane', facing: 'E', at: 2 });
+  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'pane', facing: 'S', at: 9 });
   const h = createField(0, 0);
   // x 3 is vx 36..47, x 5 60..71; y 1 is vy 48..59; z 3 is vz 36..47.
-  truthy('a vertical half facing E fills its east six voxels, full height',
-         isOccupied(h, 42, 48, 40) && isOccupied(h, 47, 59, 40));
-  falsy('and not its west six', isOccupied(h, 36, 54, 40) || isOccupied(h, 41, 54, 40));
+  truthy('a pane facing E at the east side fills its east four voxels, full height',
+         isOccupied(h, 44, 48, 40) && isOccupied(h, 47, 59, 40));
+  falsy('and not the eight west of it', isOccupied(h, 36, 54, 40) || isOccupied(h, 42, 54, 40));
   truthy('a pane facing S fills vz 40..43 across the cell', isOccupied(h, 60, 54, 40) && isOccupied(h, 71, 54, 43));
   falsy('and nothing either side of it', isOccupied(h, 64, 54, 39) || isOccupied(h, 64, 54, 44));
 }
 
-section('dual blocks bake each half in its own channel');
+section('stacks bake each part in its own channel');
 {
   const { glassDistanceAt } = await import('../js/core/field.js');
   createTestArea(12, 12);
-  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'halfBottom', second: 'glass' });
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'slab', more: [{ materialId: 'glass', shape: 'slab', at: 3 }] });
   const h = createField(0, 0);
-  truthy('the low half is opaque', isOccupied(h, 40, 50, 40));
-  falsy('the high half is not', isOccupied(h, 40, 57, 40));
-  truthy('it is glass', glassDistanceAt(h, 40, 57, 40) < 0);
+  truthy('the low slab is opaque', isOccupied(h, 40, 50, 40));
+  falsy('the glass one on it is not', isOccupied(h, 40, 54, 40));
+  truthy('it is glass', glassDistanceAt(h, 40, 54, 40) < 0);
+  falsy('and nothing over them', glassDistanceAt(h, 40, 58, 40) < 0 || isOccupied(h, 40, 58, 40));
 }
 
 section('slopes bake as staircases under their plane');
 {
   createTestArea(12, 12);
-  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'slope', facing: 'E' });
-  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'halfSlopeHigh', facing: 'W' });
+  World.set(getVoxelKey(3, 1, 3), { ...solid(), shape: 'slope', state: 'high', facing: 'E' });
+  World.set(getVoxelKey(5, 1, 3), { ...solid(), shape: 'slope', state: 'low', facing: 'W', at: 6,
+                                    more: [{ shape: 'slab' }, { shape: 'slab', at: 3 }] });
   const h = createField(0, 0);
   // x 3 is vx 36..47, y 1 is vy 48..59, z 3 is 36..47. Facing E: column k
   // (vx 36 + k) is solid up to the plane at its downhill edge, k voxels.
@@ -365,11 +367,11 @@ section('slopes bake as staircases under their plane');
   truthy('the second is one voxel', isOccupied(h, 37, 48, 40) && !isOccupied(h, 37, 49, 40));
   truthy('the sixth is five', isOccupied(h, 41, 52, 40) && !isOccupied(h, 41, 53, 40));
   truthy('the last is eleven', isOccupied(h, 47, 58, 40) && !isOccupied(h, 47, 59, 40));
-  // A high half slope facing W: its x = 5 cell (vx 60..71) rises toward -x,
-  // from half a block (vy 54) at the east edge to a whole one at the west.
-  truthy('its base half is solid across', isOccupied(h, 71, 53, 40) && isOccupied(h, 60, 53, 40));
-  falsy('nothing above its base at the east edge', isOccupied(h, 71, 54, 40));
-  truthy('at the west edge, 5.5 voxels over the base', isOccupied(h, 60, 58, 40));
+  // A low slope on two slabs facing W: its x = 5 cell (vx 60..71) rises
+  // toward -x, from two thirds (vy 56) at the east edge to a whole one at the west.
+  truthy('its two slabs are solid across', isOccupied(h, 71, 55, 40) && isOccupied(h, 60, 55, 40));
+  falsy('nothing above them at the east edge', isOccupied(h, 71, 56, 40));
+  truthy('at the west edge, 3.7 voxels over them', isOccupied(h, 60, 58, 40));
 }
 
 section('placed models bake as their cubes');

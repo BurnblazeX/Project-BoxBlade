@@ -1,6 +1,6 @@
 import { file, section, ok, truthy, throws, note } from './lib/harness.mjs';
 import { readFileSync } from 'node:fs';
-import { migrateLevel, levelRows, packRegion, unpackRegion, encodeRegion, decodeRegion,
+import { migrateLevel, levelRows, packRegion, unpackRegion, encodeRegion, decodeRegion, legacyParts,
          LEVEL_FORMAT, LEVEL_VERSION } from '../js/core/region.js';
 import { World, Region, newBlock, serializeLevel, loadLevel, clearWorldModels, Y_MIN, Y_MAX,
          CHUNK_SIZE } from '../js/core/world.js';
@@ -15,16 +15,18 @@ const v1 = {
   models: [['decor_chair', 0, 0, 0, 1]]
 };
 const sorted = rows => rows.map(r => JSON.stringify(r)).sort().join(' ');
+// v1's rows as v3 holds them: halves made parts on the Grid.
+const parts = sorted(v1.blocks.map(([x, y, z, ...t]) => [x, y, z, ...legacyParts(t)]));
 
 section('v1 levels migrate');
 {
   const level = migrateLevel(v1, shape);
-  ok('to version 2', level.version, LEVEL_VERSION);
+  ok('to version 3', level.version, LEVEL_VERSION);
   ok('bounds from the blocks', JSON.stringify(level.region.bounds), '[-1,30,-13,5]');
   ok('no spawns, no exits', JSON.stringify([level.spawns, level.exits]), '[{},[]]');
   ok('a palette of the kinds of block, 0 empty', level.palette.length, 5);
   ok('a chunk per column of chunks used', level.chunks.length, 3);
-  ok('every row comes back', sorted(levelRows(level).blocks), sorted(v1.blocks));
+  ok('every row comes back, in parts', sorted(levelRows(level).blocks), parts);
   ok('the models kept', JSON.stringify(level.models), JSON.stringify(v1.models));
   throws('a block outside the vertical range is refused',
          () => migrateLevel({ format: LEVEL_FORMAT, blocks: [[0, Y_MAX + 1, 0, 'grass']] }, shape));
@@ -40,10 +42,10 @@ section('bytes: packed, gzipped and back');
   ok('the header comes back', JSON.stringify([back.region, back.spawns, back.exits, back.models]),
      JSON.stringify([level.region, level.spawns, level.exits, level.models]));
   ok('authored bounds wider than the blocks are kept', JSON.stringify(back.region.bounds), '[-20,40,-20,40]');
-  ok('the blocks come back', sorted(levelRows(back).blocks), sorted(v1.blocks));
+  ok('the blocks come back', sorted(levelRows(back).blocks), parts);
   const gz = await encodeRegion(level);
   ok('a .bxr is gzip', gz[0] === 0x1f && gz[1] === 0x8b, true);
-  ok('and decodes to the same', sorted(levelRows(await decodeRegion(gz)).blocks), sorted(v1.blocks));
+  ok('and decodes to the same', sorted(levelRows(await decodeRegion(gz)).blocks), parts);
   ok('bytes already inflated are read as they are', (await decodeRegion(packRegion(level))).chunks.length, level.chunks.length);
   throws('a file that is not a region is refused', () => unpackRegion(new TextEncoder().encode('{"format":"x"}')));
   const bad = packRegion(level);
@@ -57,7 +59,7 @@ section('another chunk shape converts');
   ok('chunked at 16', level.chunk.size, 16);
   const back = migrateLevel(level, shape);
   ok('and back to the world\'s', back.chunk.size, CHUNK_SIZE);
-  ok('the same blocks', sorted(levelRows(back).blocks), sorted(v1.blocks));
+  ok('the same blocks', sorted(levelRows(back).blocks), parts);
 }
 
 section('the world: saved and loaded through a .bxr');
@@ -69,7 +71,11 @@ section('the world: saved and loaded through a .bxr');
   ok('every block in the world', World.size, v1.blocks.length);
   ok('a slope keeps its shape and facing', JSON.stringify([World.getAt(30, Y_MAX, 5).shape, World.getAt(30, Y_MAX, 5).facing]),
      '["slope","S"]');
-  ok('a dual block its second material', World.getAt(5, 1, 5).second, 'glass');
+  ok('a dual block a slab and two of its second material', World.getAt(5, 1, 5).more.map(p => p.materialId).join(), 'glass,glass');
+  const v2 = { ...migrateLevel(v1, shape), version: 2 };
+  v2.palette = [null, ...v1.blocks.map(([, , , ...t]) => t)];
+  ok('a v2 palette in memory is made parts too', JSON.stringify(migrateLevel(v2, shape).palette[5]),
+     JSON.stringify(legacyParts(v1.blocks[4].slice(3))));
   World.set('60,0,60', newBlock('grass'));
   const saved = serializeLevel();
   ok('bounds grow to a block placed outside them', JSON.stringify(saved.region.bounds), '[-1,60,-13,60]');

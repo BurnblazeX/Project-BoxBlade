@@ -4,13 +4,13 @@ import { withLeavesTSL, leafLightTSL } from './leafvolume.js';
 import { Fn, If, Loop, Break, float, vec3, uniform, instanceIndex, positionWorld, normalWorld, floor, max, texture, uv, abs, vec2, vec4, ivec2, min, normalize, clamp, sin, smoothstep, length, int, select, textureSize, mix, step, modelWorldMatrix, frontFacing, sign, sqrt, fract, cameraPosition, pow, round, reflect, refract, textureLoad, uint, bitOr, shiftLeft, atomicMax, atomicMin, atomicStore, atomicAdd, packHalf2x16, unpackHalf2x16, uvec4 } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES, GLASS_WALK_NUDGE } from '../core/field.js';
 import { SUN_ANGULAR_SIZE } from '../core/sun.js';
-import { BLOCK_METRES } from '../core/world.js';
+import { BLOCK_METRES, SLOPE_CODE_BASE } from '../core/world.js';
 import { terrainSampleTSL, terrainWhite, axisNormalTSL, blockFaceTSL as boxFaceTSL, texelLockTSL, terrainSurfaceTSL, surfaceBumpTSL, terrainTexelTSL, slopeFromCodeTSL, slopePlaneTSL } from './terrain.js';
 import { layout } from './layout.js';
 import { SURFACE_BIAS_VOXELS } from './field.js';
 import { GLASS_LAYERS, GLASS_MAX_BOUNCES, GLASS_WALK_STEPS, glassInReflectionTSL } from './glass.js';
 import { createReflectTraceTSL, giTraceHitTSL } from './trace.js';
-import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, isGlassCodeTSL, partAtTSL, skyOpenTSL } from './volume.js';
+import { blockFaceTSL, blockLayerTSL, blockVolumeTSL, volumeAtTSL, hitSurfaceTSL, hitTexelTSL, inHitBoundsTSL, isGlassCodeTSL, partAtTSL, skyOpenTSL } from './volume.js';
 import { boxBumpedNormalTSL, labNormalTSL } from './normals.js';
 import { NO_SKIP, createCardHitTSL } from './cards.js';
 import { skyShTSL, sunColourUniform } from './sky.js';
@@ -1090,8 +1090,8 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       }
       const p = s.xyz.toVar();
       const slope = floor(abs(s.w).sub(float(TEXEL_ID_OFFSET)).div(float(2097152))).greaterThan(float(5.5)).toVar();
-      const vol = blockVolumeTSL(terrain, round(p.div(float(BLOCK_METRES)))).toVar();
-      const sl = slopeFromCodeTSL(vol.w);
+      const vol = volumeAtTSL(terrain, round(p.div(float(BLOCK_METRES))), p).toVar();   // the slope's part: its code less the base, as blockSlope's
+      const sl = slopeFromCodeTSL(max(vol.w.sub(float(SLOPE_CODE_BASE - 4)), float(0)));
       const n = select(slope, sl.n, faceNormal(abs(s.w))).toVar();
       return { p, n, slope, sl, vol };
     };
