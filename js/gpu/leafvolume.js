@@ -39,8 +39,8 @@
 //            leaves, as spell smoke's since 2026-10-30), the sky where it is
 //            open; times the leaves' bounce colour (u.albedo).
 import * as THREE from 'three/webgpu';
-import { Fn, If, Loop, float, vec3, vec4, int, uvec3, uniform, instanceIndex, texture3D, textureStore, storage,
-         exp, floor, ceil, select, clamp, max, min } from 'three/tsl';
+import { Fn, If, Loop, Break, float, vec3, vec4, int, uvec3, uniform, instanceIndex, texture3D, textureStore, storage,
+         exp, floor, ceil, select, clamp, max, min, step, abs } from 'three/tsl';
 import { BOX_METRES } from '../core/boxgrid.js';
 import { layout } from './layout.js';
 import { sunMapFarTSL } from './sunmap.js';
@@ -49,8 +49,11 @@ import { skyOpenTSL } from './volume.js';
 
 export const LEAF_DIMS = [128, 64, 128];
 export const LEAF_ID_BITS = 18;
-// Boxes a march takes toward the sun (12 m), and each sky march (6 m).
-const STEPS = 24, SKY_STEPS = 12;
+// Boxes each sky march takes (6 m). The sun march runs on to where it leaves
+// the leaves' bounds - the length of a canopy's shadow - at most the window's
+// diagonal; it reruns only when the leaves change or the sun turns.
+const SKY_STEPS = 12;
+const SUN_STEPS = Math.ceil(Math.hypot(...LEAF_DIMS));
 
 function createLeafVolume() {
   const [X, Y, Z] = LEAF_DIMS;
@@ -82,10 +85,31 @@ function createLeafVolume() {
   const at = c => texture3D(density, c.add(0.5).div(dims)).level(0).r;
   const inside = c => c.x.greaterThanEqual(0).and(c.y.greaterThanEqual(0)).and(c.z.greaterThanEqual(0))
     .and(c.x.lessThan(float(X))).and(c.y.lessThan(float(Y))).and(c.z.lessThan(float(Z)));
-  const march = (c, d, steps = STEPS) => {
+  const march = (c, d, steps) => {
     const tau = float(0).toVar();
     Loop({ start: int(1), end: int(steps + 1), type: 'int', condition: '<', name: 'lvs' }, ({ lvs }) => {
       const q = floor(c.add(0.5).add(d.mul(float(lvs)))).toVar();
+      If(inside(q), () => { tau.addAssign(at(q)); });
+    });
+    return exp(tau.mul(u.strength).negate());
+  };
+  // Toward the sun, at the same points as a box-a-step march from c, but only
+  // the steps inside the leaves' bounds (cell coordinates, the margin already
+  // round them): from where the ray enters them to where it leaves.
+  const sunMarch = (c, d) => {
+    const x0 = c.add(0.5).toVar();
+    const bLo = u.lo.div(float(BOX_METRES)).sub(u.origin), bHi = u.hi.div(float(BOX_METRES)).sub(u.origin).add(1);
+    // An axis the ray runs along: nudged off zero, so its slab is all or nothing.
+    const inv = vec3(1, 1, 1).div(d.add(step(abs(d), vec3(1e-6, 1e-6, 1e-6)).mul(1e-6))).toVar();
+    const ta = bLo.sub(x0).mul(inv), tb = bHi.sub(x0).mul(inv);
+    const tn = min(ta, tb), tx = max(ta, tb);
+    const s0 = max(floor(max(max(tn.x, tn.y), tn.z)), float(1)).toVar();
+    const s1 = min(ceil(min(min(tx.x, tx.y), tx.z)), float(SUN_STEPS)).toVar();
+    const tau = float(0).toVar();
+    Loop({ start: int(0), end: int(SUN_STEPS), type: 'int', condition: '<', name: 'lss' }, ({ lss }) => {
+      const s = s0.add(float(lss)).toVar();
+      If(s.greaterThan(s1), () => { Break(); });
+      const q = floor(x0.add(d.mul(s))).toVar();
       If(inside(q), () => { tau.addAssign(at(q)); });
     });
     return exp(tau.mul(u.strength).negate());
@@ -108,7 +132,7 @@ function createLeafVolume() {
   const kernel = Fn(() => {
     const i = int(instanceIndex);
     const c = cellOf(i).toVar();
-    const sun = march(c, u.sunDir);
+    const sun = sunMarch(c, u.sunDir);
     const id = index.element(i).toVar();
     const here = select(id.bitAnd(int((1 << LEAF_ID_BITS) - 1)).greaterThan(int(0)), float(1), float(0));
     const code = float(id.shiftRight(int(LEAF_ID_BITS)).bitAnd(int(3)).mul(int(64))
@@ -180,8 +204,9 @@ export function leafTransmitTSL(v = leafVolume) {
 
 // Fn([origin, dir, reach, sunDir, sunLight, skyLight]) -> vec4(the light the
 // lit leaves along the ray give it, their optical depth). A metre a step, at
-// most LEAF_RAY_STEPS; from a mid point weighted by the leaves, the world's
-// sun test once.
+// most LEAF_RAY_STEPS, from where the ray enters the leaves' bounds (none
+// for a ray that misses them - most GI rays); from a mid point weighted by
+// the leaves, the world's sun test once.
 const LEAF_RAY_STEPS = 16;
 const inFns = new Map();
 export function leafInscatterTSL(terrain = null, v = leafVolume) {
@@ -190,19 +215,24 @@ export function leafInscatterTSL(terrain = null, v = leafVolume) {
     const tau = float(0).toVar(), tw = float(0).toVar(), gs = float(0).toVar(), gk = float(0).toVar();
     If(v.u.live.equal(int(1)), () => {
       const step = float(BOX_METRES * 2);
+      // The ray clipped to the bounds, as leafTransmitTSL's.
+      const inv = float(1).div(dir.add(vec3(1e-7, 1e-7, 1e-7))).toVar();
+      const ta = v.u.lo.sub(origin).mul(inv).toVar(), tb = v.u.hi.sub(origin).mul(inv).toVar();
+      const near = min(ta, tb).toVar(), far = max(ta, tb).toVar();
+      const t0 = max(max(max(near.x, near.y), near.z), float(0)).toVar();
+      const t1 = min(min(min(far.x, far.y), far.z), reach).toVar();
       Loop({ start: int(0), end: int(LEAF_RAY_STEPS), type: 'int', condition: '<', name: 'lis' }, ({ lis }) => {
-        const t = float(lis).add(0.5).mul(step).toVar();
-        If(t.lessThan(reach), () => {
-          const q = origin.add(dir.mul(t)).toVar();
-          const d = leafDensityTSL(q, v).mul(v.u.strength).mul(2).toVar();
-          If(d.greaterThan(float(1e-4)), () => {
-            const l = leafLightTSL(q, v).toVar();
-            const share = exp(tau.negate()).mul(float(1).sub(exp(d.negate())));
-            gs.addAssign(share.mul(l.x));
-            gk.addAssign(share.mul(l.y));
-            tw.addAssign(d.mul(t));
-            tau.addAssign(d);
-          });
+        const t = t0.add(float(lis).add(0.5).mul(step)).toVar();
+        If(t.greaterThanEqual(t1), () => { Break(); });
+        const q = origin.add(dir.mul(t)).toVar();
+        const d = leafDensityTSL(q, v).mul(v.u.strength).mul(2).toVar();
+        If(d.greaterThan(float(1e-4)), () => {
+          const l = leafLightTSL(q, v).toVar();
+          const share = exp(tau.negate()).mul(float(1).sub(exp(d.negate())));
+          gs.addAssign(share.mul(l.x));
+          gk.addAssign(share.mul(l.y));
+          tw.addAssign(d.mul(t));
+          tau.addAssign(d);
         });
       });
     });

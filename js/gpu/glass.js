@@ -3,7 +3,7 @@ import { GRID_DIM, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 import { BLOCK_METRES } from '../core/world.js';
 import { blockFaceTSL as boxFaceTSL, texelLockTSL } from './terrain.js';
 import { BLOCK_TEXELS } from '../core/materials.js';
-import { layout, memoCascades } from './layout.js';
+import { layout, memoCascades, memoFor } from './layout.js';
 import { decodeFieldTSL, eachCascade, ringUV } from './field.js';
 import { axisFaceTSL, blockFaceTSL, blockLayerTSL } from './volume.js';
 import { labNormalTSL } from './normals.js';
@@ -85,7 +85,15 @@ function glassEntryTSL(terrain, traced, origin, dir) {
   return { entry, nf, layer, st, tint, f0 };
 }
 
+// A shader function, one per shader: the sun, every light and the GI call it,
+// the sun twice (its march and its far march).
 export function glassRayTransmitTSL(terrain, traced, origin, dir) {
+  return memoFor(terrain, 'glassTransmit', () => Fn(([traced, origin, dir]) => glassTransmitBodyTSL(terrain, traced, origin, dir))
+    .setLayout(layout('glassTransmit', 'vec3', [{ name: 'traced', type: 'vec4' }, { name: 'origin', type: 'vec3' },
+                                                 { name: 'dir', type: 'vec3' }])))(traced, origin, dir);
+}
+
+function glassTransmitBodyTSL(terrain, traced, origin, dir) {
   const out = vec3(1, 1, 1).toVar();
   If(traced.z.greaterThan(float(1e-4)).and(traced.w.greaterThanEqual(float(0))), () => {
     const { nf, layer, st, tint, f0 } = glassEntryTSL(terrain, traced, origin, dir);

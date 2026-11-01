@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { attribute, texture, uv, mix, vec3, vec4, uniform, select, Fn, floor, normalize, cameraViewMatrix, storage } from 'three/tsl';
-import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, HALF_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL,
+import { terrainWhite, terrainKeepTSL, terrainShapeTSL, terrainClipTSL, applyTerrainVertex, SLOPE_ROWS, LOW_SLOPE_ROWS, MEDIUM_SLOPE_ROWS, terrainSurfaceTSL, MODEL_ATTRS, modelTexelTSL, terrainTexelTSL,
          terrainAlbedoTSL } from '../gpu/terrain.js';
 import { applyOcclusionMask, outsideShadeTSL } from '../gpu/occlusion.js';
 import { World, BLOCK_METRES, isSlope, partShape, partFacing, partBoxes, partSpan, slopeKind, tileParts, getVoxelKey,
@@ -227,9 +227,9 @@ function writeSplit(tex, first, data, rows) {
 // stretches the side itself.
 async function loadSlopeLayers(m, layer) {
   const t = terrainTextures, flatSide = t.flatLayers.has(layer);
-  const rowsOf = [SLOPE_ROWS, HALF_SLOPE_ROWS];
+  const rowsOf = [SLOPE_ROWS, LOW_SLOPE_ROWS, MEDIUM_SLOPE_ROWS];
   const firsts = MATERIAL_LAYERS.faces[layer].slope;
-  for (let kind = 0; kind < 2; kind++) {
+  for (let kind = 0; kind < rowsOf.length; kind++) {
     const first = firsts[kind], rows = rowsOf[kind];
     if (first < 0) continue;
     const name = m.texture + SLOPE_SUFFIXES[kind];
@@ -793,10 +793,10 @@ function fillInstances() {
         t.glassFlags.setX(i, (glass ? 1 : 0) + 2 * exposedFaceMask(bx, by, bz, box, !!slope, boxesAt));
         t.slopes.setX(i, slope);
         // A block's modelInfo (w 0): its slope plane's first layer + 1 (0: the
-        // side stretched), its top and bottom layers (terrainSurfaceTSL). A
-        // high slope takes the slope plane, the gentler ones the half plane.
-        const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1] };
-        const sk = slope ? (slopeKind(p) === 0 ? 0 : 1) : null;
+        // side stretched), its top and bottom layers (terrainSurfaceTSL): the
+        // high, low or medium slope's own plane.
+        const f = MATERIAL_LAYERS.faces[layer] || { top: layer, bottom: layer, slope: [-1, -1, -1] };
+        const sk = slope ? [0, 1, 1, 1, 2, 2][slopeKind(p)] : null;
         t.modelAttrs[0].setXYZW(i, sk == null ? 0 : f.slope[sk] + 1, f.top, f.bottom, 0);
         for (let k = 1; k < 4; k++) t.modelAttrs[k].setXYZW(i, ...zero4);
         i++;

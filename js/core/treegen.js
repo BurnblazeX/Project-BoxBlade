@@ -30,12 +30,15 @@
 // Leaves: Dynamic Trees' hydration automaton. Twig cells emit 5; an air cell
 // takes the first rule (H, C, R) where at least C of its six neighbours are AT
 // H, repeated until it settles. Then cut to the crown envelope, its edge
-// ragged by chance, and every cell not joined through leaves to the wood
-// dropped - no leaf floats.
+// ragged by chance; the crown's outer part filled near the branches, and its
+// upper half's outer band (the canopy) everywhere over their reach - a closed
+// top; and every cell not joined through leaves to the wood dropped - no
+// leaf floats.
 //
 // Then as boxes on the texel grid: each branch cell a cube of its width,
 // joined to its parent by a box of its own width, and straight runs of one
-// width merged; the leaf cells merged into as few boxes as cover them.
+// width merged; on an old tree a wider block at the trunk's foot; the
+// leaf cells merged into as few boxes as cover them.
 //
 // Pure and seeded, in exact arithmetic (no transcendentals - core/rng.js): the
 // same species, seed and age give the same tree on every machine.
@@ -51,17 +54,43 @@ export const TREE_SPECIES = {
     pulses: 160,                // the age at full size
     height: [18, 24], fork: [4, 7], scaffolds: [2, 4],
     crown: [0.5, 0.62],         // the dome's radius, a share of the height
+    // How far below the fork the crown's underside hangs at its lowest -
+    // most of the radius out, a share of the fork's height - so it rounds
+    // down over the low limbs, an oak's skirt.
+    sag: 0.35,
+    // Cells over the ground no leaf or branch comes below (the trunk aside):
+    // a block and a third (2 m), room for the player. A tree whose skirt would break it has
+    // none, and no low limbs; a sapling shorter than it, its bare trunk.
+    // Younger than clearanceAge, none of it - no clearance, no skirt, no
+    // low limbs: a raised crown on a young tree looked odd (2026-11-01).
+    clearance: 4, clearanceAge: 100,
+    // Cells over the clearance a full-size tree's fork stands at least -
+    // where its skirt hangs (fewer on a younger one).
+    skirtRoom: 2,
+    // Low limbs off the fork, between the scaffolds: out nearly flat, then
+    // drooping into the skirt ([rise at the trunk, at 0.75 of the radius], as
+    // limbRise; their branches the same); their order (fewer orders of
+    // branch than a scaffold's) and steps (radii).
+    lowLimbs: [1, 2], lowRise: [0.05, -0.55], lowOrder: 0, lowReach: 1.5,
     // A limb's share of steps up, at the trunk and out at 0.75 of the crown's
     // radius: the scaffolds, the leader, their branches.
     limbRise: [0.7, 0.12], leaderRise: [0.85, 0.35], branchRise: [0.4, 0.05],
     run: [2, 3],                // cells an out run takes
     orders: 3,                  // orders of branch off the scaffolds
-    side: [0.85, 0.7, 0.5],     // the chance of a branch off a joint, by order
+    // The chance of a branch off a joint, by order: what keeps a full-size
+    // oak at its budget (~174 nodes, ~2520 drawn leaf cells; treegen.test
+    // 'budget') with its low limbs.
+    side: [0.75, 0.6, 0.4],
     childScale: 0.65,           // a branch's length: its parent's steps left, times this
     shell: 0.85,                // branches end where the envelope's measure passes this
     buds: 0.8,                  // the chance of each of a tip's four bud twigs
-    hollow: 0.3,                // the crown is filled out from this envelope measure to its shell
+    hollow: 0.6,                // the crown is filled out from this envelope measure to its shell
+    canopy: 0.74,               // ... and its upper part from this one, branch or none: a closed top
+    canopyDown: 0.8,            // ... the upper part reaching this share of the way down below the middle
     taper: 0.12, twigRadius: 0.5, maxRadius: 3.5,
+    // The root flare: from this age the trunk stands on a block a texel a
+    // side wider than it and flareHeight texels tall.
+    flareAge: 200, flareHeight: 7,
     // Dynamic Trees' deciduous solver: [H, C, R].
     leafRules: [[5, 1, 4], [4, 2, 3], [3, 2, 2], [4, 1, 1], [3, 1, 1], [2, 1, 1]],
     textures: { bark: 'terrain_oakBark', top: 'terrain_oakBark_top', leaves: 'terrain_oakLeaves' },
@@ -80,36 +109,71 @@ const key = (x, y, z) => `${x},${y},${z}`;
 const hidden = n => Math.round(2 * n.r) < 2;
 
 // The crown envelope: a dome about height cy, radius R across, reaching `up`
-// above and `down` below. <= 1 inside.
-const envelope = (R, cy, up, down) => ({
-  R, cy, up, down,
-  measure(x, y, z) {
-    const dy = y - cy, semi = dy >= 0 ? up : down;
-    return (x * x + z * z) / (R * R) + (dy * dy) / (semi * semi);
+// above and `down` below its middle. <= 1 inside; below (the vertical term
+// times k, below cy). With sag, the underside hangs lower away from the
+// middle: its depth there down + extra x q^2 (q = (r / R)^2), extra such that
+// at its lowest it is sag below the middle's - bottom, the lowest y.
+const envelope = (R, cy, up, down, sag = 0) => {
+  const lowest = e => { let m = 0; for (let q = 0; q <= 1; q += 1 / 64) m = Math.max(m, (down + e * q * q) * Math.sqrt(1 - q)); return m; };
+  let extra = 0;
+  if (sag > 0) {
+    let lo = 0, hi = 64 * (down + sag);
+    for (let i = 0; i < 40; i++) { const mid = (lo + hi) / 2; if (lowest(mid) < down + sag) lo = mid; else hi = mid; }
+    extra = lo;
   }
-});
+  return {
+    R, cy, up, down, bottom: cy - lowest(extra),
+    measure(x, y, z, k = 1) {
+      const dy = y - cy, q = (x * x + z * z) / (R * R);
+      const semi = dy >= 0 ? up : down + extra * q * q;
+      return q + (dy >= 0 ? 1 : k) * (dy * dy) / (semi * semi);
+    }
+  };
+};
 
 // Grows a tree: { nodes: Map key -> { at: [x, y, z], r, parent }, leaves:
 // Map key -> hydration, fork: the height below which the trunk is bare,
 // envelope }, cells as [x, y, z] from the root cell (0, 0, 0, the first above
 // the ground).
-export function growTree(species, seed, age = species.pulses) {
+// blocked(x, y, z), optional: whether that cell is taken where the tree
+// stands - a block's solid, another model (world.js treeSurroundings). The
+// tree grows round it: the trunk stops under it, a limb or bud never steps
+// into it, and no leaf is in it (nor any it then leaves cut off from the
+// wood). It asks only, never draws on the seed: with nothing in the way the
+// tree is the same as without.
+export function growTree(species, seed, age = species.pulses, blocked = null) {
   const rng = createRng('tree', seed);
-  const grown = species.kit === 'oak' ? growOak(species, rng, age) : growPulses(species, rng, age);
+  const grown = species.kit === 'oak' ? growOak(species, rng, age, blocked) : growPulses(species, rng, age);
   thicken(species, grown.nodes);
-  const leaves = growLeaves(species, rng, grown.nodes, grown.envelope);
-  return { ...grown, leaves };
+  const leaves = growLeaves(species, rng, grown.nodes, grown.envelope, grown.clearance ?? 0, blocked);
+  return { ...grown, leaves, flare: age >= (species.flareAge ?? Infinity) ? species.flareHeight ?? CELL : 0 };
 }
 
 // The oak kit (see the top).
-function growOak(species, rng, age) {
+function growOak(species, rng, age, blocked = null) {
   const sc = age <= species.pulses ? Math.max(0.2, age / species.pulses) : 1 + 0.3 * (1 - species.pulses / age);
   const between = ([lo, hi]) => lo + rng.float() * (hi - lo);
-  const H = Math.max(5, Math.round(between(species.height) * sc));
-  const fork = Math.max(1, Math.min(H - 4, Math.round(between(species.fork) * sc)));
+  let H = Math.max(5, Math.round(between(species.height) * sc));
+  // Under a roof the trunk stops a cell short of it: a shorter tree.
+  if (blocked) for (let y = 1; y < H; y++) if (blocked(0, y, 0)) { H = Math.max(2, y); break; }
+  const free = blocked ? p => !blocked(p[0], p[1], p[2]) : () => true;
+  // Raised over the clearance (and the skirt's room) where a crown of four
+  // cells still fits - on a tree old enough for one.
+  const grown = age >= (species.clearanceAge ?? 0);
+  const want = grown ? species.clearance ?? 0 : 0;
+  let fork = Math.max(1, Math.min(H - 4, Math.round(between(species.fork) * sc)));
+  const raised = want + (grown ? Math.round((species.skirtRoom ?? 0) * Math.min(1, sc)) : 0);
+  if (H - 1 - raised >= 4) fork = Math.max(fork, raised);
+  else if (H - 1 - want >= 4) fork = Math.max(fork, want);
+  // This tree's clearance: the species', or a sapling's bare trunk.
+  const clearance = Math.min(want, fork);
   const R = Math.max(1.5, H * between(species.crown));
   const base = fork + 1, top = H - 1, cy = base + (top - base) * 0.4;
-  const env = envelope(R, cy, top - cy, cy - base);
+  // The skirt, as far down as the clearance lets it (a cell's margin: the
+  // leaves' edge is ragged); none, nor low limbs, under a cell of it.
+  let sag = grown ? Math.min((species.sag || 0) * base, base - clearance - 1) : 0;
+  if (sag < 1) sag = 0;
+  const env = envelope(R, cy, Math.max(0.5, top - cy), Math.max(0.5, cy - base), sag);
 
   const nodes = new Map(), owner = new Map();
   const add = (at, parent, id) => {
@@ -132,12 +196,13 @@ function growOak(species, rng, age) {
   };
   // In the crown: the dome above its middle; below, its underside counted
   // at 0.6 - a limb leaving the fork is low in the dome but well inside it.
+  // Under it, anywhere within its radius (the low limbs run out bare under
+  // the crown before they droop into the skirt); never below the
+  // underside's lowest.
   const inCrown = ([x, y, z]) => {
-    if (y > top) return false;
-    if (y < base) return true;
-    const dy = y - cy;
-    return dy >= 0 ? env.measure(x, y, z) <= species.shell
-      : (x * x + z * z) / (R * R) + 0.6 * (dy * dy) / (env.down * env.down) <= species.shell;
+    if (y > top || y < Math.max(Math.min(Math.ceil(env.bottom), fork), clearance)) return false;
+    if (y < base) return x * x + z * z <= species.shell * R * R;
+    return env.measure(x, y, z, 0.6) <= species.shell;
   };
   // Where branches end, or are about to grow: a new branch heads for room.
   const ends = [];
@@ -166,7 +231,7 @@ function growOak(species, rng, age) {
     const joints = [];
     const step = d => {
       const next = [at.at[0] + d[0], at.at[1] + d[1], at.at[2] + d[2]];
-      if (!inCrown(next) || !clear(next, b.id, steps < 2 ? b.spare : null)) return false;
+      if (!inCrown(next) || !clear(next, b.id, steps < 2 ? b.spare : null) || !free(next)) return false;
       at = add(next, at, b.id);
       steps++;
       return true;
@@ -183,10 +248,11 @@ function growOak(species, rng, age) {
         outs++; px += out[0]; pz += out[2];
       }
       if (ended) break;
-      upAcc += len * rise / (1 - rise);
-      const upLen = Math.floor(upAcc);
+      upAcc += len * rise / (1 - Math.abs(rise));
+      const upLen = Math.trunc(upAcc);
       upAcc -= upLen;
-      for (let i = 0; i < upLen && !ended; i++) ended = !step([0, 1, 0]);
+      // A negative rise droops: down runs.
+      for (let i = 0; i < Math.abs(upLen) && !ended; i++) ended = !step([0, Math.sign(upLen), 0]);
       if (!ended) joints.push({ node: at, steps, out });
     }
     ends.push(at.at);
@@ -197,7 +263,7 @@ function growOak(species, rng, age) {
       let tip = at;
       for (let i = rng.range(1, 2); i > 0; i--) {
         const next = [tip.at[0] + d[0], tip.at[1] + d[1], tip.at[2] + d[2]];
-        if (!inCrown(next) || !clear(next, b.id, null)) break;
+        if (!inCrown(next) || !clear(next, b.id, null) || !free(next)) break;
         tip = add(next, tip, b.id);
       }
     }
@@ -222,7 +288,7 @@ function growOak(species, rng, age) {
       if (!best) continue;
       ends.push(best.probe);
       queue.push({ from: j.node, hx: best.hx, hz: best.hz, order: b.order + 1, budget: len,
-                   rise: species.branchRise, id: ids++, spare: b.id, lead: 0 });
+                   rise: b.low ? species.lowRise : species.branchRise, id: ids++, spare: b.id, lead: 0, low: b.low });
     }
   };
 
@@ -241,6 +307,7 @@ function growOak(species, rng, age) {
   }
   let hx, hz, hl;
   do { hx = rng.float() * 2 - 1; hz = rng.float() * 2 - 1; hl = hx * hx + hz * hz; } while (hl > 1 || hl < 0.05);
+  const [h0x, h0z] = [hx, hz];
   for (let k = 0; k < count; k++) {
     const leader = k === 0 && count > 1;
     const from = leader ? zone[zone.length - 1] : zone[Math.min(k - (count > 1 ? 1 : 0), zone.length - 1)];
@@ -250,8 +317,22 @@ function growOak(species, rng, age) {
     // The next heading: a turn on, from the heading before jitter.
     [hx, hz] = [hx * turn[0] - hz * turn[1], hx * turn[1] + hz * turn[0]];
   }
+  // The low limbs: off the fork too, the first a quarter turn from the first
+  // scaffold, the rest evenly round; long enough to reach the skirt.
+  if (species.lowLimbs && sag > 0) {
+    const low = Math.max(1, Math.round(rng.range(...species.lowLimbs) * Math.min(1, sc)));
+    const lowTurn = { 1: [1, 0], 2: [-1, 0], 3: [-0.5, Math.sqrt(3) / 2], 4: [0, 1] }[Math.min(low, 4)];
+    let [lx, lz] = [-h0z, h0x];
+    for (let k = 0; k < low; k++) {
+      queue.push({ from: forkNode, hx: lx + (rng.float() - 0.5) * 0.4, hz: lz + (rng.float() - 0.5) * 0.4,
+                   order: species.lowOrder ?? 0, budget: Math.round((species.lowReach ?? 1.5) * R), rise: species.lowRise,
+                   id: ids++, spare: -1, lead: 0,
+                   firstRun: 2, low: true });
+      [lx, lz] = [lx * lowTurn[0] - lz * lowTurn[1], lx * lowTurn[1] + lz * lowTurn[0]];
+    }
+  }
   for (let q = 0; q < queue.length; q++) grow(queue[q]);
-  return { nodes, fork, envelope: env };
+  return { nodes, fork, envelope: env, clearance };
 }
 
 // The pulse kit (see the top).
@@ -330,13 +411,19 @@ function thicken(species, nodes) {
 // Leaves (see the top): the automaton round the twigs, cut to the envelope,
 // joined to the wood - on a dense grid round the tree. A hidden twig's own
 // cell is leaf (a hydration of 5), so the twig leaves no hole.
-function growLeaves(species, rng, nodes, env) {
+function growLeaves(species, rng, nodes, env, clearance = 0, blocked = null) {
   const M = 4;   // the automaton reaches 3 past a twig
   let lo = [0, 0, 0], hi = [0, 0, 0];
   for (const n of nodes.values()) for (let a = 0; a < 3; a++) {
     lo[a] = Math.min(lo[a], n.at[a]); hi[a] = Math.max(hi[a], n.at[a]);
   }
   lo = lo.map((v, a) => (a === 1 ? 0 : v - M)); hi = hi.map(v => v + M);
+  // ... and the whole envelope, for the canopy.
+  if (species.canopy !== undefined) {
+    const r = Math.ceil(env.R) + 1;
+    lo = [Math.min(lo[0], -r), 0, Math.min(lo[2], -r)];
+    hi = [Math.max(hi[0], r), Math.max(hi[1], Math.ceil(env.cy + env.up) + 1), Math.max(hi[2], r)];
+  }
   const sx = hi[0] - lo[0] + 1, sy = hi[1] - lo[1] + 1, sz = hi[2] - lo[2] + 1;
   const at = (x, y, z) => ((y - lo[1]) * sz + (z - lo[2])) * sx + (x - lo[0]);
   const STEP = [sz * sx, 1, -1, sx, -sx, -sz * sx];   // DIRS as index steps
@@ -385,7 +472,7 @@ function growLeaves(species, rng, nodes, env) {
   // 1, ragged) wherever a branch is within 3 cells. The twigs' clumps alone
   // left gaps between the limbs - a sparse crown of lobes (2026-10-30).
   if (species.hollow !== undefined) {
-    const floor = env.cy - env.down;
+    const floor = Math.floor(env.bottom);
     for (const n of nodes.values()) {
       if (n.at[1] < floor) continue;
       for (let dx = -3; dx <= 3; dx++) for (let dy = -3; dy <= 3; dy++) for (let dz = -3; dz <= 3; dz++) {
@@ -401,6 +488,28 @@ function growLeaves(species, rng, nodes, env) {
       }
     }
   }
+  // The canopy: the upper part's outer band (from canopyDown of the way
+  // below the middle, so the sides close down to the skirt), everywhere - an oak's top is
+  // one closed layer of leaves catching the sun. Filled near the branches
+  // alone, it opened in a ring between the leader and the scaffolds, two in
+  // five of its columns (2026-11-01); a band of the upper half alone left
+  // the sides open between it and the skirt; kept to where the branches
+  // reached, it opened windows wherever they had not (2026-11-01). A closed
+  // shell over the whole envelope, its edge ragged.
+  if (species.canopy !== undefined) {
+    for (let y = Math.max(1, Math.ceil(env.cy - (species.canopyDown ?? 0) * env.down)); y < hi[1]; y++) {
+      for (let z = lo[2] + 1; z < hi[2]; z++) for (let x = lo[0] + 1; x < hi[0]; x++) {
+        const m = env.measure(x, y, z);
+        if (m < species.canopy || m > 1) continue;
+        const i = at(x, y, z);
+        if (wood[i] || leaf[i] || m > 1 - 0.15 * rng.float()) continue;
+        leaf[i] = 2;
+        if (!seen[i]) { seen[i] = 1; near.push(i); }
+      }
+    }
+  }
+  // None under the clearance, nor where the tree's place is taken.
+  for (const i of near) if (leaf[i] && (xyz(i)[1] < clearance || (blocked && blocked(...xyz(i))))) leaf[i] = 0;
   // Joined: flood from the leaves touching shown wood.
   const joined = new Uint8Array(sx * sy * sz), queue = [];
   const cells = near.concat([...nodes.values()].filter(hidden).map(n => at(...n.at)));
@@ -477,26 +586,39 @@ function mergeCells(cells) {
 }
 
 // The boxes as model cubes (core/bbmodel.js's form), every face wrapped onto
-// its tile (bbmodel.js transformCube): bark (tile 0) on the wood's sides, end
-// grain (tile 1) on its tops and bottoms, leaves (tile 2) all round. Image
-// rows run down, so v runs against y on the sides. The trunk's root box first.
+// its tile (bbmodel.js transformCube): bark (tile 0) all round the wood - a
+// living tree shows no end grain (tile 1, for a cut one), its tops are bark
+// too - leaves (tile 2) all round. Image rows run down, so v runs against y
+// on the sides. The bark's grain runs down its tile (v): on the top and
+// bottom of a box longer along x than z the axes swap (bbmodel.js
+// faceSwapped), so the grain follows the branch. The trunk's root box first.
 const FACE_AXES = [[2, 1], [2, 1], [0, 2], [0, 2], [0, 1], [0, 1]];   // as bbmodel.js
 export function treeCubes({ wood, leaves }) {
-  const cube = (b, tileOf) => ({
-    name: '', light: false, lightLevel: null, rects: [], min: b.slice(0, 3), max: b.slice(3),
-    faces: FACE_AXES.map(([u, v], d) => ({
-      u: { axis: u, o: 12 * tileOf(d), d: 1 }, v: { axis: v, o: 0, d: v === 1 ? -1 : 1 }, wrap: true }))
-  });
+  const cube = (b, tile) => {
+    const alongX = b[3] - b[0] > b[5] - b[2];
+    return {
+      name: '', light: false, lightLevel: null, rects: [], min: b.slice(0, 3), max: b.slice(3),
+      faces: FACE_AXES.map(([u, v], d) => {
+        if (alongX && tile === 0 && (d === 2 || d === 3)) [u, v] = [v, u];
+        return { u: { axis: u, o: 12 * tile, d: 1 }, v: { axis: v, o: 0, d: v === 1 ? -1 : 1 }, wrap: true };
+      })
+    };
+  };
   const root = wood.reduce((best, b) => (b[1] <= 0 && (!best || b[4] > best[4]) ? b : best), null);
   const woodSorted = root ? [root, ...wood.filter(b => b !== root)] : wood;
-  return [...woodSorted.map(b => cube(b, d => (d === 2 || d === 3 ? 1 : 0))),
-          ...leaves.map(b => cube(b, () => 2))];
+  return [...woodSorted.map(b => cube(b, 0)), ...leaves.map(b => cube(b, 2))];
 }
 
 // The tree as boxes: { wood: [box], leaves: [box] } (see above).
-export function treeBoxes({ nodes, leaves }) {
-  const width = n => Math.max(1, Math.round(2 * n.r));
-  const wood = [];
+export function treeBoxes({ nodes, leaves, flare = 0 }) {
+  // On the trunk's axis (the trunk, the leader) an even width, rounded up:
+  // an odd one cannot sit centred on the texel grid, and stood half a texel
+  // off its tile's middle.
+  const width = n => {
+    const w = Math.max(1, Math.round(2 * n.r));
+    return w > 1 && n.at[0] === 0 && n.at[2] === 0 ? w + (w % 2) : w;
+  };
+  const wood = [], foot = [];
   for (const n of nodes.values()) {
     if (hidden(n) && n.parent) continue;
     const c = cellCentre(n.at), w = width(n);
@@ -510,8 +632,15 @@ export function treeBoxes({ nodes, leaves }) {
       const span = [0, 1, 2].map(a => (lo[a] === hi[a] ? around(c[a], w) : [lo[a], hi[a]]));
       wood.push([span[0][0], span[1][0], span[2][0], span[0][1], span[1][1], span[2][1]]);
     }
+    // The root flare (growTree): a block under the trunk, a texel a side
+    // wider, flare texels tall. Kept out of the merge, which would drop the
+    // trunk's foot inside it.
+    if (!n.parent && flare > 0) {
+      const [lo, hi] = around(0, width(n));
+      foot.push([lo - 1, 0, lo - 1, hi + 1, flare, hi + 1]);
+    }
   }
-  const woodBoxes = mergeBoxes(wood);
+  const woodBoxes = [...mergeBoxes(wood), ...foot];
   // Leaf cells clear of the wood, merged greedily: runs along x, then
   // stacked along z, then along y.
   const inWood = c => {

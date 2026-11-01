@@ -39,7 +39,7 @@
 //
 // Clouds are exclusive: each is cast round the others' cells, and smoke a
 // body pushes out never goes into another cloud.
-import { createSmokeCloud, reshapeSmokeCloud, pruneFading, expireCovered, smokeCells, occupiedCells, smokeRadius, CLOUD_SPELLS, MAX_CAST_LEVEL,
+import { createSmokeCloud, recastSmokeCloud, reshapeSmokeCloud, pruneFading, expireCovered, smokeCells, occupiedCells, smokeRadius, CLOUD_SPELLS, MAX_CAST_LEVEL,
          SMOKE_GROW_IN } from '../../core/smoke.js';
 import { createSmokeCubes, MAX_SMOKE_CLOUDS, DEFAULT_SMOKE, SMOKE_ENCLOSED_DELAY, smokeShared } from '../../gpu/smoke.js';
 import { smokeView } from '../../gpu/smokeview.js';
@@ -204,6 +204,22 @@ export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, 
            `${cloud.cubes.length} cubes, ${cloud.cubes.filter(c => c[7]).length} open to air`;
   }
 
+  // The world changed (an edit): every cloud cast again where it stands, so
+  // smoke fills the room a removed shape left and leaves a placed one's
+  // (core/smoke.js recastSmokeCloud) - its cubes kept, the rest growing in
+  // or fading out.
+  function worldChanged() {
+    if (!clouds.some(Boolean)) return;
+    const t = now();
+    blocked = bodyCellsNow(t);
+    clouds.forEach((c, k) => {
+      if (!c) return;
+      c.cloud = recastSmokeCloud(c.cloud, t, { taken: othersThan(k), blocked });
+      write(k, false);
+    });
+    if (gpu) gpu.write(clouds);
+  }
+
   function clear() {
     clouds.fill(null);
     nextSlot = 0;
@@ -290,6 +306,7 @@ export function createSmoke({ renderer, scene, camera, cascades, lighting, sky, 
     update,
     summonAt,
     clear,
+    worldChanged,
     // For the box light: when the clouds last changed, and whether one is
     // still rolling out (its shadow growing - a little past, so the last look
     // sees it whole).

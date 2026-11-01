@@ -1118,7 +1118,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       If(geo.slope, () => {
         const side = int(max(geo.vol.x.sub(float(1)), float(0))).toVar();
         const row = slopeLayerTable.element(side);
-        const first1 = select(geo.sl.kind.lessThan(float(1.5)), row.x, row.y);
+        const first1 = select(geo.sl.kind.lessThan(float(1.5)), row.x, select(geo.sl.kind.lessThan(float(4.5)), row.y, row.z));
         const sp = slopePlaneTSL(geo.sl, p, p, side, first1);
         layer.assign(sp.layer); st.assign(sp.st);
         S.base.assign(mix(texture(terrain.albedo, sp.st).depth(int(sp.layer)).level(int(0)).rgb,

@@ -169,7 +169,8 @@ export function slopePlaneTSL(sl, posW, pA, side, first1) {
   const yMid = posW.y.add(sl.grad.mul(hc.sub(posW.xz.dot(sl.f))));
   const by = round(yMid.div(Bm).add(float(0.5)).sub(sl.base).sub(sl.grad.mul(float(0.5)))).toVar();
   // The texel: its row along the climb, its column across.
-  const rows = select(sl.grad.lessThan(float(0.75)), float(HALF_SLOPE_ROWS), float(SLOPE_ROWS)).toVar();
+  const rows = select(sl.grad.lessThan(float(0.5)), float(LOW_SLOPE_ROWS),
+                      select(sl.grad.lessThan(float(0.75)), float(MEDIUM_SLOPE_ROWS), float(SLOPE_ROWS))).toVar();
   const along = posW.xz.dot(sl.f).sub(hc).div(Bm).add(float(0.5));
   const row = clamp(floor(along.mul(rows)), float(0), rows.sub(float(1))).toVar();
   const col = clamp(floor(pA.xz.dot(r).sub(wc).div(q).add(float(6))), float(0), float(11)).toVar();
@@ -207,8 +208,8 @@ export function slopePlaneTSL(sl, posW, pA, side, first1) {
 //
 // A slope's top face is its PLANE (terrainShapeTSL), with a texture of its
 // own (terrainTextures.slope*): 12 texels across and, along the climb, 17 on
-// a slope (2.12 m) or 13 on a half slope (1.68 m) - square texels of about
-// 12.5 cm on the plane. Row 0 is the foot, u runs left to right looking
+// a high slope (2.12 m), 14 on a medium (1.80 m), 13 on a low (1.58 m) -
+// texels of about 12.5 cm on the plane. Row 0 is the foot, u runs left to right looking
 // uphill. The lock snaps to the centre of THAT texel - across, on the world's
 // texel grid as any face; along, to the plane's own rows - and puts y on the
 // plane there, from the block and the texel's indices alone: every fragment
@@ -217,7 +218,7 @@ export function slopePlaneTSL(sl, posW, pA, side, first1) {
 // The normal is the plane's own (slopeTSL), not an axis.
 //
 // slopes: false where the mesh carries no blockSlope attribute.
-export const SLOPE_ROWS = 17, HALF_SLOPE_ROWS = 13;
+export const SLOPE_ROWS = 17, LOW_SLOPE_ROWS = 13, MEDIUM_SLOPE_ROWS = 14;
 //
 // The mesh's own normal ATTRIBUTE, not normalWorld: the plain material sets
 // its normalNode from this surface, and normalWorld is derived from that node

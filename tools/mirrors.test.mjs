@@ -34,7 +34,8 @@ truthy('the west plate faces the floor (+x)', !!plateIn);
 ok('3 blocks long', (plateIn.max[1] - plateIn.min[1]) / BLOCK_METRES, 3);
 truthy('the east plate faces it back (-x)',
        rects.some(r => r.axis === 0 && r.sign === -1 && r.plane === 8.5 * BLOCK_METRES));
-truthy('few rectangles for the whole bed', rects.length <= 20);
+// Each marble steps tile throws its treads, risers and sides: 12 a tile.
+truthy('few rectangles for the whole bed', rects.length <= 20 + 2 * 12);
 
 section('what a mirror can reflect');
 {
@@ -63,7 +64,7 @@ ok('nearest first - the floor under the point', out[0], 1);
 const lit = { dir: [0, 1, 0], on: true };
 ok('an area holding the bed packs as before',
    packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, lit, [],
-               { minX: 0, maxX: 20, minZ: 10, maxZ: 30 }), all);
+               { minX: 0, maxX: 30, minZ: 10, maxZ: 30 }), all);
 ok('an area far from it packs nothing',
    packMirrors(rects, { x: 0, y: 0, z: 0 }, out, MAX_MIRRORS, lit, [],
                { minX: 100, maxX: 136, minZ: 100, maxZ: 136 }), 0);
@@ -190,6 +191,20 @@ section('panes: faces mid-cell across x and z');
      .map(q => `${Math.round(q.min[0] / B * 6)},${Math.round(q.max[0] / B * 6)}`).join(), '1,3');
   ok("the centre pane's faces sit 4/12 and 8/12 across z", at(2, -1, -1 / 6).length + at(2, 1, 1 / 6).length, 2);
   ok("the full block's +x face, beside the side pane's gap, is whole", at(0, 1, -0.5).length, 1);
+}
+
+section('steps: each tread and riser');
+{
+  const { buildMirrors } = await import('../js/core/mirrors.js');
+  const { BLOCK_METRES: B } = await import('../js/core/world.js');
+  const W = new Map([['0,0,0', { materialId: 'marble', shape: 'steps', facing: 'E' }]]);
+  const r = buildMirrors(W, new Set(['marble']));
+  const thirds = v => Math.round(v / B * 3 + 1.5);
+  const treads = r.filter(q => q.axis === 1 && q.sign === 1);
+  ok('three treads, a third apart', treads.map(q => thirds(q.plane)).sort().join(), '1,2,3');
+  ok('each a third deep - the next step covers the rest', treads.map(q => thirds(q.max[0]) - thirds(q.min[0])).join(), '1,1,1');
+  const planes = s => new Set(r.filter(q => q.axis === 0 && q.sign === s).map(q => q.plane)).size;
+  ok('three risers, the back flat', `${planes(1)},${planes(-1)}`, '1,3');
 }
 
 section('stacks: each part by its own material');

@@ -69,10 +69,14 @@ const fnName = base => `${base}_${fnSerial++}`;
 export const layout = (base, type, inputs) => ({ name: fnName(base), baseName: base, type, inputs,
                                          perShader: true });
 
-const perCascades = new WeakMap();
+const perObject = new WeakMap();
 
-export function memoCascades(cascades, key, make) {
-  if (!perCascades.has(cascades)) perCascades.set(cascades, {});
-  const m = perCascades.get(cascades);
+// One function per (object, key) - the cascade set, the block volume, the
+// terrain textures - so every caller in a shader shares it.
+export function memoFor(object, key, make) {
+  if (!perObject.has(object)) perObject.set(object, {});
+  const m = perObject.get(object);
   return m[key] || (m[key] = make());
 }
+
+export const memoCascades = memoFor;

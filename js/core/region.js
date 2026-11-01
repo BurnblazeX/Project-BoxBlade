@@ -15,7 +15,9 @@
 //     region:  { name, bounds: [x0, x1, z0, z1] inclusive, seaLevel },
 //     spawns:  { name: [x, y, z] },
 //     exits:   [{ cells: [x0, y0, z0, x1, y1, z1], target, spawn }] (core/exits.js),
-//     models:  as v1 ([name, x, y, z, yaw] or [name, x, y, z, 0, wall]),
+//     models:  as v1 ([name, x, y, z, yaw] or [name, x, y, z, 0, wall]), and
+//              the Grid cell n last when not the tile's centre ([name, x, y,
+//              z, yaw, null, n] or [name, x, y, z, 0, wall, n]; world.js),
 //     chunk:   { size, yMin, height },
 //     palette: [null, [part, ...], ...] }
 // A palette row is a tile's parts (world.js tileParts), each part

@@ -136,9 +136,9 @@ export function createSplitShading(lowCap, missCap, fullCap, half = true) {
 }
 
 // Per material, its slope planes' first layers + 1 (0: the side stretched):
-// x slope, y half slope - render.js fillInstances' modelInfo.x, as a table.
+// x high, y low, z medium - render.js fillInstances' modelInfo.x, as a table.
 export const slopeLayerTable = uniformArray(MATERIAL_LAYERS.faces.map(f =>
-  new THREE.Vector4(f.slope[0] + 1, f.slope[1] + 1, 0, 0)), 'vec4').setName('bxbSlopeLayers').setGroup(tableGroup);
+  new THREE.Vector4(f.slope[0] + 1, f.slope[1] + 1, f.slope[2] + 1, 0)), 'vec4').setName('bxbSlopeLayers').setGroup(tableGroup);
 
 // The resolve, before the kernels: [clear the miss count, per pixel find
 // its sample]. cache: texelCache (scale, size).

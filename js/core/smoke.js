@@ -588,6 +588,32 @@ export function reshapeSmokeCloud(cloud, blocked = null, taken = null, now = nul
 // Seconds past a newcomer's growing in that a cube it covers stays drawn.
 const SMOKE_COVER_MARGIN = 0.05;
 
+// The cloud cast again where it stands, against the world as it is now - a
+// block or model added, moved or taken away (the travel was the cast's, and
+// went round what is gone): a new cloud, same tile, spell and level, that
+// carries the old one's look over. A cube in both keeps its birth (and its
+// time kept drawn while covered); one that came is born now and grows in;
+// one that went fades out. So smoke pours into the room a deleted shape
+// left, the rim drawing back as it does, and away from one placed in it.
+// opts as createSmokeCloud's (solidAt, glassAt, taken, blocked, models);
+// now: the smoke's clock.
+export function recastSmokeCloud(old, now, { solidAt = isSolidAt, glassAt = glassAtWorld, taken = null,
+                                             blocked = null, models = ModelBoxes } = {}) {
+  const fresh = createSmokeCloud(old.tile, solidAt, old.spell, old.level, glassAt, { taken, blocked, models });
+  const O = old.shape, S = fresh.shape;
+  for (const c of fresh.cubes) {
+    const m = c[10], was = O.cells[m] ? old.cubes[O.cubeAt[m]] : null;
+    if (!was) { c[11] = now; c[12] = 0; continue; }
+    c[11] = was[11];
+    c[12] = was[12];
+    // Seen before and covered now (by a newcomer): drawn until it has grown over.
+    if (was[7] && !c[7]) c[12] = Math.max(c[12], now + SMOKE_GROW_IN + SMOKE_COVER_MARGIN);
+    if (c[12]) S.covered.add(m);
+  }
+  fresh.fading = old.fading.concat(O.list.filter(m => !S.cells[m]).map(m => ({ cube: old.cubes[O.cubeAt[m]], died: now })));
+  return fresh;
+}
+
 // Covered cubes whose time to be seen has passed lose it (c[12] = 0), so the
 // list can drop them. Returns whether any did.
 export function expireCovered(cloud, now) {

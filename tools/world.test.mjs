@@ -455,6 +455,89 @@ section('levels: the world as data');
   createTestArea(36, 36);
 }
 
+section('models on the Grid: up to nine 4-texel models a tile');
+{
+  const { addWorldModel, mountWorldModel, removeWorldModel, clearWorldModels, modelFits, gridOccupantAt, standOrigin,
+          serializeLevel, loadLevel, MODEL_CENTRE, cellAt, LEVEL_FORMAT } = await import('../js/core/world.js');
+  const { parseBBModel } = await import('../js/core/bbmodel.js');
+  const { placeModel } = await import('../js/core/bbmodel.js');
+  const face = { uv: [0, 0, 1, 1], texture: 0 };
+  const faces = Object.fromEntries(['north', 'south', 'east', 'west', 'up', 'down'].map(f => [f, face]));
+  const stool = parseBBModel({ name: 'testStool', textures: [], elements: [{ name: 'seat', from: [-2, 0, -2], to: [2, 3, 2], faces }] });
+  const models = new Map([['testStool', stool]]);
+  World.clear(); clearWorldModels();
+  World.set('0,0,0', newBlock('grass', 'slab'));
+  World.set('1,1,0', newBlock('grass'));
+  const a = addWorldModel(stool, 0, 0, 0, 0, cellAt(0, 0, 0));
+  const b = addWorldModel(stool, 0, 0, 0, 0, cellAt(2, 0, 2));
+  ok('two stools in one tile, at opposite corners', `${a.cubes[0].min[0]},${b.cubes[0].min[0]}`, '-6,2');
+  ok('standing on the slab, a third up', a.cubes[0].min[1], 4 - 6);
+  ok('each takes its Grid cell', `${gridOccupantAt('0,0,0_3') === a},${gridOccupantAt('0,0,0_23') === b}`, 'true,true');
+  falsy('a third will not go where one is', modelFits(placeModel(stool, standOrigin(0, 0, 0, cellAt(0, 0, 0))).cubes));
+  truthy('but will beside it', modelFits(placeModel(stool, standOrigin(0, 0, 0, cellAt(1, 0, 0))).cubes));
+  {
+    // A tree stands in the middle column wherever it is aimed (or saved).
+    const tree = addWorldModel({ ...stool, species: {} }, 1, 1, 0, 0, cellAt(0, 0, 0));
+    ok('a tree aimed at a corner column stands centred', `${tree.n === MODEL_CENTRE},${tree.cubes[0].min[0]}`, `true,${12 - 2}`);
+    removeWorldModel(tree);
+  }
+  {
+    // A tree grows round what is where it stands, and again when that changes.
+    const { treeModel } = await import('../js/core/models.js');
+    const { regrowTrees, isSolidAt, BLOCK_METRES: M } = await import('../js/core/world.js');
+    const name = 'tree_oak#7@160';
+    World.set('10,0,10', newBlock('grass'));
+    const tree = addWorldModel(treeModel(name), 10, 0, 10, 0);
+    const open = treeModel(name);
+    ok('in the open: the tree as grown anywhere', `${tree.cubes.length},${tree.model.leafAll.length}`,
+       `${open.cubes.length},${open.leafAll.length}`);
+    ok('... nothing to regrow', regrowTrees().length, 0);
+    // A wall through its crown: a row of blocks three tiles east, 5 to 9 m up.
+    const wall = [];
+    for (let y = 3; y <= 6; y++) for (let z = 4; z <= 16; z++) wall.push(`13,${y},${z}`);
+    for (const k of wall) World.set(k, newBlock('stone'));
+    ok('a wall built through it: regrown', regrowTrees()[0] === tree, true);
+    const T = M / 12;   // metres a texel
+    const leafIn = ([x, y, z]) => isSolidAt((tree.at[0] + x * 4) * M / 12, (tree.at[1] + y * 4 + 2) * M / 12, (tree.at[2] + z * 4) * M / 12);
+    const inSolid = c => isSolidAt((c.min[0] + c.max[0]) / 2 * T, (c.min[1] + c.max[1]) / 2 * T, (c.min[2] + c.max[2]) / 2 * T);
+    truthy('... it reached there before', open.cubes.length > 0 && placeModel(open, tree.at, 0).cubes.some(inSolid) ||
+           open.leafAll.some(leafIn));
+    ok('... no wood in the wall', tree.cubes.some(inSolid), false);
+    ok('... nor any leaf', tree.model.leafAll.some(leafIn), false);
+    truthy('... and the crown still there, round it', tree.model.leafAll.length > open.leafAll.length / 2);
+    for (const k of wall) World.delete(k);
+    regrowTrees();
+    ok('the wall gone: the tree as in the open again', `${tree.cubes.length},${tree.model.leafAll.length}`,
+       `${open.cubes.length},${open.leafAll.length}`);
+    removeWorldModel(tree);
+    World.delete('10,0,10');
+  }
+  const torch = mountWorldModel(stool, 0, 1, 0, 'E', cellAt(1, 2, 0));
+  ok('a wall model hangs at its Grid cell: up the wall, flush to it', `${torch.at[1]},${torch.at[2]},${torch.at[0]}`, '14,-4,0');
+  const rows = serializeLevel().models;
+  ok('saved with their Grid cells', JSON.stringify(rows),
+     '[["testStool",0,0,0,0,null,0],["testStool",0,0,0,0,null,20],["testStool",0,1,0,0,"E",7]]');
+  // The block volume has three slots a tile: with a model in it, two parts.
+  const { withPart, hasModelIn } = await import('../js/core/world.js');
+  const slab = at => ({ materialId: 'grass', shape: 'slab', at });
+  const two = withPart(World.get('0,0,0'), slab(6), '0,0,0');
+  truthy('a tile with a model takes a second part', !!two);
+  falsy('but not a third', withPart(two, slab(3), '0,0,0'));
+  truthy('which an empty tile would', !!withPart(two, slab(3)));
+  World.set('2,0,0', withPart(withPart(newBlock('grass', 'slab'), slab(3)), slab(6)));
+  falsy('a model does not go into a tile of three parts', modelFits(placeModel(stool, [24, -2, 0]).cubes));
+  removeWorldModel(a);
+  ok('removed, its cell is free', gridOccupantAt('0,0,0_3'), null);
+  truthy('the tile still has the other stool', hasModelIn('0,0,0'));
+  removeWorldModel(b);
+  falsy('and then none', hasModelIn('0,0,0'));
+  loadLevel({ format: LEVEL_FORMAT, version: 1, blocks: [[0, 0, 0, 'grass']], models: [['testStool', 0, 0, 0, 0]] }, models);
+  ok('an old row stands at the centre of its tile', JSON.stringify(serializeLevel().models[0]), '["testStool",0,0,0,0]');
+  ok('the centre is the middle column', MODEL_CENTRE, cellAt(1, 0, 1));
+  clearWorldModels();
+  createTestArea(36, 36);
+}
+
 section('steps');
 {
   const { blockShape: shapeOf, isCompound, groundHeightAt: ground } = await import('../js/core/world.js');

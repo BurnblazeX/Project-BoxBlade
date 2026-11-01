@@ -54,6 +54,12 @@ for (const m of MATERIALS) {
   const { w, h } = png(m.texture);
   ok(`${m.texture} is ${BLOCK_TEXELS}x${BLOCK_TEXELS}`, `${w}x${h}`, `${BLOCK_TEXELS}x${BLOCK_TEXELS}`);
 }
+// Slope planes: rows along the climb, by slope (gpu/terrain.js SLOPE_ROWS).
+for (const [suffix, rows] of [['_slope', 17], ['_lowSlope', 13], ['_mediumSlope', 14]])
+  for (const map of ['', '_n']) {
+    const { w, h } = png(`terrain_grass${suffix}${map}`);
+    ok(`terrain_grass${suffix}${map} is 12x${rows}`, `${w}x${h}`, `12x${rows}`);
+  }
 for (const t of ['terrain_marble', 'terrain_ironPlate']) {
   for (const suffix of ['_n', '_s']) {
     const { w, h } = png(t + suffix);
@@ -65,7 +71,7 @@ section('materials are found by their texture files');
 {
   const { materialIdsFromFiles } = await import('../js/core/materials.js');
   const files = ['terrain_grass.png', 'terrain_grass_n.png', 'terrain_grass_s.png', 'terrain_grass_slope.png',
-                 'terrain_grass_slope_n.png', 'terrain_grass_halfSlope.png', 'terrain_grass_halfSlope_s.png',
+                 'terrain_grass_slope_n.png', 'terrain_grass_lowSlope.png', 'terrain_grass_mediumSlope_s.png',
                  'terrain_sandstone.png', 'terrain_sandstone_e.png', 'terrain_sandstone_a.png',
                  'terrain_grass_slope_a.png', 'terrain_oakPlanks.png', 'other.png',
                  '../assets/textures/terrain_cobble.png']
@@ -77,13 +83,13 @@ section('materials are found by their texture files');
 section('faces and slope planes get layers after the materials');
 {
   const mats = [{ texture: 't_a' }, { texture: 't_pillar' }, { texture: 't_log' }, { texture: 't_ramp' }];
-  const files = new Set(['t_pillar_top', 't_pillar_bottom', 't_log_top', 't_ramp_halfSlope_n']);
+  const files = new Set(['t_pillar_top', 't_pillar_bottom', 't_log_top', 't_ramp_lowSlope_n']);
   const { faces, end } = allocateMaterialLayers(mats, n => files.has(n));
   ok('a plain material: every face its own layer', JSON.stringify(faces[0]),
-     JSON.stringify({ top: 0, bottom: 0, slope: [-1, -1] }));
+     JSON.stringify({ top: 0, bottom: 0, slope: [-1, -1, -1] }));
   ok('top and bottom, after the materials', `${faces[1].top},${faces[1].bottom}`, '4,5');
   ok('a missing bottom takes the top', `${faces[2].top},${faces[2].bottom}`, '6,6');
-  ok('any one map authors a plane, two layers', faces[3].slope.join(','), '-1,7');
+  ok('any one map authors a plane, two layers', faces[3].slope.join(','), '-1,7,-1');
   ok('the end', end, 9);
   ok('face companions are not materials',
      materialIdsFromFiles(['x/terrain_log.png', 'x/terrain_log_top.png', 'x/terrain_log_bottom_n.png']).join(','), 'log');

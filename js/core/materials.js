@@ -14,7 +14,7 @@
 // _s is DEFAULT_SPECULAR. Every block texture is BLOCK_TEXELS square - one
 // texel per field voxel, the §4 lock.
 //
-// <texture>_a.png (and _top_a, _bottom_a, _slope_a, _halfSlope_a): the albedo
+// <texture>_a.png (and _top_a, _bottom_a, _slope_a, _lowSlope_a, _mediumSlope_a): the albedo
 // with shadows on. The main texture has its shading baked in for the plain
 // path; the shaded path lights the surface itself, so it draws this flatter
 // one instead (render.js setShadedAlbedo). Not for glass, and a metal texel
@@ -43,7 +43,7 @@ export const MATERIALS = [
 //
 // Every other terrain_<id>.png in assets/textures is a material too, found at
 // load: add a texture and it is in the game and the editor's palette, mapped
-// like the rest - no code. Its companions (_n, _s, _a, _slope, _halfSlope, and
+// like the rest - no code. Its companions (_n, _s, _a, _slope, _lowSlope, _mediumSlope, and
 // their _n / _s / _a) are found by name as for the materials above. Properties a
 // texture cannot say go in terrain_<id>.json beside it, e.g. { "glass": true }.
 // Appended after the built-in list, alphabetically: a layer is an index into
@@ -54,7 +54,7 @@ export const MATERIALS = [
 // build time, and in node - the tests - the call throws and the built-in list
 // is all there is.
 export const MATERIAL_TEXTURE_PREFIX = 'terrain_';
-const COMPANION = /_(n|s|e|a)$|_(slope|halfSlope|top|bottom)(_(n|s|e|a))?$/;
+const COMPANION = /_(n|s|e|a)$|_(slope|lowSlope|mediumSlope|top|bottom)(_(n|s|e|a))?$/;
 export function materialIdsFromFiles(paths) {
   const ids = [];
   for (const p of paths) {
@@ -82,15 +82,16 @@ const layerById = new Map(MATERIALS.map((m, i) => [m.id, i]));
 // companions, each with its own _n / _s, add layers after the materials':
 //   <texture>_top.png, <texture>_bottom.png  the +y / -y faces, as a pillar's
 //     ends (a missing _bottom takes the _top, as a log's two ends match);
-//   <texture>_slope.png (12 x 17), <texture>_halfSlope.png (12 x 13)  a
-//     slope's plane, split over two 12 x 12 layers: rows 0-11, then the rest.
+//   <texture>_slope.png (12 x 17), _lowSlope.png (12 x 13), _mediumSlope.png
+//     (12 x 14)  a high, low or medium slope's plane, split over two 12 x 12
+//     layers: rows 0-11, then the rest.
 // So every face of everything - blocks, slopes, model tiles - is one read of
 // the same three arrays (render.js terrainTexelTSL).
 // has(name): whether assets/textures holds name.png.
-// Returns { faces: per material { top, bottom, slope: [slope, halfSlope] }
+// Returns { faces: per material { top, bottom, slope: [high, low, medium] }
 // (a slope entry -1 when the plane takes the side texture, stretched), end:
 // the first layer after them (where models.js starts) }.
-export const SLOPE_SUFFIXES = ['_slope', '_halfSlope'];
+export const SLOPE_SUFFIXES = ['_slope', '_lowSlope', '_mediumSlope'];
 export function allocateMaterialLayers(materials, has) {
   let next = materials.length;
   const any = name => has(name) || has(name + '_n') || has(name + '_s') || has(name + '_a');

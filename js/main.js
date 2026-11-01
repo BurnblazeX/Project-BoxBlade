@@ -2,7 +2,7 @@ import * as THREE from 'three/webgpu';
 import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS, MODELS_AND_TREES, treeModel } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
-         worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel,
+         worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel, regrowTrees,
          loadLevel, findPath, DEV_LEVEL, Region, regionSpawn, setOccupantAt, vacateAt } from './core/world.js';
 import { decodeRegion } from './core/region.js';
 import { createExitTracker } from './core/exits.js';
@@ -570,8 +570,10 @@ const picker = createPicker(camera);
 // The terrain mesh is refilled in place (render.js), the block-material
 // volume with it; the mirrors rebuild on their next update; the field is
 // re-baked in full, and the worker handed the new world; the model lights are
-// re-read. Returns a message for the editor when something needs a reload.
+// re-read; the clouds are cast again round what is there now. Returns a message for the editor when something needs a reload.
 function applyWorldEdit() {
+  // First the trees the edit reaches into: grown again round it (world.js).
+  regrowTrees();
   const r = rebuildWorldInstances();
   if (!r.ok) return { message: `${r.count} pieces is past the terrain mesh's room - save and reload` };
   texel.syncCount();
@@ -580,6 +582,7 @@ function applyWorldEdit() {
   lighting.syncModelLights();
   boxLight.rebuild();
   leaves.invalidate();
+  smoke.worldChanged();
   if (shadowsOn) {
     // No prior footprint: a full bake, not a scroll (core/field.js createFieldAt).
     for (const g of shadowGrids) if (g) g.filledBlocks = null;
@@ -1954,6 +1957,10 @@ const bxbApi = installConsole(createConsole({
           ['torch', lighting.torchOn, () => lighting.toggleTorch(), () => lighting.toggleTorch(), false],
           [`model lights (${lighting.modelLightCount})`, lighting.modelLightCount > 0,
            () => { lighting.modelLightsOn = false; }, () => { lighting.modelLightsOn = true; }, false],
+          ['leaf cubes (not drawn; their light kept)', leaves.on,
+           () => { leaves.cubesDrawn = false; }, () => { leaves.cubesDrawn = true; }, false],
+          ['leaves (all: cubes, light, shading through them)', leaves.on,
+           () => { leaves.on = false; }, () => { leaves.on = true; }, false],
           ['sprites (not drawn)', true,
            () => { shown = spriteMeshes().filter(m => m.visible); shown.forEach(m => { m.visible = false; }); },
            () => shown.forEach(m => { m.visible = true; }), false],

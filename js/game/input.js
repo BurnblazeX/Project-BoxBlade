@@ -22,6 +22,26 @@ export function createInput({ game, player, interaction, encounter, picker, mark
 
   const isWalkingManual = () => game.keys.w || game.keys.a || game.keys.s || game.keys.d;
 
+  // A sprite's panel target, when it has one to open: an entity, or an
+  // Object that is a Container (Decor and Lights have none).
+  function panelTarget(sprite) {
+    const target = sprites.targetOf(sprite);
+    return target && (!target.subType || target.subType === 'Container') ? target : undefined;
+  }
+  const inReach = target => pathDistance(player.gridPos, target.gridPos) <= 2;
+  // F's target: the one lit under the cursor, else the nearest in reach.
+  let litTarget = null;
+  function interactTarget() {
+    if (litTarget && inReach(litTarget)) return litTarget;
+    let best = null, bestD = Infinity;
+    for (const s of sprites.hoverable()) {
+      const t = panelTarget(s);
+      const d = t ? pathDistance(player.gridPos, t.gridPos) : Infinity;
+      if (d <= 2 && d < bestD) { best = t; bestD = d; }
+    }
+    return best;
+  }
+
   // A rejected click says why once - not again for the same tile on release.
   function reject(key, message) {
     if (key === warned) return;
@@ -84,18 +104,10 @@ export function createInput({ game, player, interaction, encounter, picker, mark
     // Intercept clicks on ANY sprite (including the tree) so you can't walk through them
     const hitSprite = picker.objectAt(e.clientX, e.clientY, sprites.clickable());
     if (hitSprite) {
-      let target = sprites.targetOf(hitSprite); // undefined for the tree - no panel, by design
-
-      // Check if the target is an Object instead of an Entity
-      if (target && target.subType) {
-        // Ignore Decor and Lights; only allow interaction with Containers
-        if (target.subType !== 'Container') {
-          target = undefined;
-        }
-      }
+      const target = panelTarget(hitSprite); // undefined for the tree - no panel, by design
 
       if (game.mode === 'explore' && target) {
-        if (pathDistance(player.gridPos, target.gridPos) <= 2) {
+        if (inReach(target)) {
           interaction.open(target);
         } else {
           console.log(`${target.name} is too far away to interact!`);
@@ -149,12 +161,14 @@ export function createInput({ game, player, interaction, encounter, picker, mark
 
     // A target in look-range lights up, and the cursor says it can be clicked.
     let lit = null;
+    litTarget = null;
     document.body.style.cursor = 'default';
     if (game.mode === 'explore' && !game.interactionTarget) {
       const hovered = picker.objectAt(e.clientX, e.clientY, sprites.hoverable());
-      const target = hovered && sprites.targetOf(hovered);
-      if (target && pathDistance(player.gridPos, target.gridPos) <= 2) {
+      const target = hovered && panelTarget(hovered);
+      if (target && inReach(target)) {
         lit = hovered;
+        litTarget = target;
         document.body.style.cursor = 'pointer';
       }
     }
@@ -209,10 +223,19 @@ export function createInput({ game, player, interaction, encounter, picker, mark
     }
   }
 
-  // The game's keys, down: walking, Escape closes the panel, B into battle
-  // around Bob's chunk alone (the enemy joins when provoked) and out again.
+  // The game's keys, down: walking, Escape closes the panel, F - interact -
+  // opens the panel of what is lit or nearest in reach and closes it again
+  // (an exit Bob stands on comes first: main.js), B into battle around Bob's
+  // chunk alone (the enemy joins when provoked) and out again.
   function keyDown(key) {
     if (key === 'escape' && game.interactionTarget) interaction.close();
+    if (key === 'f' && game.mode === 'explore') {
+      if (game.interactionTarget) interaction.close();
+      else {
+        const target = interactTarget();
+        if (target) interaction.open(target);
+      }
+    }
     if (game.keys.hasOwnProperty(key)) game.keys[key] = true;
     if (key === 'b') {
       if (game.mode === 'explore') encounter.startBattle(false);

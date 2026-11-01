@@ -46,7 +46,8 @@ for (const [path, text] of Object.entries(sources)) {
 }
 
 // Generated trees (core/treegen.js): a species is a model with no cubes of
-// its own and three tiles - bark, end grain, and the leaves through its ramp
+// its own and three tiles - bark, end grain (for a cut tree; a living one is bark all
+// round), and the leaves through its ramp
 // (render.js loadModelTiles composes them from the terrain textures; the
 // leaves' tile is unused since the leaves became cells, core/leaves.js). Each
 // tree is that model with its own cubes, named tree_<species>#<seed>@<age>
@@ -63,18 +64,26 @@ for (const [name, species] of Object.entries(TREE_SPECIES)) {
   TREE_MODELS.set(name, model);
 }
 const TREE_NAME = /^tree_([A-Za-z]+)#(-?\d+)@(\d+)$/;
+export const treeName = (species, seed, age) => `tree_${species}#${seed}@${age}`;
 // The tree named `name` (tree_<species>#<seed>@<age>), grown; null if it
-// names none.
-export function treeModel(name) {
+// names none. The last one grown in the open is kept: the editor's cursor and
+// panel ask for the same tree again and again. blocked (treegen.js
+// growTree's): grown round what is where it stands - a placed tree's own
+// (world.js addWorldModel), not kept. growIn(blocked): the same tree grown so.
+let lastTree = null;
+export function treeModel(name, blocked = null) {
+  if (!blocked && lastTree && lastTree.name === name) return lastTree;
   const m = TREE_NAME.exec(name || '');
   const base = m && TREE_MODELS.get(m[1]);
   if (!base) return null;
-  const grown = treeBoxes(growTree(base.species, Number(m[2]), Number(m[3])));
+  const grown = treeBoxes(growTree(base.species, Number(m[2]), Number(m[3]), blocked));
   // The wood as cubes; the leaves as cells, drawn apart (core/leaves.js).
   const cubes = treeCubes({ wood: grown.wood, leaves: [] });
   const trunk = cubes[0];
-  return { ...base, name, cubes, bounds: trunk ? [{ min: trunk.min, max: trunk.max }] : [], stats: grown,
-           leafCells: grown.cells, leafAll: grown.all };
+  const tree = { ...base, name, cubes, bounds: trunk ? [{ min: trunk.min, max: trunk.max }] : [], stats: grown,
+                 leafCells: grown.cells, leafAll: grown.all, growIn: b => treeModel(name, b) };
+  if (!blocked) lastTree = tree;
+  return tree;
 }
 // Models by name, trees grown on the way (for world.js loadLevel).
 export const MODELS_AND_TREES = { get: name => MODELS.get(name) || treeModel(name) };

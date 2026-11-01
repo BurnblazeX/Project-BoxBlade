@@ -50,6 +50,12 @@ const ROWS = 6;
 
 export const SMOKE_REACH = 36;      // metres a shadow ray looks for smoke: C1
 
+// The sun's ray looks as far as any cloud is: it is clipped to each live
+// cloud's box and steps only inside the ones it crosses, so the reach costs
+// nothing - and a cloud's shadow is as long as a tower's (the sun depth map
+// holds only opaque blocks). Finite, so the box clip stays plain arithmetic.
+export const SMOKE_SUN_REACH = 1e4;
+
 // Boxes along a ray through one cloud's box, at most: its diagonal.
 const STEPS = Math.ceil(SMOKE_BOX * Math.sqrt(3));
 
@@ -275,7 +281,7 @@ export const smokeTransmitTSL = (shared, origin, dir, reach = float(SMOKE_REACH)
 // Thickness in half-metre box equivalents, independent of spell density.
 // Eight boxes block the sun fully, like an opaque occluder; ambient remains.
 export const smokeSunTransmitTSL = (shared, origin, dir) =>
-  float(1).sub(clamp(smokeTauTSL(shared, false, true)(origin, dir, float(SMOKE_REACH)).div(float(SMOKE_SUN_BOXES)), float(0), float(1)));
+  float(1).sub(clamp(smokeTauTSL(shared, false, true)(origin, dir, float(SMOKE_SUN_REACH)).div(float(SMOKE_SUN_BOXES)), float(0), float(1)));
 
 // The smoke at p, every live cloud's (the soft copy, grown): vec4(colour x
 // extinction, extinction) - extinction /m, times strength. Inline: one call

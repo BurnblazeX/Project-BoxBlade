@@ -1,13 +1,14 @@
 import * as THREE from 'three/webgpu';
-import { If, Loop, Break, float, vec2, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
+import { Fn, If, Loop, Break, float, vec2, vec3, uniform, texture3D, floor, max, texture, abs, vec4, min, clamp, length, int, select, mix, step, sign, fract, round } from 'three/tsl';
 import { GRID_DIM, VOXEL_METRES } from '../core/field.js';
-import { BLOCK_METRES, Y_MIN, SLOPE_CODE_BASE } from '../core/world.js';
+import { BLOCK_METRES, Y_MIN, SLOPE_CODE_BASE, SLOPE_KINDS, GRID, codeBox } from '../core/world.js';
 import { VOLUME_SLOTS } from '../core/blockvolume.js';
 import { SKY_TOP_STEPS } from '../core/skytop.js';
 import { terrainWhite, blockFaceTSL as boxFaceTSL, texelLockTSL, modelTexelCoreTSL } from './terrain.js';
 import { MODEL_HIT_RECORD } from '../core/bbmodel.js';
 import { MATERIALS } from '../core/materials.js';
 import { boxBumpedNormalTSL, labNormalTSL } from './normals.js';
+import { layout, memoFor } from './layout.js';
 
 // --- What a ray hit: the block volume, its shapes and the surface at a hit ---
 
@@ -84,7 +85,18 @@ export function axisFaceTSL(g) {
 // terrain: the block volume, so the planes of the parts in p's cell count
 // too (world.js codeBox) - a pane's or a slab's faces sit mid-cell. Mirrors
 // core/field.js blockFaceNormal with a world.
+//
+// With terrain it is a real shader function (one per shader, not a copy per
+// call) and the slots are a loop: unrolled, the walk was most of every glass
+// and reflection shader, and the build time with it.
 export function blockFaceTSL(p, dir, leaving, terrain = null) {
+  if (!terrain) return blockFaceCoreTSL(p, dir, leaving, null);
+  return memoFor(terrain.blocks, leaving ? 'blockFaceLeaving' : 'blockFaceHitting', () =>
+    Fn(([p, dir]) => blockFaceCoreTSL(p, dir, leaving, terrain))
+      .setLayout(layout('blockFace', 'vec3', [{ name: 'p', type: 'vec3' }, { name: 'dir', type: 'vec3' }])))(p, dir);
+}
+
+function blockFaceCoreTSL(p, dir, leaving, terrain) {
   const f = fract(p.div(float(BLOCK_METRES)).add(float(0.5))).toVar();
   const ad = abs(dir).toVar();
   const edge = min(f, vec3(1, 1, 1).sub(f)).toVar();
@@ -92,15 +104,12 @@ export function blockFaceTSL(p, dir, leaving, terrain = null) {
     const cell = round(p.div(float(BLOCK_METRES))).toVar();
     // Slot by slot while there are parts: a later slot holds one only if
     // the slot before it does.
-    const near = s => {
-      const v = blockVolumeTSL(terrain, cell, s).toVar();
-      If(v.x.greaterThan(float(0.5)), () => {
-        const box = codeBoxTSL(v.w);
-        edge.assign(min(edge, min(abs(f.sub(box.lo)), abs(f.sub(box.hi)))));
-        if (s + 1 < VOLUME_SLOTS) near(s + 1);
-      });
-    };
-    near(0);
+    Loop({ start: int(0), end: int(VOLUME_SLOTS), type: 'int', condition: '<' }, ({ i }) => {
+      const v = blockVolumeTSL(terrain, cell, i).toVar();
+      If(v.x.lessThanEqual(float(0.5)), () => { Break(); });
+      const box = codeBoxTSL(v.w);
+      edge.assign(min(edge, min(abs(f.sub(box.lo)), abs(f.sub(box.hi)))));
+    });
   }
   // Metres to the nearest boundary on each axis, less a millimetre's worth of
   // how squarely the ray crosses it (the tie-break), and ruled out where the ray
@@ -268,37 +277,53 @@ const holdsTSL = (v, f) => v.x.greaterThan(float(0.5)).and(inCodeBoxTSL(f, codeB
 // q: the first slot whose part's box (codeBoxTSL) holds it, or that holds the
 // tile's model - the first slot when none does (a hit a hair outside its
 // part, a full tile). A later slot is read only past a part that missed.
+// One shader function per volume (gi.js passes its own terrain object around
+// the same one), the slots a loop with one read and one box in it: the first
+// slot is kept as the fallback; air, or a model, ends the walk at once (a
+// model holds every point).
 export function volumeAtTSL(terrain, cell, q) {
-  const v = blockVolumeTSL(terrain, cell).toVar();
-  const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5)).toVar();
-  const next = s => {
-    const u = blockVolumeTSL(terrain, cell, s).toVar();
-    If(holdsTSL(u, f), () => { v.assign(u); })
-      .ElseIf(u.x.greaterThan(float(0.5)), () => { if (s + 1 < VOLUME_SLOTS) next(s + 1); });
-  };
-  If(v.x.greaterThan(float(0.5)).and(inCodeBoxTSL(f, codeBoxTSL(v.w)).not()), () => { next(1); });
-  return v;
+  return memoFor(terrain.blocks, 'volumeAt', () => Fn(([cell, q]) => {
+    const v = vec4(0, 0, 0, 0).toVar();
+    const f = q.div(float(BLOCK_METRES)).sub(cell).add(float(0.5)).toVar();
+    Loop({ start: int(0), end: int(VOLUME_SLOTS), type: 'int', condition: '<' }, ({ i }) => {
+      const u = blockVolumeTSL(terrain, cell, i).toVar();
+      const holds = holdsTSL(u, f).toVar();
+      If(i.equal(int(0)).or(holds), () => { v.assign(u); });
+      If(holds.or(u.x.lessThanEqual(float(0.5))), () => { Break(); });
+    });
+    return v;
+  }).setLayout(layout('volumeAt', 'vec4', [{ name: 'cell', type: 'vec3' }, { name: 'q', type: 'vec3' }])))(cell, q);
 }
 
 // The box the rays take for a shape code (the volume's A; world.js codeBox),
 // in cell fractions: a box on the Grid, its span on each axis one of six
 // pairs of thirds (x + 6y + 36z), or a slope's span over the whole tile.
 // Divisions offset half a step, so an inexact one never floors low.
-const spanLoTSL = k => select(k.lessThan(float(2.5)), float(0), select(k.lessThan(float(4.5)), float(1), float(2)));
-const spanHiTSL = k => select(k.lessThan(float(0.5)), float(3), select(k.lessThan(float(1.5)), float(1),
-                      select(k.lessThan(float(3.5)), float(2), float(3))));
+//
+// Tables read as sums of steps, not chains of selects: three writes a select
+// whose branches are not plain values as an if/else tree, and this box was
+// most of every volume lookup, repeated at each. Exact - the entries are
+// whole numbers of Grid steps, divided at the end as before.
+const tableTSL = (values, k, one) => values.slice(1).reduce((acc, v, i) =>
+  (v === values[i] ? acc : acc.add(step(one(i + 0.5), k).mul(float(v - values[i])))), one(values[0]));
+const asFloat = v => float(v), asVec3 = v => vec3(v, v, v);
+// The spans of thirds a box code's x, y and z digits name, from codeBox itself.
+const SPAN_LO = [0, 1, 2, 3, 4, 5].map(k => Math.round(codeBox(k)[0] * GRID));
+const SPAN_HI = [0, 1, 2, 3, 4, 5].map(k => Math.round(codeBox(k)[1] * GRID));
 function codeBoxTSL(a) {
   const c = a.toVar();
-  const slope = c.greaterThan(float(SLOPE_CODE_BASE - 0.5));
-  // SLOPE_KINDS: [rise, Grid height] - 0 [3, 0], 1 [1, 0], 2 [1, 1], 3 [1, 2], 4 [2, 0], 5 [2, 1].
-  const kind = floor(c.sub(float(SLOPE_CODE_BASE)).add(float(0.5)).div(float(4)));
-  const rise = select(kind.lessThan(float(0.5)), float(3), select(kind.lessThan(float(3.5)), float(1), float(2)));
-  const sy0 = select(kind.equal(float(2)).or(kind.equal(float(5))), float(1), select(kind.equal(float(3)), float(2), float(0)));
+  const slope = step(float(SLOPE_CODE_BASE - 0.5), c).toVar();   // 1 a slope, 0 a box
+  // SLOPE_KINDS: [rise, Grid height] per kind.
+  const kind = floor(c.sub(float(SLOPE_CODE_BASE)).add(float(0.5)).div(float(4))).toVar();
+  const rise = tableTSL(SLOPE_KINDS.map(k => k[0]), kind, asFloat);
+  const sy0 = tableTSL(SLOPE_KINDS.map(k => k[1]), kind, asFloat).toVar();
   const ky = floor(c.add(float(0.5)).div(float(6))), kz = floor(c.add(float(0.5)).div(float(36)));
-  const kx = c.sub(ky.mul(float(6))), kyy = ky.sub(kz.mul(float(6)));
-  const lo = vec3(select(slope, float(0), spanLoTSL(kx)), select(slope, sy0, spanLoTSL(kyy)), select(slope, float(0), spanLoTSL(kz)));
-  const hi = vec3(select(slope, float(3), spanHiTSL(kx)), select(slope, sy0.add(rise), spanHiTSL(kyy)), select(slope, float(3), spanHiTSL(kz)));
-  return { lo: lo.div(float(3)), hi: hi.div(float(3)) };
+  const k = vec3(c.sub(ky.mul(float(6))), ky.sub(kz.mul(float(6))), kz).toVar();
+  // mix by 0 or 1 is exact: the other side is finite (a slope's digits and a
+  // box's kind run past their tables, which then read their last entry).
+  const lo = mix(tableTSL(SPAN_LO, k, asVec3), vec3(float(0), sy0, float(0)), slope);
+  const hi = mix(tableTSL(SPAN_HI, k, asVec3), vec3(float(GRID), sy0.add(rise), float(GRID)), slope);
+  return { lo: lo.div(float(GRID)), hi: hi.div(float(GRID)) };
 }
 
 // What fills world point q for the walk through glass (world.js partAt, its
@@ -311,17 +336,16 @@ export function partAtTSL(terrain, q) {
   const f = q.div(Bm).sub(cell).add(float(0.5)).toVar();
   const v = vec4(0, 0, 0, 0).toVar();
   const box = { lo: vec3(0, 0, 0).toVar(), hi: vec3(1, 1, 1).toVar() };
-  const take = s => {
-    const u = blockVolumeTSL(terrain, cell, s).toVar();
-    If(u.x.greaterThan(float(0.5)), () => {
-      const b = codeBoxTSL(u.w);
-      const lo = b.lo.toVar(), hi = b.hi.toVar();
-      If(inCodeBoxTSL(f, { lo, hi }), () => {
-        v.assign(u); box.lo.assign(lo); box.hi.assign(hi);
-      }).Else(() => { if (s + 1 < VOLUME_SLOTS) take(s + 1); });
+  Loop({ start: int(0), end: int(VOLUME_SLOTS), type: 'int', condition: '<' }, ({ i }) => {
+    const u = blockVolumeTSL(terrain, cell, i).toVar();
+    If(u.x.lessThanEqual(float(0.5)), () => { Break(); });
+    const b = codeBoxTSL(u.w);
+    const lo = b.lo.toVar(), hi = b.hi.toVar();
+    If(inCodeBoxTSL(f, { lo, hi }), () => {
+      v.assign(u); box.lo.assign(lo); box.hi.assign(hi);
+      Break();
     });
-  };
-  take(0);
+  });
   const inBox = v.x.greaterThan(float(0.5));
   // Outside the volume is air (blockVolumeTSL reads it so too).
   const rel = cell.sub(terrain.blocks.origin);

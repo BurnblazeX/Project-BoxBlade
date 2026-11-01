@@ -1,5 +1,5 @@
 import { file, section, ok } from './lib/harness.mjs';
-import { createSmokeCloud, sphereCubes, sphereMeasure, smokeAt, smokeRadius, smokeAppear, SMOKE_SPHERE,
+import { createSmokeCloud, recastSmokeCloud, sphereCubes, sphereMeasure, smokeAt, smokeRadius, smokeAppear, SMOKE_SPHERE,
          SMOKE_RADIUS, SMOKE_CUBE, CLOUD_SPELLS, MAX_CAST_LEVEL, SMOKE_MAX_RADIUS,
          SMOKE_BOX, SMOKE_BOX_FROM } from '../js/core/smoke.js';
 import { BLOCK_METRES } from '../js/core/world.js';
@@ -268,4 +268,22 @@ section('a cube a newcomer covers stays seen until it has grown over it');
   ok('before then nothing expires', expireCovered(cl, 6.1), false);
   ok('after, they go back to unseen', expireCovered(cl, 7) && cl.cubes.every(q => !q[12]), true);
   ok('more than the walls were not kept', kept.length <= walls, true);
+}
+
+section('cast again when the world changes');
+{
+  // A post standing in the cloud: x, z within a block of (1.5, 0), up to 3 m.
+  const post = (x, y, z) => ground(x, y) || (Math.abs(x - 1.5) < 0.75 && Math.abs(z) < 0.75 && y < 3);
+  const before = createSmokeCloud(tile, post, fog, fog.level, () => false, { models: [] });
+  const inPost = ([x, y, z]) => Math.abs(x - 1.5) < 0.75 && Math.abs(z) < 0.75 && y < 3;
+  ok('cast round a post: none in it', before.cubes.some(inPost), false);
+  const after = recastSmokeCloud(before, 10, { solidAt: ground, glassAt: () => false, models: [] });
+  ok('the post gone, cast again: its room is smoke', after.cubes.filter(inPost).length, 3 * 3 * 4);   // 3 x 3 cubes across, 4 up
+  ok('... holding the same volume', `${after.cubes.length},${after.volume}`, `${before.volume},${before.volume}`);
+  const born = new Map(before.cubes.map(c => [c[10], c[11]]));
+  ok('... the cubes it had keep their birth', after.cubes.filter(c => born.has(c[10])).every(c => c[11] === born.get(c[10])), true);
+  ok('... the ones that came are born now', after.cubes.filter(inPost).every(c => c[11] === 10), true);
+  ok('... and the rim it no longer needs fades out', after.fading.length > 0 && after.fading.every(f => f.died === 10), true);
+  const back = recastSmokeCloud(after, 20, { solidAt: post, glassAt: () => false, models: [] });
+  ok('the post back: out of it again', back.cubes.some(inPost), false);
 }

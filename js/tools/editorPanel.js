@@ -7,7 +7,7 @@
 // from its own data - a material its texture, a model a front view built from
 // its cubes' own pixels, a shape its profile - built once and kept.
 import { MATERIALS } from '../core/materials.js';
-import { MODELS } from '../core/models.js';
+import { MODELS, TREE_MODELS, treeModel, treeName } from '../core/models.js';
 import { BLOCK_SHAPES, hasFacing, Region, shapeStates, partBoxes, partSpan } from '../core/world.js';
 import { textureUrl } from '../render/render.js';
 import { facePixel, bakeFaces } from '../core/bbmodel.js';
@@ -83,6 +83,32 @@ function shapePicture(shape, state) {
       g.closePath(); g.fill();
     } else {
       for (const [x0, x1, y0, y1] of partBoxes(part)) g.fillRect(x0 * n, n - y1 * n, (x1 - x0) * n, (y1 - y0) * n);
+    }
+    return c;
+  });
+}
+
+// A tree's seed when none is typed: any, so each tree placed is its own.
+export const newTreeSeed = () => Math.floor(Math.random() * 1e6);
+export const TREE_AGE_MAX = 500;
+// A grown tree (core/models.js treeModel): seen from the south, its wood and
+// its leaves in flat colours, far ones first.
+function treePicture(name) {
+  return picture('t:' + name, () => {
+    const { stats, species } = treeModel(name);
+    const leaf = `rgb(${species.ramp[2].join(',')})`;
+    const boxes = [...stats.wood.map(b => [b, '#6b4a2e']), ...stats.leaves.map(b => [b, leaf])]
+      .sort((p, q) => p[0][5] - q[0][5]);
+    let lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
+    for (const [b] of boxes) {
+      lo = [Math.min(lo[0], b[0]), Math.min(lo[1], b[1])];
+      hi = [Math.max(hi[0], b[3]), Math.max(hi[1], b[4])];
+    }
+    const size = Math.max(1, hi[0] - lo[0], hi[1] - lo[1]), ox = (size - (hi[0] - lo[0])) / 2;
+    const c = pixelated(size, size), g = c.getContext('2d');
+    for (const [b, colour] of boxes) {
+      g.fillStyle = colour;
+      g.fillRect(b[0] - lo[0] + ox, size - (b[4] - lo[1]), b[3] - b[0], b[4] - b[1]);
     }
     return c;
   });
@@ -206,12 +232,18 @@ export function createPalette({ state, pick, levelName }) {
 
     // What is selected, and which way it faces.
     const sel = el('div', 'sel');
-    const turns = state.kind === 'model' || (state.kind === 'block' && hasFacing(state.shape));
+    const turns = state.kind === 'model' || state.kind === 'tree' || (state.kind === 'block' && hasFacing(state.shape));
     if (state.kind === 'exit' || state.kind === 'spawn') {
       const t = el('div');
       t.append(el('div', 'what', state.kind === 'exit' ? 'Exit' : 'Spawn'),
                el('div', 'hint', state.kind === 'exit' ? 'click a top face · Shift+drag a box · RMB removes'
                                                        : 'click a top face · RMB removes'));
+      sel.appendChild(t);
+    } else if (state.kind === 'tree') {
+      sel.appendChild(treePicture(treeName(state.species, state.seed, state.age)));
+      const t = el('div');
+      t.append(el('div', 'what', titleCase(state.species)),
+               el('div', 'hint', `tree · seed ${state.seed}` + (state.seedText ? '' : ' · F new seed')));
       sel.appendChild(t);
     } else if (state.kind === 'model') {
       const model = MODELS.get(state.model);
@@ -271,6 +303,45 @@ export function createPalette({ state, pick, levelName }) {
       shapes.appendChild(tile);
     }
     panel.appendChild(shapes);
+
+    // Trees (core/treegen.js): grown from a species, a seed and an age;
+    // each one placed takes a new seed.
+    panel.appendChild(el('h3', '', `Trees (${TREE_MODELS.size})`));
+    for (const [name, base] of TREE_MODELS) {
+      if (!match(name, 'tree')) continue;
+      const on = state.kind === 'tree' && state.species === name, full = base.species.pulses;
+      const row = el('div', 'row' + (on ? ' on' : ''));
+      const t = el('div');
+      t.append(el('div', '', titleCase(name)), el('div', 'cat', 'tree · grown'));
+      row.append(treePicture(treeName(name, 0, full)), t);
+      row.onclick = () => pick({ kind: 'tree', species: name, seed: on ? state.seed : newTreeSeed(), age: on ? state.age : full });
+      panel.appendChild(row);
+    }
+    if (state.kind === 'tree') {
+      // The seed: typed, every tree placed is that one; empty, each a new one.
+      const s = el('label', '', 'Seed (empty: a new one each tree)');
+      const f = el('input');
+      f.value = state.seedText;
+      f.placeholder = String(state.seed);
+      f.oninput = () => {
+        state.seedText = f.value.trim();
+        const n = parseInt(state.seedText, 10);
+        if (Number.isFinite(n)) state.seed = n;
+      };
+      f.onchange = () => render();
+      s.appendChild(f);
+      panel.appendChild(s);
+      const full = TREE_MODELS.get(state.species).species.pulses;
+      const ageText = () => `Age ${state.age} (full size at ${full})`;
+      const a = el('label', '', ageText());
+      const r = el('input');
+      r.type = 'range'; r.min = 1; r.max = TREE_AGE_MAX; r.value = state.age;
+      r.style.width = '100%';
+      r.oninput = () => { state.age = Number(r.value); a.firstChild.textContent = ageText(); };
+      r.onchange = () => render();
+      a.appendChild(r);
+      panel.appendChild(a);
+    }
 
     // Models.
     panel.appendChild(el('h3', '', `Models (${MODELS.size})`));

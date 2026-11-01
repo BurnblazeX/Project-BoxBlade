@@ -1,35 +1,35 @@
 {
  "default/low": {
-  "vertex": "247cd45aa801eacd",
-  "fragment": "97ffaa291a0392c4"
+  "vertex": "d82faea5d1e624ce",
+  "fragment": "b0db757e429f9785"
  },
  "default/terrain": {
-  "vertex": "e6707e426a86850b",
-  "fragment": "27fe37de0407b426"
+  "vertex": "8104eb53c4a024b4",
+  "fragment": "ce89c6f49bcdb6db"
  },
  "default/glassLow": {
-  "vertex": "2f4ebb2743185567",
-  "fragment": "8a9d8aa5f8d72170"
+  "vertex": "20a4358788e096a6",
+  "fragment": "feb857f2b5ed3bd2"
  },
  "default/glass": {
-  "vertex": "68441336adfa54d5",
-  "fragment": "de2d6f72fca3bd50"
+  "vertex": "102a35515913519c",
+  "fragment": "4e8be0d379a7dfac"
  },
  "default/sprite": {
   "vertex": "0e983690a96026bc",
   "fragment": "4ae06c8f86ffbc51"
  },
  "default/split.0:splitBase": {
-  "compute": "be689b2e9f51fde2"
+  "compute": "63aa1ff67976601a"
  },
  "default/split.1:splitPoints": {
-  "compute": "ee5545a69064028b"
+  "compute": "4a2038cf354405ae"
  },
  "default/split.2:splitMirror": {
-  "compute": "131d4e5ffd80e23c"
+  "compute": "042e54bc89366e87"
  },
  "default/split.3:splitFinal": {
-  "compute": "147b9c9e24124849"
+  "compute": "ef6150628270902c"
  },
  "default/split.4:splitGlassSurface": {
   "compute": "39bd6731e9496079"
@@ -50,36 +50,36 @@
   "compute": "246a8d722d0ea228"
  },
  "texelgi/low": {
-  "vertex": "247cd45aa801eacd",
-  "fragment": "97ffaa291a0392c4"
+  "vertex": "d82faea5d1e624ce",
+  "fragment": "b0db757e429f9785"
  },
  "texelgi/terrain": {
-  "vertex": "ee3b47a679cae177",
-  "fragment": "96f11997d0496add"
+  "vertex": "2fecaa7a7f359af3",
+  "fragment": "6b76ecc4e01f6451"
  },
  "texelgi/glassLow": {
-  "vertex": "2f4ebb2743185567",
-  "fragment": "8a9d8aa5f8d72170"
+  "vertex": "20a4358788e096a6",
+  "fragment": "feb857f2b5ed3bd2"
  },
  "texelgi/glass": {
-  "vertex": "68441336adfa54d5",
-  "fragment": "de2d6f72fca3bd50"
+  "vertex": "102a35515913519c",
+  "fragment": "4e8be0d379a7dfac"
  },
  "texelgi/sprite": {
   "vertex": "4645724836fd3fdb",
   "fragment": "3a8f0d2d0f0cf78b"
  },
  "texelgi/split.0:splitBase": {
-  "compute": "c4937f98d169fd0c"
+  "compute": "4a6f7f7325da195f"
  },
  "texelgi/split.1:splitPoints": {
-  "compute": "ee5545a69064028b"
+  "compute": "4a2038cf354405ae"
  },
  "texelgi/split.2:splitMirror": {
-  "compute": "131d4e5ffd80e23c"
+  "compute": "042e54bc89366e87"
  },
  "texelgi/split.3:splitFinal": {
-  "compute": "59e66fae658f224b"
+  "compute": "ac55aa6a6aa41759"
  },
  "texelgi/split.4:splitGlassSurface": {
   "compute": "39bd6731e9496079"
@@ -115,24 +115,24 @@
   "compute": "246a8d722d0ea228"
  },
  "cache/low": {
-  "vertex": "ec18c89da25645b0",
-  "fragment": "34753ba62dbb2e14"
+  "vertex": "9de4d2e7489948f3",
+  "fragment": "5be16d0e11501aa6"
  },
  "cache/terrain": {
-  "vertex": "8763b6cf57e5f363",
-  "fragment": "f338286808470ccd"
+  "vertex": "9c9079f4df3f3952",
+  "fragment": "6a5c360c459dce0a"
  },
  "cache/miss": {
-  "vertex": "e5bc00da567fa93c",
-  "fragment": "67c6a17b86a8b57b"
+  "vertex": "b4d6c06287fc7cac",
+  "fragment": "7858d544786db632"
  },
  "cache/glassLow": {
-  "vertex": "6db786503ce7cc18",
-  "fragment": "f2671bb5eca31f2a"
+  "vertex": "acadb6cfb512744b",
+  "fragment": "4224dacb1c19f194"
  },
  "cache/glass": {
-  "vertex": "bd8d2f401e54954e",
-  "fragment": "6b716bf997a3bf23"
+  "vertex": "2415940a2981a1ba",
+  "fragment": "62a40bdeaec37c5c"
  },
  "cache/glassMiss": {
   "vertex": "fd41e70eab9d127f",
@@ -146,8 +146,8 @@
   "compute": "ba9884acf5808022"
  },
  "plain/terrain": {
-  "vertex": "d057f8a791235bd5",
-  "fragment": "3e13ffe1d61ddc1d"
+  "vertex": "0b04c4be628e7d7e",
+  "fragment": "a4e6c06cd7599b8e"
  },
  "plain/glass": {
   "vertex": "3219fed80f1d18ce",

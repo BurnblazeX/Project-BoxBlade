@@ -1,6 +1,6 @@
 import { validExit } from './exits.js';
 import { isGlassMaterial } from './materials.js';
-import { placeModel } from './bbmodel.js';
+import { placeModel, quarterTurn } from './bbmodel.js';
 import { rectCovered } from './rects.js';
 import { createChunkWorld } from './chunks.js';
 import { LEVEL_FORMAT, LEVEL_VERSION, migrateLevel, partRow, chunkBounds, unionBounds } from './region.js';
@@ -546,37 +546,169 @@ export function getColumnTop(x, z) {
 
 // --- Placed models (bbmodel.js) ---
 //
-// A model stands on a block's top face - its origin at the centre of that
-// face - turned yaw quarter turns (addWorldModel); or hangs on a wall
-// (mountWorldModel). Its cubes are world boxes in world texels (metres /
-// 0.125): the renderer draws them, the field bakes them. A model with
-// bounding boxes (Blockbench bounding_box elements) takes the tile under it,
-// like an entity standing there, so nothing walks into it; one without - a
-// wall torch - is walked under.
+// A model stands on a block's top face - its origin at the centre of one of
+// the tile's nine Grid columns, on the surface there - turned yaw quarter
+// turns (addWorldModel); or hangs on a wall at a Grid cell (mountWorldModel).
+// n, the Grid cell (world.js cellAt; its y unused standing), is saved with
+// it; 10 - the middle column, the floor - is the tile's centre, where every
+// model stood before the Grid. Models 4 texels wide fit a Grid cell, so up to
+// nine share a tile. Its cubes are world boxes in world texels (metres /
+// 0.125): the renderer draws them, the field bakes them. The Grid cells they
+// cover are taken (gridOccupantAt, keyed 'x,y,z_n'): another model is not
+// placed into them (modelFits). A model with bounding boxes (Blockbench
+// bounding_box elements) takes the tile under it, like an entity standing
+// there, so nothing walks into it; one without - a wall torch - is walked under.
 export const WorldModels = [];
 const TEXEL_METRES = BLOCK_METRES / 12;
 // Every placed cube as [x0, y0, z0, x1, y1, z1] in world texels - what the
 // field bakes (core/field.js), and what the field worker is sent.
 export const ModelBoxes = [];
+export const MODEL_CENTRE = cellAt(1, 0, 1);
 
-export function addWorldModel(model, x, y, z, yaw = 0) {
-  const at = [x * 12, surfaceLevel(x, y, z) * 12 - 6, z * 12];
-  return placeEntry(model, at, yaw, [x, y, z], [x, y, z]);
+// The Grid cells taken, 'x,y,z_n' -> the model's entry.
+const GridOccupants = new Map();
+export const gridOccupantAt = key => GridOccupants.get(key) || null;
+// The tiles models are in, 'x,y,z' -> how many: the block volume keeps a slot
+// of such a tile for its model (core/blockvolume.js), so it holds one part
+// fewer (withPart, modelFits).
+const TileModels = new Map();
+export const hasModelIn = key => TileModels.has(key);
+const tilesOf = gridKeys => [...new Set(gridKeys.map(k => k.split('_')[0]))];
+function countTileModels(entry, d) {
+  for (const t of tilesOf(entry.gridKeys)) {
+    const n = (TileModels.get(t) || 0) + d;
+    if (n > 0) TileModels.set(t, n); else TileModels.delete(t);
+  }
+}
+// The Grid cells world-texel cubes cover, as keys: a Grid cell is 4 texels,
+// a tile's three from -6 texels round its centre.
+export function modelGridKeys(cubes) {
+  const keys = new Set();
+  const g = t => Math.floor((t + 6) / 4);
+  for (const c of cubes) {
+    if (c.light) continue;
+    const lo = c.min.map(g), hi = c.max.map(t => g(t - 1e-6));
+    for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
+      const t = [x, y, z].map(v => Math.floor(v / GRID));
+      keys.add(`${t[0]},${t[1]},${t[2]}_${cellAt(x - t[0] * GRID, y - t[1] * GRID, z - t[2] * GRID)}`);
+    }
+  }
+  return [...keys];
+}
+// Whether placed cubes go where no model is.
+// and into tiles of fewer than MAX_PARTS parts.
+export const modelFits = cubes => {
+  const keys = modelGridKeys(cubes);
+  return keys.every(k => !GridOccupants.has(k)) && tilesOf(keys).every(t => tileParts(World.get(t)).length < MAX_PARTS);
+};
+
+// Where a model standing on block (x, y, z) at Grid column n has its origin,
+// in world texels: the column's centre, on the surface there.
+export function standOrigin(x, y, z, n = MODEL_CENTRE) {
+  const [gx, , gz] = atCell(n);
+  const block = getBlock(x, y, z);
+  const level = block ? y + surfaceOr(block, (gx + 0.5) / GRID, (gz + 0.5) / GRID) : surfaceLevel(x, y, z);
+  return [x * 12 + (gx - 1) * 4, level * 12 - 6, z * 12 + (gz - 1) * 4];
+}
+// A generated tree (models.js treeModel: it has a species) always stands in
+// its tile's middle column, wherever it was aimed or saved - and is grown
+// there, round what is there (treeSurroundings).
+export function addWorldModel(model, x, y, z, yaw = 0, n = MODEL_CENTRE) {
+  if (model.species) n = MODEL_CENTRE;
+  const at = standOrigin(x, y, z, n);
+  const sight = model.growIn ? treeSurroundings(at, yaw) : null;
+  const entry = placeEntry(sight ? model.growIn(sight) : model, at, yaw, [x, y, z], [x, y, z]);
+  entry.n = n;
+  if (sight) { sight.except = entry; entry.treeSight = sight; }
+  return entry;
+}
+
+// --- Trees grown round the world (core/treegen.js growTree's blocked) ---
+//
+// A tree's cells are half-metre BoxGrid cells, (0, 0, 0) the first over the
+// block it stands on, turned with it. One is taken by a block's solid at its
+// centre (isSolidAt: a slab, a step, a slope's staircase) or by a placed
+// model in its Grid cell - not another tree's (two crowns meet and mingle;
+// were they solid to each other, each regrowing round the other would
+// reshape the other again). The answers are kept, every cell the growth
+// asked about: a world edit asks them again (regrowTrees), and only a tree
+// whose answers changed is grown again.
+const TREE_CELL = 4;   // texels a cell (treegen.js CELL)
+const cellCode = (x, y, z) => ((x + 512) * 1024 + (y + 512)) * 1024 + (z + 512);
+const cellOfCode = c => [Math.floor(c / 1048576) - 512, (Math.floor(c / 1024) % 1024) - 512, (c % 1024) - 512];
+// The Grid cell key ('x,y,z_n') of world texel w.
+function gridKeyAt(w) {
+  const g = w.map(t => Math.floor((t + 6) / 4)), t = g.map(v => Math.floor(v / GRID));
+  return `${t[0]},${t[1]},${t[2]}_${cellAt(g[0] - t[0] * GRID, g[1] - t[1] * GRID, g[2] - t[2] * GRID)}`;
+}
+// blocked(x, y, z) for a tree with origin `at` (world texels) turned yaw;
+// .except: its own entry, once placed; .memo: code -> the answer given.
+export function treeSurroundings(at, yaw) {
+  const T = quarterTurn(1, yaw);
+  const ask = (x, y, z) => {
+    const c = [x * TREE_CELL, y * TREE_CELL + TREE_CELL / 2, z * TREE_CELL], w = [0, 0, 0];
+    for (let a = 0; a < 3; a++) { const [b, sgn] = T.axisOf[a]; w[b] = at[b] + T.p[b] + sgn * c[a]; }
+    if (isSolidAt(w[0] * TEXEL_METRES, w[1] * TEXEL_METRES, w[2] * TEXEL_METRES)) return true;
+    const o = GridOccupants.get(gridKeyAt(w));
+    return !!o && o !== blocked.except && !o.model.growIn;
+  };
+  const memo = new Map();
+  const blocked = (x, y, z) => {
+    const code = cellCode(x, y, z);
+    let v = memo.get(code);
+    if (v === undefined) { v = ask(x, y, z); memo.set(code, v); }
+    return v;
+  };
+  blocked.except = null;
+  blocked.memo = memo;
+  // Whether any answer is different now.
+  blocked.stale = () => { for (const [code, v] of memo) if (ask(...cellOfCode(code)) !== v) return true; return false; };
+  return blocked;
+}
+
+// After a world edit: every tree whose surroundings changed grown again in
+// place, round them. Returns the entries regrown.
+export function regrowTrees() {
+  const regrown = [];
+  for (const entry of WorldModels) {
+    if (!entry.treeSight || !entry.treeSight.stale()) continue;
+    for (const k of entry.gridKeys) if (GridOccupants.get(k) === entry) GridOccupants.delete(k);
+    countTileModels(entry, -1);
+    const sight = treeSurroundings(entry.at, entry.yaw);
+    sight.except = entry;
+    const model = entry.model.growIn(sight);
+    Object.assign(entry, { model, treeSight: sight }, placeModel(model, entry.at, entry.yaw));
+    entry.gridKeys = modelGridKeys(entry.cubes);
+    for (const k of entry.gridKeys) if (!GridOccupants.has(k)) GridOccupants.set(k, entry);
+    countTileModels(entry, 1);
+    regrown.push(entry);
+  }
+  if (regrown.length) {
+    ModelBoxes.length = 0;
+    for (const m of WorldModels) for (const c of m.cubes) if (!c.light) ModelBoxes.push([...c.min, ...c.max]);
+  }
+  return regrown;
 }
 
 // A wall model: its NORTH side (-z in Blockbench) is the side against the
 // wall, flush with its cell's north edge. It hangs in the air cell (x, y, z),
-// origin at the centre of that cell's floor, turned so its north faces the
+// origin at the floor of its Grid cell n there - along the wall and up it;
+// toward the wall it is always the middle - turned so its north faces the
 // wall - which is `wall` (N, E, S, W) of the cell. It belongs to the wall
 // block: in battle it shows and hides with it. Returns null, and places
 // nothing, when there is no block on that side to hang on.
 const WALL_YAW = { N: 0, W: 1, S: 2, E: 3 };     // quarter turns taking north to it
-export function mountWorldModel(model, x, y, z, wall) {
+export function wallOrigin(x, y, z, wall, n = MODEL_CENTRE) {
+  const [dx] = FACINGS[wall] || [0, 0];
+  const [gx, gy, gz] = atCell(n);
+  return [x * 12 + (dx ? 0 : (gx - 1) * 4), y * 12 - 6 + gy * 4, z * 12 + (dx ? (gz - 1) * 4 : 0)];
+}
+export function mountWorldModel(model, x, y, z, wall, n = MODEL_CENTRE) {
   const [dx, dz] = FACINGS[wall] || [0, 0];
   if (WALL_YAW[wall] === undefined || !getBlock(x + dx, y, z + dz)) return null;
-  const at = [x * 12, y * 12 - 6, z * 12];
-  const entry = placeEntry(model, at, WALL_YAW[wall], [x + dx, y, z + dz], [x, y - 1, z], wall);
+  const entry = placeEntry(model, wallOrigin(x, y, z, wall, n), WALL_YAW[wall], [x + dx, y, z + dz], [x, y - 1, z], wall);
   entry.cell = [x, y, z];
+  entry.n = n;
   return entry;
 }
 
@@ -586,6 +718,8 @@ export function removeWorldModel(entry) {
   if (i < 0) return false;
   WorldModels.splice(i, 1);
   vacateAt(getVoxelKey(...entry.tile), 'prop:' + entry.name);
+  for (const k of entry.gridKeys) if (GridOccupants.get(k) === entry) GridOccupants.delete(k);
+  countTileModels(entry, -1);
   ModelBoxes.length = 0;
   for (const m of WorldModels) for (const c of m.cubes) if (!c.light) ModelBoxes.push([...c.min, ...c.max]);
   return true;
@@ -665,11 +799,12 @@ export function gridAt(part, g) {
   return cellAt(...[0, 1, 2].map(a => Math.max(0, Math.min(g[a], GRID - (b[2 * a + 1] - b[2 * a])))));
 }
 // A block with a part added - null when it would not fit: a Grid cell
-// already taken, or MAX_PARTS there already.
-export function withPart(block, part) {
+// already taken, or MAX_PARTS there already (one fewer with a model in tile
+// key, hasModelIn).
+export function withPart(block, part, key = null) {
   if (!block) return newBlock(part.materialId, part.shape, part.facing, part.state, part.at);
   const parts = tileParts(block);
-  if (parts.length >= MAX_PARTS || !partFits(part)) return null;
+  if (parts.length >= MAX_PARTS - (key && hasModelIn(key) ? 1 : 0) || !partFits(part)) return null;
   const taken = parts.reduce((m, p) => m | partCells(p), 0);
   if (taken & partCells(part)) return null;
   const [first, ...rest] = [...parts, part];
@@ -707,9 +842,12 @@ export function serializeLevel() {
     }
     chunks.push({ cx, cz, cells: out });
   });
-  const models = WorldModels.map(m => m.wall
-    ? [m.name, ...m.cell, 0, m.wall]
-    : [m.name, m.x, m.y, m.z, m.yaw]);
+  // The Grid cell only when it is not the tile's centre.
+  const models = WorldModels.map(m => {
+    const row = m.wall ? [m.name, ...m.cell, 0, m.wall] : [m.name, m.x, m.y, m.z, m.yaw];
+    if (m.n !== MODEL_CENTRE) { if (!m.wall) row.push(null); row.push(m.n); }
+    return row;
+  });
   const level = { format: LEVEL_FORMAT, version: LEVEL_VERSION,
     region: { name: Region.name, bounds: Region.bounds, seaLevel: Region.seaLevel },
     spawns: Region.spawns, exits: Region.exits, models,
@@ -734,10 +872,10 @@ export function loadLevel(level, models, name = null) {
   // One that cannot work (no target, a broken box) is dropped, not tripped on.
   Region.exits = (level.exits || []).map(validExit).filter(Boolean);
   const missing = [];
-  for (const [name, x, y, z, yaw, wall] of level.models || []) {
+  for (const [name, x, y, z, yaw, wall, n = MODEL_CENTRE] of level.models || []) {
     const model = models.get(name);
-    const placed = model && (wall ? mountWorldModel(model, x, y, z, wall)
-                                  : addWorldModel(model, x, y, z, yaw || 0));
+    const placed = model && (wall ? mountWorldModel(model, x, y, z, wall, n)
+                                  : addWorldModel(model, x, y, z, yaw || 0, n));
     if (!placed) missing.push(name);
   }
   return missing;
@@ -758,6 +896,9 @@ function placeEntry(model, at, yaw, owner, tile, wall = null) {
   }));
   WorldModels.push(entry);
   for (const c of placed.cubes) if (!c.light) ModelBoxes.push([...c.min, ...c.max]);
+  entry.gridKeys = modelGridKeys(placed.cubes);
+  for (const k of entry.gridKeys) if (!GridOccupants.has(k)) GridOccupants.set(k, entry);
+  countTileModels(entry, 1);
   const tileKey = getVoxelKey(...tile);
   if (model.bounds.length && getBlock(...tile) && !occupantAt(tileKey)) setOccupantAt(tileKey, 'prop:' + model.name);
   return entry;
@@ -766,6 +907,8 @@ function placeEntry(model, at, yaw, owner, tile, wall = null) {
 export function clearWorldModels() {
   for (const m of WorldModels) vacateAt(getVoxelKey(...m.tile), 'prop:' + m.name);
   WorldModels.length = 0;
+  GridOccupants.clear();
+  TileModels.clear();
   ModelBoxes.length = 0;
 }
 

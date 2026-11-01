@@ -157,6 +157,19 @@ export function createShadowSets({ renderer, scene, camera, options, texel, spri
     }
   }
 
+  // The set's compute kernels, compiled before the set is shown, side by
+  // side: one compileComputeAsync each, since three's list form waits for
+  // each pipeline before starting the next, and a kernel left to its first
+  // renderer.compute is built and compiled synchronously inside that frame -
+  // tens of seconds, enough on Ultra for the browser to drop the device.
+  // Chrome compiles async pipelines on a thread pool; Firefox, on its one GPU
+  // thread, at least without freezing the page.
+  function compileKernels(kernels) {
+    const list = [...new Set(kernels.flatMap(k => (!k ? [] : k.isComputeNode ? [k]
+      : Object.values(k).flatMap(v => (Array.isArray(v) ? v : [v]))).filter(v => v && v.isComputeNode)))];
+    return Promise.all(list.map(k => renderer.compileComputeAsync(k)));
+  }
+
   // Everything a set's shaders depend on: the node options, the terrain mesh and
   // the texel cache, and per sprite its plain material, its normal map and
   // whether it draws opaque.
@@ -222,7 +235,10 @@ export function createShadowSets({ renderer, scene, camera, options, texel, spri
              ...[glassMat, glassLow, glassMiss].filter(Boolean), ...spriteSet.mats],
       compiled: false
     };
-    set.ready = compileOffscreen(pairs).catch(err => {
+    const kernels = [set.splitKernels, set.giKernels, set.mirrorCache,
+                     set.splitKernels && opts.split && opts.split.resolve,
+                     set.splitKernels && opts.split && opts.split.room && opts.split.room.ease];
+    set.ready = Promise.all([compileOffscreen(pairs), compileKernels(kernels)]).catch(err => {
       console.warn('[shadows] background compile failed, swapping anyway', err);
     }).then(() => {
       set.compiled = true;

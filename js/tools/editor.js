@@ -30,23 +30,26 @@
 // Exits and spawns are drawn while editing (cyan, yellow) and saved in the
 // region's header (core/exits.js).
 //
-// A model placed on a top face stands on it; on a side face it hangs on that
-// wall, its north side against it (world.js mountWorldModel).
+// A model placed on a top face stands on it, in the Grid column under the
+// cursor; on a side face it hangs on that wall at the Grid cell under the
+// cursor, its north side against it (world.js mountWorldModel). Not where
+// another model's cubes already are (world.js modelFits).
 //
 // Edits go through world.js (World, addWorldModel, ...) and then the one hook
 // main.js hands in, onEdit, which rebuilds what depends on the world: the
 // terrain instances, the field, the mirrors, the model lights.
 import * as THREE from 'three/webgpu';
 import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, GRID, partBoxes, partSpan, partFacing, isSlope,
-         surfaceLevel, tileParts, withPart, withoutPart, gridAt,
+         surfaceLevel, tileParts, withPart, withoutPart, gridAt, cellAt, MODEL_CENTRE, standOrigin, wallOrigin, modelFits,
+         treeSurroundings,
          WorldModels, addWorldModel, mountWorldModel, removeWorldModel,
          serializeLevel, DEV_LEVEL, Region, nextShapeState } from '../core/world.js';
 import { exitBox, exitsWithout } from '../core/exits.js';
 import { encodeRegion } from '../core/region.js';
 import { MATERIALS } from '../core/materials.js';
-import { MODELS } from '../core/models.js';
+import { MODELS, treeModel, treeName } from '../core/models.js';
 import { worldInstancedMesh, instanceInfo } from '../render/render.js';
-import { createPalette } from './editorPanel.js';
+import { createPalette, newTreeSeed } from './editorPanel.js';
 import { placeModel as placeModelBoxes } from '../core/bbmodel.js';
 
 const FLY_SPEED = 10;          // m/s; Shift x3
@@ -60,9 +63,10 @@ const FACING_ORDER = ['N', 'E', 'S', 'W'];
 export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = () => DEV_LEVEL }) {
   const state = {
     active: false,
-    // The selection: a block (material, shape and its state) or a model; a
-    // facing for both.
+    // The selection: a block (material, shape and its state), a model or a
+    // tree (species, seed, age: core/models.js treeModel); a facing for all.
     kind: 'block', materialId: MATERIALS[0].id, shape: 'full', shapeState: 'full', model: null, facing: 0,
+    species: null, seed: 0, seedText: '', age: 0,
     // Markers (kind 'exit' or 'spawn'): where an exit leads, a spawn's name.
     exitTarget: '', exitSpawn: 'start', spawnName: 'start',
     yaw: 0, pitch: -0.6, pos: new THREE.Vector3(),
@@ -227,35 +231,46 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     for (const [cell, at] of tries) {
       if (!inBounds(cell[1])) continue;
       const part = selectedPart(at);
-      const block = withPart(World.get(getVoxelKey(...cell)), part);
+      const block = withPart(World.get(getVoxelKey(...cell)), part, getVoxelKey(...cell));
       if (block) return { kind: 'block', cell, part, block };
     }
     return null;
   }
   // The tile a row or box starts from: the one the first click would place in.
   const startCell = t => { const p = state.kind === 'block' && planPlacement(t); return p ? p.cell : t.place; };
+  // A tree in the cursor, grown round what is where it would stand (as
+  // world.js addWorldModel grows it): one tile and turn at a time, until an
+  // edit - a growth is ~30 ms.
+  let treeAt = null;
+  const treeHere = (model, at, yaw) => {
+    const key = `${model.name}|${at.join()}|${yaw}`;
+    if (!treeAt || treeAt.key !== key) treeAt = { key, model: model.growIn(treeSurroundings(at, yaw)) };
+    return treeAt.model;
+  };
   function planPlacement(target) {
     if (!target) return null;
     if (state.kind === 'block') return target.model ? null : blockPlan(target);
-    const model = MODELS.get(state.model);
+    const model = state.kind === 'tree' ? treeModel(treeName(state.species, state.seed, state.age)) : MODELS.get(state.model);
     if (!model || target.model) return null;
     const [nx, ny, nz] = target.normal;
+    const [gx, gy, gz] = target.grid.at;
+    let plan = null;
     if (ny > 0) {
-      // On a top face: stands on that block, origin at its top.
-      const k = target.key;
-      const at = [k[0] * 12, surfaceLevel(...k) * 12 - 6, k[2] * 12];
-      return { kind: 'model', model, stand: k, yaw: state.facing,
-               cubes: placeModelBoxes(model, at, state.facing).cubes };
-    }
-    if (ny === 0) {
+      // On a top face: stands on that block, in the Grid column under the
+      // cursor - a tree in the middle one (world.js addWorldModel).
+      const k = target.key, n = state.kind === 'tree' ? MODEL_CENTRE : cellAt(gx, 0, gz);
+      const at = standOrigin(...k, n);
+      const shown = state.kind === 'tree' ? treeHere(model, at, state.facing) : model;
+      plan = { kind: 'model', model, stand: k, yaw: state.facing, n,
+               cubes: placeModelBoxes(shown, at, state.facing).cubes };
+    } else if (ny === 0 && state.kind === 'model') {
       // On a side face: hangs in the cell in front of it, north to the wall.
       const wall = nx > 0 ? 'W' : nx < 0 ? 'E' : nz > 0 ? 'N' : 'S';
-      const c = target.place;
-      const at = [c[0] * 12, c[1] * 12 - 6, c[2] * 12];
-      return { kind: 'model', model, cell: c, wall,
-               cubes: placeModelBoxes(model, at, WALL_YAW[wall]).cubes };
+      const c = target.place, n = cellAt(gx, gy, gz);
+      plan = { kind: 'model', model, cell: c, wall, n,
+               cubes: placeModelBoxes(model, wallOrigin(...c, wall, n), WALL_YAW[wall]).cubes };
     }
-    return null;
+    return plan && modelFits(plan.cubes) ? plan : null;
   }
 
   // A row: the drag picks the axis whose on-screen direction it follows
@@ -344,7 +359,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   function placeBlockAt(c, part) {
     const k = getVoxelKey(...c);
     if (!inBounds(c[1])) return false;
-    const block = withPart(World.get(k), part);
+    const block = withPart(World.get(k), part, k);
     if (!block) return false;
     World.set(k, block);
     return true;
@@ -378,8 +393,11 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   function placeModel(target) {
     const plan = planPlacement(target);
     if (!plan || plan.kind !== 'model') return false;
-    return !!(plan.wall ? mountWorldModel(plan.model, ...plan.cell, plan.wall)
-                        : addWorldModel(plan.model, ...plan.stand, plan.yaw));
+    const placed = plan.wall ? mountWorldModel(plan.model, ...plan.cell, plan.wall, plan.n)
+                             : addWorldModel(plan.model, ...plan.stand, plan.yaw, plan.n);
+    // No seed typed: the next tree is another.
+    if (placed && state.kind === 'tree' && !state.seedText) state.seed = newTreeSeed();
+    return !!placed;
   }
   function boxCells(a, b) {
     const lo = a.map((v, i) => Math.min(v, b[i])), hi = a.map((v, i) => Math.max(v, b[i]));
@@ -433,6 +451,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   }
 
   function edited(what) {
+    treeAt = null;
     const r = onEdit();
     if (r && r.message) status(r.message);
     else status(what);
@@ -469,6 +488,10 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
         const next = nextShapeState(state.shape, state.shapeState);
         if (next !== state.shapeState) { state.shapeState = next; renderPanel(); showCursor(state.hover); }
         else status(`${state.shape} has one state`);
+      } else if (state.kind === 'tree') {
+        // A new seed, and the typed one cleared: from here each tree is new.
+        state.seed = newTreeSeed(); state.seedText = '';
+        renderPanel(); showCursor(state.hover);
       } else if (state.kind === 'model') status('models have no states yet');
       return;
     }

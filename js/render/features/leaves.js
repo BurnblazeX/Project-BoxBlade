@@ -38,6 +38,9 @@ const windowAt = f => [boxIndex(f.x) - LEAF_DIMS[0] / 2, boxIndex(f.y) - LEAF_DI
 const STRAY = 16;
 // The sun's turn (1 - cos) that works the light out again.
 const SUN_TURN = 1e-5;
+// The camera's turn (cos) that sorts the cubes' draw order again (gpu/
+// leaves.js sort): a Q/E step sorts once or twice on its way round.
+const SORT_TURN = Math.cos(Math.PI / 12);
 
 // The light the leaves bounce (gpu/leafvolume.js u.albedo): the first
 // species' ramp, its mean, linear. One colour for all leaves for now.
@@ -53,6 +56,7 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
   const params = { ...DEFAULT_LEAVES };
   let heading = 0;            // the wind's, degrees from +x toward +z
   let on = true;
+  let cubesDrawn = true;      // off only inside bxb.gpuprofile: the light stays
   let gpu = null, gpuFor = null, gpuCards = null, gpuLightCards = null, gpuBasic = false;
   let warmed = null;
   let dirty = true;           // the list to rewrite
@@ -63,6 +67,8 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
   let volumeDirty = true;     // the density to refill
   let windowOrigin = null;
   let lit = null;             // the sun direction the light was worked out for
+  let sortedFor = null;       // the camera forward the draw order was sorted for
+  const forward = new THREE.Vector3();
   const t0 = performance.now();
   const now = () => (performance.now() - t0) / 1000;
 
@@ -70,6 +76,7 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
     const f = focus();
     last = gpu.write(models(), f ? [f.x, f.y, f.z] : null);
     boxes = placedLeafBoxes(models());
+    sortedFor = null;
     dirty = false;
     lightAll = true;
     volumeDirty = true;
@@ -172,13 +179,18 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
     if (made !== warmed) { warmed = made; warm(made); }
     if (dirty) write();
     const u = gpu.uniforms;
-    gpu.mesh.visible = on && u.count.value > 0;
-    if (!gpu.mesh.visible) { leafVolume.u.live.value = 0; lit = null; return; }
+    if (!on || u.count.value === 0) { gpu.mesh.visible = false; leafVolume.u.live.value = 0; lit = null; return; }
+    gpu.mesh.visible = cubesDrawn;
     writeSunUniforms(gpu.sun, sun.light.position, sun.angular());
     // Where the crown thins (gpu/leaves.js hideCutTSL): the player's chest.
     const f = focus();
     if (f) leafView.focus.value.set(f.x, f.y + PLAYER_CHEST, f.z);
     updateVolume(gpu.sun.dir.value);
+    camera.getWorldDirection(forward);
+    if (!sortedFor || sortedFor.dot(forward) < SORT_TURN) {
+      gpu.sort(forward);
+      sortedFor = (sortedFor || new THREE.Vector3()).copy(forward);
+    }
     const ambient = sun.uniforms().ambientUniform.value;
     u.sunLight.value = sun.on() ? (gpuBasic ? 1 : 1 - ambient) : 0;
     u.time.value = now();
@@ -221,6 +233,11 @@ export function createLeaves({ renderer, scene, camera, cascades, lighting, sky,
     update,
     // The placed models changed: the list is rewritten next frame.
     invalidate() { dirty = true; },
+    // Profiling (bxb.gpuprofile): all of the leaves, or only their cubes' draw.
+    get on() { return on; },
+    set on(v) { on = !!v; },
+    get cubesDrawn() { return cubesDrawn; },
+    set cubesDrawn(v) { cubesDrawn = !!v; },
     commands,
     settings: { title: 'Leaves', settings: [
       { key: 'leaveson', label: 'Leaves', type: 'toggle', get: () => on, set: v => { on = v; } },

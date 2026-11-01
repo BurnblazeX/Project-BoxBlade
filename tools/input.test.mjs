@@ -17,7 +17,7 @@ let tileUnder = null;               // what the picker reports under the cursor
 const warnings = [];
 console.warn = msg => warnings.push(msg);
 
-function setup(mode) {
+function setup(mode, sprites = null) {
   createTestArea(30, 30);
   const game = createGameState();
   game.mode = mode;
@@ -29,10 +29,11 @@ function setup(mode) {
     path: () => marks.push(['path']), clearPath: () => {}, pulsing: () => false
   };
   const input = createInput({
-    game, player, interaction: { open() {}, close() {} }, encounter: {},
+    game, player, encounter: {},
+    interaction: { open(t) { game.interactionTarget = t; }, close() { game.interactionTarget = null; } },
     picker: { tileAt: () => tileUnder, objectAt: () => null },
     markers,
-    sprites: { clickable: () => [], hoverable: () => [], targetOf: () => undefined, highlight() {} }
+    sprites: sprites || { clickable: () => [], hoverable: () => [], targetOf: () => undefined, highlight() {} }
   });
   warnings.length = 0;
   return { game, player, marks, input };
@@ -93,6 +94,20 @@ section('explore: press walks, release only when the press did not');
   release();
   ok('released over a tile, it walks there', t.game.path.length > 0 && t.game.moveTargetKey === getVoxelKey(4, GROUND_Y, 6), true);
   ok('no warnings in explore', warnings.length, 0);
+}
+
+section('F: the panel of the nearest target in reach, and closed again');
+{
+  const near = (x, z, extra = {}) => ({ name: `${x},${z}`, gridPos: { x, y: GROUND_Y, z }, ...extra });
+  const targets = [near(9, 9), near(3, 2, { subType: 'Decor' }), near(4, 2), near(2, 4, { subType: 'Container' })];
+  const t = setup('explore', { clickable: () => [], hoverable: () => targets, targetOf: s => s, highlight() {} });
+  t.input.keyDown('f');
+  ok('opens the nearest in reach, passing over Decor', t.game.interactionTarget && t.game.interactionTarget.name, '4,2');
+  t.input.keyDown('f');
+  ok('F again closes it', t.game.interactionTarget, null);
+  t.player.gridPos = { x: 20, y: GROUND_Y, z: 20 };
+  t.input.keyDown('f');
+  ok('nothing in reach, nothing opens', t.game.interactionTarget, null);
 }
 
 globalThis.window = saved.window;

@@ -54,7 +54,7 @@
 //         round): the leaves in reflections and through glass (gpu/shade.js).
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, Break, float, vec2, vec3, vec4, int, uvec3, uniform, uniformArray, instanceIndex, storage,
-         select, max, min, sin, fract, floor, round, abs, sign, step, clamp, length, mix, smoothstep, dot,
+         select, max, min, sin, fract, floor, round, abs, sign, step, clamp, length, sqrt, mix, smoothstep, dot, uint,
          varying, frontFacing, texture3D, textureStore, cameraPosition, positionGeometry, normalGeometry } from 'three/tsl';
 import { createSunUniforms } from './sun.js';
 import { createCubeWorldLight } from './cubelight.js';
@@ -62,14 +62,20 @@ import { smokeShared, smokeSunTransmitTSL } from './smokeshadow.js';
 import { wind } from './wind.js';
 import { leafVolume, leafLightTSL, LEAF_DIMS, LEAF_ID_BITS } from './leafvolume.js';
 import { layout } from './layout.js';
+import { mix32TSL } from './hitcache.js';
 import { smokeViewHitTSL } from './smokeview.js';
 import { TREE_SPECIES } from '../core/treegen.js';
 import { BOX_METRES } from '../core/boxgrid.js';
 import { placedLeafCubes } from '../core/leaves.js';
 
 export const LEAF_CUBE_CAPACITY = 131072;
-// Cubes lit a frame: the whole list over a few frames.
-export const LEAF_LIGHT_SLICE = 16384;
+// The draw order's distance steps (sort): finer than a cube across any
+// window, and steps x capacity stays an exact float64.
+const ORDER_STEPS = 1 << 20;
+// Cubes lit a frame: the whole list over a few frames. Each is a sun march
+// and one a lamp; at 16384 three big oaks (~6000 cubes) were all lit every
+// frame.
+export const LEAF_LIGHT_SLICE = 4096;
 export const DEFAULT_LEAVES = {
   albedo: 1, sway: 0.06, speed: 1.6, waveLength: 6, clump: 3,
   sun: 1, lamps: 1, sky: 1, gradient: 0.35, sss: 0.45, ms: 0.8, cutout: 0.65,
@@ -84,9 +90,13 @@ const CORNER_DIMS = [WX + 1, WY + 1, WZ + 1];
 const ID_BITS = LEAF_ID_BITS, ID_MASK = (1 << ID_BITS) - 1;
 // Boxes a reflection's walk takes at most.
 const LEAF_VIEW_STEPS = 96;
-// A point in the unit square for lattice cell v of face plane s.
-const hash2 = (v, s) => fract(sin(vec2(v.dot(vec2(127.1, 311.7)).add(s.mul(74.7)),
-                                       v.dot(vec2(269.5, 183.3)).add(s.mul(246.1)))).mul(float(43758.5453)));
+// A point in the unit square for lattice cell v (0 .. 255 each) of face plane
+// s (0 .. 1791): an integer hash of the three - exact, and no sin() (two a
+// cell were eighteen a pixel).
+const hash2 = (v, s) => {
+  const h = mix32TSL(uint(v.x).add(uint(v.y).mul(uint(256))).add(uint(s).mul(uint(65536)))).toVar();
+  return vec2(float(h.bitAnd(uint(0xffff))), float(h.shiftRight(uint(16)))).div(float(65536));
+};
 
 // The species' ramps, four colours each in species order (core/leaves.js
 // LEAF_SPECIES), linear.
@@ -169,12 +179,14 @@ function leafColourTSL(r, n, ns, w, lightAt, aim, skyColour, u, sunDir, cutAt = 
   const plane = floor(q.dot(nr).add(0.5)).mod(256).add(nr.dot(vec3(1, 2, 3)).add(3).mul(256));
   const g = floor(uv).add(0.5).div(u.clump).toVar();
   const cell = floor(g).toVar(), f = fract(g).toVar();
-  let d = float(4);
+  // The nearest feature point, squared distances compared, one root.
+  let d2 = float(16);
   for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
     const o = vec2(ox, oy);
-    d = min(d, length(o.add(hash2(cell.add(o).mod(256), plane)).sub(f)));
+    const e = o.add(hash2(cell.add(o).mod(256), plane)).sub(f);
+    d2 = min(d2, e.dot(e));
   }
-  const near = float(1).sub(d).toVar();
+  const near = float(1).sub(sqrt(d2)).toVar();
   const level = int(clamp(floor(near.mul(4)), float(0), float(3)));
   const albedo = leafView.ramps.element(speciesOf(w).mul(int(4)).add(level)).xyz;
   // Darker toward the crown's bottom: its height share in w's fraction.
@@ -297,6 +309,12 @@ export function createLeafCubes({ cascades, lights, biasUniform, fadeStartUnifor
   const lightAttr = new THREE.StorageBufferAttribute(COUNT * 3 * 4, 4);
   const light = storage(lightAttr, 'vec4', COUNT * 3).setName('bxbLeafLight');
   const lightRead = storage(lightAttr, 'vec4', COUNT * 3).toReadOnly().setName('bxbLeafLightRead');
+  // The order the cubes are drawn in: nearest the camera first (sort), so
+  // the faces behind a kept leaf texel fail the depth test before they are
+  // shaded. The draw reads through it; the light stays by cube.
+  const orderAttr = new THREE.StorageBufferAttribute(new Uint32Array(COUNT), 1);
+  const order = storage(orderAttr, 'uint', COUNT).toReadOnly().setName('bxbLeafOrder');
+  let sortKeys = null;
   const { index } = leafVolume, { corners } = leafView;
 
   const u = {
@@ -363,7 +381,8 @@ export function createLeafCubes({ cascades, lights, biasUniform, fadeStartUnifor
   })().compute(COUNT * 8).setName('leafCorners');
 
   // The cubes: their drawn faces, each corner swayed from its rest position.
-  const cube = cubes.element(instanceIndex);
+  const drawn = int(order.element(instanceIndex)).toVar();
+  const cube = cubes.element(drawn);
   const n = normalGeometry;
   const face = select(n.x.greaterThan(0.5), int(0), select(n.x.lessThan(-0.5), int(1),
     select(n.y.greaterThan(0.5), int(2), select(n.y.lessThan(-0.5), int(3), select(n.z.greaterThan(0.5), int(4), int(5))))));
@@ -371,7 +390,7 @@ export function createLeafCubes({ cascades, lights, biasUniform, fadeStartUnifor
   const rest = cube.xyz.add(positionGeometry.mul(float(BOX_METRES))).toVar();
   const mat = new THREE.MeshBasicNodeMaterial();
   mat.positionNode = select(open, rest.add(swayTSL(rest, u)), cube.xyz);
-  const at = int(instanceIndex).mul(int(3));
+  const at = drawn.mul(int(3));
   const vSun = varying(lightRead.element(at), 'vLeafSun');
   const vLamp = varying(lightRead.element(at.add(int(1))), 'vLeafLamp');
   const vAim = varying(lightRead.element(at.add(int(2))).xyz, 'vLeafAim');
@@ -409,6 +428,28 @@ export function createLeafCubes({ cascades, lights, biasUniform, fadeStartUnifor
       mesh.count = r.count;
       u.count.value = r.count;
       return r;
+    },
+    // Draws the cubes nearest first along view (the camera's forward, any
+    // length): their distances quantised above their ids in a float64, one
+    // native sort.
+    sort(view) {
+      const n = mesh.count, arr = cubeAttr.array, ids = orderAttr.array;
+      if (!n) return;
+      if (!sortKeys) sortKeys = new Float64Array(COUNT);
+      const keys = sortKeys.subarray(0, n);
+      let lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < n; i++) {
+        const d = arr[4 * i] * view.x + arr[4 * i + 1] * view.y + arr[4 * i + 2] * view.z;
+        keys[i] = d;
+        if (d < lo) lo = d;
+        if (d > hi) hi = d;
+      }
+      const scale = ORDER_STEPS / Math.max(hi - lo, 1e-6);
+      for (let i = 0; i < n; i++) keys[i] = Math.floor((keys[i] - lo) * scale) * COUNT + i;
+      keys.sort();
+      for (let k = 0; k < n; k++) ids[k] = keys[k] % COUNT;
+      orderAttr.addUpdateRange(0, n);
+      orderAttr.needsUpdate = true;
     },
     // The index of the leaf window whose min box is origin: each drawn cube
     // inside it at its box (see ID_BITS).
