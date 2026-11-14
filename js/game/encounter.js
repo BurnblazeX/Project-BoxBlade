@@ -10,7 +10,7 @@
 // ticks: the tick clock, for the pauses between turns. worldClock: game time,
 // which in battle stands still but for the rounds: 6 s each, counted as each
 // begins (core/clock.js).
-import { World, getVoxelKey, enterBattle, exitBattle, getReachableVoxels, isStandable, BLOCK_METRES, occupantAt, setOccupantAt, vacateAt } from '../core/world.js';
+import { World, getVoxelKey, enterBattle, exitBattle, getReachableVoxels, isEnterable, BLOCK_METRES, setOccupantAt, vacateAt } from '../core/world.js';
 import { rollInitiativeForParticipants, resetBattleState, turnOrder, currentTurnIndex, getCurrentEntity,
          nextTurn, addParticipant, roundNumber } from './battle.js';
 import { performAttack, isDefeated, takeEnemyTurn, isInMeleeRange } from './combat.js';
@@ -117,7 +117,7 @@ export function createEncounter({ game, player, enemy, playerSprite, enemySprite
             const cz = ez + dz;
             if (cx >= minX && cx <= maxX && cz >= minZ && cz <= maxZ) {
               const checkKey = getVoxelKey(cx, enemy.gridPos.y, cz);
-              if (World.get(checkKey) && isStandable(cx, enemy.gridPos.y, cz) && !occupantAt(checkKey)) {
+              if (World.get(checkKey) && isEnterable(cx, enemy.gridPos.y, cz)) {
                 ex = cx;
                 ez = cz;
                 found = true;

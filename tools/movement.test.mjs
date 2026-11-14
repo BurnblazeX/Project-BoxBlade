@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { file, section, ok, near } from './lib/harness.mjs';
+import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { occupantAt, setOccupantAt } from '../js/core/world.js';
 import { World, getVoxelKey, BLOCK_METRES as B } from '../js/core/world.js';
 import { followPath, walk, vacate, occupy, faceSprite, getSpriteWorldPos } from '../js/game/movement.js';
@@ -86,6 +86,25 @@ floor();
   const { e, sprite } = character('p', 1, 1);
   walk(e, sprite, { d: true }, 0, 0.1);
   near('a full block up blocks the walk', sprite.position.x, B);
+}
+floor();
+{
+  // Two walls meeting at a corner, the tile beyond it open: the body - half a
+  // Grid cell either side of the point - may not slip between them.
+  put(2, 1, 1); put(1, 1, 2);
+  const { e, sprite } = character('p', 1, 1);
+  for (let i = 0; i < 40; i++) walk(e, sprite, { d: true, s: true }, 0, 0.02);
+  ok('diagonally into the corner, it stays in its tile', `${e.gridPos.x},${e.gridPos.z}`, '1,1');
+  truthy('its body short of both walls',
+         sprite.position.x <= 1.5 * B - 0.25 + 1e-9 && sprite.position.z <= 1.5 * B - 0.25 + 1e-9);
+}
+floor();
+{
+  put(2, 1, 1);
+  const { e, sprite } = character('p', 1, 1);
+  for (let i = 0; i < 40; i++) walk(e, sprite, { d: true }, 0, 0.01);
+  truthy('walking at a wall, the body stops at its face', sprite.position.x <= 1.5 * B - 0.25 + 1e-9);
+  truthy('and gets close to it', sprite.position.x > 1.5 * B - 0.25 - 0.1);
 }
 
 section('facing');

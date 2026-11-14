@@ -1,7 +1,7 @@
 import { file, section, ok, truthy, falsy } from './lib/harness.mjs';
 import { exitBox, exitAt, exitsWithout, validExit, createExitTracker } from '../js/core/exits.js';
 
-file('exits.test.mjs - exits between regions (World plan P2, step 3)');
+file('exits.test.mjs - exits between zones (World plan P2, step 3)');
 
 const door = { cells: [10, 0, 4, 11, 0, 4], target: 'test_b', spawn: 'start' };
 const gate = { cells: [0, 2, 0, 0, 2, 0], target: 'dev_level', spawn: 'east' };

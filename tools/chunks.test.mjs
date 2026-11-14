@@ -103,7 +103,7 @@ section('material properties');
   ok('iron conducts, grass does not', `${materialProps('ironPlate').conductive}${materialProps('grass').conductive}`, '10');
 }
 
-section('a million blocks (a 512-block region)');
+section('a million blocks (a 512-block zone)');
 {
   const w = make();
   const t0 = performance.now();

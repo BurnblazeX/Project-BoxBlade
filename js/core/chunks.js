@@ -2,7 +2,7 @@
 //
 // Until 2026-10-28 World was a Map from a "x,y,z" string to a block object:
 // fine for the Dev Level's 2,270 blocks, about 150 bytes a block, and every
-// question about a box of the world meant walking all of it. A region of
+// question about a box of the world meant walking all of it. A zone of
 // 512 x 512 blocks holds around a million. So the world is now chunks of
 // size x height x size cells (12 x 48 x 12), each a Uint16Array of block
 // types, made when something is first put in them and dropped when emptied.
@@ -205,7 +205,7 @@ export function createChunkWorld({ size = 12, yMin, height }) {
       return cellsOf(box ? chunksIn(box[0], box[1], box[2], box[3]) : chunks.values(), box);
     },
     layerAt, setLayerAt,
-    // --- Whole chunks, for regions on disk (core/region.js) ---
+    // --- Whole chunks, for zones on disk (core/zone.js) ---
     // fn(cx, cz, cells, palette) per chunk: cells index the palette (0 empty).
     // Both are the store's own - read them, never write them.
     forEachChunk(fn) { for (const c of chunks.values()) fn(c.cx, c.cz, c.cells, palette); },

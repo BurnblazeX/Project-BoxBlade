@@ -284,7 +284,7 @@ async function loadFaceLayers(m, layer) {
 // air to the rays that ask (reflection and glass hits, the GI). It FOLLOWS
 // THE PLAYER (World plan P2a, core/follow.js): a world that fits sits centred
 // in it and it never moves; a bigger one recentres when the player leaves the
-// window's middle half (followBlockVolume), so a region can be any size. 128
+// window's middle half (followBlockVolume), so a zone can be any size. 128
 // is enough: rays never leave C2 (+-24 blocks) and the screen spans about
 // +-17. The sky-top map shares its footprint. Per tile, a slot a part
 // (core/blockvolume.js VOLUME_SLOTS), each BLOCK_VOLUME_SIZE[2] further along
@@ -619,10 +619,10 @@ function instanceMatrix(out, idx, key, visible = true) {
 // and every compiled shader set hold this mesh and its buffers, and a new mesh
 // would strand them all. Past its capacity an edit cannot be shown until a
 // reload (rebuildWorldInstances says so).
-// Regions load in place (World plan P2), so the first one sets the room for
+// Zones load in place (World plan P2), so the first one sets the room for
 // all of them: never less than TERRAIN_MIN_CAPACITY instances (~10 MB at 156
-// bytes each), enough for the village. A region past it reloads the page into
-// that region (main.js loadRegion), which sizes the mesh for it.
+// bytes each), enough for the village. A zone past it reloads the page into
+// that zone (main.js loadZone), which sizes the mesh for it.
 export const INSTANCE_HEADROOM = 16384;
 export const TERRAIN_MIN_CAPACITY = 65536;
 let terrain = null;   // { geometry, instanceData, attrs: {...}, capacity }

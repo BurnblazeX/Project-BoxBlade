@@ -67,7 +67,7 @@ export function updateActionResources(turnResources) {
   document.getElementById('res-move').innerText = turnResources.moveRemaining;
 }
 
-// The loading screen, while another region loads (main.js loadRegion): its
+// The loading screen, while another zone loads (main.js loadZone): its
 // name, then progress through the steps - fraction 0..1 and what is happening.
 export function showLoading(name) {
   document.getElementById('loading-name').innerText = name;

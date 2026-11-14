@@ -69,6 +69,11 @@ function frameUniform(node) {
 // declares) never depends on what else was built first. Their owners take them
 // from here: gpu/hitcache.js, roommeter.js, smokeshadow.js, smokeview.js,
 // texel.js (split shading's eye), texelgi.js.
+// What the sun's static shadow reads beyond its uniforms - the field's
+// contents, the sun depth map - calls changed() when it moves: the visible-
+// texel table's sun store (gpu/texel.js) then marches every texel again.
+export const sunInputs = { epoch: 1, changed() { this.epoch++; } };
+
 export const frameValues = {
   hitHalf: frameUniform(uniform(int(0))),          // the hit cache's write half
   roomBlend: frameUniform(uniform(float(1))),      // the room meter's ease

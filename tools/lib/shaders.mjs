@@ -189,7 +189,9 @@ function shaderSet(name, over) {
   // The compute kernels the set carries.
   for (const [k, c] of computeNodes({ split: built.splitKernels, gi: built.giKernels,
                                       mirror: built.mirrorCache,
-                                      room: built.splitKernels ? opts.split.room.ease : null })) {
+                                      room: built.splitKernels ? opts.split.room.ease : null,
+                                      // The visible-texel table's resolve (the low-res one is not held).
+                                      table: built.splitKernels && opts.split.table ? opts.split.resolve : null })) {
     out[`${name}/${k}`] = wgslOf(c);
   }
   return out;
@@ -218,6 +220,11 @@ export async function buildAllShaders() {
     s.resolve = G.createSplitResolve(s, texelCache);
     return s;
   };
+  const tableShading = () => {
+    const s = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true, 1 << 19);
+    s.resolve = G.createSplitResolve(s, texelCache);
+    return s;
+  };
   // Each set with GI as main.js would have it: the LPV, texel GI, the LPV, off.
   const giSet = (mode, on = true) => {
     const settings = giFeature.settings.settings;
@@ -229,6 +236,11 @@ export async function buildAllShaders() {
   Object.assign(sets, shaderSet('default', { split: splitShading() }));
   giSet('texel');
   Object.assign(sets, shaderSet('texelgi', { split: splitShading() }));
+  // The visible-texel table (bxb.splittable), with texel GI's patch register.
+  Object.assign(sets, shaderSet('table', { split: tableShading() }));
+  // ... with dispersion, as Ultra: the view through glass a lane a colour.
+  const disp = shaderSet('table-dispersion', { split: tableShading(), glassDispersion: 0.02 });
+  for (const k of Object.keys(disp)) if (k.includes('splitGlassThrough')) sets[k] = disp[k];
   giSet('lpv');
   Object.assign(sets, shaderSet('cache', { texelCache: true, hitCache }));
   giSet('lpv', false);
@@ -345,7 +357,8 @@ export function buildLeafShaders() {
   // the reflections - the binding limits are per shader, so they add up.
   const mode = giFeature.settings.settings.find(x => x.key === 'gimode');
   mode.set('texel');
-  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  // The visible-texel table, as the game runs: its kernels bind the most.
+  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true, 1 << 19);
   split2.resolve = G.createSplitResolve(split2, texelCache);
   for (const [k, v] of Object.entries(shaderSet('leaf-all', { leaves: G.leafVolume, leafView: true, smoke: G.smokeShared,
                                                               smokeView: true, split: split2 }))) {
@@ -375,7 +388,8 @@ export function buildSmokeShaders() {
   // ... and with texel GI, whose rays the smoke dims.
   const mode = giFeature.settings.settings.find(x => x.key === 'gimode');
   mode.set('texel');
-  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  // The visible-texel table, as the game runs: its kernels bind the most.
+  const split2 = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true, 1 << 19);
   split2.resolve = G.createSplitResolve(split2, texelCache);
   for (const [k, v] of Object.entries(shaderSet('smoke-texelgi', { smoke: G.smokeShared, smokeView: true, split: split2 }))) {
     if (k.includes('gi.')) out[`texel GI with smoke: ${k}`] = { compute: v.fragment || v.compute || v.vertex || '' };
@@ -389,8 +403,9 @@ export function buildSmokeShaders() {
 export function buildExposureShaders() {
   const meter = G.createExposureMeter();
   const split = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true);
+  const table = G.createSplitShading(1 << 18, 1 << 17, 1 << 21, true, 1 << 19);
   const out = {};
-  for (const [name, source] of [['split', { split }], ['target', { cache: texelCache }]]) {
+  for (const [name, source] of [['split', { split }], ['table', { split: table }], ['target', { cache: texelCache }]]) {
     meter.kernels(source).forEach((k, i) => { out[`exposure/${name}/${i}`] = wgslOf(k); });
   }
   // Our AgX (gpu/tonemap.js), on a plain material: proves the function builds.

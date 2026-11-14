@@ -1,9 +1,9 @@
 import { validExit } from './exits.js';
-import { isGlassMaterial } from './materials.js';
+import { isGlassMaterial, isNatureMaterial } from './materials.js';
 import { placeModel, quarterTurn } from './bbmodel.js';
 import { rectCovered } from './rects.js';
 import { createChunkWorld } from './chunks.js';
-import { LEVEL_FORMAT, LEVEL_VERSION, migrateLevel, partRow, chunkBounds, unionBounds } from './region.js';
+import { LEVEL_FORMAT, LEVEL_VERSION, migrateLevel, partRow, chunkBounds, unionBounds } from './zone.js';
 
 // --- CHUNK / VERTICAL LAYOUT ---
 // A chunk is 12x12 blocks in footprint and 48 blocks tall: 8 below ground,
@@ -34,7 +34,7 @@ export const World = createChunkWorld({ size: CHUNK_SIZE, yMin: Y_MIN, height: C
 
 // --- Who stands where ---
 //
-// A cell's occupant (an entity's id, a prop's 'prop:<model>') used to be a
+// A cell's occupant (an entity's id; props collide on the Grid, bodyFits) used to be a
 // field on its block. The block objects are shared types now, so occupancy is
 // its own table, by voxel key: a few entries, not one per block. A cell
 // emptied (World.delete) or a world cleared takes its occupants with it.
@@ -49,6 +49,10 @@ export function setOccupantAt(key, id) {
 // Off a cell, only if it is the occupant there.
 export function vacateAt(key, id) {
   if (Occupants.get(key) === id) Occupants.delete(key);
+}
+// Every occupied tile, fn(key, id) (tools/hitboxes.js).
+export function forEachOccupant(fn) {
+  Occupants.forEach((id, key) => fn(key, id));
 }
 {
   const clear = World.clear, del = World.delete;
@@ -407,18 +411,22 @@ export function slopeLevel(part, fx, fz) {
 // null where no part covers it. Closed: on the edge between two treads, the
 // higher; on the cell's edge, what is on that edge.
 function surfaceAt(block, fx, fz) {
-  let top = null;
+  return topPartAt(block, fx, fz).top;
+}
+// The same, and the part it is the top of: { top, part }.
+function topPartAt(block, fx, fz) {
+  let top = null, at = null;
   for (const part of tileParts(block)) {
     if (isSlope(part)) {
       const l = slopeLevel(part, fx, fz);
-      if (top === null || l > top) top = l;
+      if (top === null || l > top) { top = l; at = part; }
       continue;
     }
     for (const b of partBoxes(part)) {
-      if (fx >= b[0] && fx <= b[1] && fz >= b[4] && fz <= b[5] && (top === null || b[3] > top)) top = b[3];
+      if (fx >= b[0] && fx <= b[1] && fz >= b[4] && fz <= b[5] && (top === null || b[3] > top)) { top = b[3]; at = part; }
     }
   }
-  return top;
+  return { top, part: at };
 }
 // Where no part covers the point: the floor beside open steps, else the
 // block's top (a pane is stood on at its top, as a wall).
@@ -467,6 +475,25 @@ export function isStandable(x, y, z) {
 // y = 0 - so levels compare directly across cells. Over the cell's middle.
 export function surfaceLevel(x, y, z) {
   return y + surfaceOr(getBlock(x, y, z), 0.5, 0.5);
+}
+// The same at a point of the tile (fractions fx, fz across it); null where
+// there is no block.
+export function surfaceLevelAt(x, y, z, fx, fz) {
+  const block = getBlock(x, y, z);
+  return block ? y + surfaceOr(block, fx, fz) : null;
+}
+// Where plants can grow at a point of the tile: the level of its surface
+// there when the part on top is of a nature material (materials.js
+// isNatureMaterial) and open to the sky's side - no block on the cell above
+// lying on it - else null. For the foliage to come (grass cards).
+export function natureLevelAt(x, y, z, fx, fz) {
+  const block = getBlock(x, y, z);
+  if (!block) return null;
+  const { top, part } = topPartAt(block, fx, fz);
+  if (top === null || !isNatureMaterial(part.materialId)) return null;
+  const above = top >= 1 ? getBlock(x, y + 1, z) : null;
+  if (above && topPartAt(above, fx, fz).top !== null && blockSpan(above)[0] <= 0) return null;
+  return y + top;
 }
 
 // The surface's height at the edge toward (dx, dz), in the same levels: on a
@@ -555,9 +582,9 @@ export function getColumnTop(x, z) {
 // nine share a tile. Its cubes are world boxes in world texels (metres /
 // 0.125): the renderer draws them, the field bakes them. The Grid cells they
 // cover are taken (gridOccupantAt, keyed 'x,y,z_n'): another model is not
-// placed into them (modelFits). A model with bounding boxes (Blockbench
-// bounding_box elements) takes the tile under it, like an entity standing
-// there, so nothing walks into it; one without - a wall torch - is walked under.
+// placed into them (modelFits). A model's bounding boxes (Blockbench
+// bounding_box elements) take the Grid cells they reach into, so nothing walks
+// into them (bodyFits); one without - a wall torch, a carpet - is walked through.
 export const WorldModels = [];
 const TEXEL_METRES = BLOCK_METRES / 12;
 // Every placed cube as [x0, y0, z0, x1, y1, z1] in world texels - what the
@@ -678,6 +705,7 @@ export function regrowTrees() {
     sight.except = entry;
     const model = entry.model.growIn(sight);
     Object.assign(entry, { model, treeSight: sight }, placeModel(model, entry.at, entry.yaw));
+    gridSolids = null;
     entry.gridKeys = modelGridKeys(entry.cubes);
     for (const k of entry.gridKeys) if (!GridOccupants.has(k)) GridOccupants.set(k, entry);
     countTileModels(entry, 1);
@@ -717,7 +745,7 @@ export function removeWorldModel(entry) {
   const i = WorldModels.indexOf(entry);
   if (i < 0) return false;
   WorldModels.splice(i, 1);
-  vacateAt(getVoxelKey(...entry.tile), 'prop:' + entry.name);
+  gridSolids = null;
   for (const k of entry.gridKeys) if (GridOccupants.get(k) === entry) GridOccupants.delete(k);
   countTileModels(entry, -1);
   ModelBoxes.length = 0;
@@ -725,11 +753,24 @@ export function removeWorldModel(entry) {
   return true;
 }
 
+// A placed model in another of its states (models.js modelStates): the same
+// spot, turn and Grid cell, with that state's cubes, light and collision.
+// Returns the new entry - the old one is gone - or null, the old one kept,
+// when the new state's cubes do not fit beside the models around it.
+export function swapWorldModel(entry, model) {
+  if (!removeWorldModel(entry)) return null;
+  const put = m => (entry.wall ? mountWorldModel(m, ...entry.cell, entry.wall, entry.n)
+                               : addWorldModel(m, entry.x, entry.y, entry.z, entry.yaw, entry.n));
+  if (modelFits(placeModel(model, entry.at, entry.yaw).cubes)) { const swapped = put(model); if (swapped) return swapped; }
+  put(entry.model);
+  return null;
+}
+
 // --- Levels: the world as data ---
 //
 // What the editor saves and the game loads: every block, every placed model
-// by name, and the region's settings, spawns and exits. Entities are not in it
-// yet. On disk a region is a .bxr file, level format v3 (core/region.js); v1's
+// by name, and the zone's settings, spawns and exits. Entities are not in it
+// yet. On disk a zone is a .bxz file, level format v4 (core/zone.js); v1's
 // JSON levels, a row per block in halves, still load:
 //   { format: 'boxblade-level', version: 1,
 //     blocks: [[x, y, z, materialId, shape?, facing?, second?], ...],
@@ -737,21 +778,21 @@ export function removeWorldModel(entry) {
 //             [[name, x, y, z, 0, wall], ...] }      hung in cell (x, y, z)
 export { LEVEL_FORMAT };
 
-// The Dev Level (levels/dev_level.bxr): the test map every feature through
+// The Dev Level (levels/dev_level.bxz): the test map every feature through
 // A10 was built and measured on - the church, the glass bed, the torches. The
-// game loads it and the editor saves to it, until regions (World plan P2)
-// bring a level per region.
+// game loads it and the editor saves to it. It is a detached zone: not on the
+// terrain master, so it carries its own chunks (core/zone.js).
 export const DEV_LEVEL = 'dev_level';
 
-// The loaded region's settings (World plan P2 §4.1): its name, bounds
+// The loaded zone's settings (World plan P2 §4.1): its name, bounds
 // [x0, x1, z0, z1] (inclusive, in blocks), sea level, named spawn points
 // [x, y, z], and exits. Set by loadLevel; saved back by serializeLevel.
-export const Region = { name: null, bounds: null, seaLevel: null, spawns: {}, exits: [] };
+export const Zone = { name: null, bounds: null, seaLevel: null, spawns: {}, exits: [] };
 
-// A spawn point of the loaded region, [x, y, z]: the one named, else its
+// A spawn point of the loaded zone, [x, y, z]: the one named, else its
 // 'start', else null.
-export function regionSpawn(name = 'start') {
-  return Region.spawns[name] || Region.spawns.start || null;
+export function zoneSpawn(name = 'start') {
+  return Zone.spawns[name] || Zone.spawns.start || null;
 }
 
 // A block: its first part - materialId, shape, facing, state, at - and the
@@ -773,7 +814,7 @@ function cleanPart({ materialId, shape, facing, state, at }) {
   if (at) part.at = at;
   return part;
 }
-// A palette row's block (core/region.js): its parts' rows.
+// A palette row's block (core/zone.js): its parts' rows.
 export function blockFromRows(rows) {
   const [first, ...rest] = rows.map(r => ({ materialId: r[0], shape: r[1], facing: r[2], state: r[3], at: r[4] }));
   return newBlock(first.materialId, first.shape, first.facing, first.state, first.at, rest);
@@ -820,7 +861,7 @@ export function withoutPart(block, i) {
            walkable: block.walkable, triggerId: block.triggerId };
 }
 
-// The world as a v2 level in memory (core/region.js): copies of its chunks,
+// The world as a v4 level in memory (core/zone.js): copies of its chunks,
 // indexing a palette of only the block types in use. The bounds grow to take
 // in any block the editor put outside them.
 export function serializeLevel() {
@@ -849,15 +890,15 @@ export function serializeLevel() {
     return row;
   });
   const level = { format: LEVEL_FORMAT, version: LEVEL_VERSION,
-    region: { name: Region.name, bounds: Region.bounds, seaLevel: Region.seaLevel },
-    spawns: Region.spawns, exits: Region.exits, models,
+    zone: { name: Zone.name, bounds: Zone.bounds, seaLevel: Zone.seaLevel },
+    spawns: Zone.spawns, exits: Zone.exits, models,
     chunk: { size, yMin, height }, palette, chunks };
-  level.region.bounds = unionBounds(Region.bounds, chunkBounds(chunks, World.shape));
+  level.zone.bounds = unionBounds(Zone.bounds, chunkBounds(chunks, World.shape));
   return level;
 }
 
-// Replaces the world with a level: v2 in memory, its readable form, or v1.
-// models: name -> parsed model (models.js); name: the region's, if the level
+// Replaces the world with a level: v2 to v4 in memory, its readable form, or v1.
+// models: name -> parsed model (models.js); name: the zone's, if the level
 // does not say. Returns the names of models it could not find, or place.
 export function loadLevel(level, models, name = null) {
   level = migrateLevel(level, World.shape);
@@ -865,12 +906,12 @@ export function loadLevel(level, models, name = null) {
   World.clear();
   const blocks = level.palette.map(row => row && blockFromRows(row));
   for (const { cx, cz, cells } of level.chunks) World.putChunk(cx, cz, cells, blocks);
-  Region.name = level.region.name ?? name;
-  Region.bounds = level.region.bounds;
-  Region.seaLevel = level.region.seaLevel;
-  Region.spawns = level.spawns;
+  Zone.name = level.zone.name ?? name;
+  Zone.bounds = level.zone.bounds;
+  Zone.seaLevel = level.zone.seaLevel;
+  Zone.spawns = level.spawns;
   // One that cannot work (no target, a broken box) is dropped, not tripped on.
-  Region.exits = (level.exits || []).map(validExit).filter(Boolean);
+  Zone.exits = (level.exits || []).map(validExit).filter(Boolean);
   const missing = [];
   for (const [name, x, y, z, yaw, wall, n = MODEL_CENTRE] of level.models || []) {
     const model = models.get(name);
@@ -899,14 +940,13 @@ function placeEntry(model, at, yaw, owner, tile, wall = null) {
   entry.gridKeys = modelGridKeys(placed.cubes);
   for (const k of entry.gridKeys) if (!GridOccupants.has(k)) GridOccupants.set(k, entry);
   countTileModels(entry, 1);
-  const tileKey = getVoxelKey(...tile);
-  if (model.bounds.length && getBlock(...tile) && !occupantAt(tileKey)) setOccupantAt(tileKey, 'prop:' + model.name);
+  gridSolids = null;
   return entry;
 }
 
 export function clearWorldModels() {
-  for (const m of WorldModels) vacateAt(getVoxelKey(...m.tile), 'prop:' + m.name);
   WorldModels.length = 0;
+  gridSolids = null;
   GridOccupants.clear();
   TileModels.clear();
   ModelBoxes.length = 0;
@@ -1119,9 +1159,82 @@ export function pathDistance(a, b) {
 // entered at the level stepLevel picks: its surface within half a block of
 // this one (a half block steps up onto a full one). A full block's rise is
 // impassable until Jump exists.
-function isEnterable(x, y, z) {
+export function isEnterable(x, y, z) {
   if (!isStandable(x, y, z)) return false;
-  return !occupantAt(getVoxelKey(x, y, z));
+  if (occupantAt(getVoxelKey(x, y, z))) return false;
+  return bodyFits(x * BLOCK_METRES, surfaceHeight(x, y, z), z * BLOCK_METRES);
+}
+
+// --- Collision on the Grid ---
+//
+// What a character walks into is measured in Grid cells (half a metre, three
+// a tile each way): a placed model's bounding boxes (Blockbench bounding_box
+// elements) take every Grid cell they reach into, not the whole tile. A
+// character's body is a box BODY_HALF either side of its point, BODY_HEIGHT
+// tall from the ground under it; it goes where that box meets no taken cell
+// (bodyFits), and a path steps from tile to tile only where the body slides
+// from middle to middle (canCross) - a fence along a tile's edge blocks the
+// crossing, not the tile. The ground itself - steps, headroom - is still
+// tile by tile (stepLevel, isStandable), and so are characters among
+// themselves (occupantAt): battle is fought on tiles.
+export const GRID_METRES = BLOCK_METRES / GRID;
+export const BODY_HALF = GRID_METRES / 2;
+export const BODY_HEIGHT = BLOCK_METRES;
+const CELL_TEXELS = 12 / GRID;
+// 'gx,gy,gz' of the taken Grid cells, global (tile x's are 3x .. 3x + 2), and
+// the 'x,z' tiles they are in; null after a model edit, worked out when asked.
+let gridSolids = null, solidTiles = null;
+function buildGridSolids() {
+  gridSolids = new Set(); solidTiles = new Set();
+  for (const m of WorldModels) for (const b of m.bounds || []) {
+    // World texels; a tile's cells start half a block (6 texels) below its middle.
+    const lo = b.min.map(v => Math.floor((v + 6) / CELL_TEXELS));
+    const hi = b.max.map(v => Math.ceil((v + 6) / CELL_TEXELS) - 1);
+    for (let x = lo[0]; x <= hi[0]; x++) for (let y = lo[1]; y <= hi[1]; y++) for (let z = lo[2]; z <= hi[2]; z++) {
+      gridSolids.add(`${x},${y},${z}`);
+      solidTiles.add(`${Math.floor(x / GRID)},${Math.floor(z / GRID)}`);
+    }
+  }
+}
+// The taken Grid cells (tools/hitboxes.js draws them).
+export function gridSolidCells() {
+  if (!gridSolids) buildGridSolids();
+  return gridSolids;
+}
+// Metres -> Grid cell coordinate (fractional): cell g spans [g, g + 1).
+const toCell = m => (m + BLOCK_METRES / 2) / GRID_METRES;
+const EDGE = 1e-6;
+// Whether a body standing at (wx, wz) on ground at height wy (metres) meets
+// no taken Grid cell. Touching a cell's face is not meeting it.
+export function bodyFits(wx, wy, wz) {
+  if (!gridSolids) buildGridSolids();
+  if (!gridSolids.size) return true;
+  const x0 = Math.floor(toCell(wx - BODY_HALF) + EDGE), x1 = Math.ceil(toCell(wx + BODY_HALF) - EDGE) - 1;
+  const y0 = Math.floor(toCell(wy) + EDGE), y1 = Math.ceil(toCell(wy + BODY_HEIGHT) - EDGE) - 1;
+  const z0 = Math.floor(toCell(wz - BODY_HALF) + EDGE), z1 = Math.ceil(toCell(wz + BODY_HALF) - EDGE) - 1;
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) for (let z = z0; z <= z1; z++) {
+    if (gridSolids.has(`${x},${y},${z}`)) return false;
+  }
+  return true;
+}
+// Whether a body slides straight from tile a's middle to tile b's (a path's
+// step; a and b { x, y, z }, neighbours): tried every half a body's width,
+// on a's ground the first half of the way and b's the rest.
+export function canCross(a, b) {
+  if (!gridSolids) buildGridSolids();
+  if (!gridSolids.size) return true;
+  // Only the tiles of the step's square can be reached into.
+  let near = false;
+  for (let x = Math.min(a.x, b.x); x <= Math.max(a.x, b.x) && !near; x++)
+    for (let z = Math.min(a.z, b.z); z <= Math.max(a.z, b.z) && !near; z++) near = solidTiles.has(`${x},${z}`);
+  if (!near) return true;
+  const ga = surfaceHeight(a.x, a.y, a.z), gb = surfaceHeight(b.x, b.y, b.z);
+  const n = Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) * BLOCK_METRES / BODY_HALF);
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    if (!bodyFits((a.x + (b.x - a.x) * t) * BLOCK_METRES, t <= 0.5 ? ga : gb, (a.z + (b.z - a.z) * t) * BLOCK_METRES)) return false;
+  }
+  return true;
 }
 
 // A* over standable tiles. Called on every click, every held-mouse retarget
@@ -1258,6 +1371,7 @@ export function findPath(start, end, allowDiagonals = false) {
 
       if (currentArena && !currentArena.has(getVoxelKey(neighbor.x, neighbor.y, neighbor.z))) continue;
       if (!canEnter(neighbor.x, neighbor.y, neighbor.z)) continue;
+      if (!canCross(current, neighbor)) continue;
 
       // Prevent clipping through solid OR occupied corners when moving diagonally:
       // both corners must be steppable from here too.
@@ -1354,6 +1468,7 @@ export function getReachableVoxels(start, speed) {
 
       if (currentArena && !currentArena.has(nKey)) continue;
       if (!isEnterable(neighbor.x, neighbor.y, neighbor.z)) continue;
+      if (!canCross(p, neighbor)) continue;
 
       const newCost = current.cost + 1;
       if (!reachable.has(nKey) || newCost < reachable.get(nKey)) {

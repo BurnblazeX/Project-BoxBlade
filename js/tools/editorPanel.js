@@ -7,8 +7,8 @@
 // from its own data - a material its texture, a model a front view built from
 // its cubes' own pixels, a shape its profile - built once and kept.
 import { MATERIALS } from '../core/materials.js';
-import { MODELS, TREE_MODELS, treeModel, treeName } from '../core/models.js';
-import { BLOCK_SHAPES, hasFacing, Region, shapeStates, partBoxes, partSpan } from '../core/world.js';
+import { MODELS, TREE_MODELS, MODEL_STATES, treeModel, treeName, modelStates, modelStateOf } from '../core/models.js';
+import { BLOCK_SHAPES, hasFacing, Zone, shapeStates, partBoxes, partSpan } from '../core/world.js';
 import { textureUrl } from '../render/render.js';
 import { facePixel, bakeFaces } from '../core/bbmodel.js';
 
@@ -20,7 +20,10 @@ export const SHAPE_ORDER = Object.keys(BLOCK_SHAPES);
 // 'ironPlate' -> 'Iron Plate'; 'decor_wallTorch' -> { category: 'decor', name: 'Wall Torch' }.
 export const titleCase = s => s.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ')
   .replace(/\b\w/g, c => c.toUpperCase()).trim();
+// A model in one of its states (models.js) is labelled by its base:
+// 'decor_fence_rails' -> { category: 'decor', name: 'Fence' }.
 export function modelLabel(name) {
+  name = modelStateOf(name).base;
   const i = name.indexOf('_');
   return i > 0 ? { category: name.slice(0, i), name: titleCase(name.slice(i + 1)) }
                : { category: '', name: titleCase(name) };
@@ -163,6 +166,7 @@ const CSS = `
 #editor-panel .top { display:flex; justify-content:space-between; align-items:baseline; }
 #editor-panel .top b { font-size:13px; letter-spacing:.06em; }
 #editor-panel .hint { color:#7f8896; font-size:11px; }
+#editor-panel .top .erase { color:#ff6666; font-size:11px; font-weight:600; letter-spacing:.06em; }
 #editor-panel .sel { display:flex; gap:10px; align-items:center; margin-top:8px; padding:8px;
   background:#22262e; border:1px solid #3a3f48; border-radius:6px; }
 #editor-panel .sel canvas { width:44px; height:44px; background:#0e1014; border-radius:4px; }
@@ -210,10 +214,10 @@ export function createPalette({ state, pick, levelName }) {
   }
   document.body.appendChild(panel);
   let filter = '';
-  // The regions on disk, for the exit's target (GET /__levels, dev server).
-  let regionNames = [];
-  const loadRegionNames = () => fetch('/__levels').then(r => (r.ok ? r.json() : []))
-    .then(names => { regionNames = names; }).catch(() => {});
+  // The zones on disk, for the exit's target (GET /__levels, dev server).
+  let zoneNames = [];
+  const loadZoneNames = () => fetch('/__levels').then(r => (r.ok ? r.json() : []))
+    .then(names => { zoneNames = names; }).catch(() => {});
   const match = (...labels) => !filter || labels.some(l => l.toLowerCase().includes(filter));
   const el = (tag, cls, text) => {
     const e = document.createElement(tag);
@@ -227,7 +231,8 @@ export function createPalette({ state, pick, levelName }) {
     const caret = keepFocus ? document.activeElement.selectionStart : 0;
     panel.textContent = '';
     const top = el('div', 'top');
-    top.append(el('b', '', 'EDITOR'), el('span', 'hint', `levels/${levelName()}.bxr · Tab to leave`));
+    top.append(el('b', '', 'EDITOR'), ...(state.erase ? [el('span', 'erase', 'ERASER · X')] : []),
+               el('span', 'hint', `levels/${levelName()}.bxz · Tab to leave`));
     panel.appendChild(top);
 
     // What is selected, and which way it faces.
@@ -250,7 +255,10 @@ export function createPalette({ state, pick, levelName }) {
       const lab = modelLabel(state.model || '');
       if (model) sel.appendChild(modelPicture(state.model, model));
       const t = el('div');
-      t.append(el('div', 'what', lab.name), el('div', 'hint', 'model' + (lab.category ? ` · ${lab.category}` : '')));
+      const { state: st } = modelStateOf(state.model || '');
+      const states = modelStates(state.model || '').length;
+      t.append(el('div', 'what', lab.name), el('div', 'hint', 'model' + (lab.category ? ` · ${lab.category}` : '') +
+               (states > 1 ? ` · ${st} (${states} states) · F` : '')));
       sel.appendChild(t);
     } else {
       const m = MATERIALS.find(x => x.id === state.materialId);
@@ -304,9 +312,10 @@ export function createPalette({ state, pick, levelName }) {
     }
     panel.appendChild(shapes);
 
-    // Trees (core/treegen.js): grown from a species, a seed and an age;
-    // each one placed takes a new seed.
-    panel.appendChild(el('h3', '', `Trees (${TREE_MODELS.size})`));
+    // Foliage: the trees (core/treegen.js), grown from a species, a seed and
+    // an age, each one placed taking a new seed. Grass cards go here too
+    // once their art exists.
+    panel.appendChild(el('h3', '', `Foliage (${TREE_MODELS.size})`));
     for (const [name, base] of TREE_MODELS) {
       if (!match(name, 'tree')) continue;
       const on = state.kind === 'tree' && state.species === name, full = base.species.pulses;
@@ -344,17 +353,19 @@ export function createPalette({ state, pick, levelName }) {
     }
 
     // Models.
-    panel.appendChild(el('h3', '', `Models (${MODELS.size})`));
+    // One row a model, its states in it: the one selected shown, else the first.
+    panel.appendChild(el('h3', '', `Models (${MODEL_STATES.size})`));
     let shown = 0;
-    for (const [name, model] of MODELS) {
-      const lab = modelLabel(name);
-      if (!match(name, lab.name, lab.category)) continue;
-      const on = state.kind === 'model' && state.model === name;
+    for (const [base, names] of MODEL_STATES) {
+      const lab = modelLabel(base);
+      if (!match(base, lab.name, lab.category, ...names)) continue;
+      const on = state.kind === 'model' && names.includes(state.model);
+      const name = on ? state.model : names[0], model = MODELS.get(name);
       const row = el('div', 'row' + (on ? ' on' : ''));
-      row.title = name + (model.cubes.some(c => c.light) ? ' - emits light' : '');
+      row.title = names.join(', ') + (model.cubes.some(c => c.light) ? ' - emits light' : '');
       const t = el('div');
       t.append(el('div', '', lab.name + (model.cubes.some(c => c.light) ? ' ☀' : '')),
-               el('div', 'cat', lab.category || 'model'));
+               el('div', 'cat', (lab.category || 'model') + (names.length > 1 ? ` · ${names.length} states` : '')));
       row.append(modelPicture(name, model), t);
       row.onclick = () => pick({ kind: 'model', model: name });
       panel.appendChild(row);
@@ -362,9 +373,9 @@ export function createPalette({ state, pick, levelName }) {
     }
     if (!shown) panel.appendChild(el('div', 'empty', MODELS.size ? 'no model matches' : 'no .bbmodel in assets/objects'));
 
-    // Markers: exits and spawns (core/exits.js), in the region's header.
+    // Markers: exits and spawns (core/exits.js), in the zone's header.
     panel.appendChild(el('h3', '', 'Markers'));
-    for (const [kind, label, cat] of [['exit', 'Exit', 'to another region'], ['spawn', 'Spawn', 'where arrivals stand']]) {
+    for (const [kind, label, cat] of [['exit', 'Exit', 'to another zone'], ['spawn', 'Spawn', 'where arrivals stand']]) {
       const row = el('div', 'row' + (state.kind === kind ? ' on' : ''));
       const t = el('div');
       t.append(el('div', '', label), el('div', 'cat', cat));
@@ -389,20 +400,20 @@ export function createPalette({ state, pick, levelName }) {
       panel.appendChild(l);
     };
     if (state.kind === 'exit') {
-      field('Leads to region', 'exitTarget', regionNames);
+      field('Leads to zone', 'exitTarget', zoneNames);
       field('Arrive at spawn', 'exitSpawn');
     }
-    if (state.kind === 'spawn') field('Spawn name', 'spawnName', Object.keys(Region.spawns));
+    if (state.kind === 'spawn') field('Spawn name', 'spawnName', Object.keys(Zone.spawns));
     const marks = [
-      ...Object.entries(Region.spawns).map(([n, at]) => `spawn ${n}  ${at.join(', ')}`),
-      ...Region.exits.map(e => `exit  ${e.cells.slice(0, 3).join(',')}..${e.cells.slice(3).join(',')} -> ${e.target}:${e.spawn}`)];
+      ...Object.entries(Zone.spawns).map(([n, at]) => `spawn ${n}  ${at.join(', ')}`),
+      ...Zone.exits.map(e => `exit  ${e.cells.slice(0, 3).join(',')}..${e.cells.slice(3).join(',')} -> ${e.target}:${e.spawn}`)];
     panel.appendChild(el('div', 'marks', marks.length ? marks.join('\n') : 'no exits or spawns'));
 
     if (state.message) panel.appendChild(el('div', 'msg', state.message));
     const help = el('details');
     help.appendChild(el('summary', '', 'Controls'));
     help.appendChild(el('div', '',
-      'LMB           place on the face\nLMB drag      place a row\nRMB         remove\nShift+LMB drag  fill a box\n' +
+      'LMB           place on the face\nLMB drag      fill a rectangle\nR (dragging)  floor / wall / wall\nX            eraser: LMB removes\nRMB         remove\nShift+LMB drag  fill a box\n' +
       'Shift+RMB drag  clear a box\nRMB drag      look\nWASD, Space   fly  (Shift: fast)\n' +
       'L-Ctrl or C   down\n' +
       'Q / E         turn\nCtrl+S        save'));
@@ -413,7 +424,7 @@ export function createPalette({ state, pick, levelName }) {
     el: panel, render,
     show(on) {
       panel.style.display = on ? 'block' : 'none';
-      if (on) { render(); loadRegionNames().then(() => { if (panel.style.display !== 'none') render(); }); }
+      if (on) { render(); loadZoneNames().then(() => { if (panel.style.display !== 'none') render(); }); }
     }
   };
 }

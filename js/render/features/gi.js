@@ -264,7 +264,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     giLastT = now;
     texelGI.blend.value = giResponse > 0 ? 1 - Math.exp(-dt / giResponse) : 1;
     packTexelSprites(texelGI);
-    list.push(kernels.patches, kernels.sums, kernels.filter, kernels.direct);
+    list.push(kernels.patchArgs, kernels.patches, kernels.sums, kernels.filter, kernels.direct);
     texelGI.frame.value = (texelGI.frame.value + 1) >>> 0;
   }
 
@@ -346,7 +346,7 @@ export function createGI({ renderer, cascades, sun, lighting, sky, mirrors, spri
     }),
     update,
     stepTexel,
-    // Another region loaded (main.js loadRegion): every volume starts again
+    // Another zone loaded (main.js loadZone): every volume starts again
     // from nothing at its next update, as on first use.
     reset() { lpvOrigins = []; },
     // The LPV's bindings for the fog (gpu/fog.js), while the LPV is the bounce.

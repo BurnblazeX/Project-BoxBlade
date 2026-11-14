@@ -60,7 +60,11 @@ export function buildTerrainMaterials({ built, opts, cache, cached }) {
     // Resolved: misses shaded by the kernels too, read per pixel - only when
     // glass (if any) is split as well, as it shares the passes.
     // Legacy sends slopes and glowing cubes to the miss pass, so not resolved.
-    const resolved = split && opts.splitResolve && !opts.splitLegacy && (built.splitGlass || !glassNode);
+    // The visible-texel table is always resolved (it has no low-res pass to
+    // look up); glass it cannot split (a glass debug view) is shaded per
+    // pixel, outside the G-buffer.
+    const table = !!(split && split.table);
+    const resolved = table || (split && opts.splitResolve && !opts.splitLegacy && (built.splitGlass || !glassNode));
     if (resolved) {
       terrainMat = createShadowMaterial(worldInstancedMesh, createSplitReadNode(cache, split));
     } else {
@@ -75,7 +79,9 @@ export function buildTerrainMaterials({ built, opts, cache, cached }) {
     missMat.stencilRef = 0;
     missMat.stencilZPass = THREE.KeepStencilOp;
     }
-    if (glassNode && resolved) {
+    if (glassNode && table && !built.splitGlass) {
+      glassMat = createShadowMaterial(glassInstancedMesh, glassNode);
+    } else if (glassNode && resolved) {
       glassLow = new THREE.MeshBasicNodeMaterial();
       glassLow.outputNode = createTexelGBufferNode(true, opts.splitLegacy);
       glassMat = createShadowMaterial(glassInstancedMesh, createSplitReadNode(cache, split));
@@ -260,16 +266,24 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
   let splitResolveOn = true;
   // Debug: the kernels' A08//00a surface path (bxb.splitlegacy()).
   let splitLegacy = false;
+  // The visible-texel table instead of the low-res samples (bxb.splittable()):
+  // each texel on screen shaded once. Needs the resolve, not legacy. On by
+  // default since 2026-11-11: submit, GPU, compute and CPU all a little lower,
+  // ~0.3 ms in some views, none worse.
+  let splitTable = true;
+  let splitTableShading = null;
   let splitFailed = false;
-  function ensureSplitShading() {
-    if (splitShading) return splitShading;
+  const tableMode = () => splitTable && splitResolveOn && !splitLegacy;
+  function ensureSplitShading(table = tableMode()) {
+    if (table ? splitTableShading : splitShading) return table ? splitTableShading : splitShading;
     // Include the actual viewport: an emulated 4K canvas can exceed the screen.
     const dpr = window.devicePixelRatio || 1;
-    const { full, low, miss } = splitCapacityFor(Math.max(screen.width * dpr, window.innerWidth),
-                                               Math.max(screen.height * dpr, window.innerHeight));
-    splitShading = createSplitShading(low, miss, full, splitHalf);
-    splitShading.resolve = createSplitResolve(splitShading, texelCache);
-    return splitShading;
+    const cap = splitCapacityFor(Math.max(screen.width * dpr, window.innerWidth),
+                                 Math.max(screen.height * dpr, window.innerHeight));
+    const s = createSplitShading(cap.low, cap.miss, cap.full, splitHalf, table ? cap.table : 0);
+    s.resolve = createSplitResolve(s, texelCache);
+    if (table) splitTableShading = s; else splitShading = s;
+    return s;
   }
   // A validation error soon after split shading goes on: fall back to the
   // one-shader path for the session rather than draw nothing.
@@ -291,15 +305,36 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
 
   // Split shading's kernels over this frame's low-res samples, in one submit.
   let roomLastT = 0;
+  // A store's generation: bumped when the set or anything its stamp covers
+  // changes - the sun store's (gpu/sun.js parts.stamp: every texel marches
+  // again), the hit-light store's (gpu/hitstore.js: every hit is lit again).
+  const stepper = () => {
+    let held = null, last = '';
+    return (set, stamp, gen) => {
+      const now = stamp();
+      if (set === held && now === last) return;
+      held = set;
+      last = now;
+      gen.value = (gen.value + 1) >>> 0 || 1;
+    };
+  };
+  const stepSunGen = stepper(), stepHitGen = stepper();
   // early: other features' kernels to go first in the same pass (main.js
   // collectCompute) - sent here only when render() found split shading on.
   function runSplitShading(resolved, early = []) {
     const set = activeSet();
     const ks = set && set.splitKernels;
-    const s = splitShading, rt = texelCache.rt;
-    s.width.value = rt.width;
-    s.count.value = Math.min(rt.width * rt.height, s.lowCap);
+    const s = set.split, rt = texelCache.rt;
+    if (!s.table) {
+      s.width.value = rt.width;
+      s.count.value = Math.min(rt.width * rt.height, s.lowCap);
+    }
     s.viewPos.value.copy(camera.position);
+    if (s.table && set.sunStamp) stepSunGen(set, set.sunStamp, s.sunGen);
+    if (s.hitStore) {
+      if (set.hitStamp) stepHitGen(set, set.hitStamp, s.hitStore.gen);
+      s.hitStore.frame.value = (s.hitStore.frame.value + 1) >>> 0;
+    }
     const list = [...early];
     // Texel GI: the patch list starts empty; the base kernel fills it.
     const gk = set.giKernels;
@@ -308,12 +343,20 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
       const full = texelCache.idRT;
       s.fullWidth.value = full.width;
       s.fullCount.value = Math.min(full.width * full.height, s.fullCap);
-      s.resolve[1].count = s.fullCount.value;
+      // The per-pixel kernels: the low-res resolve's one, the table's insert and claim.
+      for (const k of s.table ? s.resolve.slice(1, 3) : [s.resolve[1]]) k.count = s.fullCount.value;
       list.push(...s.resolve);
     }
-    // This frame's low-res samples, then (resolved) up to missCap misses.
+    // This frame's low-res samples, then (resolved) up to missCap misses -
+    // or, with the table, the listed texels, as many as the GPU counted.
     const n = s.count.value + (resolved ? s.missCap : 0);
-    for (const k of ks) { k.count = n; list.push(k); }
+    for (const k of ks) {
+      // The sun refresh brings its own (gpu/texel.js createSunRefreshKernel).
+      // Table: the count is only three's bound (a kernel checks its own list's
+      // count) - room for the glass lanes, three a texel.
+      if (s.table) { k.count = s.capacity * 3; k.dispatchSize = k.dispatchSize || s.args.attr; } else k.count = n;
+      list.push(k);
+    }
     // The room meter's mean (gpu/roommeter.js), eased over ROOM_RESPONSE s
     // of real time, so the frame rate does not change how fast it follows.
     const now = performance.now();
@@ -339,7 +382,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     const set = activeSet();
     const active = texelCacheOn && shadowsOn() && terrainLowMat && mesh
       && mesh.material === terrainLookupMat;
-    const splitting = !!(active && set && set.splitKernels && splitShading);
+    const splitting = !!(active && set && set.splitKernels && set.split);
     if (!splitting && early.length) renderer.compute(early.length === 1 ? early[0] : early);
     // Glass joins the same cache: its own low-res, lookup and miss materials,
     // the same target and ids (a glass texel is a world texel), one prepass.
@@ -360,8 +403,11 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     mesh.material = terrainLowMat;
     if (glassActive) glass.material = glassLowMat;
     camera.layers.set(TEXEL_LAYER);
-    renderer.setRenderTarget(texelCache.rt);
-    renderer.render(scene, camera);
+    // The visible-texel table has no low-res samples: the full-res G-buffer only.
+    if (!(splitting && set.split.table)) {
+      renderer.setRenderTarget(texelCache.rt);
+      renderer.render(scene, camera);
+    }
     // Resolved: the same G-buffer draws at full res, so every pixel knows its texel.
     if (resolved) {
       renderer.setRenderTarget(texelCache.idRT);
@@ -396,7 +442,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
       usage: 'bxb.splithalf()',
       run: () => {
         splitHalf = !splitHalf;
-        splitShading = null;          // reallocated at the new precision
+        splitShading = splitTableShading = null;   // reallocated at the new precision
         rebuild();
         return `split shading buffers at ${splitHalf ? 'half' : 'full'} precision`;
       }
@@ -419,10 +465,60 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
         return `split kernels on the ${splitLegacy ? 'A08//00a' : 'current'} surface path`;
       }
     },
+    splittable: {
+      help: 'split shading: each visible texel shaded once, through a per-frame hash table, ' +
+            'instead of the low-res samples (rebuilds; needs splitresolve on)',
+      usage: 'bxb.splittable()',
+      run: () => {
+        splitTable = !splitTable;
+        rebuild();
+        return `split shading over ${splitTable ? 'the visible-texel table' : 'the low-res samples'}` +
+               (splitTable && !tableMode() ? ' (waiting on splitresolve on, splitlegacy off)' : '');
+      }
+    },
+    sunstore: {
+      help: 'the visible-texel table holds each texel\'s static sun shadow across frames, and marches ' +
+            'it again only when something it reads changes. Off: every texel every frame (the A/B; no rebuild)',
+      usage: 'bxb.sunstore()',
+      run: () => {
+        const s = ensureSplitShading(true);
+        s.storeOn.value = s.storeOn.value ? 0 : 1;
+        return `sun store ${s.storeOn.value ? 'on' : 'off - every texel marched every frame'}`;
+      }
+    },
+    hitstore: {
+      help: 'with the visible-texel table, the rays\' hits (reflections, texel GI) take each texel\'s direct light from a store, lit once ' +
+            'and held until the sun, the world or a lamp changes - and at most N frames, for moving shadows. ' +
+            'A number sets N; no argument toggles it (the A/B; no rebuild)',
+      usage: 'bxb.hitstore()  |  bxb.hitstore(8)',
+      run: (every = null) => {
+        // The table's alone: the low-res samples have none.
+        const st = ensureSplitShading(true).hitStore;
+        if (every !== null) st.every.value = Math.max(1, Math.round(Number(every)));
+        else st.on.value = st.on.value ? 0 : 1;
+        return `hit-light store ${st.on.value ? `on, an entry lives at most ${st.every.value} frames`
+                                              : 'off - every hit lit every time'}`;
+      }
+    },
     splitstats: {
-      help: "split shading: last frame's misses against the list's room",
+      help: "split shading: last frame's misses against the list's room - or, with the table, its texels against its slots",
       usage: 'await bxb.splitstats()',
       run: async () => {
+        const set = activeSet();
+        const t = set && set.split && set.split.table ? set.split : null;
+        if (t) {
+          let n, fresh, glass;
+          try {
+            const words = new Uint32Array(await renderer.getArrayBufferAsync(t.queue.attr));
+            n = words[0];
+            fresh = words[t.words.refreshCount];
+            glass = words[t.words.glassCount];
+          } catch { return 'the table has not run yet'; }
+          return `${n} texels listed (${glass} glass) in ${t.table} slots (${(100 * n / t.table).toFixed(1)}% full), ` +
+                 `${t.fullCount.value} pixels; sun ${set.sunStamp ? `marched for ${fresh} ` +
+                 `(store ${t.storeOn.value ? 'on' : 'off'})` : 'not stored in this set'}; ` +
+                 `generations: sun ${t.sunGen.value}, hits ${t.hitStore.gen.value}`;
+        }
         if (!splitShading) return 'split shading is off';
         let misses;
         try {
@@ -457,6 +553,19 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     get on() { return texelCacheOn; },
     get splitOn() { return splitOn; },
     set splitOn(v) { splitOn = !!v; },
+    // The visible-texel table (bxb.splittable): set, then rebuild.
+    get splitTable() { return splitTable; },
+    set splitTable(v) { splitTable = !!v; },
+    // Whether the table can run: it needs the resolve, and not legacy.
+    get tableReady() { return splitResolveOn && !splitLegacy; },
+    // The sun store (bxb.sunstore): whether the showing set holds one, and its switch.
+    get sunStoreHeld() { const set = activeSet(); return !!(set && set.sunStamp); },
+    get sunStoreOn() { return !!(splitTableShading && splitTableShading.storeOn.value); },
+    set sunStoreOn(v) { ensureSplitShading(true).storeOn.value = v ? 1 : 0; },
+    // The hit-light store (bxb.hitstore): whether the showing set reads one, and its switch.
+    get hitStoreHeld() { const set = activeSet(); return !!(set && set.hitStamp); },
+    get hitStoreOn() { return !!(splitTableShading && splitTableShading.hitStore.on.value); },
+    set hitStoreOn(v) { if (!!v !== this.hitStoreOn) commands.hitstore.run(); },
     // Where the terrain's lit colour is this frame, for the exposure meter
     // (gpu/exposure.js): split shading's result buffer, or the low-res target
     // (under split shading that holds positions, not colour). null with no
@@ -468,7 +577,7 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
     meterSource() {
       const set = activeSet();
       if (!texelCacheOn || !shadowsOn() || !set || !set.lowMat) return null;
-      if (set.splitKernels) return splitShading ? { split: splitShading } : null;
+      if (set.splitKernels) return set.split ? { split: set.split } : null;
       return texelCache.tex ? { cache: texelCache } : null;
     },
     // The target bindings, and the meshes drawing the full-res passes.
@@ -551,6 +660,21 @@ export function createTexelCache({ renderer, scene, camera, rig, shadowsOn, acti
       { key: 'texelcache', label: 'Texel-rate shading', type: 'toggle',
         help: 'terrain shaded once per texel in a low-res pass, reused at full res',
         get: () => texelCacheOn, set: v => flip(texelCacheOn, v, () => commands.texelcache.run()) },
+      { key: 'splittable', label: 'A/B: visible-texel table (each texel shaded once)', type: 'toggle',
+        help: 'split shading lists each texel on screen once through a per-frame hash table, ' +
+              'in place of the low-res samples (several per texel). Rebuilds',
+        get: () => splitTable, set: v => flip(splitTable, v, () => commands.splittable.run()) },
+      { key: 'sunstore', label: 'A/B: sun store (static sun held per texel)', type: 'toggle',
+        help: 'with the visible-texel table, each texel\'s static sun shadow is kept across frames and ' +
+              'marched again only when the sun, the world or the cascades change. Off: marched every frame',
+        get: () => !!(splitTableShading && splitTableShading.storeOn.value),
+        set: v => { ensureSplitShading(true).storeOn.value = v ? 1 : 0; } },
+      { key: 'hitstore', label: 'A/B: hit-light store (rays\' hits lit once)', type: 'toggle',
+        help: 'reflection and texel GI rays take the direct light at their hit texel from a store, lit once ' +
+              'and held until the sun, world or lamps change (moving shadows: at most 8 frames). Off: lit every time',
+        get: () => !!(splitTableShading && splitTableShading.hitStore.on.value),
+        set: v => flip(!!(splitTableShading && splitTableShading.hitStore.on.value), v,
+                       () => commands.hitstore.run()) },
       { key: 'roomlight', label: 'A/B: revealed faces take the room light', type: 'toggle',
         help: 'a cut wall top under a lifted roof is lit by the mean light on the surfaces inside ' +
               '(off: its own estimate - the LPV beside it, or the sky). Needs split shading',

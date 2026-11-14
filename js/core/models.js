@@ -45,13 +45,47 @@ for (const [path, text] of Object.entries(sources)) {
   MODELS.set(file, model);
 }
 
+// --- Object states (World plan §7.3) ---
+//
+// A model's states are one .bbmodel each, named category_name_state:
+// decor_fence_rails and decor_fence_bare are the fence in two states. A name
+// with no third part (decor_chair) is a model of one state. The states keep
+// their own names - a placed model saves as the state it is in - and each
+// brings its own cubes, light and collision. Sorted by name; the first is the
+// one the editor places.
+const STATE_NAME = /^([^_]+_[^_]+)_(.+)$/;
+// 'decor_fence_rails' -> { base: 'decor_fence', state: 'rails' };
+// 'decor_chair' -> { base: 'decor_chair', state: null }.
+export function modelStateOf(name) {
+  const m = STATE_NAME.exec(name || '');
+  return m ? { base: m[1], state: m[2] } : { base: name, state: null };
+}
+// Names grouped by base, each group's states sorted: base -> [names].
+export function groupModelStates(names) {
+  const groups = new Map();
+  for (const name of [...names].sort()) {
+    const { base } = modelStateOf(name);
+    if (!groups.has(base)) groups.set(base, []);
+    groups.get(base).push(name);
+  }
+  return groups;
+}
+export const MODEL_STATES = groupModelStates(MODELS.keys());
+// The states of the model `name` is one of, itself alone if it has none.
+export const modelStates = name => MODEL_STATES.get(modelStateOf(name).base) || [name];
+// The state after name's, round to the first.
+export function nextModelState(name) {
+  const s = modelStates(name);
+  return s[(s.indexOf(name) + 1) % s.length];
+}
+
 // Generated trees (core/treegen.js): a species is a model with no cubes of
 // its own and three tiles - bark, end grain (for a cut tree; a living one is bark all
 // round), and the leaves through its ramp
 // (render.js loadModelTiles composes them from the terrain textures; the
 // leaves' tile is unused since the leaves became cells, core/leaves.js). Each
 // tree is that model with its own cubes, named tree_<species>#<seed>@<age>
-// so a region saves and regrows it (treeModel).
+// so a zone saves and regrows it (treeModel).
 export const TREE_MODELS = new Map();
 for (const [name, species] of Object.entries(TREE_SPECIES)) {
   const t = species.textures;

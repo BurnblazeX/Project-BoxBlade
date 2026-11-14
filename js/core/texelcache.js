@@ -9,7 +9,25 @@ export function splitCapacityFor(width, height) {
   const w = Math.max(1, Math.ceil(width)), h = Math.max(1, Math.ceil(height));
   const full = Math.min(w * h, 1 << 24);
   return { full, low: Math.min(Math.ceil(w / 2) * Math.ceil(h / 2), 1 << 22),
-           miss: Math.ceil(full / 16) };
+           miss: Math.ceil(full / 16), table: tableSlotsFor(full) };
+}
+
+// The visible-texel table (gpu/texel.js createSplitShading, table mode): one
+// slot per TABLE_PIXELS_PER_SLOT pixels, a power of two. The texels on screen
+// are far fewer than the pixels (today's resolve shades at most the low-res
+// samples plus full / 16 misses, ~0.4 of the slots), so the table stays well
+// under half full and its probe runs short. At most TABLE_MAX_SLOTS: the
+// kernels go one thread a texel by an indirect dispatch, at most 65535
+// workgroups of 64.
+export const TABLE_PIXELS_PER_SLOT = 4;
+export const TABLE_MIN_SLOTS = 1 << 12;
+export const TABLE_MAX_SLOTS = 1 << 21;
+// Slots a key may sit past its home - both how far an insert carries a key
+// and how far a pixel looks for its own.
+export const TABLE_PROBES = 8;
+export function tableSlotsFor(pixels) {
+  const want = Math.max(1, Math.ceil(pixels / TABLE_PIXELS_PER_SLOT));
+  return Math.max(TABLE_MIN_SLOTS, Math.min(TABLE_MAX_SLOTS, 2 ** Math.ceil(Math.log2(want))));
 }
 
 // The texel cache's low-res pass samples every `spacing` pixels, and each

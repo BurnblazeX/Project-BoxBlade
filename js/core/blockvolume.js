@@ -2,7 +2,7 @@
 //
 // render.js keeps a 128 x 48 x 128 window of the world's blocks on the GPU -
 // each block's layers and shape, and a model cell's hit-table entry - which
-// follows the player over a region wider than it (core/follow.js). Until
+// follows the player over a zone wider than it (core/follow.js). Until
 // 2026-10-29 every move of the window rebuilt and re-uploaded all of it, 6 MB,
 // a hitch each time. Now x and z are a ring: block (x, z) always sits at
 // (x mod size, z mod size), wherever the window is, so a move rewrites only

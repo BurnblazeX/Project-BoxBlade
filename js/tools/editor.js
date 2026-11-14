@@ -6,29 +6,37 @@
 //   left click          place the selection on the face under the cursor, in
 //                       the Grid cell against it: a part stacks into a tile
 //                       beside the parts already there (world.js withPart)
-//   left drag           place a row of blocks along the axis the drag follows
+//   left drag           place a rectangle of blocks (one wide: a row) in the
+//                       plane of the face the drag starts on (dragTo)
+//   R (while dragging)  turn the drag's plane: floor, then either wall
+//   X                   the eraser, on or off: the left button removes - a
+//                       click as a right click does, a drag a rectangle of
+//                       tiles as the left drag places one, Shift a box
 //   right click         remove what is under the cursor (a model, or one
 //                       part of a tile)
 //   Shift + left drag   fill the box between two cells with the selection
 //   Shift + right drag  clear the box between two cells
 //   right drag          look around
+// While a drag places or clears, its size in blocks is shown by the cursor.
 //   W A S D, Space      fly (Shift: faster); Left Ctrl or C down
 //   Q / E               turn the selection (slopes, steps, panes, models)
 //   F                   the selection's next state (shapes: world.js
-//                       BLOCK_SHAPES states; models: object states, none yet)
-//   Ctrl + S            save the level (the loaded region's, levels/<name>.bxr;
+//                       BLOCK_SHAPES states; models: object states,
+//                       models.js MODEL_STATES)
+//   Shift + F           the next state of the placed model under the cursor
+//   Ctrl + S            save the level (the loaded zone's, levels/<name>.bxz;
 //                       dev server only)
 //   Tab                 back to the game
 //
 // With Exit or Spawn picked in the panel (Markers), clicks place those
 // instead, on the ground block's top face - the cell the party stands on:
 //   left click          a spawn of the name in the panel (moves it if it is
-//                       there already); an exit of one cell to the region and
+//                       there already); an exit of one cell to the zone and
 //                       spawn in the panel
 //   Shift + left drag   an exit over the box of cells
 //   right click         removes the exit or spawns on that cell
 // Exits and spawns are drawn while editing (cyan, yellow) and saved in the
-// region's header (core/exits.js).
+// zone's header (core/exits.js).
 //
 // A model placed on a top face stands on it, in the Grid column under the
 // cursor; on a side face it hangs on that wall at the Grid cell under the
@@ -42,12 +50,12 @@ import * as THREE from 'three/webgpu';
 import { World, getVoxelKey, BLOCK_METRES, Y_MIN, Y_MAX, GRID, partBoxes, partSpan, partFacing, isSlope,
          surfaceLevel, tileParts, withPart, withoutPart, gridAt, cellAt, MODEL_CENTRE, standOrigin, wallOrigin, modelFits,
          treeSurroundings,
-         WorldModels, addWorldModel, mountWorldModel, removeWorldModel,
-         serializeLevel, DEV_LEVEL, Region, nextShapeState } from '../core/world.js';
+         WorldModels, addWorldModel, mountWorldModel, removeWorldModel, swapWorldModel,
+         serializeLevel, DEV_LEVEL, Zone, nextShapeState } from '../core/world.js';
 import { exitBox, exitsWithout } from '../core/exits.js';
-import { encodeRegion } from '../core/region.js';
+import { encodeZone } from '../core/zone.js';
 import { MATERIALS } from '../core/materials.js';
-import { MODELS, treeModel, treeName } from '../core/models.js';
+import { MODELS, treeModel, treeName, nextModelState, modelStateOf } from '../core/models.js';
 import { worldInstancedMesh, instanceInfo } from '../render/render.js';
 import { createPalette, newTreeSeed } from './editorPanel.js';
 import { placeModel as placeModelBoxes } from '../core/bbmodel.js';
@@ -56,10 +64,11 @@ const FLY_SPEED = 10;          // m/s; Shift x3
 const LOOK_SPEED = 0.004;      // radians per pixel
 const DRAG_PIXELS = 4;         // a right press that moves less is a click
 const MAX_BOX_CELLS = 20000;   // one fill or clear at most
-const MAX_ROW_CELLS = 256;     // one row at most, each way
+const MAX_ROW_CELLS = 256;     // a drag's reach along each axis, each way
+const EDGE_ON = 0.15;          // a drag's plane seen flatter than this: its end stands
 const FACING_ORDER = ['N', 'E', 'S', 'W'];
 
-// levelName: the level saved to, asked at each save - the loaded region's.
+// levelName: the level saved to, asked at each save - the loaded zone's.
 export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName = () => DEV_LEVEL }) {
   const state = {
     active: false,
@@ -71,7 +80,9 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     exitTarget: '', exitSpawn: 'start', spawnName: 'start',
     yaw: 0, pitch: -0.6, pos: new THREE.Vector3(),
     keys: new Set(),
-    drag: null,          // { button, x, y, moved, shift, start (a target) }
+    erase: false,        // the eraser (X): the left button removes
+    pointer: [0, 0],     // the mouse, in client pixels
+    drag: null,          // { button, x, y, moved, shift, start (a target), end, axes, plane, erase }
     hover: null          // the target under the cursor
   };
 
@@ -167,8 +178,8 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   function drawMarkers() {
     const pts = [], cols = [];
     const add = (from, colour) => { for (let i = from; i < pts.length; i += 3) cols.push(colour.r, colour.g, colour.b); };
-    for (const e of Region.exits) { const n = pts.length; standingBox(e.cells, 2, 0, pts); add(n, EXIT_COLOUR); }
-    for (const at of Object.values(Region.spawns)) {
+    for (const e of Zone.exits) { const n = pts.length; standingBox(e.cells, 2, 0, pts); add(n, EXIT_COLOUR); }
+    for (const at of Object.values(Zone.spawns)) {
       const n = pts.length;
       standingBox([...at, ...at], 1.5, 0.35, pts);
       add(n, SPAWN_COLOUR);
@@ -273,43 +284,61 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     return plan && modelFits(plan.cubes) ? plan : null;
   }
 
-  // A row: the drag picks the axis whose on-screen direction it follows
-  // most closely, and runs from the start cell to where the cursor's ray
-  // passes nearest that axis's line through it - so a row can climb into the
-  // air, where there is no face to point at.
-  function rowEnd(start, clientX, clientY) {
-    const W = innerWidth, H = innerHeight;
-    const toPx = v => { v.project(camera); return [(v.x + 1) / 2 * W, (1 - v.y) / 2 * H]; };
-    const c = new THREE.Vector3(...start).multiplyScalar(B);
-    const [sx, sy] = toPx(c.clone());
-    const mx = clientX - sx, my = clientY - sy, m = Math.hypot(mx, my);
-    if (m < 1) return start;
-    let axis = -1, bestCos = -1;
-    for (let a = 0; a < 3; a++) {
-      const e = c.clone(); e.setComponent(a, e.getComponent(a) + B);
-      const [ex, ey] = toPx(e);
-      const len = Math.hypot(ex - sx, ey - sy);
-      if (len < 2) continue;                     // seen end-on: no direction to follow
-      const cos = Math.abs((mx * (ex - sx) + my * (ey - sy)) / (len * m));
-      if (cos > bestCos) { bestCos = cos; axis = a; }
-    }
-    if (axis < 0) return start;
-    ndc.set((clientX / W) * 2 - 1, -(clientY / H) * 2 + 1);
+  // The tile a drag starts from: the one a click would place in, or with the
+  // eraser the one under the cursor.
+  const dragStart = d => (d.erase ? d.start.key : startCell(d.start));
+  // A drag fills a rectangle in a plane through the tile it starts in. First
+  // the plane of the face it started on - a floor from the ground, a wall from
+  // a wall - and R turns it to the next of the three, so a floor can stand up
+  // as a wall either way and a wall can lie down. The rectangle runs out to
+  // where the cursor's ray meets the plane; one cell wide, it is a row. A
+  // plane seen nearly edge-on gives no answer, and the last end stands.
+  // Updates d: plane (its normal axis), end (the far cell), axes (the two
+  // it spans). The eraser's drags clear the same rectangles.
+  const PLANE_NAMES = ['N-S wall', 'floor', 'E-W wall'];   // by normal axis
+  function dragTo(d, clientX, clientY) {
+    const start = dragStart(d), normal = d.start.normal, na = normal.findIndex(v => v !== 0);
+    if (d.plane < 0) d.plane = na < 0 ? 1 : na;
+    const c = d.plane;
+    d.axes = [0, 2, 1].filter(a => a !== c);
+    ndc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
     raycaster.setFromCamera(ndc, camera);
-    const { origin: o, direction: d } = raycaster.ray;
-    // Closest approach of the ray o + t d to the line c + s u (u the axis):
-    // s = (u.w - (d.u)(d.w)) / (1 - (d.u)^2), w = o - c.
-    const w = o.clone().sub(c);
-    const du = d.getComponent(axis), denom = 1 - du * du;
-    if (denom < 1e-6) return start;
-    const s = (w.getComponent(axis) - du * d.dot(w)) / denom;
-    const n = Math.max(-MAX_ROW_CELLS, Math.min(MAX_ROW_CELLS, Math.round(s / B)));
-    const end = start.slice(); end[axis] += n;
-    return end;
+    const { origin: o, direction: dir } = raycaster.ray;
+    const dc = dir.getComponent(c);
+    // On the face itself when it is the face's plane, so the rectangle stays
+    // under the cursor - behind the tile placed in, in front of the one
+    // erased; through the start tile's centre otherwise.
+    const plane = (start[c] + (c === na ? (d.erase ? 0.5 : -0.5) * normal[na] : 0)) * B;
+    const t = Math.abs(dc) < EDGE_ON ? -1 : (plane - o.getComponent(c)) / dc;
+    if (t <= 0) { if (!d.end) d.end = start; return; }
+    const end = start.slice();
+    for (const a of d.axes) {
+      const n = Math.round((o.getComponent(a) + t * dir.getComponent(a)) / B) - start[a];
+      end[a] = start[a] + Math.max(-MAX_ROW_CELLS, Math.min(MAX_ROW_CELLS, n));
+    }
+    d.end = end;
+  }
+
+  // --- The size of a drag, by the cursor: blocks along each axis it spans ---
+  const sizeLabel = document.createElement('div');
+  sizeLabel.id = 'editor-size';
+  document.body.appendChild(sizeLabel);
+  // Cells a to b inclusive, along `axes`: "5 × 3 = 15", then what, if
+  // given ("floor"). null hides it.
+  function showSize(a, b, axes, what = '') {
+    if (!a || !b) { sizeLabel.style.display = 'none'; return; }
+    const n = (axes.length ? axes : [0]).map(i => Math.abs(b[i] - a[i]) + 1);
+    const total = n.reduce((p, v) => p * v, 1);
+    sizeLabel.textContent = (n.filter(v => v > 1).length > 1 ? `${n.join(' × ')} = ${total}` : n.join(' × '))
+      + (what ? `  ${what}` : '');
+    sizeLabel.style.left = `${state.pointer[0] + 18}px`;
+    sizeLabel.style.top = `${state.pointer[1] + 18}px`;
+    sizeLabel.style.display = 'block';
   }
 
   function showCursor(target) {
     const d = state.drag;
+    showSize(null);
     if (isMarker()) {
       // The cell, or the box of cells a Shift drag makes an exit of.
       const g = groundOf(target), pts = [];
@@ -318,14 +347,15 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       setOutline(pts, d && d.button === 2 ? 0xff6666 : state.kind === 'exit' ? 0x55ccff : 0xffd060);
       return;
     }
-    if (d && d.row) {
-      const a = startCell(d.start), b = d.row, pts = [];
+    if (d && d.end) {
+      const a = dragStart(d), b = d.end, pts = [];
       boxEdges(a.map((v, i) => (Math.min(v, b[i]) - 0.5) * B), a.map((v, i) => (Math.max(v, b[i]) + 0.5) * B), pts);
-      setOutline(pts, 0x66ff88);
+      setOutline(pts, d.erase ? 0xff6666 : 0x66ff88);
+      showSize(a, b, d.axes, PLANE_NAMES[d.plane] + (d.erase ? ', clear' : ''));
       return;
     }
     if (!target) { cursor.visible = false; return; }
-    const removing = d ? d.button === 2 : false;
+    const removing = d ? d.button === 2 || d.erase : state.erase;
     const pts = [];
     if (d && d.shift && d.start) {
       // A box: its whole extent, in cells.
@@ -333,6 +363,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       const b = removing ? target.key : target.place;
       const lo = a.map((v, i) => (Math.min(v, b[i]) - 0.5) * B), hi = a.map((v, i) => (Math.max(v, b[i]) + 0.5) * B);
       boxEdges(lo, hi, pts);
+      showSize(a, b, [0, 2, 1]);
     } else if (removing) {
       // What would go: the model hit, or the part of the tile.
       if (target.model) cubeEdges(target.model.cubes, pts);
@@ -411,27 +442,27 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
   // --- Exits and spawns ---
   function placeExit(cells) {
     const target = state.exitTarget.trim();
-    if (!target) { status('name the region this exit leads to (Markers)'); return; }
+    if (!target) { status('name the zone this exit leads to (Markers)'); return; }
     const spawn = state.exitSpawn.trim() || 'start';
     // One exit per cell: a new one replaces any it overlaps.
-    Region.exits = [...exitsWithout(Region.exits, cells), { cells, target, spawn }];
+    Zone.exits = [...exitsWithout(Zone.exits, cells), { cells, target, spawn }];
     drawMarkers();
     status(`exit to ${target} (${spawn}) - Ctrl+S to save`);
   }
   function placeSpawn(cell) {
     const name = state.spawnName.trim() || 'start';
-    Region.spawns = { ...Region.spawns, [name]: cell.slice() };
+    Zone.spawns = { ...Zone.spawns, [name]: cell.slice() };
     drawMarkers();
     status(`spawn ${name} at ${cell.join(', ')} - Ctrl+S to save`);
   }
   function removeMarkersAt(cell) {
     const box = [...cell, ...cell];
-    const exits = exitsWithout(Region.exits, box);
-    const spawns = Object.fromEntries(Object.entries(Region.spawns)
+    const exits = exitsWithout(Zone.exits, box);
+    const spawns = Object.fromEntries(Object.entries(Zone.spawns)
       .filter(([, at]) => at[0] !== cell[0] || at[1] !== cell[1] || at[2] !== cell[2]));
-    const n = Region.exits.length - exits.length + Object.keys(Region.spawns).length - Object.keys(spawns).length;
-    Region.exits = exits;
-    Region.spawns = spawns;
+    const n = Zone.exits.length - exits.length + Object.keys(Zone.spawns).length - Object.keys(spawns).length;
+    Zone.exits = exits;
+    Zone.spawns = spawns;
     drawMarkers();
     status(n ? `removed ${n} marker${n > 1 ? 's' : ''} - Ctrl+S to save` : 'no exit or spawn on that cell');
   }
@@ -477,10 +508,35 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     // shortcuts off the fly keys (Ctrl+D would bookmark). Ctrl+W cannot be
     // held back - the browser closes the tab - so C descends too.
     if (e.ctrlKey && ['KeyA', 'KeyD', 'KeyS', 'Space'].includes(e.code)) e.preventDefault();
+    if (k === 'r' && state.drag && state.drag.end) {
+      state.drag.plane = (state.drag.plane + 1) % 3;
+      dragTo(state.drag, ...state.pointer);
+      showCursor(state.hover);
+      return;
+    }
+    if (k === 'x' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      state.erase = !state.erase;
+      status(state.erase ? 'eraser on: LMB removes, drag clears a rectangle (X: off)' : 'eraser off');
+      showCursor(state.hover);
+      return;
+    }
     if (k === 'q' || k === 'e') {
       state.facing = (state.facing + (k === 'e' ? 1 : 3)) % 4;
       renderPanel();
       showCursor(state.hover);   // the outline turns with it
+      return;
+    }
+    if (k === 'f' && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      // A placed model, in place: the same spot and turn, its next state.
+      const entry = state.hover && state.hover.model;
+      if (!entry) { status('Shift+F: point at a placed model'); return; }
+      const next = MODELS.get(nextModelState(entry.name));
+      if (!next || next === entry.model) { status(`${entry.name} has one state`); return; }
+      const swapped = swapWorldModel(entry, next);
+      if (!swapped) { status(`${next.name} does not fit here`); return; }
+      state.hover.model = swapped;
+      edited(`${modelStateOf(next.name).state} state`);
+      showCursor(state.hover);
       return;
     }
     if (k === 'f' && !e.altKey && !e.ctrlKey && !e.metaKey) {
@@ -492,7 +548,11 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
         // A new seed, and the typed one cleared: from here each tree is new.
         state.seed = newTreeSeed(); state.seedText = '';
         renderPanel(); showCursor(state.hover);
-      } else if (state.kind === 'model') status('models have no states yet');
+      } else if (state.kind === 'model') {
+        const next = nextModelState(state.model);
+        if (next !== state.model) { state.model = next; renderPanel(); showCursor(state.hover); }
+        else status(`${state.model} has one state`);
+      }
       return;
     }
     state.keys.add(e.code);
@@ -508,20 +568,22 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     if (e.button !== 0 && e.button !== 2) return;
     state.drag = { button: e.button, x: e.clientX, y: e.clientY, moved: false, shift: e.shiftKey,
                    start: e.shiftKey || e.button === 0 ? targetAt(e.clientX, e.clientY) : null,
-                   row: null };
+                   end: null, axes: null, plane: -1, erase: state.erase && e.button === 0 && !isMarker() };
+    state.pointer = [e.clientX, e.clientY];
     showCursor(targetAt(e.clientX, e.clientY));
   }
   function onPointerMove(e) {
     if (!state.active) return;
     e.stopPropagation();
     const d = state.drag;
+    state.pointer = [e.clientX, e.clientY];
     if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > DRAG_PIXELS) d.moved = true;
     if (d && d.button === 2 && !d.shift) {
       state.yaw -= e.movementX * LOOK_SPEED;
       state.pitch = Math.max(-1.5, Math.min(1.5, state.pitch - e.movementY * LOOK_SPEED));
     }
-    if (d && d.moved && d.button === 0 && !d.shift && d.start && state.kind === 'block') {
-      d.row = rowEnd(startCell(d.start), e.clientX, e.clientY);
+    if (d && d.moved && d.button === 0 && !d.shift && d.start && (d.erase ? !d.start.model : state.kind === 'block')) {
+      dragTo(d, e.clientX, e.clientY);
     }
     state.hover = targetAt(e.clientX, e.clientY);
     showCursor(state.hover);
@@ -538,26 +600,30 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       return;
     }
     // Rows and boxes take the part the first tile would: the same Grid cell in each.
-    const startPlan = d.start && state.kind === 'block' ? planPlacement(d.start) : null;
-    if (d.row) {
+    const startPlan = d.start && state.kind === 'block' && !d.erase ? planPlacement(d.start) : null;
+    if (d.end && d.erase) {
       let n = 0;
-      if (startPlan) for (const c of boxCells(startPlan.cell, d.row)) n += placeBlockAt(c, startPlan.part);
-      if (n) edited(`placed a row of ${n}`);
+      for (const c of boxCells(d.start.key, d.end)) n += removeBlockAt(c);
+      if (n) edited(`cleared ${n}`);
+    } else if (d.end) {
+      let n = 0;
+      if (startPlan) for (const c of boxCells(startPlan.cell, d.end)) n += placeBlockAt(c, startPlan.part);
+      if (n) edited(`placed ${n}`);
     } else if (d.shift && d.start && target) {
       let n = 0;
-      if (d.button === 0 && startPlan) {
+      if (d.button === 0 && !d.erase && startPlan) {
         const endPlan = planPlacement(target);
         for (const c of boxCells(startPlan.cell, endPlan ? endPlan.cell : target.place)) n += placeBlockAt(c, startPlan.part);
-      } else if (d.button === 2) {
+      } else if (d.button === 2 || d.erase) {
         for (const c of boxCells(d.start.key, target.key)) n += removeBlockAt(c);
       }
-      if (n) edited(`${d.button === 0 ? 'filled' : 'cleared'} ${n} cells`);
+      if (n) edited(`${d.button === 0 && !d.erase ? 'filled' : 'cleared'} ${n} cells`);
     } else if (!d.moved && target) {
       let ok = false;
-      if (d.button === 0) ok = state.kind === 'block' ? placeAt(target) : placeModel(target);
+      if (d.button === 0 && !d.erase) ok = state.kind === 'block' ? placeAt(target) : placeModel(target);
       else if (target.model) ok = removeWorldModel(target.model);
       else ok = removePart(target.key, target.part || 0);
-      if (ok) edited(d.button === 0 ? 'placed' : 'removed');
+      if (ok) edited(d.button === 0 && !d.erase ? 'placed' : 'removed');
     }
     showCursor(targetAt(e.clientX, e.clientY));
   }
@@ -578,9 +644,9 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
       const name = levelName();
       const res = await fetch(`/__levels?name=${encodeURIComponent(name)}`, {
         method: 'POST', headers: { 'Content-Type': 'application/octet-stream' },
-        body: await encodeRegion(serializeLevel())
+        body: await encodeZone(serializeLevel())
       });
-      status(res.ok ? `saved levels/${name}.bxr` : `save failed: ${await res.text()}`);
+      status(res.ok ? `saved levels/${name}.bxz` : `save failed: ${await res.text()}`);
     } catch (err) {
       status(`save failed - saving needs the dev server (npm run dev): ${err.message}`);
     }
@@ -594,6 +660,7 @@ export function createEditor({ scene, camera, dom, onEdit, onToggle, levelName =
     palette.show(on);
     state.keys.clear();
     state.drag = null;
+    showSize(null);
     drawMarkers();
     if (on) {
       // Start from where the game camera is, looking the way it looks.

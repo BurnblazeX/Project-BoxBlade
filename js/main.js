@@ -3,8 +3,8 @@ import { uniform, mix, vec3 } from 'three/tsl';
 import { MODELS, MODELS_AND_TREES, treeModel } from './core/models.js';
 import { World, getVoxelKey, createTestArea, createEntity, getColumnTop, CHUNK_SIZE,
          worldMirrorEntries, followGround, ModelBoxes, addWorldModel, WorldModels, mountWorldModel, regrowTrees,
-         loadLevel, findPath, DEV_LEVEL, Region, regionSpawn, setOccupantAt, vacateAt } from './core/world.js';
-import { decodeRegion } from './core/region.js';
+         loadLevel, findPath, DEV_LEVEL, Zone, zoneSpawn, setOccupantAt, vacateAt } from './core/world.js';
+import { decodeZone } from './core/zone.js';
 import { createExitTracker } from './core/exits.js';
 import { silhouetteRadii } from './core/smoke.js';
 import { createEditor } from './tools/editor.js';
@@ -41,6 +41,7 @@ import { createToneMap } from './render/features/tonemap.js';
 import { createOcclusion } from './render/features/occlusion.js';
 import { getSpriteWorldPos, followPath, walk, WALK_SPEED, ENEMY_SPEED } from './game/movement.js';
 import { toggleFieldDebug, refreshFieldDebug, isFieldDebugVisible } from './tools/debug.js';
+import { createHitboxView } from './tools/hitboxes.js';
 import { createFieldAt, gridOriginFor, GRID_DIM, marchOccupancy, sphereTrace,
          CASCADE_COUNT, applyHandoff } from './core/field.js';
 import { makeClipSamples, updateCharacterClipping, addSpriteTangent, crossedPlanesGeometry } from './render/sprites.js';
@@ -168,15 +169,15 @@ dirLight.position.set(...sunForHour(DEFAULT_SKY_HOUR));
 scene.add(dirLight);
 
 // --- WORLD GENERATION ---
-// The Dev Level (levels/dev_level.bxr - the editor writes it) if there is
-// one; otherwise the test area built in code, with its test props. A region
-// is a .bxr (level format v2, core/region.js); a v1 .json still loads.
+// The Dev Level (levels/dev_level.bxz - the editor writes it) if there is
+// one; otherwise the test area built in code, with its test props. A zone
+// is a .bxz (level format v2, core/zone.js); a v1 .json still loads.
 async function fetchLevel(name) {
   const get = ext => fetch(`${import.meta.env.BASE_URL}levels/${name}.${ext}`, { cache: 'no-store' })
     .then(res => res.ok ? res : null, () => null);
   try {
-    const bxr = await get('bxr');
-    if (bxr) return await decodeRegion(await bxr.arrayBuffer());
+    const bxz = await get('bxz');
+    if (bxz) return await decodeZone(await bxz.arrayBuffer());
     const json = await get('json');
     return json ? await json.json() : null;
   } catch (err) {
@@ -184,17 +185,17 @@ async function fetchLevel(name) {
     return null;
   }
 }
-// ?region=<name>&spawn=<name> starts in another region - and is how a region
-// too big for the terrain mesh is loaded (loadRegion).
+// ?zone=<name>&spawn=<name> starts in another zone - and is how a zone
+// too big for the terrain mesh is loaded (loadZone).
 const startAt = new URLSearchParams(location.search);
-let startRegion = startAt.get('region') || DEV_LEVEL;
-let savedLevel = await fetchLevel(startRegion);
-if (!savedLevel && startRegion !== DEV_LEVEL) {
-  console.warn(`[level] no region ${startRegion}: the Dev Level instead`);
-  savedLevel = await fetchLevel(startRegion = DEV_LEVEL);
+let startZone = startAt.get('zone') || DEV_LEVEL;
+let savedLevel = await fetchLevel(startZone);
+if (!savedLevel && startZone !== DEV_LEVEL) {
+  console.warn(`[level] no zone ${startZone}: the Dev Level instead`);
+  savedLevel = await fetchLevel(startZone = DEV_LEVEL);
 }
 if (savedLevel) {
-  const missing = loadLevel(savedLevel, MODELS_AND_TREES, startRegion);
+  const missing = loadLevel(savedLevel, MODELS_AND_TREES, startZone);
   if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
 } else {
 createTestArea(36, 36);
@@ -232,8 +233,8 @@ initWorldRender(scene);
 const player = createEntity({
   id: "player_1",
   name: "Bob",
-  // The region's spawn point (?spawn=, else 'start'); else inside chunk (0, 0).
-  gridPos: (([x, y, z]) => ({ x, y, z }))(regionSpawn(startAt.get('spawn') || 'start') || [8, 0, 8]),
+  // The zone's spawn point (?spawn=, else 'start'); else inside chunk (0, 0).
+  gridPos: (([x, y, z]) => ({ x, y, z }))(zoneSpawn(startAt.get('spawn') || 'start') || [8, 0, 8]),
   speed: 6,
   mode: "explore"
 });
@@ -561,6 +562,8 @@ const ticks = createTickClock();
 const worldClock = createWorldClock(DEFAULT_SKY_HOUR);
 worldClock.running = false;
 const smoothing = createTickSmoothing([playerSprite, enemySprite]);
+// Alt+H: what blocks movement (tools/hitboxes.js).
+const hitboxes = createHitboxView(scene, () => [playerSprite, enemySprite]);
 
 // --- What is under the cursor (render/picking.js) ---
 const picker = createPicker(camera);
@@ -594,7 +597,7 @@ function applyWorldEdit() {
 const editor = createEditor({
   scene, camera, dom: renderer.domElement,
   onEdit: applyWorldEdit,
-  levelName: () => Region.name || DEV_LEVEL,
+  levelName: () => Zone.name || DEV_LEVEL,
   onToggle: on => {
     if (on && game.mode !== 'explore') { console.log('the editor opens in explore mode only'); return false; }
     // Nothing carries over: no walk in progress, no key held down.
@@ -825,6 +828,14 @@ window.addEventListener('keydown', (e) => {
     return;
   }
 
+  // Alt+H: the collision overlay - taken tiles, model bounding boxes, the
+  // characters' points.
+  if (e.altKey && e.code === 'KeyH') {
+    e.preventDefault();
+    console.log(hitboxes.toggle());
+    return;
+  }
+
   // Debug: Alt+G toggles the field occupancy overlay.
   if (e.altKey && e.code === 'KeyG') {
     e.preventDefault();
@@ -944,7 +955,7 @@ function animate(time) {
   // 1. The game's ticks for the time that passed; the characters are then
   // drawn between their last two tick positions.
   smoothing.restore();
-  if (!regionLoading) ticks.advance(realDt);
+  if (!zoneLoading) ticks.advance(realDt);
   smoothing.show(ticks.alpha);
 
   // The panel closes once Bob walks out of look-range of its target;
@@ -1012,6 +1023,7 @@ function animate(time) {
   tonemap.update();   // meters this frame's terrain, before the main render
   fog.update();   // after the texel cache drew this frame's G-buffer
   boxLight.update();
+  hitboxes.update();
   renderer.render(scene, camera);
   resolveGPUTime();
   const tEnd = performance.now();
@@ -1470,11 +1482,11 @@ function buildPerPixelShadows() {
          (sun.rays === 1 ? '. bxb.soften() for a penumbra.' : '');
 }
 
-// --- Regions, loaded in place (World plan P2 §4.2) ---
+// --- Zones, loaded in place (World plan P2 §4.2) ---
 //
 // The Dev Level's test props - Evil Bob, the trees, the chest and the barrel,
 // built in code above rather than kept in the level - stand only in the Dev
-// Level. In another region they are parked far outside it, hidden, and put
+// Level. In another zone they are parked far outside it, hidden, and put
 // back where they were on the way home.
 const PARKED = -100000;
 let devPropsHome = null;   // where each prop was, while parked
@@ -1500,30 +1512,30 @@ function setDevProps(home) {
     devPropsHome = null;
   }
 }
-setDevProps(!savedLevel || startRegion === DEV_LEVEL);
+setDevProps(!savedLevel || startZone === DEV_LEVEL);
 
-// Input is held while a region loads: a capture-phase listener on window that
+// Input is held while a zone loads: a capture-phase listener on window that
 // stops each event before the game's (and the editor's) own see it.
-let regionLoading = false;
+let zoneLoading = false;
 for (const t of ['keydown', 'keyup', 'pointerdown', 'pointerup', 'pointermove', 'wheel', 'contextmenu']) {
-  window.addEventListener(t, e => { if (regionLoading) { e.stopImmediatePropagation(); e.preventDefault(); } },
+  window.addEventListener(t, e => { if (zoneLoading) { e.stopImmediatePropagation(); e.preventDefault(); } },
                           { capture: true, passive: false });
 }
-// Frames drawn behind the loading screen once the region is in: the LPV fills
+// Frames drawn behind the loading screen once the zone is in: the LPV fills
 // and new pipelines compile there, not in the first frames the player sees.
-const REGION_WARMUP_FRAMES = 45;
+const ZONE_WARMUP_FRAMES = 45;
 
-// Replaces the region with another, in place: the loading screen goes up, the
+// Replaces the zone with another, in place: the loading screen goes up, the
 // tick and input stop, the level replaces the world, everything made from the
 // world is rebuilt, the party stands at the spawn point, a few frames warm the
-// lighting, and the screen comes down. Explore mode only. A region the terrain
+// lighting, and the screen comes down. Explore mode only. A zone the terrain
 // mesh has no room for - or with glass, in a world built without any - reloads
-// the page into it (?region=&spawn=), which builds the mesh for it.
-async function loadRegion(name, spawn = 'start') {
-  if (regionLoading) return 'a region is already loading';
-  if (game.mode !== 'explore') return 'regions load in explore mode only';
+// the page into it (?zone=&spawn=), which builds the mesh for it.
+async function loadZone(name, spawn = 'start') {
+  if (zoneLoading) return 'a zone is already loading';
+  if (game.mode !== 'explore') return 'zones load in explore mode only';
   const t0 = performance.now();
-  regionLoading = true;
+  zoneLoading = true;
   if (editor.active) editor.setActive(false);
   game.path = [];
   game.moveTargetKey = null;
@@ -1536,7 +1548,7 @@ async function loadRegion(name, spawn = 'start') {
   try {
     await step(0.05, 'reading');
     const level = await fetchLevel(name);
-    if (!level) throw new Error(`no region ${name}`);
+    if (!level) throw new Error(`no zone ${name}`);
 
     await step(0.25, 'building the world');
     smoke.clear();
@@ -1544,7 +1556,7 @@ async function loadRegion(name, spawn = 'start') {
     const missing = loadLevel(level, MODELS_AND_TREES, name);
     if (missing.length) console.warn(`[level] models not found or not placeable: ${missing.join(', ')}`);
     setDevProps(name === DEV_LEVEL);
-    const at = regionSpawn(spawn);
+    const at = zoneSpawn(spawn);
     if (!at) console.warn(`[level] ${name} has no spawn ${spawn} or start: standing at 8, 0, 8`);
     [player.gridPos.x, player.gridPos.y, player.gridPos.z] = at || [8, 0, 8];
     exitTracker.disarm();   // arriving on an exit does not offer it back
@@ -1557,7 +1569,7 @@ async function loadRegion(name, spawn = 'start') {
     if (!r.ok || r.glassNeeded) {
       UI.setLoadingProgress(0.5, 'too big for this world: reloading into it');
       reloading = true;
-      location.search = `?region=${encodeURIComponent(name)}&spawn=${encodeURIComponent(spawn)}`;
+      location.search = `?zone=${encodeURIComponent(name)}&spawn=${encodeURIComponent(spawn)}`;
       return `reloading into ${name}`;
     }
     texel.syncCount();
@@ -1575,7 +1587,7 @@ async function loadRegion(name, spawn = 'start') {
       ensureShadowGrids();
     }
 
-    for (let f = 0; f < REGION_WARMUP_FRAMES; f++) await step(0.65 + 0.35 * f / REGION_WARMUP_FRAMES, 'lighting');
+    for (let f = 0; f < ZONE_WARMUP_FRAMES; f++) await step(0.65 + 0.35 * f / ZONE_WARMUP_FRAMES, 'lighting');
     const ms = performance.now() - t0;
     console.log(`[level] ${name} loaded in ${(ms / 1000).toFixed(2)} s`);
     return `${name}: ${World.size} blocks, ${WorldModels.length} models, at ${player.gridPos.x}, ${player.gridPos.y}, ` +
@@ -1587,27 +1599,27 @@ async function loadRegion(name, spawn = 'start') {
     // Reloading: the screen stays up, and input held, until the page goes.
     if (!reloading) {
       UI.hideLoading();
-      regionLoading = false;
+      zoneLoading = false;
     }
   }
 }
 
 // --- Exits (core/exits.js) ---
 //
-// Standing on one, in explore mode, offers the region it leads to: a prompt,
+// Standing on one, in explore mode, offers the zone it leads to: a prompt,
 // and F or its button to go. Placeholder look (World plan P2 4.4); zero
 // travel time. In co-op the party will go together, on the host's word
 // (coop-from-the-start) - for now Bob alone decides.
 const exitTracker = createExitTracker();
 exitTracker.disarm();   // the page can open onto an exit (?spawn=)
 let offeredExit = null;
-const regionTitle = name => name.split(/[_-]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+const zoneTitle = name => name.split(/[_-]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 function updateExitPrompt() {
-  const e = game.mode === 'explore' && !editor.active && !regionLoading
-    ? exitTracker.update(Region.exits, player.gridPos) : null;
+  const e = game.mode === 'explore' && !editor.active && !zoneLoading
+    ? exitTracker.update(Zone.exits, player.gridPos) : null;
   if (e === offeredExit) return;
   offeredExit = e;
-  if (e) UI.showExitPrompt(`To ${regionTitle(e.target)}`);
+  if (e) UI.showExitPrompt(`To ${zoneTitle(e.target)}`);
   else UI.hideExitPrompt();
 }
 async function takeExit() {
@@ -1615,7 +1627,7 @@ async function takeExit() {
   if (!e) return;
   offeredExit = null;
   UI.hideExitPrompt();
-  console.log(`[level] ${await loadRegion(e.target, e.spawn)}`);
+  console.log(`[level] ${await loadZone(e.target, e.spawn)}`);
 }
 UI.onExitTravel(takeExit);
 
@@ -1703,7 +1715,7 @@ const bxbApi = installConsole(createConsole({
   cardparity: cards.commands.cardparity,
   cards: cards.commands.cards,
   tree: {
-    help: 'grow a tree (core/treegen.js) on the block three east of Bob - saved with the region like any model',
+    help: 'grow a tree (core/treegen.js) on the block three east of Bob - saved with the zone like any model',
     usage: "bxb.tree()  a random oak  |  bxb.tree('oak', 42)  that seed  |  bxb.tree('oak', 42, 200)  older (age; full size at 160)",
     run: (species = 'oak', seed = Math.floor(Math.random() * 1e6), age = null) => {
       const base = treeModel(`tree_${species}#0@1`);
@@ -1718,12 +1730,12 @@ const bxbApi = installConsole(createConsole({
              (r && r.message ? ` - ${r.message}` : '');
     }
   },
-  region: {
-    help: 'load another region in place (levels/<name>.bxr), at a spawn point; no name: the one loaded',
-    usage: "bxb.region()  |  await bxb.region('dev_level')  |  await bxb.region('test_b', 'start')",
+  zone: {
+    help: 'load another zone in place (levels/<name>.bxz), at a spawn point; no name: the one loaded',
+    usage: "bxb.zone()  |  await bxb.zone('dev_level')  |  await bxb.zone('test_b', 'start')",
     run: (name = null, spawn = 'start') => name === null
-      ? `region ${Region.name} - bounds ${JSON.stringify(Region.bounds)}, spawns ${Object.keys(Region.spawns).join(', ') || 'none'}`
-      : loadRegion(name, spawn)
+      ? `zone ${Zone.name} - bounds ${JSON.stringify(Zone.bounds)}, spawns ${Object.keys(Zone.spawns).join(', ') || 'none'}`
+      : loadZone(name, spawn)
   },
   preset: {
     help: 'graphics preset: ' + PRESET_NAMES.join(', ') + ' - what each sets is in tools/presets.js',
@@ -1844,6 +1856,9 @@ const bxbApi = installConsole(createConsole({
   },
   splithalf: texel.commands.splithalf,
   splitresolve: texel.commands.splitresolve,
+  splittable: texel.commands.splittable,
+  sunstore: texel.commands.sunstore,
+  hitstore: texel.commands.hitstore,
   splitlegacy: texel.commands.splitlegacy,
   gistats: gi.commands.gistats,
   splitstats: texel.commands.splitstats,
@@ -1945,6 +1960,7 @@ const bxbApi = installConsole(createConsole({
         const texelGI = engine.options().texelGI;
         const rebuild = () => buildPerPixelShadows();
         const flag = set => [() => { set(false); rebuild(); }, () => { set(true); rebuild(); }];
+        const table0 = texel.splitTable;
         let shown = [];
         // [name, applies, off, back on, rebuilds]. A case already off is skipped.
         const cases = [
@@ -1979,8 +1995,21 @@ const bxbApi = installConsole(createConsole({
           // Off costs MORE: every GI ray hit runs the light loop again.
           ['patch direct-light cache (GI hits)', !!texelGI && texelGI.ab.direct.value === 1,
            () => { texelGI.ab.direct.value = 0; }, () => { texelGI.ab.direct.value = 1; }, false],
-          ['split shading', texel.splitOn, ...flag(v => { texel.splitOn = v; }), true],
+          // Not with texel GI: the one-shader set then holds everything Ultra
+          // shades, and compiling it took the GPU process down (2026-11-11,
+          // device lost, white screen). Texel GI has no fallback without it anyway.
+          ['split shading', texel.splitOn && !texelGI, ...flag(v => { texel.splitOn = v; }), true],
+          // The resolve, either way round: the other one in its place.
+          [texel.splitTable ? 'visible-texel table (the low-res resolve instead)'
+                            : 'low-res resolve (the visible-texel table instead)', texel.splitOn && texel.tableReady,
+           ...flag(v => { texel.splitTable = v ? table0 : !table0; }), true],
           ['hit lighting cache', hitCacheOn, ...flag(v => { hitCacheOn = v; }), true],
+          // No rebuild: every texel's static sun marched each frame, as before the store.
+          ['sun store (marched every frame instead)', texel.sunStoreHeld && texel.sunStoreOn,
+           () => { texel.sunStoreOn = false; }, () => { texel.sunStoreOn = true; }, false],
+          // No rebuild: every ray hit lit afresh, as before the store.
+          ['hit-light store (hits lit every time instead)', texel.hitStoreHeld && texel.hitStoreOn,
+           () => { texel.hitStoreOn = false; }, () => { texel.hitStoreOn = true; }, false],
           ['model lookup in reflection hits', !!terrainTextures.modelHits, ...flag(v => { modelHitsOn = v; }), true],
           ['reflections (and glass shading)', reflectionsOn,
            () => bxbApi.spec('reflect'), () => bxbApi.spec('reflect'), true]
@@ -1990,12 +2019,22 @@ const bxbApi = installConsole(createConsole({
         // renderP95: the spread within a measurement - a saving smaller than the
         // baselines' drift (the last row) is not a saving.
         const row = (name, m) => ({ case: name, render: m.render, compute: m.compute, renderP95: m.renderP95 });
+        // A lost device ends the run: past it every measurement repeats the
+        // last frame's timings, which read as real numbers.
+        let lost = null;
+        const device = renderer.backend && renderer.backend.device;
+        if (device && device.lost) device.lost.then(info => { lost = info; });
         const before = await measure(false);
         rows.push(row('baseline', before));
         for (const [name, applies, off, on, rebuilds] of cases) {
           if (!applies) continue;
           off();
           const m = await measure(rebuilds);
+          if (lost) {
+            console.warn(`[gpuprofile] the GPU device was lost during '${name}' (${lost.message}) - stopped; reload the page`);
+            console.table(rows);
+            return rows;
+          }
           on();
           if (rebuilds) await sets.done;
           rows.push(row(`${name} off`, m));

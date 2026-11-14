@@ -13,15 +13,16 @@
 // (Gameplay §9). tools/rng.test.mjs scans the generator modules for them.
 //
 // Seeds are pure functions of what they are for, never of what ran before:
-// chunkSeed(world, region, cx, cz, layer) gives a chunk the same stream
-// whichever order the chunks are generated in, so a region rebuilt on load,
-// the backdrop seen from the next region and a co-op client all agree.
+// chunkSeed(world, cx, cz, layer) gives a chunk the same stream whichever
+// order the chunks are generated in. Chunk coordinates are the terrain
+// master's, one world for every zone, so a zone rebuilt on load, the same
+// chunk seen from the next zone and a co-op client all agree.
 //
 // RNG_VERSION is saved beside the seed. Changing any output here moves every
 // generated tree in every save, so it is a version bump, and the fixed
 // outputs in the test say when it happened.
 
-export const RNG_VERSION = 1;
+export const RNG_VERSION = 2;   // 2: chunkSeed lost its region name
 
 const TWO_32 = 4294967296;
 
@@ -38,7 +39,7 @@ export function mix32(h) {
   return (h ^ (h >>> 16)) >>> 0;
 }
 
-// FNV-1a over the string's UTF-16 code units: region and layer names.
+// FNV-1a over the string's UTF-16 code units: layer names.
 export function hashString(text) {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
@@ -68,8 +69,8 @@ export function hash32(...parts) {
 
 // A chunk's seed for one generator layer ('terrain', 'scatter', 'tiles', ...).
 // worldSeed is the world's key (seedKey below), not the text a player typed.
-export function chunkSeed(worldSeed, region, cx, cz, layer) {
-  return hash32(worldSeed, region, cx, cz, layer);
+export function chunkSeed(worldSeed, cx, cz, layer) {
+  return hash32(worldSeed, cx, cz, layer);
 }
 
 // --- World seeds: the player's side ---

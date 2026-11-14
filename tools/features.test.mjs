@@ -336,6 +336,35 @@ section('texel cache');
   ok('off: the key says so', JSON.stringify(tc.keyParts()), '[false,null]');
   ok('the settings run the command', (tc.settings[0].set(true), tc.on), true);
   ok('nothing to draw without a set', (tc.render(), rebuilds), 2);
+  ok('the visible-texel table is the default', tc.splitTable, true);
+  // The store's buffers are sized to the screen.
+  Object.assign(globalThis, { window: { devicePixelRatio: 1, innerWidth: 64, innerHeight: 64 },
+                              screen: { width: 64, height: 64 } });
+  ok('the sun store starts on', tc.commands.sunstore.run(), 'sun store off - every texel marched every frame');
+  ok('and flips back without a rebuild', `${tc.commands.sunstore.run()}/${rebuilds}`, 'sun store on/2');
+  delete globalThis.window;
+  delete globalThis.screen;
+  ok('no set holds one yet', tc.sunStoreHeld, false);
+  Object.assign(globalThis, { window: { devicePixelRatio: 1, innerWidth: 64, innerHeight: 64 },
+                              screen: { width: 64, height: 64 } });
+  ok('the hit-light store starts on', tc.commands.hitstore.run(), 'hit-light store off - every hit lit every time');
+  ok('a number sets its longest life', (tc.commands.hitstore.run(), tc.commands.hitstore.run(4)),
+     'hit-light store on, an entry lives at most 4 frames');
+  delete globalThis.window;
+  delete globalThis.screen;
+}
+
+section('the visible-texel table queue');
+{
+  const { tableWords } = await import('../js/gpu/texel.js');
+  const { HIT_STORE_SLOTS, HIT_STORE_STRIDE } = await import('../js/gpu/hitstore.js');
+  const m = 1 << 10, w = tableWords(m), hits = HIT_STORE_SLOTS * HIT_STORE_STRIDE;
+  // [start, words] of each region, in order: count, list, keys, samples, refresh count,
+  // refresh list, glass count and list, the hit-light store.
+  const regions = [[0, 1], [w.list, m], [w.keys, m], [w.samples, 4 * m], [w.refreshCount, 1], [w.refresh, m],
+                   [w.glassCount, 1], [w.glass, m], [w.hits, hits]];
+  ok('the regions follow one another', regions.every(([a, n], i) => i === 0 || a === regions[i - 1][0] + regions[i - 1][1]), true);
+  ok('and fill it exactly', w.total, w.hits + hits);
 }
 
 section('sprite atlas');

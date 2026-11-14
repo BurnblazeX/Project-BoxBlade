@@ -22,7 +22,9 @@ import { HIT_FAR_METRES, hitCacheReadTSL, hitCacheWriteTSL } from './hitcache.js
 import { GI_ANCHORS, GI_CHECK, GI_LAST, GI_LIST_CAP, GI_STALE_FRAMES, GI_STAMPS, GI_STRIDE, faceFrameTSL, faceIndexTSL, patchKeyTSL, patchSideTSL, texelGILevelTSL, createTexelGIKernels, createTexelGIReadTSL, createPatchRegisterTSL } from './texelgi.js';
 import { createPointLightsTSL } from './pointlights.js';
 import { RAW_VIEWS, SPLIT_VIEWS, surfaceViewTSL } from './debugview.js';
-import { TEXEL_ID_OFFSET, slopeLayerTable } from './texel.js';
+import { TEXEL_ID_OFFSET, slopeLayerTable, splitTableThreadTSL, faceNormalTSL, createSunRefreshKernel,
+         sunStoreReadTSL, splitLightTSL, tableGlassKernelTSL } from './texel.js';
+import { hitStoreReadTSL, hitStoreWriteTSL, hitStampFor, HIT_REFLECT } from './hitstore.js';
 import { DEFAULT_AMBIENT, GROUND_REFERENCE_FLOOR, createSoftSunTSL, createSunUniforms, sunShadeTSL } from './sun.js';
 
 // ---------------------------------------------------------------------------
@@ -131,12 +133,17 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // sunMarch false (profiling only): the sun is unshadowed everywhere - to
   // measure what its march costs. The GI's own sun march is left alone.
   // Through spell smoke and the trees' leaves too (gpu/leafvolume.js: dappled shade).
-  const sunShadow = withLeavesTSL(leaves, withSmokeTSL(smoke, sun.dir, sunMarch ? createSoftSunTSL({
+  const sunParts = {}, sunCore = sunMarch ? createSoftSunTSL({
     cascades, sunDir: sun.dir, sunTangent: sun.tangent,
     sunBitangent: sun.bitangent, maxDist, coneRadiusUniform: sun.coneRadius,
     rayCount: rays, bayerTex, stepsUniform, biasUniform, cone, quantise,
-    fadeStartUniform, edgeFadeUniform, cards, glass: glassT, terrain
-  }) : () => asColour(float(1))));
+    fadeStartUniform, edgeFadeUniform, cards, glass: glassT, terrain, partsOut: sunParts
+  }) : null;
+  const sunShadow = withLeavesTSL(leaves, withSmokeTSL(smoke, sun.dir, sunCore || (() => asColour(float(1)))));
+  // The visible-texel table holds the static part per texel (gpu/texel.js); the base kernel reads it.
+  const sunStore = split && split.table && sunParts.static ? sunParts : null;
+  const sunAt = (idx, p, n) => (sunStore ? withLeavesTSL(leaves, withSmokeTSL(smoke, sun.dir, (q, m, skip) =>
+    sunStore.live(sunStoreReadTSL(split, idx, !!glassT), q, m, skip)))(p, n, NO_SKIP) : sunShadow(p, n, NO_SKIP));
 
   const aoDistance = aoDistanceUniform || uniform(float(AO_DISTANCE));
   // The cones are built for AO, for GI, or both - GI gathers along them - so
@@ -166,6 +173,10 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // on (reflections, the view through glass) - surfaces never seen directly
   // would have none. null in every other build, as cacheMode is set per build.
   let hitRegister = null;
+  // The hit-light store (gpu/hitstore.js): only with a stamp to keep it
+  // honest; read and written by the split kernels' builds alone (storeHits).
+  const hitStore = split && split.hitStore && (sunParts.stamp || !sunOn) ? split.hitStore : null;
+  let storeHits = null;
   // nS: the shading normal the texel GI is seen by (the face's without one).
   // giAt: { p, n } - where the texel GI is read instead of p, n (a sprite
   // reads the ground under it).
@@ -458,6 +469,23 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // A record as a lighting request (lightBatch).
   const hitRequest = rec => ({ active: rec.met, P: rec.P, N: rec.N, lift: rec.lift,
                                skip: rec.skip, nS: rec.nS, secondary: true, far: rec.far });
+  // The records' light: the store's for a block hit it holds, else one light
+  // batch for the rest, written back - a far hit (unshadowed lamps) only reads.
+  const hitLights = recs => {
+    if (!storeHits) return lightBatch(recs.map(hitRequest));
+    const held = recs.map(r => {
+      const look = hitStoreReadTSL(storeHits, r.P, r.N, HIT_REFLECT);
+      return { look, on: r.lambert.lessThan(float(0.5)).and(look.ok.equal(int(1))).toVar() };
+    });
+    const outs = lightBatch(recs.map((r, i) => ({ ...hitRequest(r), active: select(held[i].on, float(0), r.met) })));
+    return recs.map((r, i) => {
+      If(r.met.greaterThan(float(0.5)).and(held[i].on.not()).and(r.lambert.lessThan(float(0.5))).and(r.far.lessThan(float(0.5))), () => {
+        hitStoreWriteTSL(storeHits, r.P, r.N, HIT_REFLECT, glassT ? outs[i].vis : vec3(outs[i].vis), outs[i].diff);
+      });
+      const a = held[i].look.a;
+      return { vis: select(held[i].on, glassT ? a : a.x, outs[i].vis), diff: select(held[i].on, held[i].look.b, outs[i].diff) };
+    });
+  };
   // The colour a record shows, from its request's answer (vis, diff): what
   // hitLight computes, term for term and in its order.
   const composeHit = (rec, vis, diff) => {
@@ -827,7 +855,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
 
   const glassNode = reflectTrace ? Fn(() => {
     cacheMode = 'none';
-    hitRegister = null;
+    hitRegister = storeHits = null;
     const n = axisNormalTSL(normalWorld).toVar();
     const p = texelLockTSL(positionWorld, n).toVar();
     const st = boxFaceTSL(p, n).st.toVar();
@@ -915,7 +943,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // +4 ms with the write in every pass).
   const makeNode = (writeCache = false) => Fn(() => {
     cacheMode = hitCache ? (writeCache ? 'atomic' : 'read') : 'none';
-    hitRegister = null;
+    hitRegister = storeHits = null;
     // normalWorld rather than a derivative reconstruction: the terrain is boxes,
     // so the interpolated normal IS the exact face normal, and the marcher needs
     // it to lift the ray origin off the face along the surface rather than along
@@ -1075,24 +1103,18 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
   // Glass splits too, unless a glass debug view is on (glassNode keeps those).
   const splitGlass = !!(split && glass && reflectTrace && !glassView);
   if (split && terrain && (!view || (texelGI && SPLIT_VIEWS.has(view)))) {
-    const faceNormal = id => {
-      const f = floor(id.sub(float(TEXEL_ID_OFFSET)).div(float(2097152)));
-      return select(f.lessThan(float(0.5)), vec3(1, 0, 0), select(f.lessThan(float(1.5)), vec3(-1, 0, 0),
-             select(f.lessThan(float(2.5)), vec3(0, 1, 0), select(f.lessThan(float(3.5)), vec3(0, -1, 0),
-             select(f.lessThan(float(4.5)), vec3(0, 0, 1), vec3(0, 0, -1))))));
-    };
     // A sample's geometry: its locked position and normal - a box face's
     // from its id, a slope plane's (face 6) from its block's code.
     const geoAt = s => {
       if (splitLegacy) {
         // A08//00a: box faces only (slopes and glowing cubes are misses).
-        return { p: s.xyz.toVar(), n: faceNormal(abs(s.w)).toVar(), slope: null, legacy: true };
+        return { p: s.xyz.toVar(), n: faceNormalTSL(abs(s.w)).toVar(), slope: null, legacy: true };
       }
       const p = s.xyz.toVar();
       const slope = floor(abs(s.w).sub(float(TEXEL_ID_OFFSET)).div(float(2097152))).greaterThan(float(5.5)).toVar();
       const vol = volumeAtTSL(terrain, round(p.div(float(BLOCK_METRES))), p).toVar();   // the slope's part: its code less the base, as blockSlope's
       const sl = slopeFromCodeTSL(max(vol.w.sub(float(SLOPE_CODE_BASE - 4)), float(0)));
-      const n = select(slope, sl.n, faceNormal(abs(s.w))).toVar();
+      const n = select(slope, sl.n, faceNormalTSL(abs(s.w))).toVar();
       return { p, n, slope, sl, vol };
     };
     // The surface there - a box face as a reflection hit rebuilds one, a
@@ -1142,65 +1164,41 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     };
     // body(idx, s, geo): a terrain sample only; glass and empty ones are the
     // base kernel's alone. Threads: this frame's low-res samples, then the
-    // misses; idx is where each one's buffers are (misses from lowCap on).
-    const kernel = (name, body, base = null) => Fn(() => {
+    // misses (from lowCap on) - or the table's listed texels, at their slots.
+    const kernel = (name, body, base = null, glassList = false, lanes = 1) => Fn(() => {
       cacheMode = 'none';
       hitRegister = texelGI ? registerPatch : null;
+      storeHits = hitStore;
+      const run = (idx, s, lane = null) => {
+        const terrainSample = () => body(idx, s, geoAt(s), lane);
+        if (base) base(idx, s, terrainSample);
+        else If(s.w.greaterThan(float(1.5)), terrainSample);
+      };
       if (splitLegacy) {
         // A08//00a exactly: low-res samples only, no miss list.
         const idx = int(instanceIndex).toVar();
         If(idx.lessThan(split.count), () => {
-          const s = textureLoad(split.rt, ivec2(idx.mod(split.width), idx.div(split.width))).toVar();
-          const terrainSample = () => body(idx, s, geoAt(s));
-          if (base) base(idx, s, terrainSample);
-          else If(s.w.greaterThan(float(1.5)), terrainSample);
+          run(idx, textureLoad(split.rt, ivec2(idx.mod(split.width), idx.div(split.width))).toVar());
         });
         return;
       }
+      if (split.table) { splitTableThreadTSL(split, run, glassList, lanes); return; }
       const t = int(instanceIndex).toVar();
       const misses = min(int(split.missCount.ro.element(int(0))), int(split.missCap));
       const low = t.lessThan(split.count);
       const slot = t.sub(split.count).toVar();
       If(low.or(slot.lessThan(misses)), () => {
         const idx = select(low, t, int(split.lowCap).add(slot)).toVar();
-        const s = select(low,
+        run(idx, select(low,
           textureLoad(split.rt, ivec2(t.mod(split.width), t.div(split.width))),
-          split.missSamples.ro.element(max(slot, int(0)))).toVar();
-        const terrainSample = () => body(idx, s, geoAt(s));
-        if (base) base(idx, s, terrainSample);
-        else If(s.w.greaterThan(float(1.5)), terrainSample);
+          split.missSamples.ro.element(max(slot, int(0)))).toVar());
       });
     })().compute(split.capacity).setName(name);
-    const addResult = (idx, c) => {
-      const r = split.result.rw.element(idx).toVar();
-      split.result.rw.element(idx).assign(vec4(r.xyz.add(c), r.w));
-    };
-    // The packed ambient / highlights (createSplitShading: light).
-    const readLight = idx => {
-      if (!split.half) {
-        return { env: split.env.rw.element(idx).xyz.toVar(), spec: split.spec.rw.element(idx).xyz.toVar() };
-      }
-      const w = split.light.rw.element(idx).toVar();
-      const a = unpackHalf2x16(w.x), b = unpackHalf2x16(w.y), c = unpackHalf2x16(w.z);
-      return { env: vec3(a.x, a.y, b.x), spec: vec3(b.y, c.x, c.y) };
-    };
-    const writeLight = (idx, env, spec) => {
-      if (!split.half) {
-        split.env.rw.element(idx).assign(vec4(env, float(0)));
-        split.spec.rw.element(idx).assign(vec4(spec, float(0)));
-        return;
-      }
-      split.light.rw.element(idx).assign(uvec4(packHalf2x16(vec2(env.x, env.y)),
-        packHalf2x16(vec2(env.z, spec.x)), packHalf2x16(vec2(spec.y, spec.z)), uint(0)));
-    };
-    const addSpec = (idx, c) => {
-      const l = readLight(idx);
-      writeLight(idx, l.env, l.spec.add(c));
-    };
+    const { addResult, readLight, writeLight, addSpec } = splitLightTSL(split);
     // Texel GI: list this sample's patch for the patch kernel (gpu/texelgi.js
     // createPatchRegisterTSL) - p locked on a box face, n its axis normal.
     const registerPatch = texelGI ? createPatchRegisterTSL(texelGI, giLevel) : null;
-    splitKernels = [];
+    splitKernels = sunStore && sunOn && !view ? [createSunRefreshKernel({ split, geoAt, sunStatic: sunStore.static, sunDir: sun.dir, glass: !!glassT })] : [];
     // The room meter's tap (gpu/roommeter.js): each kernel's diffuse light.
     const roomTap = split.room ? split.room.tap(terrain) : null;
     // Glowing cubes are a kernel case unless legacy (then they are misses).
@@ -1233,7 +1231,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
       const sunSpec = vec3(0, 0, 0).toVar();
       if (sunOn) {
         const vis = sunVisZero();
-        If(n.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunShadow(p, n, NO_SKIP)); });
+        If(n.dot(sun.dir).greaterThan(float(0)), () => { vis.assign(sunAt(idx, p, n)); });
         light.addAssign(sunColourUniform.mul(sunDirect(vis, S.nS, shadeMode)));
         if (spec) sunSpec.assign(S.brdf(sun.dir).mul(vis).mul(sunLight()).mul(sunColourUniform));
       }
@@ -1300,7 +1298,7 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
             // shadeTraced, spelled out so the reflection-hit debug views (bxb.view) can show its parts.
             const { hit, crossed } = traceReflection(origin, dir, reach);
             const rec = traceRecord(origin, dir, hit);
-            const [o] = lightBatch([hitRequest(rec)]);
+            const [o] = hitLights([rec]);
             const refl = throughGlass(composeHit(rec, o.vis, o.diff), origin, dir, crossed).toVar();
             // 1 the hit's own colour, unlit; 2 its distance (white = 16 m, red = a miss).
             If(splitDebug.equal(int(1)), () => { refl.assign(select(rec.met.greaterThan(float(0.5)), rec.alb, rec.col)); });
@@ -1343,9 +1341,9 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
                                            float(REFLECT_ROUGH_END), G.d.alpha)).toVar();
         return G;
       };
-      const glassKernel = (name, body) => kernel(name, body, (idx, s, run) => {
+      const glassKernel = (name, body, lanes = 1) => tableGlassKernelTSL(split, kernel(name, body, (idx, s, run) => {
         If(s.w.lessThan(float(-1.5)), run);
-      });
+      }, true, lanes), lanes);
       splitKernels.push(glassKernel('splitGlassSurface', (idx, s, geo) => {
         const { p, n } = geo;
         const G = glassAt(p, n);
@@ -1371,27 +1369,29 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
         If(G.smooth.greaterThan(float(0)), () => {
           traceRecord(reflOrigin, rdir, reflectTrace(reflOrigin, rdir, reflectMax).toVar(), null, reflRec);
         });
-        const [o] = lightBatch([hitRequest(reflRec)]);
+        const [o] = hitLights([reflRec]);
         const reflected = ambientAt(reflOrigin, G.nS).toVar();
         If(G.smooth.greaterThan(float(0)), () => {
           reflected.assign(mix(reflected, composeHit(reflRec, o.vis, o.diff), G.smooth));
         });
         writeLight(idx, reflected, readLight(idx).spec);
       }));
-      splitKernels.push(glassKernel('splitGlassThrough', (idx, s, geo) => {
+      // With dispersion under the table, a lane a colour: one walk each, three threads a texel.
+      splitKernels.push(glassKernel('splitGlassThrough', (idx, s, geo, lane) => {
         const { p, n } = geo;
         const G = glassAt(p, n);
         const sf = sqrt(clamp(G.d.f0.x, float(0), float(0.5)));
         const ior = float(1).add(sf).div(float(1).sub(sf)).toVar();
-        const iors = glassDispersion > 0
+        const iors = lane ? [ior.mul(float(1).add(float(glassDispersion).mul(float(lane).sub(float(1)))))] : glassDispersion > 0
           ? [ior.mul(float(1 - glassDispersion)), ior, ior.mul(float(1 + glassDispersion))] : [ior];
         const throughs = iors.map(x => glassThroughRec(p, n, G.nS, G.v, x, G.d.f0.x, G.d.alpha, G.tint, G.smooth));
         const traced = throughs.filter(t => !t.debug);
-        const lit = traced.length ? lightBatch(traced.map(t => hitRequest(t.rec))) : [];
+        const lit = traced.length ? hitLights(traced.map(t => t.rec)) : [];
         const colours = throughs.map(t => glassThroughColour(t, t.debug ? null : lit[traced.indexOf(t)]));
-        const seen = glassDispersion > 0 ? vec3(colours[0].x, colours[1].y, colours[2].z) : colours[0];
-        split.result.rw.element(idx).assign(vec4(seen, s.w.negate()));
-      }));
+        const seen = glassDispersion > 0 && !lane ? vec3(colours[0].x, colours[1].y, colours[2].z) : colours[0];
+        if (lane) ['x', 'y', 'z'].forEach((c, k) => If(lane.equal(int(k)), () => split.result.rw.element(idx)[c].assign(seen[c])));
+        split.result.rw.element(idx)[lane ? 'w' : 'xyzw'].assign(lane ? s.w.negate() : vec4(seen, s.w.negate()));
+      }, glassDispersion > 0 ? 3 : 1));
       splitKernels.push(glassKernel('splitGlassCompose', (idx, s, geo) => {
         const { p, n } = geo;
         const G = glassAt(p, n);
@@ -1476,14 +1476,16 @@ export function createShadowColorNode({ cascades, sunDirection, maxDistance = 12
     texelGI, cascades, terrain, trace: reflectTrace, glass: glassT, bias, sky, ambient, shadeMode, sun,
     sunOn, sunShadow, sunVisZero, sunDirect, skyIrradiance, pointLight, mirrorTrace, giRead,
     // The near band and V_p need the cones' AO.
-    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null, smoke, leaves }) : null;
+    cones: cones && aoOn ? cones : null, nearReach: cones && aoOn ? aoDistance : null, smoke, leaves, hitStore }) : null;
 
   return { node, nodeCaching, splitKernels, giKernels, splitGlass: !!splitKernels && splitGlass,
            glassNode: terrainView ? node : glassNode, sun, cascades, lights,
            // A raw view: the sprite draws the term itself, not times its art (gpu/sprite.js).
            spriteLight: Object.assign(spriteLight, { raw: RAW_VIEWS.has(view) }),
            mirrorCache: (mirrorLight && mirrorLight.cacheKernel) || null,
-           maxDistUniform: maxDist, ambientUniform: ambient, revealedLight };
+           maxDistUniform: maxDist, ambientUniform: ambient, revealedLight,
+           sunStamp: sunStore && splitKernels ? sunStore.stamp : null,
+           hitStamp: hitStore && splitKernels ? hitStampFor({ sunParts, lights, texelGI }) : null };
 }
 
 // How far through the rough band a reflection's reach shrinks: 0.75 = to a

@@ -1,6 +1,7 @@
 import { file, section, ok, near, truthy } from './lib/harness.mjs';
 import { texelPixels, texelCacheSpacingFor, TEXEL_METRES, TEXEL_SPACING_MIN,
-         TEXEL_SPACING_MAX, splitCapacityFor } from '../js/core/texelcache.js';
+         TEXEL_SPACING_MAX, splitCapacityFor, tableSlotsFor, TABLE_MAX_SLOTS, TABLE_MIN_SLOTS,
+         TABLE_PIXELS_PER_SLOT, TABLE_PROBES } from '../js/core/texelcache.js';
 
 file('texelcache.test.mjs - the texel cache follows the texel size on screen');
 
@@ -30,3 +31,19 @@ ok('4K includes every pixel even on a smaller reported screen', splitCapacityFor
 truthy('odd dimensions include the final low-res row and column', splitCapacityFor(1921, 1081).low >= 961 * 541);
 ok('allocation retains its bounded full-pixel capacity', splitCapacityFor(10000, 10000).full, 1 << 24);
 ok('allocation retains its bounded low-res capacity', splitCapacityFor(10000, 10000).low, 1 << 22);
+
+section('the visible-texel table');
+ok('1440p: 2^20 slots', splitCapacityFor(2560, 1440).table, 1 << 20);
+ok('1080p: 2^19', splitCapacityFor(1920, 1080).table, 1 << 19);
+ok('4K: 2^21, the cap', splitCapacityFor(3840, 2160).table, TABLE_MAX_SLOTS);
+ok('past the cap: still the cap', tableSlotsFor(1 << 26), TABLE_MAX_SLOTS);
+ok('a tiny canvas: the floor', tableSlotsFor(16), TABLE_MIN_SLOTS);
+truthy('always a power of two', [1000, 123457, 2073600, 3686400].every(p => {
+  const n = tableSlotsFor(p);
+  return (n & (n - 1)) === 0;
+}));
+truthy('at least a slot per 4 pixels below the cap', [1000, 123457, 2073600].every(p =>
+  tableSlotsFor(p) * TABLE_PIXELS_PER_SLOT >= p));
+// The kernels' indirect dispatch: one thread a texel, 64 a workgroup.
+truthy('a full table fits one dispatch dimension', TABLE_MAX_SLOTS / 64 <= 65535);
+truthy('the probe run is within the smallest table', TABLE_PROBES < TABLE_MIN_SLOTS);

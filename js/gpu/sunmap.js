@@ -13,7 +13,7 @@ import { layout } from './layout.js';
 // and a redraw is a few uniform writes, never a rebuild. The target keeps its
 // texture object through a resize, so the shaders' binding stays good.
 //
-// Full float: a stored s is metres up to a region's diagonal, and a receiver
+// Full float: a stored s is metres up to a zone's diagonal, and a receiver
 // outside C2 compares it at SUN_MAP_MIN_REACH (1.5 m) - half float's half a
 // metre at a few hundred would be its own shadow.
 

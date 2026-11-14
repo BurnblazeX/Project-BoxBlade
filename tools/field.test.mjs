@@ -397,9 +397,13 @@ section('placed models bake as their cubes');
   truthy('a leg is solid (x 1..2, z -2..-1)', isOccupied(h, 67, 48, 64));
   truthy('the backrest post reaches 9 up', isOccupied(h, 64, 56, 64));
   falsy('and no higher', isOccupied(h, 64, 57, 64));
-  truthy('with bounds, the tile is taken', !!occupantAt('5,0,5'));
+  // Props collide on the Grid (world.js bodyFits), not by taking the tile.
+  const { bodyFits, surfaceHeight } = await import('../js/core/world.js');
+  const bodyAt = () => bodyFits(5 * BLOCK_METRES, surfaceHeight(5, 0, 5), 5 * BLOCK_METRES);
+  falsy('with bounds, a body on the tile meets them', bodyAt());
+  falsy('and the tile itself is not taken', !!occupantAt('5,0,5'));
   clearWorldModels();
-  falsy('cleared, it is free again', !!occupantAt('5,0,5'));
+  truthy('cleared, a body fits again', bodyAt());
   truthy('and standable', standable(5, 0, 5));
 }
 

@@ -3,7 +3,7 @@
 //
 // A tree's wood is model cubes like any model's; its leaves are cells drawn
 // here. The list is rewritten when the placed models change (invalidate():
-// a world edit, a region loaded); its light goes round the list a slice a
+// a world edit, a zone loaded); its light goes round the list a slice a
 // frame, and the whole of it at once after a rewrite.
 //
 // ctx as createSmoke's (render/features/smoke.js): renderer, scene, camera,

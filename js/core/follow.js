@@ -1,7 +1,7 @@
 // --- Windows that follow the player (World plan P2a) ---
 //
-// No renderer volume covers a whole region: each is a fixed number of blocks
-// across, placed around the player, so a region can be any size (the user's
+// No renderer volume covers a whole zone: each is a fixed number of blocks
+// across, placed around the player, so a zone can be any size (the user's
 // may be 384 or 512 a side). The field and the LPV have always followed;
 // the block volume and the box light use this, and the sun map has its own
 // version of the same idea in core/sunmap.js.
@@ -37,7 +37,7 @@ export function windowAxis(prev, focus, size, lo, hi, margin = Math.floor(size /
   if (prev !== null && prev !== undefined && focus >= prev + margin && focus < prev + size - margin) return prev;
   // Never past the world's edge: a window half over air was rebuilt each time
   // the focus came near either side, and a world a little wider than the
-  // window (a 140-block region, 128 across) moved it about every block an
+  // window (a 140-block zone, 128 across) moved it about every block an
   // editor pan crossed. Clamped, it has a handful of places at most.
   const at = Math.round((focus - size / 2) / stride) * stride;
   return Math.max(lo, Math.min(hi - size + 1, at));

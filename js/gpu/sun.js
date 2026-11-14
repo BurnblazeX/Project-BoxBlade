@@ -10,7 +10,8 @@ import { glassRayTransmitTSL } from './glass.js';
 import { createConeTraceSunTSL, createShadowTraceTSL, createReflectTraceTSL } from './trace.js';
 import { createCardsTSL } from './cards.js';
 import { skyOpenTSL } from './volume.js';
-import { sunMap, sunMapFarTSL, sunSoftReach } from './sunmap.js';
+import { sunMap, sunMapFarTSL, sunSoftReach, sunWorldTop } from './sunmap.js';
+import { sunInputs } from './uploads.js';
 
 // --- The sun's march, past its reach ---
 //
@@ -168,7 +169,7 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
                                   stepsUniform = null, biasUniform = null,
                                   cone = false, quantise = true,
                                   fadeStartUniform = null, edgeFadeUniform = null,
-                                  cards = null, glass = false, terrain = null }) {
+                                  cards = null, glass = false, terrain = null, partsOut = null }) {
   // terrain: the terrain textures, for the sky-top map (sunRoofTSL); null: none.
   // glass: a world with glass - the terrain textures (for the tint of the
   // texel a ray enters glass through), or false. The visibility is then a
@@ -244,11 +245,17 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
   // the same one. Kept as an early return rather than threaded through the loop
   // below so that neither path carries the other's machinery.
   if (cone) {
-    return Fn(([p, n, skip]) => {
+    // The static part: everything the world decides - the field march, the
+    // far march, the sun depth map - and none of what moves (the sprites'
+    // cards; smoke and leaves are multiplied in by the caller). glass: vec4
+    // (the tint through, the visibility), else the visibility. Its own
+    // function, so the visible-texel table's sun store (gpu/texel.js) can
+    // hold it across frames - parts below.
+    const staticPart = Fn(([p, n]) => {
       // toVar, not a bare expression. TSL hoists a node into a variable at the
       // point it is first REUSED, and here that is inside the C1 loop - which
       // only runs when C0 did not conclude. Everywhere the march ended in C0,
-      // the card test below then read an origin that was never assigned, (0,0,0),
+      // the card test then read an origin that was never assigned, (0,0,0),
       // and every sprite shadow vanished from that region.
       const origin = p.add(n.mul(bias.mul(float(VOXEL_METRES)))).toVar();
       const reach = reachFor(origin).toVar();
@@ -262,21 +269,26 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       }
       // Whatever lies further toward the sun than the march looked.
       visible.mulAssign(farMap(origin, reach));
-      // Sprites left the distance field so that each light could have them
-      // facing IT - see createCardsTSL. Same ray, same cap, same cone radius, so
-      // a character's penumbra and a wall's come out of one formula.
-      if (cardsFn) {
-        visible.mulAssign(cardsFn(origin, sunDir, float(CARD_SUN_REACH),
-                                  coneRadiusUniform, skip));
-      }
+      return glass ? vec4(through, visible) : visible;
+    }).setLayout(layout('sunStatic', glass ? 'vec4' : 'float', [
+      { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' }]));
+    // Sprites left the distance field so that each light could have them
+    // facing IT - see createCardsTSL. Same ray, same cap, same cone radius, so
+    // a character's penumbra and a wall's come out of one formula.
+    const withCards = (v, p, n, skip) => (cardsFn
+      ? v.mul(cardsFn(p.add(n.mul(bias.mul(float(VOXEL_METRES)))), sunDir, float(CARD_SUN_REACH),
+                      coneRadiusUniform, skip)) : v);
+    const quantised = quantise && stepsUniform && bayerTex;
+    const fn = Fn(([p, n, skip]) => {
+      const st = staticPart(p, n).toVar();
+      const visible = withCards(glass ? st.w : st, p, n, skip).toVar();
+      const through = glass ? st.xyz : null;
       // The cone trace is ANALYTIC: d/(R*t) is a continuous function of the
       // geometry, so its penumbra is already smooth and there is nothing here a
       // dither is fixing. Quantising it throws that away and replaces it with
       // banding, then breaks the banding up with a crosshatch. Off by default for
       // this path - it is a style choice, not a correctness one.
-      if (!quantise || !stepsUniform || !bayerTex) {
-        return glass ? through.mul(visible) : visible;
-      }
+      if (!quantised) return glass ? through.mul(visible) : visible;
       const wt = p.div(float(VOXEL_METRES)).floor();
       const dither = texture(bayerTex, wt.xz.add(vec2(0, wt.y)).mul(float(0.25))).r;
       const stepped = clamp(visible.mul(stepsUniform).add(dither).floor().div(stepsUniform),
@@ -284,6 +296,21 @@ export function createSoftSunTSL({ cascades, sunDir, sunTangent,
       return glass ? through.mul(stepped) : stepped;
     }).setLayout(layout('sunCone', outType, [
       { name: 'p', type: 'vec3' }, { name: 'n', type: 'vec3' }, { name: 'skip', type: 'vec2' }]));
+    // partsOut, for a held static part: static (p, n), live (held, p, n, skip)
+    // - held in the shadow's own type (glass: the tint times the visibility) -
+    // and stamp(), a string that changes whenever anything static reads
+    // changes. An object filled in, as a TSL function takes no properties.
+    // Not when quantised: the steps are taken of the whole visibility.
+    if (partsOut && !quantised) Object.assign(partsOut, {
+      static: staticPart, live: withCards,
+      stamp: () => [sunDir.value.x, sunDir.value.y, sunDir.value.z, coneRadiusUniform.value,
+                    maxDist.value, bias.value, fadeStart.value, edgeFade.value, sunSoftReach.value,
+                    sunMap.on.value, sunWorldTop.value, sunInputs.epoch,
+                    // The sky-top map and the glass's tint: textures that load or change in place.
+                    terrain && terrain.skyTop ? terrain.skyTop.version : 0,
+                    glass ? `${glass.ready}:${glass.albedo && glass.albedo.version}` : 0].join()
+    });
+    return fn;
   }
 
   return Fn(([p, n, skip]) => {

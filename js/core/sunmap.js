@@ -5,7 +5,7 @@
 // metre more is a step for every lit texel. With 48 levels a tower throws a
 // shadow a hundred metres long (World plan P1), so the march alone cuts it off.
 //
-// The far half is a depth map from the sun over the whole region: each texel
+// The far half is a depth map from the sun over the whole zone: each texel
 // holds s = dot(p, L) - base of the first surface the sun meets, L the sun's
 // direction (toward it). For a receiver at p, s_map - s_p is how far toward the
 // sun its farthest blocker is - and a blocker counts here only past the
@@ -66,7 +66,7 @@ export function sunMapGrid(radius, maxSide) {
 
 // --- Where the map lies, and how fine it is (World plan P2a) ---
 //
-// The map follows the player rather than covering the region. A blocker
+// The map follows the player rather than covering the zone. A blocker
 // projects onto the map at the same texel as the shadow it casts, so only the
 // receivers need covering - a square of SUN_MAP_WINDOW either side of the
 // player's projection, the screen and its margins - while the depth range

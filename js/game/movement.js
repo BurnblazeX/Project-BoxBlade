@@ -7,7 +7,7 @@
 // only ever clears an occupant it owns, so two overlapping briefly never
 // erase each other.
 import * as THREE from 'three/webgpu';
-import { World, getVoxelKey, stepLevel, surfaceHeight, BLOCK_METRES, occupantAt, setOccupantAt, vacateAt } from '../core/world.js';
+import { World, getVoxelKey, stepLevel, surfaceHeight, BLOCK_METRES, occupantAt, setOccupantAt, vacateAt, bodyFits, BODY_HALF } from '../core/world.js';
 
 // An entity's gridPos.y is the block it stands ON, so its sprite sits on that
 // block's top face - half a block lower on a half-bottom (world.js).
@@ -82,14 +82,20 @@ export function followPath(entity, sprite, path, speed, dt, heading, continuous 
   return false;
 }
 
+const EDGE = 1e-6;
 export const WALK_SPEED = 8;    // m/s: Bob, on foot and along a clicked path
 export const ENEMY_SPEED = 5;   // m/s: Evil Bob, wandering and in battle
 
 // One frame of keyboard walking: keys { w, a, s, d } relative to the screen,
 // heading the camera's settled heading. A column is entered at the same level
 // or a half-block step (world.js stepLevel) - a full block's rise needs
-// Jump - and not while another character occupies it. Blocked on both axes,
-// it slides along whichever one is free.
+// Jump - and not while another character occupies it. The body - BODY_HALF
+// either side of the point - goes only where every tile it reaches over is
+// one a step from here reaches too, so it neither leans into a wall nor slips
+// between two walls that meet at a corner, and where it meets no prop's Grid
+// cell (world.js bodyFits); unless it is in one already, so a fence placed on
+// it never traps it. Blocked on both axes, it slides along whichever one is
+// free.
 export function walk(entity, sprite, keys, heading, dt) {
   let rawDx = 0, rawDz = 0;
   if (keys.w) rawDz -= 1;
@@ -111,26 +117,39 @@ export function walk(entity, sprite, keys, heading, dt) {
 
   const newX = sprite.position.x + dx * WALK_SPEED * dt;
   const newZ = sprite.position.z + dz * WALK_SPEED * dt;
-  const nextGX = Math.round(newX / BLOCK_METRES);
-  const nextGZ = Math.round(newZ / BLOCK_METRES);
 
   const p = entity.gridPos;
   const levelAt = (gx, gz) => (gx === p.x && gz === p.z)
     ? p.y
     : stepLevel(p.x, p.y, p.z, gx, gz);
-  const canWalk = (gx, gz) => {
+  // The tiles the body reaches over at (wx, wz), in metres: touching a tile's
+  // edge is not reaching over it.
+  const tileLo = w => Math.floor((w - BODY_HALF) / BLOCK_METRES + 0.5 + EDGE);
+  const tileHi = w => Math.ceil((w + BODY_HALF) / BLOCK_METRES + 0.5 - EDGE) - 1;
+  // Whether the body fits at (wx, wz) standing on tile level y there.
+  const fits = (wx, wz, gx, y, gz) => {
+    for (let tx = tileLo(wx); tx <= tileHi(wx); tx++) for (let tz = tileLo(wz); tz <= tileHi(wz); tz++) {
+      if ((tx !== gx || tz !== gz) && levelAt(tx, tz) === null) return false;
+    }
+    return bodyFits(wx, surfaceHeight(gx, y, gz), wz);
+  };
+  const stuck = !fits(sprite.position.x, sprite.position.z, p.x, p.y, p.z);
+  // Whether the body can stand at (wx, wz), in metres.
+  const canWalk = (wx, wz) => {
+    const gx = Math.round(wx / BLOCK_METRES), gz = Math.round(wz / BLOCK_METRES);
     const y = levelAt(gx, gz);
     if (y === null) return false;
     const o = occupantAt(getVoxelKey(gx, y, gz));
-    return !o || o === entity.id;
+    if (o && o !== entity.id) return false;
+    return stuck || fits(wx, wz, gx, y, gz);
   };
 
-  if (canWalk(nextGX, nextGZ)) {
+  if (canWalk(newX, newZ)) {
     sprite.position.x = newX;
     sprite.position.z = newZ;
   } else {
-    if (canWalk(nextGX, Math.round(sprite.position.z / BLOCK_METRES))) sprite.position.x = newX;
-    if (canWalk(Math.round(sprite.position.x / BLOCK_METRES), nextGZ)) sprite.position.z = newZ;
+    if (canWalk(newX, sprite.position.z)) sprite.position.x = newX;
+    if (canWalk(sprite.position.x, newZ)) sprite.position.z = newZ;
   }
 
   trackColumn(entity, sprite);

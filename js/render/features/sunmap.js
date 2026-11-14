@@ -7,7 +7,7 @@
 // the sun turned past SUN_MAP_REDRAW, the world changed, the arena hid or
 // showed blocks, the preset changed the softening, or - over a world wider
 // than SUN_MAP_WINDOW - the player left the middle of the map's window
-// (World plan P2a: the map follows the player, it does not cover the region).
+// (World plan P2a: the map follows the player, it does not cover the zone).
 // Its texel follows the softening grid (sunMapTexelFor), its size the window.
 //
 // ctx:
@@ -29,6 +29,7 @@ import { sunMapBounds, sunMapFrame, sunMapStale, sunMapMoved, sunMapTexelFor, su
          SUN_MAP_WINDOW } from '../../core/sunmap.js';
 import { BLOCK_METRES } from '../../core/world.js';
 import { sunMap, sunSoftReach, sunWorldTop, createSunMapMaterial } from '../../gpu/sunmap.js';
+import { sunInputs } from '../../gpu/uploads.js';
 
 const TAP_OPTIONS = ['off', 'hard', 4, 6, 8];
 const REACH_OPTIONS = ['12m', 'c1'];
@@ -101,6 +102,7 @@ export function createSunMap({ renderer, sunLight, shadowsOn, focus }) {
     dirty = false;
     draws++;
     sunMap.on.value = 1;
+    sunInputs.changed();
   }
 
   // The player's feet, metres - where a following map centres.
@@ -152,7 +154,7 @@ export function createSunMap({ renderer, sunLight, shadowsOn, focus }) {
     shadowSettings: [
       { key: 'farshadow', label: 'Far shadows', type: 'select',
         options: TAP_OPTIONS.map(o => ({ value: o, label: typeof o === 'number' ? `soft, up to ${o}x${o}` : o })),
-        help: 'shadows past the soft march, from a sun depth map over the region: softened inside C2, ' +
+        help: 'shadows past the soft march, from a sun depth map over the zone: softened inside C2, ' +
               'hard past it - off: they stop at the march, as before',
         get: () => mode, set: v => commands.farshadow.run(v) },
       { key: 'sunreach', label: 'Soft sun reach', type: 'select',

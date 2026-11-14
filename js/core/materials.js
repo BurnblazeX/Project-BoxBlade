@@ -22,7 +22,8 @@
 export const BLOCK_TEXELS = 12;
 
 export const MATERIALS = [
-  { id: 'grass',     texture: 'terrain_grass' },
+  // nature: plants grow on it (world.js natureLevelAt) - the ground foliage takes to.
+  { id: 'grass',     texture: 'terrain_grass', nature: true },
   // Polished black marble: a dielectric mirror-ish finish (see its _s).
   { id: 'marble',    texture: 'terrain_marble' },
   // Polished iron plate: LabPBR metal 230.
@@ -125,6 +126,11 @@ export function glassSurfaceTransmit(f0, cosI) {
 export function isGlassMaterial(id) {
   const i = id == null ? -1 : layerById.get(id);
   return i != null && i >= 0 && MATERIALS[i].glass === true;
+}
+// Whether plants grow on it: grass, for now the grass block alone.
+export function isNatureMaterial(id) {
+  const i = id == null ? -1 : layerById.get(id);
+  return i != null && i >= 0 && MATERIALS[i].nature === true;
 }
 
 // A block's layer. No id: layer 0. An id with no material (a level naming a

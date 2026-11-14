@@ -2,29 +2,29 @@ import { defineConfig } from 'vite';
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { decodeRegion } from './js/core/region.js';
+import { decodeZone } from './js/core/zone.js';
 
 // Levels (the editor, js/tools/editor.js) live in levels/ at the repo root:
-// <name>.bxr, a region in level format v2 (js/core/region.js), or a v1
+// <name>.bxz, a zone in level format v4 (js/core/zone.js), or a v1
 // <name>.json, which still loads. Under the dev server they are read at
-// /levels/<name>.<ext> and written by POST /__levels?name=<name>, the .bxr
+// /levels/<name>.<ext> and written by POST /__levels?name=<name>, the .bxz
 // bytes as the body; a build copies them into dist/levels/, so the deployed
 // game loads them and cannot write them. Not in public/, whose changes the dev
 // server may answer with a reload - mid-edit.
 const LEVELS_DIR = path.resolve('levels');
 const LEVEL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
-const LEVEL_TYPES = { bxr: 'application/octet-stream', json: 'application/json' };
+const LEVEL_TYPES = { bxz: 'application/octet-stream', json: 'application/json' };
 function levelsPlugin() {
   return {
     name: 'boxblade-levels',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
         const url = new URL(req.url, 'http://local');
-        const get = url.pathname.match(/^\/levels\/([A-Za-z0-9_-]{1,64})\.(bxr|json)$/);
+        const get = url.pathname.match(/^\/levels\/([A-Za-z0-9_-]{1,64})\.(bxz|json)$/);
         if (req.method === 'GET' && get) {
           const file = path.join(LEVELS_DIR, `${get[1]}.${get[2]}`);
           if (!fs.existsSync(file)) { res.statusCode = 404; return res.end(); }
-          // Sent as stored: a .bxr is gzip already, and carries no
+          // Sent as stored: a .bxz is gzip already, and carries no
           // Content-Encoding, so the game inflates it itself.
           res.setHeader('Content-Type', LEVEL_TYPES[get[2]]);
           res.setHeader('Cache-Control', 'no-store');
@@ -34,7 +34,7 @@ function levelsPlugin() {
         // GET: the names of the levels there, for the editor's exits.
         if (req.method === 'GET') {
           const names = fs.existsSync(LEVELS_DIR)
-            ? [...new Set(fs.readdirSync(LEVELS_DIR).filter(f => /\.(bxr|json)$/.test(f)).map(f => f.replace(/\.\w+$/, '')))]
+            ? [...new Set(fs.readdirSync(LEVELS_DIR).filter(f => /\.(bxz|json)$/.test(f)).map(f => f.replace(/\.\w+$/, '')))]
             : [];
           res.setHeader('Content-Type', 'application/json');
           return res.end(JSON.stringify(names.sort()));
@@ -47,9 +47,9 @@ function levelsPlugin() {
         req.on('end', async () => {
           try {
             const bytes = new Uint8Array(Buffer.concat(parts));
-            await decodeRegion(bytes);   // refuses anything that is not a region
+            await decodeZone(bytes);   // refuses anything that is not a zone
             fs.mkdirSync(LEVELS_DIR, { recursive: true });
-            fs.writeFileSync(path.join(LEVELS_DIR, name + '.bxr'), bytes);
+            fs.writeFileSync(path.join(LEVELS_DIR, name + '.bxz'), bytes);
             res.end('saved');
           } catch (err) {
             res.statusCode = 400;
@@ -61,7 +61,7 @@ function levelsPlugin() {
     generateBundle() {
       if (!fs.existsSync(LEVELS_DIR)) return;
       for (const f of fs.readdirSync(LEVELS_DIR)) {
-        if (!/\.(bxr|json)$/.test(f)) continue;
+        if (!/\.(bxz|json)$/.test(f)) continue;
         this.emitFile({ type: 'asset', fileName: 'levels/' + f, source: fs.readFileSync(path.join(LEVELS_DIR, f)) });
       }
     }

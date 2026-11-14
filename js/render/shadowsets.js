@@ -230,6 +230,12 @@ export function createShadowSets({ renderer, scene, camera, options, texel, spri
       mirrorCache: built.mirrorCache,
       splitKernels: lowMat && built.splitKernels ? built.splitKernels : null,
       giKernels: lowMat && built.giKernels ? built.giKernels : null,
+      // The split shading buffers its kernels were built over.
+      split: lowMat && built.splitKernels ? opts.split : null,
+      // The sun store's stamp (gpu/sun.js parts.stamp), when the set holds one.
+      sunStamp: lowMat && built.sunStamp ? built.sunStamp : null,
+      // ... and the hit-light store's (gpu/hitstore.js hitStampFor).
+      hitStamp: lowMat && built.hitStamp ? built.hitStamp : null,
       resolved: !!(lowMat && built.splitKernels && !missMat),
       mats: [terrainMat, ...[lowMat, missMat].filter(Boolean),
              ...[glassMat, glassLow, glassMiss].filter(Boolean), ...spriteSet.mats],

@@ -141,7 +141,7 @@ section('panes: a Grid column, at the side or the centre');
 section('stacks: up to three parts in a tile, a material each');
 {
   const { blockParts, partAt, serializeLevel, withPart, withoutPart, isMulti, gridAt } = await import('../js/core/world.js');
-  const { levelRows, legacyParts } = await import('../js/core/region.js');
+  const { levelRows, legacyParts } = await import('../js/core/zone.js');
   let s = newBlock('marble', 'slab');
   s = withPart(s, { materialId: 'glass', shape: 'slab', at: 3 });
   s = withPart(s, { materialId: 'grass', shape: 'slab', at: 6 });
@@ -402,9 +402,9 @@ section('findPath: identical to the old array search, ties included');
 section('levels: the world as data');
 {
   const { serializeLevel, loadLevel, newBlock, WorldModels, ModelBoxes, removeWorldModel,
-          addWorldModel, mountWorldModel, clearWorldModels, LEVEL_FORMAT } = await import('../js/core/world.js');
+          addWorldModel, mountWorldModel, clearWorldModels, LEVEL_FORMAT, gridSolidCells } = await import('../js/core/world.js');
   const { parseBBModel } = await import('../js/core/bbmodel.js');
-  const { levelRows, encodeRegion, decodeRegion } = await import('../js/core/region.js');
+  const { levelRows, encodeZone, decodeZone } = await import('../js/core/zone.js');
   const { readFileSync } = await import('node:fs');
   const models = new Map(['decor_chair', 'decor_wallTorch'].map(n => [n, parseBBModel(
     readFileSync(new URL(`../assets/objects/${n}.bbmodel`, import.meta.url), 'utf8'), n)]));
@@ -421,12 +421,12 @@ section('levels: the world as data');
      '[0,0,0,["grass"]]');
   ok('the models', JSON.stringify(saved.models),
      '[["decor_chair",6,0,8,1],["decor_wallTorch",19,2,11,0,"E"]]');
-  // Round trip: through a .bxr, into an emptied world, and out again the same.
-  const bytes = await encodeRegion(serializeLevel());
+  // Round trip: through a .bxz, into an emptied world, and out again the same.
+  const bytes = await encodeZone(serializeLevel());
   World.clear(); clearWorldModels();
-  ok('loads with nothing missing', loadLevel(await decodeRegion(bytes), models).length, 0);
+  ok('loads with nothing missing', loadLevel(await decodeZone(bytes), models).length, 0);
   ok('and saves back identically', JSON.stringify(levelRows(serializeLevel())), JSON.stringify(saved));
-  truthy('the chair takes its tile again', !!occupantAt('6,0,8'));
+  truthy('the chair takes Grid cells again, not its tile', gridSolidCells().size > 0 && !occupantAt('6,0,8'));
   ok('the models bake again', ModelBoxes.length,
      models.get('decor_chair').cubes.length + models.get('decor_wallTorch').cubes.filter(c => !c.light).length);
   ok('a v1 level still loads', loadLevel({ format: LEVEL_FORMAT, version: 1, blocks: [[0, 0, 0, 'grass', 'halfTop']] }, models).length, 0);
@@ -444,8 +444,57 @@ section('levels: the world as data');
   const c = addWorldModel(models.get('decor_chair'), 1, 0, 1, 0);
   truthy('removed', removeWorldModel(c));
   ok('nothing left to bake', ModelBoxes.length, 0);
-  falsy('its tile is free', !!occupantAt('1,0,1'));
+  ok('its Grid cells are free', gridSolidCells().size, 0);
   falsy('removing it twice does nothing', removeWorldModel(c));
+
+  // Object states (models.js): category_name_state files are one model. The
+  // chair and the carpet stand in for two states of one here.
+  const { modelStateOf, groupModelStates } = await import('../js/core/models.js');
+  const { swapWorldModel } = await import('../js/core/world.js');
+  ok('a state is the third part of the name', JSON.stringify(modelStateOf('decor_fence_rails')), '{"base":"decor_fence","state":"rails"}');
+  ok('a name of two parts has no state', JSON.stringify(modelStateOf('decor_wallTorch')), '{"base":"decor_wallTorch","state":null}');
+  ok('states group under their base, sorted', JSON.stringify([...groupModelStates(['decor_fence_rails', 'decor_chair', 'decor_fence_bare'])]),
+     '[["decor_chair",["decor_chair"]],["decor_fence",["decor_fence_bare","decor_fence_rails"]]]');
+  const a = { ...models.get('decor_chair'), name: 'decor_test_a' };
+  const b = { ...parseBBModel(readFileSync(new URL('../assets/objects/decor_carpet.bbmodel', import.meta.url), 'utf8'), 'decor_carpet'), name: 'decor_test_b' };
+  World.clear(); clearWorldModels();
+  World.set('3,0,3', newBlock('grass'));
+  const first = addWorldModel(a, 3, 0, 3, 1, 4);
+  const swapped = swapWorldModel(first, b);
+  truthy('swapped', !!swapped);
+  ok('one model still', WorldModels.length, 1);
+  ok('same spot, turn and Grid cell', JSON.stringify([swapped.x, swapped.y, swapped.z, swapped.yaw, swapped.n, swapped.at]),
+     JSON.stringify([3, 0, 3, 1, 4, first.at]));
+  ok('saved as the state it is in', JSON.stringify(levelRows(serializeLevel()).models), '[["decor_test_b",3,0,3,1,null,4]]');
+  ok("bakes the new state's cubes", ModelBoxes.length, b.cubes.filter(c => !c.light).length);
+  ok('and back', swapWorldModel(swapped, a).name, 'decor_test_a');
+  ok('its old entry is gone', swapWorldModel(swapped, a), null);
+
+  // Collision on the Grid: a prop's bounding boxes take half-metre cells, not
+  // its tile. A wall along a tile's south edge, a post in a tile's middle.
+  const { bodyFits, canCross, isEnterable, findPath, BODY_HALF } = await import('../js/core/world.js');
+  const wall = { name: 'test_wall', cubes: [], bounds: [{ min: [-6, 0, 4], max: [6, 12, 6] }] };
+  const post = { name: 'test_post', cubes: [], bounds: [{ min: [-2, 0, -2], max: [2, 12, 2] }] };
+  World.clear(); clearWorldModels();
+  for (let x = 0; x < 10; x++) for (let z = 0; z < 10; z++) World.set(`${x},0,${z}`, newBlock('grass'));
+  const floor = surfaceHeight(5, 0, 5);
+  ok('a straight step, nothing placed', findPath({ x: 5, y: 0, z: 5 }, { x: 5, y: 0, z: 6 }).length, 1);
+  addWorldModel(wall, 5, 0, 5, 0);
+  ok('the wall takes one row of Grid cells, three tall', gridSolidCells().size, 3 * 3);
+  truthy('its tile can still be stood in', isEnterable(5, 0, 5));
+  falsy('but not crossed out of to the south', canCross({ x: 5, y: 0, z: 5 }, { x: 5, y: 0, z: 6 }));
+  truthy('east is open', canCross({ x: 5, y: 0, z: 5 }, { x: 6, y: 0, z: 5 }));
+  const round = findPath({ x: 5, y: 0, z: 5 }, { x: 5, y: 0, z: 6 });
+  ok('a path goes round it', round.length, 3);
+  truthy('touching its face, a body fits', bodyFits(5 * 1.5, floor, 5 * 1.5 + 0.25 - BODY_HALF));
+  falsy('a little further in, it does not', bodyFits(5 * 1.5, floor, 5 * 1.5 + 0.3 - BODY_HALF));
+  truthy('over it, a body fits', bodyFits(5 * 1.5, floor + 1.5, 5 * 1.5 + 0.5));
+  addWorldModel(post, 2, 0, 2, 0);
+  falsy('a post in the middle of a tile closes it', isEnterable(2, 0, 2));
+  ok('and no path ends there', findPath({ x: 2, y: 0, z: 4 }, { x: 2, y: 0, z: 2 }).length, 0);
+  truthy('a body fits half a metre beside it', bodyFits(2 * 1.5 + 0.5, floor, 2 * 1.5));
+  clearWorldModels();
+  truthy('cleared, the step is open again', canCross({ x: 5, y: 0, z: 5 }, { x: 5, y: 0, z: 6 }));
 
   ok('a full block has no shape', newBlock('grass', 'full', 'N').shape, undefined);
   ok('only a shape that turns keeps a facing', `${newBlock('grass', 'slab', 'N').facing},${newBlock('grass', 'slope', 'W').facing}`,
@@ -608,3 +657,21 @@ section('buried faces are not drawn');
   ok('the opaque slab\'s top under the glass is drawn', exposedFaceMask(0, 0, 0, half, false, () => opaqueBoxes(stack)) & 4, 4);
 }
 
+section('where plants grow (natureLevelAt)');
+{
+  const { natureLevelAt } = await import('../js/core/world.js');
+  const { isNatureMaterial } = await import('../js/core/materials.js');
+  truthy('the grass block is nature', isNatureMaterial('grass'));
+  falsy('marble is not', isNatureMaterial('marble'));
+  World.clear();
+  World.set('0,0,0', newBlock('grass'));
+  World.set('1,0,0', newBlock('marble'));
+  World.set('2,0,0', newBlock('grass'));
+  World.set('2,1,0', newBlock('marble'));
+  World.set('3,0,0', newBlock('grass', 'slab'));
+  near("a grass block's top", natureLevelAt(0, 0, 0, 0.5, 0.5), 1);
+  ok('not on marble', natureLevelAt(1, 0, 0, 0.5, 0.5), null);
+  ok('not under a block', natureLevelAt(2, 0, 0, 0.5, 0.5), null);
+  near("a grass slab's top", natureLevelAt(3, 0, 0, 0.5, 0.5), 1 / 3);
+  ok('not where nothing is', natureLevelAt(4, 0, 0, 0.5, 0.5), null);
+}

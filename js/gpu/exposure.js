@@ -35,11 +35,22 @@ export function createExposureMeter() {
   };
   // split: createSplitShading's buffers - samples spread evenly over this
   // frame's count. In float: count * i overflows an int at full screen sizes.
-  const splitKernel = split => Fn(() => {
+  // The visible-texel table keeps colours by slot, so a grid over the
+  // pixels, through each one's slot - as even over the screen as before.
+  const tableKernel = split => Fn(() => {
+    const i = int(instanceIndex);
+    const rows = split.fullCount.div(split.fullWidth);
+    const gx = float(i.mod(int(METER_GRID))).add(float(0.5)).div(float(METER_GRID));
+    const gy = float(i.div(int(METER_GRID))).add(float(0.5)).div(float(METER_GRID));
+    const px = int(gy.mul(float(rows))).mul(split.fullWidth).add(int(gx.mul(float(split.fullWidth))));
+    const si = split.pixelSample.ro.element(px).toVar();
+    If(si.greaterThanEqual(int(0)), () => { add(split.result.ro.element(si)); });
+  })().compute(METER_SAMPLES).setName('exposureMeterTable');
+  const splitKernel = split => (split.table ? tableKernel(split) : Fn(() => {
     const i = float(int(instanceIndex));
     const idx = int(i.add(float(0.5)).mul(float(split.count)).div(float(METER_SAMPLES))).toVar();
     If(idx.lessThan(split.count), () => { add(split.result.ro.element(idx)); });
-  })().compute(METER_SAMPLES).setName('exposureMeterSplit');
+  })().compute(METER_SAMPLES).setName('exposureMeterSplit'));
   // cache: the texel cache's target bindings - a grid over its size.
   const targetKernel = cache => Fn(() => {
     const i = int(instanceIndex);

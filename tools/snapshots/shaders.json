@@ -16,35 +16,35 @@
   "fragment": "4e8be0d379a7dfac"
  },
  "default/sprite": {
-  "vertex": "0e983690a96026bc",
-  "fragment": "4ae06c8f86ffbc51"
+  "vertex": "7243ff3a3689b657",
+  "fragment": "21b58c65a3213fd0"
  },
  "default/split.0:splitBase": {
-  "compute": "63aa1ff67976601a"
+  "compute": "cff03a4e79d49945"
  },
  "default/split.1:splitPoints": {
-  "compute": "4a2038cf354405ae"
+  "compute": "e1d7526bd4312921"
  },
  "default/split.2:splitMirror": {
-  "compute": "042e54bc89366e87"
+  "compute": "855840e14a770e80"
  },
  "default/split.3:splitFinal": {
-  "compute": "ef6150628270902c"
+  "compute": "7ae51a4ef462df39"
  },
  "default/split.4:splitGlassSurface": {
-  "compute": "39bd6731e9496079"
+  "compute": "0db45405ad107544"
  },
  "default/split.5:splitGlassReflect": {
-  "compute": "45e2ab3e88b9c324"
+  "compute": "61979b597f33a0f2"
  },
  "default/split.6:splitGlassThrough": {
-  "compute": "cde70cfab870a495"
+  "compute": "0d044dcacac72e21"
  },
  "default/split.7:splitGlassCompose": {
-  "compute": "944004d1dfae75af"
+  "compute": "1b65b959a0dc0ed0"
  },
  "default/mirror": {
-  "compute": "ba9884acf5808022"
+  "compute": "6a3cb10a6a8f0eb7"
  },
  "default/room:roomMeterEase": {
   "compute": "246a8d722d0ea228"
@@ -66,38 +66,41 @@
   "fragment": "4e8be0d379a7dfac"
  },
  "texelgi/sprite": {
-  "vertex": "4645724836fd3fdb",
-  "fragment": "3a8f0d2d0f0cf78b"
+  "vertex": "4b941a832325caa9",
+  "fragment": "ac0735239ce908bb"
  },
  "texelgi/split.0:splitBase": {
-  "compute": "4a6f7f7325da195f"
+  "compute": "84c703d7f6dc0b13"
  },
  "texelgi/split.1:splitPoints": {
-  "compute": "4a2038cf354405ae"
+  "compute": "e1d7526bd4312921"
  },
  "texelgi/split.2:splitMirror": {
-  "compute": "042e54bc89366e87"
+  "compute": "855840e14a770e80"
  },
  "texelgi/split.3:splitFinal": {
-  "compute": "ac55aa6a6aa41759"
+  "compute": "416ba9fe8473af39"
  },
  "texelgi/split.4:splitGlassSurface": {
-  "compute": "39bd6731e9496079"
+  "compute": "0db45405ad107544"
  },
  "texelgi/split.5:splitGlassReflect": {
-  "compute": "78c8e13f2294b184"
+  "compute": "400d3ce8e9ac5454"
  },
  "texelgi/split.6:splitGlassThrough": {
-  "compute": "83a43737d207b037"
+  "compute": "0ee86032476ea980"
  },
  "texelgi/split.7:splitGlassCompose": {
-  "compute": "944004d1dfae75af"
+  "compute": "1b65b959a0dc0ed0"
  },
  "texelgi/gi.reset:giPatchReset": {
   "compute": "2e2d602bc54595e2"
  },
+ "texelgi/gi.patchArgs:giPatchArgs": {
+  "compute": "06a4cb0f0bcb1bf9"
+ },
  "texelgi/gi.patches:giPatches": {
-  "compute": "2f6e7f07ee252cb0"
+  "compute": "9909e46179ca5d6b"
  },
  "texelgi/gi.sums:giSums": {
   "compute": "827ec5c1e5d6a03b"
@@ -106,68 +109,166 @@
   "compute": "71d9d9efa8d924dd"
  },
  "texelgi/gi.direct:giDirect": {
-  "compute": "4513ab2e1f532f94"
+  "compute": "bddded31256604c5"
  },
  "texelgi/mirror": {
-  "compute": "ba9884acf5808022"
+  "compute": "6a3cb10a6a8f0eb7"
  },
  "texelgi/room:roomMeterEase": {
   "compute": "246a8d722d0ea228"
  },
+ "table/low": {
+  "vertex": "d82faea5d1e624ce",
+  "fragment": "b0db757e429f9785"
+ },
+ "table/terrain": {
+  "vertex": "ff139c2703728541",
+  "fragment": "86569abe1705c08f"
+ },
+ "table/glassLow": {
+  "vertex": "20a4358788e096a6",
+  "fragment": "feb857f2b5ed3bd2"
+ },
+ "table/glass": {
+  "vertex": "7b139525b3e32c95",
+  "fragment": "72a7e62b1978fb35"
+ },
+ "table/sprite": {
+  "vertex": "4b941a832325caa9",
+  "fragment": "ac0735239ce908bb"
+ },
+ "table/split.0:splitSunRefresh": {
+  "compute": "bc6418fa533f810e"
+ },
+ "table/split.1:splitBase": {
+  "compute": "0bd1b82ebdc560a0"
+ },
+ "table/split.2:splitPoints": {
+  "compute": "1bf8183b97f353de"
+ },
+ "table/split.3:splitMirror": {
+  "compute": "deedd57c655cb856"
+ },
+ "table/split.4:splitFinal": {
+  "compute": "30206a7b7483b8c9"
+ },
+ "table/split.5:splitGlassSurface": {
+  "compute": "bbc6648f809a05b0"
+ },
+ "table/split.6:splitGlassReflect": {
+  "compute": "8fe8cbc8b4a305a2"
+ },
+ "table/split.7:splitGlassThrough": {
+  "compute": "690213ccce4cebd5"
+ },
+ "table/split.8:splitGlassCompose": {
+  "compute": "b61162ec55ea1d7f"
+ },
+ "table/gi.reset:giPatchReset": {
+  "compute": "2e2d602bc54595e2"
+ },
+ "table/gi.patchArgs:giPatchArgs": {
+  "compute": "06a4cb0f0bcb1bf9"
+ },
+ "table/gi.patches:giPatches": {
+  "compute": "61c8f3ad3fdb46c7"
+ },
+ "table/gi.sums:giSums": {
+  "compute": "827ec5c1e5d6a03b"
+ },
+ "table/gi.filter:giFilter": {
+  "compute": "71d9d9efa8d924dd"
+ },
+ "table/gi.direct:giDirect": {
+  "compute": "0b07a95091db75e5"
+ },
+ "table/mirror": {
+  "compute": "6a3cb10a6a8f0eb7"
+ },
+ "table/room:roomMeterEase": {
+  "compute": "246a8d722d0ea228"
+ },
+ "table/table.0:splitTableClear": {
+  "compute": "1d5ae269ac6f2058"
+ },
+ "table/table.1:splitTableInsert": {
+  "compute": "203ed1e781876520"
+ },
+ "table/table.2:splitTableClaim": {
+  "compute": "2b7a87ec1a2f2656"
+ },
+ "table/table.3:splitTableArgs": {
+  "compute": "3cbd896e32ca6353"
+ },
+ "table/table.4:splitSunBind": {
+  "compute": "03944e0c15ced1fd"
+ },
+ "table/table.5:splitSunRefreshArgs": {
+  "compute": "5e66f7142151347e"
+ },
+ "table/table.6:splitGlassArgs": {
+  "compute": "872c28abf2ecfebb"
+ },
+ "table/table.7:splitGlassArgs3": {
+  "compute": "ec591774bbe89f95"
+ },
+ "table-dispersion/split.7:splitGlassThrough": {
+  "compute": "63dd3cf177d12b53"
+ },
  "cache/low": {
-  "vertex": "9de4d2e7489948f3",
-  "fragment": "5be16d0e11501aa6"
+  "vertex": "79129ec4e875f50a",
+  "fragment": "3af0781b7dcb2e39"
  },
  "cache/terrain": {
   "vertex": "9c9079f4df3f3952",
   "fragment": "6a5c360c459dce0a"
  },
  "cache/miss": {
-  "vertex": "b4d6c06287fc7cac",
-  "fragment": "7858d544786db632"
+  "vertex": "b77543ff3e04ea71",
+  "fragment": "c84650ba7759fb5f"
  },
  "cache/glassLow": {
-  "vertex": "acadb6cfb512744b",
-  "fragment": "4224dacb1c19f194"
+  "vertex": "ee98c6b64fa091de",
+  "fragment": "a1976afd9ed34471"
  },
  "cache/glass": {
   "vertex": "2415940a2981a1ba",
   "fragment": "62a40bdeaec37c5c"
  },
  "cache/glassMiss": {
-  "vertex": "fd41e70eab9d127f",
-  "fragment": "2b1b55224a9060a1"
+  "vertex": "203b247b1997964f",
+  "fragment": "bef3ea97e97947a5"
  },
  "cache/sprite": {
-  "vertex": "0e983690a96026bc",
-  "fragment": "4ae06c8f86ffbc51"
+  "vertex": "7243ff3a3689b657",
+  "fragment": "21b58c65a3213fd0"
  },
  "cache/mirror": {
-  "compute": "ba9884acf5808022"
+  "compute": "6a3cb10a6a8f0eb7"
  },
  "plain/terrain": {
-  "vertex": "0b04c4be628e7d7e",
-  "fragment": "a4e6c06cd7599b8e"
+  "vertex": "8e1cf93e20962d93",
+  "fragment": "207d96b9d685af35"
  },
  "plain/glass": {
-  "vertex": "3219fed80f1d18ce",
-  "fragment": "554dba8410b6e0d2"
+  "vertex": "3505b61ecc140ab0",
+  "fragment": "914d2e2a0d5f8005"
  },
  "plain/sprite": {
-  "vertex": "f2455cc4d08a1ccb",
-  "fragment": "51133d3d000d7f63"
+  "vertex": "b3af2bcc22b009de",
+  "fragment": "936d839c9f336950"
  },
  "plain/mirror": {
-  "compute": "ba9884acf5808022"
+  "compute": "6a3cb10a6a8f0eb7"
  },
  "lpv0/0:LPV.Clear": {
   "compute": "31ed372c3175c2c9"
  },
  "lpv0/1:LPV.Solid": {
-  "compute": "9e17ff8c2ddd0ce9"
+  "compute": "044db9479358c44a"
  },
  "lpv0/2:LPV.Inject": {
-  "compute": "1dcececc183a12b4"
+  "compute": "51bc07cb2d89e511"
  },
  "lpv0/3:LPV.Propagate": {
   "compute": "c362048f750b370a"
@@ -182,10 +283,10 @@
   "compute": "31ed372c3175c2c9"
  },
  "lpv1/1:LPV.Solid": {
-  "compute": "9e17ff8c2ddd0ce9"
+  "compute": "044db9479358c44a"
  },
  "lpv1/2:LPV.Inject": {
-  "compute": "1dcececc183a12b4"
+  "compute": "51bc07cb2d89e511"
  },
  "lpv1/3:LPV.Propagate": {
   "compute": "c362048f750b370a"

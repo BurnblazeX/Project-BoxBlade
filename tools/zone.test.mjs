@@ -1,0 +1,191 @@
+import { file, section, ok, truthy, throws, note } from './lib/harness.mjs';
+import { readFileSync } from 'node:fs';
+import { migrateLevel, levelRows, packZone, unpackZone, encodeZone, decodeZone, legacyParts,
+         LEVEL_FORMAT, LEVEL_VERSION } from '../js/core/zone.js';
+import { World, Zone, newBlock, serializeLevel, loadLevel, clearWorldModels, Y_MIN, Y_MAX,
+         CHUNK_SIZE } from '../js/core/world.js';
+
+file('zone.test.mjs - zones on disk, level format v2 (World plan P2)');
+
+const shape = World.shape;
+const v1 = {
+  format: LEVEL_FORMAT, version: 1,
+  blocks: [[0, 0, 0, 'grass'], [1, 0, 0, 'grass'], [-1, Y_MIN, -13, 'marble'], [30, Y_MAX, 5, 'grass', 'slope', 'S'],
+           [5, 1, 5, 'marble', 'halfBottom', null, 'glass']],
+  models: [['decor_chair', 0, 0, 0, 1]]
+};
+const sorted = rows => rows.map(r => JSON.stringify(r)).sort().join(' ');
+// v1's rows as v3 holds them: halves made parts on the Grid.
+const parts = sorted(v1.blocks.map(([x, y, z, ...t]) => [x, y, z, ...legacyParts(t)]));
+
+section('v1 levels migrate');
+{
+  const level = migrateLevel(v1, shape);
+  ok('to version 3', level.version, LEVEL_VERSION);
+  ok('bounds from the blocks', JSON.stringify(level.zone.bounds), '[-1,30,-13,5]');
+  ok('no spawns, no exits', JSON.stringify([level.spawns, level.exits]), '[{},[]]');
+  ok('a palette of the kinds of block, 0 empty', level.palette.length, 5);
+  ok('a chunk per column of chunks used', level.chunks.length, 3);
+  ok('every row comes back, in parts', sorted(levelRows(level).blocks), parts);
+  ok('the models kept', JSON.stringify(level.models), JSON.stringify(v1.models));
+  throws('a block outside the vertical range is refused',
+         () => migrateLevel({ format: LEVEL_FORMAT, blocks: [[0, Y_MAX + 1, 0, 'grass']] }, shape));
+  throws('a newer version is refused', () => migrateLevel({ format: LEVEL_FORMAT, version: 99, blocks: [] }, shape));
+  throws('a file that is not a level is refused', () => migrateLevel({ blocks: [] }, shape));
+}
+
+section('bytes: packed, gzipped and back');
+{
+  const level = migrateLevel({ ...v1, zone: { name: 'test', bounds: [-20, 40, -20, 40], seaLevel: -2 },
+                               spawns: { start: [0, 1, 0] }, exits: [{ cells: [1, 1, 0, 1, 1, 0], target: 'b', spawn: 'start' }] }, shape);
+  const back = unpackZone(packZone(level));
+  ok('the header comes back', JSON.stringify([back.zone, back.spawns, back.exits, back.models]),
+     JSON.stringify([level.zone, level.spawns, level.exits, level.models]));
+  ok('authored bounds wider than the blocks are kept', JSON.stringify(back.zone.bounds), '[-20,40,-20,40]');
+  ok('the blocks come back', sorted(levelRows(back).blocks), parts);
+  const gz = await encodeZone(level);
+  ok('a .bxz is gzip', gz[0] === 0x1f && gz[1] === 0x8b, true);
+  ok('and decodes to the same', sorted(levelRows(await decodeZone(gz)).blocks), parts);
+  ok('bytes already inflated are read as they are', (await decodeZone(packZone(level))).chunks.length, level.chunks.length);
+  throws('a file that is not a zone is refused', () => unpackZone(new TextEncoder().encode('{"format":"x"}')));
+  const bad = packZone(level);
+  bad[bad.length - 1] = 0xff;            // the last run's type, past the palette
+  throws('a corrupt chunk is refused', () => unpackZone(bad));
+}
+
+section('a v3 file: .bxr magic, the zone under region');
+{
+  const bytes = packZone(migrateLevel({ ...v1, zone: { name: 'old', bounds: [0, 1, 0, 1], seaLevel: null } }, shape));
+  const n = new DataView(bytes.buffer).getUint32(4, true);
+  const { zone, ...head } = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + n)));
+  const h = new TextEncoder().encode(JSON.stringify({ ...head, version: 3, region: zone }));
+  const old = new Uint8Array(8 + h.length + bytes.length - 8 - n);
+  old.set([0x42, 0x58, 0x52, 0x00], 0);
+  new DataView(old.buffer).setUint32(4, h.length, true);
+  old.set(h, 8);
+  old.set(bytes.subarray(8 + n), 8 + h.length);
+  const back = migrateLevel(unpackZone(old), shape);
+  ok('reads as v4, its zone under zone', JSON.stringify([back.version, back.zone.name, 'region' in back]),
+     JSON.stringify([LEVEL_VERSION, 'old', false]));
+  ok('... with its blocks', sorted(levelRows(back).blocks), parts);
+}
+
+section('another chunk shape converts');
+{
+  const level = migrateLevel(v1, { size: 16, yMin: -8, height: 48 });
+  ok('chunked at 16', level.chunk.size, 16);
+  const back = migrateLevel(level, shape);
+  ok('and back to the world\'s', back.chunk.size, CHUNK_SIZE);
+  ok('the same blocks', sorted(levelRows(back).blocks), parts);
+}
+
+section('the world: saved and loaded through a .bxz');
+{
+  clearWorldModels();
+  const missing = loadLevel(v1, new Map(), 'fallback');
+  ok('the chair is reported missing (no models given)', JSON.stringify(missing), '["decor_chair"]');
+  ok('the name falls back to the one given', Zone.name, 'fallback');
+  ok('every block in the world', World.size, v1.blocks.length);
+  ok('a slope keeps its shape and facing', JSON.stringify([World.getAt(30, Y_MAX, 5).shape, World.getAt(30, Y_MAX, 5).facing]),
+     '["slope","S"]');
+  ok('a dual block a slab and two of its second material', World.getAt(5, 1, 5).more.map(p => p.materialId).join(), 'glass,glass');
+  const v2 = { ...migrateLevel(v1, shape), version: 2 };
+  v2.palette = [null, ...v1.blocks.map(([, , , ...t]) => t)];
+  ok('a v2 palette in memory is made parts too', JSON.stringify(migrateLevel(v2, shape).palette[5]),
+     JSON.stringify(legacyParts(v1.blocks[4].slice(3))));
+  World.set('60,0,60', newBlock('grass'));
+  const saved = serializeLevel();
+  ok('bounds grow to a block placed outside them', JSON.stringify(saved.zone.bounds), '[-1,60,-13,60]');
+  ok('the palette holds only types in use', saved.palette.length, 5);
+  World.delete('60,0,60');
+  const before = sorted(levelRows(serializeLevel()).blocks);
+  const bytes = await encodeZone(serializeLevel());
+  World.clear();
+  loadLevel(await decodeZone(bytes), new Map());
+  ok('a round trip through the file leaves the world the same', sorted(levelRows(serializeLevel()).blocks), before);
+  ok('emptied chunks are not saved', serializeLevel().chunks.length, 3);
+}
+
+section('the Dev Level');
+{
+  const url = new URL('../levels/dev_level.bxz', import.meta.url);
+  let bytes = null;
+  try { bytes = readFileSync(url); } catch { /* not converted yet */ }
+  truthy('levels/dev_level.bxz exists', bytes);
+  if (bytes) {
+    const level = await decodeZone(new Uint8Array(bytes));
+    ok('is named', level.zone.name, 'dev_level');
+    truthy('holds its blocks', levelRows(level).blocks.length > 2000);
+    note(`${bytes.length} bytes, ${level.chunks.length} chunks, ${level.palette.length - 1} kinds of block`);
+  }
+}
+
+section('a large zone: size and speed');
+{
+  // 384 x 384 blocks of ground four to six deep, hills, a road, a building
+  // every 24 blocks, and the surface a random mix of four materials, cell by
+  // cell - worse for runs than any painted map: ~700k blocks.
+  const hash = (x, z) => { let h = Math.imul(x, 374761393) + Math.imul(z, 668265263); h = Math.imul(h ^ (h >>> 13), 1274126177); return (h ^ (h >>> 16)) >>> 0; };
+  const top = ['grass', 'grass', 'dirt', 'gravel'];
+  const blocks = [];
+  for (let x = 0; x < 384; x++) {
+    for (let z = 0; z < 384; z++) {
+      const h = Math.round(Math.sin(x / 40) * Math.cos(z / 50) * 2) + 2;
+      for (let y = -3; y <= h - 2; y++) blocks.push([x, y, z, y === h - 2 ? (z % 64 < 3 ? 'path' : top[hash(x, z) & 3]) : 'dirt']);
+      if (x % 24 < 6 && z % 24 < 6) for (let y = h - 1; y <= h + 2; y++) blocks.push([x, y, z, 'stone']);
+    }
+  }
+  const level = migrateLevel({ format: LEVEL_FORMAT, blocks }, shape);
+  let t = performance.now();
+  const gz = await encodeZone(level);
+  const encodeMs = performance.now() - t;
+  t = performance.now();
+  const back = await decodeZone(gz);
+  const decodeMs = performance.now() - t;
+  const json = JSON.stringify({ format: LEVEL_FORMAT, version: 1, blocks }).length;
+  note(`${blocks.length} blocks: ${(gz.length / 1024).toFixed(0)} KB as a .bxz against ${(json / 1048576).toFixed(1)} MB of v1 JSON; ` +
+       `encode ${encodeMs.toFixed(0)} ms, decode ${decodeMs.toFixed(0)} ms`);
+  truthy('under a megabyte', gz.length < 1 << 20);
+  ok('every chunk back', back.chunks.length, level.chunks.length);
+  t = performance.now();
+  World.clear();
+  loadLevel(back, new Map());
+  const loadMs = performance.now() - t;
+  note(`into the world in ${loadMs.toFixed(0)} ms`);
+  ok('every block in the world', World.size, blocks.length);
+  truthy('decoded and loaded in under a second', decodeMs + loadMs < 1000);
+  World.clear();
+}
+
+section('zones: A, then B, then A again is A loaded fresh (World plan P2 §4.5)');
+{
+  const { WorldModels, ModelBoxes, occupantAt, zoneSpawn } = await import('../js/core/world.js');
+  const { parseBBModel } = await import('../js/core/bbmodel.js');
+  const { readdirSync } = await import('node:fs');
+  const dir = new URL('../assets/objects/', import.meta.url);
+  const { treeModel } = await import('../js/core/models.js');
+  const files = new Map(readdirSync(dir).filter(f => f.endsWith('.bbmodel')).map(f => {
+    const n = f.replace('.bbmodel', '');
+    return [n, parseBBModel(readFileSync(new URL(f, dir), 'utf8'), n)];
+  }));
+  // Generated trees by name too, as the game resolves them (core/models.js MODELS_AND_TREES).
+  const models = { get: n => files.get(n) || treeModel(n) };
+  const read = async n => decodeZone(new Uint8Array(readFileSync(new URL(`../levels/${n}.bxz`, import.meta.url))));
+  const a = await read('dev_level'), b = await read('test_b');
+  const state = () => JSON.stringify({
+    blocks: levelRows(serializeLevel()).blocks, zone: Zone,
+    models: WorldModels.map(m => [m.name, m.x, m.y, m.z, m.yaw, m.wall]), boxes: ModelBoxes,
+    occupied: WorldModels.map(m => occupantAt(`${m.tile[0]},${m.tile[1]},${m.tile[2]}`))
+  });
+  World.clear(); clearWorldModels();
+  ok('A loads with every model found', loadLevel(a, models, 'dev_level').length, 0);
+  const fresh = state();
+  ok('B loads with every model found', loadLevel(b, models, 'test_b').length, 0);
+  ok('B is B: its zone', Zone.name, 'test_b');
+  ok('nothing of A is left in B', World.size, 26154);
+  ok('B\'s spawn by name', JSON.stringify(zoneSpawn('hut')), '[19,0,15]');
+  ok('an unknown spawn is the start', JSON.stringify(zoneSpawn('nowhere')), '[12,0,30]');
+  loadLevel(a, models, 'dev_level');
+  ok('A again is A fresh: blocks, zone, models, their boxes and tiles', state(), fresh);
+  World.clear(); clearWorldModels();
+}

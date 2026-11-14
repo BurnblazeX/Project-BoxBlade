@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { Fn, If, Loop, Break, float, vec3, uniform, texture3D, max, texture, abs, vec2, min, clamp, smoothstep, int, select } from 'three/tsl';
+import { sunInputs } from './uploads.js';
 import { GRID_DIM, VOXEL_METRES, createFieldAt, DISTANCE_RANGE, FIELD_CHANNELS, gridIndex, ringSegments, ringSegmentsY, ringSegmentsZ, HIT_EPS, MIN_STEP, MAX_TRACE_STEPS } from '../core/field.js';
 
 // --- WebGPU compute plumbing and the sphere trace on the GPU ---
@@ -306,6 +307,7 @@ export function followShadowGrid(grid, tex, bindings, originBlock, renderer = nu
 // both after a main-thread re-origin and after a worker hand-off.
 export function commitShadowGrid(grid, tex, bindings, renderer = null) {
   writeCascadeBindings(bindings, grid);
+  sunInputs.changed();
   // A slide changed only the strips that scrolled in, so only those go up.
   // Anything else - a full rebake, or no renderer to copy with - is the old
   // whole-texture upload.

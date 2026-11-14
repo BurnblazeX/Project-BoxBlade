@@ -29,13 +29,13 @@ section('generators use only exact arithmetic');
 // it: bump RNG_VERSION and update them together, on purpose.
 section(`fixed outputs (RNG_VERSION ${RNG_VERSION})`);
 {
-  ok('version', RNG_VERSION, 1);
+  ok('version', RNG_VERSION, 2);
   const r = createRng(1);
   ok('seed 1: the first six draws', Array.from({ length: 6 }, () => r.u32()).join(),
      '1828152527,3394835397,2967886022,2251045104,4148684523,4055680838');
   ok('mix32', [mix32(0), mix32(1), mix32(0xdeadbeef)].join(), '0,1753845952,3861431939');
   ok('hash32', [hash32(1, 2), hash32(2, 1), hash32('village', -3, 7)].join(), '1035792493,2052497589,1730010372');
-  ok('chunkSeed', chunkSeed(12345, 'village', 2, -1, 'scatter'), 2594038256);
+  ok('chunkSeed', chunkSeed(12345, 2, -1, 'scatter'), 1823408089);
   const s = createRng('village', 4);
   ok('seeded by parts', [s.u32(), s.int(6), s.range(10, 20), s.float()].join(), '3370752306,4,15,0.6098617669194937');
   ok('value noise', valueNoise2(7, 0.5, 0.25), 0.5676057248917914);
@@ -62,7 +62,7 @@ section('world seeds, as Minecraft\'s');
   ok('two fresh seeds differ', randomSeed() !== randomSeed(), true);
   // Same seed, same world: every chunk's stream follows from the key alone.
   const world = seed => Array.from({ length: 9 }, (_, i) =>
-    createRng(chunkSeed(seedKey(seed), 'village', i % 3, Math.floor(i / 3), 'scatter')).u32()).join();
+    createRng(chunkSeed(seedKey(seed), i % 3, Math.floor(i / 3), 'scatter')).u32()).join();
   ok('the same seed typed twice builds the same chunks', world('Over the River'), world(' Over the River'));
   ok('another seed builds other chunks', world('Over the River') !== world('Over the river'), true);
 }
@@ -77,9 +77,9 @@ section('hashing');
   throws('a missing part is refused', () => hash32(undefined));
   // 64 x 64 chunks of one layer: every seed different.
   const seeds = new Set();
-  for (let cx = -32; cx < 32; cx++) for (let cz = -32; cz < 32; cz++) seeds.add(chunkSeed(1, 'road', cx, cz, 'scatter'));
+  for (let cx = -32; cx < 32; cx++) for (let cz = -32; cz < 32; cz++) seeds.add(chunkSeed(1, cx, cz, 'scatter'));
   ok('4096 neighbouring chunks, 4096 seeds', seeds.size, 4096);
-  ok('layers do not share a seed', chunkSeed(1, 'road', 0, 0, 'scatter') !== chunkSeed(1, 'road', 0, 0, 'terrain'), true);
+  ok('layers do not share a seed', chunkSeed(1, 0, 0, 'scatter') !== chunkSeed(1, 0, 0, 'terrain'), true);
 }
 
 section('streams are pure functions of their seed');
@@ -88,7 +88,7 @@ section('streams are pure functions of their seed');
   ok('same seed, same stream', take(createRng(42), 50), take(createRng(42), 50));
   ok('next seed, another stream', take(createRng(42), 5) !== take(createRng(43), 5), true);
   // Chunks generated in two orders: each chunk's stream is its own.
-  const draw = (cx, cz) => createRng(chunkSeed(9, 'village', cx, cz, 'scatter')).u32();
+  const draw = (cx, cz) => createRng(chunkSeed(9, cx, cz, 'scatter')).u32();
   const forward = [], backward = new Map();
   for (let i = 0; i < 25; i++) forward.push(draw(i % 5, Math.floor(i / 5)));
   for (let i = 24; i >= 0; i--) backward.set(i, draw(i % 5, Math.floor(i / 5)));

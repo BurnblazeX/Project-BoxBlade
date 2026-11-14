@@ -1,9 +1,9 @@
-// --- Exits: where a region leads to another (World plan P2, step 3) ---
+// --- Exits: where a zone leads to another (World plan P2, step 3) ---
 //
 // An exit is a box of the cells the party stands on - [x0, y0, z0, x1, y1,
 // z1], inclusive, the ground blocks' own keys (player.gridPos) - and where it
-// goes: { cells, target: region name, spawn: spawn name in it }. They ride in
-// the region's header (core/region.js) beside the spawns, { name: [x, y, z] },
+// goes: { cells, target: zone name, spawn: spawn name in it }. They ride in
+// the zone's header (core/zone.js) beside the spawns, { name: [x, y, z] },
 // and the editor places both (tools/editor.js).
 //
 // Standing on an exit offers the way on (main.js: a prompt, F or its button);
@@ -30,7 +30,7 @@ export function exitAt(exits, x, y, z) {
   return null;
 }
 
-// What a region's exit list is without those touching the cells of box b -
+// What a zone's exit list is without those touching the cells of box b -
 // how the editor removes an exit (a right click on any of its cells).
 export function exitsWithout(exits, b) {
   return (exits || []).filter(e => {

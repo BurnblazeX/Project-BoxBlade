@@ -91,14 +91,14 @@ section('the softening grid never spreads its taps thin');
 section('a big world: the map follows the player (World plan P2a)');
 {
   const dot = (a, c) => a[0] * c[0] + a[1] * c[1] + a[2] * c[2];
-  // A 512-block region, 768 m across.
+  // A 512-block zone, 768 m across.
   const big = { min: [-384, -12, -384], max: [384, 60, 384] };
   const sun = { x: 1, y: 0.4, z: 0.3 };
   const texel = sunMapTexelFor(4);
   const at = { x: 100, y: 3, z: -50 };
   const f = sunMapFrame(big, sun, at, SUN_MAP_WINDOW, texel);
   ok('it follows', f.follows, true);
-  ok('over the window, not the region', f.half, SUN_MAP_WINDOW);
+  ok('over the window, not the zone', f.half, SUN_MAP_WINDOW);
   const p = [at.x, at.y, at.z];
   ok('centred on the player, within half a texel', Math.abs(dot(p, f.right) - f.plane[0]) <= texel / 2 + 1e-9 &&
      Math.abs(dot(p, f.up) - f.plane[1]) <= texel / 2 + 1e-9, true);
